@@ -1,0 +1,20 @@
+# The ONLY permitted internal (workspace-to-workspace) dependency edges.
+# `cargo xtask graph-check` fails if any crate depends on a workspace crate not
+# listed for it, or if a crate has no entry here at all. Adding an edge is a
+# deliberate, reviewable act — edit this file in the same PR that adds the dep.
+#
+# Mirrors the allowed dependency graph in bootstrap-plan.md §3. Notably forbidden:
+# `backend -> frontend` (backend may only know the IR) and anything -> `runtime`
+# (only the rt-abi contract is shared).
+[allow]
+midir    = []
+rt-abi   = []
+rt-stub  = ["rt-abi"]
+runtime  = ["rt-abi"]
+frontend = ["midir"]
+backend  = ["midir", "rt-abi"]
+interp   = ["frontend", "rt-abi"]
+fmt      = ["frontend"]
+lsp      = ["frontend"]
+driver   = ["frontend", "backend", "interp", "fmt"]
+xtask    = []

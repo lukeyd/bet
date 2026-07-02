@@ -1,0 +1,22 @@
+[package]
+name = "backend"
+description = "bet backend: midir -> LLVM IR (inkwell), pass pipeline, lld linking, 6 target triples"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+midir  = { path = "../midir" }
+rt-abi = { path = "../rt-abi" }
+# LLVM is laid in but NOT built by default: `inkwell`/`llvm-sys` are pinned and
+# lockfile-audited yet only compiled under `--features llvm`, so the default
+# workspace build needs no LLVM install. Wire it in when backend work begins.
+inkwell = { workspace = true, optional = true }
+
+[features]
+default = []
+llvm = ["dep:inkwell"]
+
+[lints]
+workspace = true

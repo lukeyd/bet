@@ -1,0 +1,13 @@
+[package]
+name = "rt-stub"
+description = "Naive malloc-backed implementation of rt-abi (bootstrap only; never ships)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rt-abi = { path = "../rt-abi" }
+
+[lints]
+workspace = true

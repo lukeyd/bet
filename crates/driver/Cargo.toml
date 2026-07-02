@@ -1,0 +1,21 @@
+[package]
+name = "driver"
+description = "The `bet` CLI users invoke: compile / run / fmt / test"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The user-facing binary is named `bet` (the language name), not `driver`.
+[[bin]]
+name = "bet"
+path = "src/main.rs"
+
+[dependencies]
+frontend = { path = "../frontend" }
+backend  = { path = "../backend" }
+interp   = { path = "../interp" }
+fmt      = { path = "../fmt" }
+
+[lints]
+workspace = true

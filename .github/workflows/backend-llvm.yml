@@ -1,0 +1,24 @@
+name: backend-llvm
+
+# Ready-but-not-wired: manual only. The default `ci.yml` never builds LLVM, so no
+# runner needs it. When the backend work begins, this one-click job builds `backend`
+# with the `llvm` feature against the pinned LLVM (keep the version in sync with the
+# `inkwell` feature in the root Cargo.toml and `cargo xtask setup-llvm`).
+on:
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: install LLVM 18
+        run: sudo apt-get update && sudo apt-get install -y llvm-18-dev libpolly-18-dev
+      - name: install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: build backend with llvm
+        run: cargo build -p backend --features llvm --locked

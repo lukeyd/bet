@@ -1,0 +1,17 @@
+# Single source of truth for the toolchain. rustup reads this on every `cargo`
+# invocation and on CI (`rustup show`), so every agent and runner uses the same
+# compiler with zero setup drift.
+[toolchain]
+channel    = "1.96.1"
+components = ["rustfmt", "clippy"]
+profile    = "minimal"
+
+# Cross-compilation targets are intentionally NOT listed yet: the CI matrix uses
+# NATIVE runners for all 6 combos (each builds its host target by default), and
+# listing targets here would make rustup auto-download all six locally on first
+# use. Add them when the runtime cross-compile work begins (bootstrap-plan §4.4):
+# targets = [
+#   "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
+#   "x86_64-apple-darwin",      "aarch64-apple-darwin",
+#   "x86_64-pc-windows-msvc",   "aarch64-pc-windows-msvc",
+# ]

@@ -1,0 +1,13 @@
+[package]
+name = "fmt"
+description = "bet canonical formatter (consumes the frontend library)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+frontend = { path = "../frontend" }
+
+[lints]
+workspace = true

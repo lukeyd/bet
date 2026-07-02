@@ -1,0 +1,106 @@
+# tasks.toml — work breakdown that drives velocity + ETA (see `cargo xtask timelog eta`).
+#
+# Each task's `slug` MUST match the --task passed to scripts/timelog.sh so logged
+# time aggregates onto the right task. `size` is a RELATIVE estimate in points
+# (Fibonacci-ish); absolute value doesn't matter, only ratios. `status` is one of
+# todo | doing | done. Velocity = (points of done tasks) / (active hours on them);
+# ETA = (remaining points) / velocity. Sizes are initial guesses — tune them as
+# real velocity data accrues so the ETA sharpens.
+#
+# Seeded from bootstrap-plan.md §2/§6 and language-spec.md §11.4 + plan-amendment-01 §7.
+
+[[task]]
+slug = "step0-skeleton"
+name = "Step 0: workspace skeleton, CI, conventions, time-tracking"
+size = 5
+status = "doing"
+
+[[task]]
+slug = "midir"
+name = "Step 1a: midir crate — IR types, builder, .mir text format, validator"
+size = 13
+status = "todo"
+
+[[task]]
+slug = "rt-abi"
+name = "Step 1b: runtime ABI + rt-stub (incl. platform layer, amendment §6.1)"
+size = 8
+status = "todo"
+
+[[task]]
+slug = "grammar-corpus"
+name = "Step 1c: frozen EBNF grammar + 30-50 golden corpus programs"
+size = 8
+status = "todo"
+
+[[task]]
+slug = "tracer-bullet"
+name = "Step 2: spill.it(\"hi\") end-to-end (frontend->midir->backend->stub) on 3 OSes"
+size = 5
+status = "todo"
+
+[[task]]
+slug = "frontend"
+name = "Fan-out: frontend library — lexer, parser, AST, typecheck, midir emit"
+size = 21
+status = "todo"
+
+[[task]]
+slug = "backend"
+name = "Fan-out: backend — midir -> LLVM IR, pass pipeline, lld linking, 6 targets"
+size = 21
+status = "todo"
+
+[[task]]
+slug = "runtime"
+name = "Fan-out: runtime — cribs, generations, scratch, allocator ctx, scheduler, OS layer"
+size = 21
+status = "todo"
+
+[[task]]
+slug = "interp"
+name = "Fan-out: tree-walking interpreter + differential test partner"
+size = 13
+status = "todo"
+
+[[task]]
+slug = "stdlib"
+name = "Fan-out: stdlib (spill, fs, str, math, mem, stash, bytes, gg, ...)"
+size = 13
+status = "todo"
+
+[[task]]
+slug = "tooling"
+name = "Fan-out: fmt (self-hosted), lsp, driver CLI, package manager"
+size = 13
+status = "todo"
+
+[[task]]
+slug = "milestone-3-arenas"
+name = "Milestone 3: crib/cop/evict arena allocation end-to-end through codegen"
+size = 8
+status = "todo"
+
+[[task]]
+slug = "milestone-4-tag-holla"
+name = "Milestone 4: tag/holla end-to-end with debug-mode trust() checking"
+size = 8
+status = "todo"
+
+[[task]]
+slug = "milestone-6-pong"
+name = "Milestone 6: Pong demo"
+size = 8
+status = "todo"
+
+[[task]]
+slug = "selfhost"
+name = "Milestone 7.1: self-host stage 1 (frontend rewritten in bet)"
+size = 34
+status = "todo"
+
+[[task]]
+slug = "doom"
+name = "Milestone 7.2: Doom port targeting gg platform layer"
+size = 34
+status = "todo"

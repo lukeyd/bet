@@ -1,0 +1,13 @@
+(* ============================================================================
+   bet — surface grammar (EBNF)  ★ FROZEN ARTIFACT (placeholder)
+
+   Status: NOT YET FROZEN. This file is formalized and frozen in Step 1c
+   (bootstrap-plan.md §1c), alongside writing the 30-50 program golden corpus —
+   writing real programs is what settles the open syntax questions (ASI rules,
+   default visibility=hush, numeric spellings) faster than debate.
+
+   Keyword vocabulary and syntax overview: language-spec.md §3-§4.
+   New surface constructs from plan-amendment-01: `moods`/`vibe` (sum types +
+   pattern match, §2.1), generics `[T]` (§2.2), bit operators (§2.4), function
+   types `finna(T)->U` (§2.5), `extern`/`rawptr` (§2.6), `bounce` (§2.8).
+   ============================================================================ *)

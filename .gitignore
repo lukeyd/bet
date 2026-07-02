@@ -1,0 +1,18 @@
+# Rust / Cargo build artifacts
+/target
+**/*.rs.bk
+*.pdb
+
+# Local pinned-LLVM install used by `cargo xtask setup-llvm`
+/.llvm
+
+# Release artifacts (`cargo xtask dist`)
+/dist
+
+# OS / editor cruft
+.DS_Store
+.idea/
+.vscode/
+
+# NOTE: Cargo.lock is intentionally COMMITTED (the workspace ships the `bet` binary;
+#       CI builds with --locked). timelog/ is intentionally COMMITTED (durable effort log).

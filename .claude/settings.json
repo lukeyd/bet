@@ -1,0 +1,16 @@
+{
+  "$comment": "Committed workspace rule for the bet project. The PostToolUse hook appends one timestamped heartbeat after every tool call (see scripts/timelog-hook.sh and timelog/README.md). It is the mechanical backstop for the time-tracking system; the semantic spans in scripts/timelog.sh are the primary source.",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$CLAUDE_PROJECT_DIR/scripts/timelog-hook.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}

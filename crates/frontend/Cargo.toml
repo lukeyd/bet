@@ -1,0 +1,13 @@
+[package]
+name = "frontend"
+description = "bet frontend LIBRARY: lexer -> parser -> AST -> typecheck -> midir (reused by tooling)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+midir = { path = "../midir" }
+
+[lints]
+workspace = true

@@ -1,0 +1,49 @@
+# Virtual workspace root for `bet` (the language implementation).
+# No [package] here — members live under crates/. std/, tests/, selfhost/, ports/
+# are NOT crates (they hold bet source, data, and future harnesses); they are
+# excluded defensively so cargo never tries to auto-discover them.
+[workspace]
+resolver = "3"
+members  = ["crates/*"]
+exclude  = ["std", "tests", "selfhost", "ports"]
+
+[workspace.package]
+edition = "2024"
+version = "0.0.0"
+license = "Apache-2.0"        # placeholder — confirm before first release
+publish = false
+
+[workspace.dependencies]
+# --- live now (used by xtask) ---
+anyhow         = "1"
+cargo_metadata = "0.19"
+serde          = { version = "1", features = ["derive"] }
+serde_json     = "1"
+toml           = "0.8"
+
+# --- seeded but not yet wired into any crate's [dependencies] ---
+# (Cargo only locks/builds deps that a member actually references, so listing
+#  them here is a zero-cost catalog that keeps versions consistent when adopted.)
+inkwell   = { version = "0.5", default-features = false, features = ["llvm18-0"] }
+thiserror = "1"
+logos     = "0.14"
+chumsky   = "0.9"
+tower-lsp = "0.20"
+criterion = "0.5"
+insta     = "1"
+libc      = "0.2"
+
+# Lint policy inherited by every crate via `[lints] workspace = true`.
+# Levels live here; CI runs clippy with `-D warnings`, so any of these is a hard error there.
+[workspace.lints.rust]
+# NOTE: unsafe_code is deliberately NOT forbidden — rt-abi/rt-stub/runtime/backend
+# need `unsafe` (extern "C", FFI, raw slabs) in Step 1+. Kept at warn.
+unsafe_code = "warn"
+# `unused_crate_dependencies` is intentionally OFF in Step 0: the stub crates wire
+# their real dependency EDGES (so graph-check is meaningful) but the empty lib.rs
+# files don't reference them yet, which would trip this lint under `-D warnings`.
+# Re-enable in Step 1 once crates actually use their deps.
+# unused_crate_dependencies = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

@@ -1,0 +1,4 @@
+# `cargo xtask <cmd>` runs the repo-automation crate (graph-check, timelog, ...).
+# Without this alias, `cargo xtask` errors "no such subcommand" on a fresh clone.
+[alias]
+xtask = "run --quiet --package xtask --"

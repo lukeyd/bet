@@ -1,0 +1,13 @@
+[package]
+name = "lsp"
+description = "bet language server (tower-lsp), consuming the frontend library"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+frontend = { path = "../frontend" }
+
+[lints]
+workspace = true

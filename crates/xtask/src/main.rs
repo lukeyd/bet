@@ -1,0 +1,629 @@
+//! `xtask` — repo automation for the `bet` project, run as `cargo xtask <command>`.
+//!
+//! Commands:
+//!   graph-check         enforce the internal dependency graph (graph-allowlist.toml)
+//!   timelog report      per-activity / per-task active-time totals from timelog/events
+//!   timelog eta         velocity + estimated time to completion (timelog/tasks.toml)
+//!   setup-llvm          print per-OS guidance for the pinned LLVM (backend --features llvm)
+//!   corpus | dist       stubs (land in Step 2 / release work)
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+use anyhow::{Context, Result, bail};
+
+const USAGE: &str = "\
+usage: cargo xtask <command>
+  graph-check                 verify workspace deps against graph-allowlist.toml
+  timelog report [--json] [--idle-cap SECS]
+  timelog eta    [--hours-per-day N] [--idle-cap SECS]
+  setup-llvm                  per-OS LLVM install guidance
+  corpus | dist               (stubs — Step 2 / release)";
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cmd = args.first().map(String::as_str).unwrap_or("");
+    let rest: &[String] = if args.len() > 1 { &args[1..] } else { &[] };
+
+    let res = match cmd {
+        "graph-check" => graph_check(),
+        "timelog" => timelog(rest),
+        "setup-llvm" => setup_llvm(),
+        "corpus" => stub_cmd(
+            "corpus",
+            "differential corpus testing (Step 2 tracer bullet)",
+        ),
+        "dist" => stub_cmd("dist", "release-artifact packaging for the 6 targets"),
+        "" => {
+            eprintln!("{USAGE}");
+            return ExitCode::FAILURE;
+        }
+        other => {
+            eprintln!("xtask: unknown command {other:?}\n{USAGE}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match res {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("xtask: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `crates/xtask/` -> repo root is two parents up.
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn stub_cmd(name: &str, what: &str) -> Result<()> {
+    println!("xtask {name}: not implemented yet — lands with {what}.");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// graph-check
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+struct AllowFile {
+    allow: BTreeMap<String, Vec<String>>,
+}
+
+fn graph_check() -> Result<()> {
+    use cargo_metadata::{DependencyKind, MetadataCommand};
+
+    let root = workspace_root();
+
+    let allow_path = root.join("graph-allowlist.toml");
+    let allow_src = std::fs::read_to_string(&allow_path)
+        .with_context(|| format!("reading {}", allow_path.display()))?;
+    let allow: AllowFile = toml::from_str(&allow_src).context("parsing graph-allowlist.toml")?;
+
+    let metadata = MetadataCommand::new()
+        .manifest_path(root.join("Cargo.toml"))
+        .exec()
+        .context("running `cargo metadata`")?;
+
+    let members: std::collections::BTreeSet<String> = metadata
+        .workspace_packages()
+        .iter()
+        .map(|p| p.name.to_string())
+        .collect();
+
+    let mut violations: Vec<String> = Vec::new();
+
+    for pkg in metadata.workspace_packages() {
+        let name = pkg.name.to_string();
+        let allowed: std::collections::BTreeSet<&String> = allow
+            .allow
+            .get(&name)
+            .map(|v| v.iter().collect())
+            .unwrap_or_default();
+
+        if !allow.allow.contains_key(&name) {
+            violations.push(format!(
+                "  crate `{name}` has no entry in graph-allowlist.toml"
+            ));
+        }
+
+        for dep in &pkg.dependencies {
+            if dep.kind == DependencyKind::Development {
+                continue; // dev-deps (test helpers) may cross freely
+            }
+            let dname = dep.name.to_string();
+            if dname == name || !members.contains(&dname) {
+                continue; // self or external crate — not our concern
+            }
+            if !allowed.contains(&dname) {
+                violations.push(format!("  {name} -> {dname}  (edge not in allowlist)"));
+            }
+        }
+    }
+
+    // Hygiene: warn (don't fail) on allowlist entries for crates that no longer exist.
+    for k in allow.allow.keys() {
+        if !members.contains(k) {
+            eprintln!("warning: allowlist entry `{k}` is not a workspace crate");
+        }
+    }
+
+    if violations.is_empty() {
+        println!("graph-check OK ({} crates)", members.len());
+        Ok(())
+    } else {
+        violations.sort();
+        bail!("dependency-graph violations:\n{}", violations.join("\n"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// timelog
+// ---------------------------------------------------------------------------
+
+const DEFAULT_IDLE_CAP_SECS: i64 = 300; // gaps longer than this are clamped (idle)
+
+#[derive(serde::Deserialize, Default)]
+struct RawEvent {
+    ts: String,
+    #[serde(default)]
+    event: String,
+    #[serde(default)]
+    activity: String,
+    #[serde(default)]
+    session: String,
+}
+
+struct SpanEvent {
+    secs: i64,
+    event: String,
+    activity: String,
+}
+
+struct SpanFile {
+    task: String,
+    session: String,
+    events: Vec<SpanEvent>,
+}
+
+/// A heartbeat: (epoch seconds, session id).
+type Beat = (i64, String);
+/// Parsed contents of `timelog/events/`: semantic span files + mechanical heartbeats.
+type LoadedEvents = (Vec<SpanFile>, Vec<Beat>);
+
+#[derive(Default)]
+struct Totals {
+    per_activity: BTreeMap<String, i64>,
+    per_task: BTreeMap<String, i64>,
+    grand: i64,
+    unclosed: usize,
+}
+
+fn timelog(args: &[String]) -> Result<()> {
+    let sub = args.first().map(String::as_str).unwrap_or("report");
+    let flags: &[String] = if args.len() > 1 { &args[1..] } else { &[] };
+    let idle_cap = flag_value(flags, "--idle-cap")
+        .map(|v| v.parse::<i64>())
+        .transpose()
+        .context("--idle-cap must be an integer number of seconds")?
+        .unwrap_or(DEFAULT_IDLE_CAP_SECS);
+
+    let root = workspace_root();
+    let (spans, beats) = load_events(&root.join("timelog").join("events"))?;
+    let totals = compute_totals(&spans, &beats, idle_cap);
+
+    match sub {
+        "report" => {
+            if flags.iter().any(|f| f == "--json") {
+                report_json(&totals);
+            } else {
+                report_human(&totals, idle_cap);
+            }
+            Ok(())
+        }
+        "eta" => {
+            let hpd = flag_value(flags, "--hours-per-day")
+                .map(|v| v.parse::<f64>())
+                .transpose()
+                .context("--hours-per-day must be a number")?;
+            eta(&root, &totals, hpd)
+        }
+        other => bail!("unknown `timelog` subcommand {other:?} (use report|eta)"),
+    }
+}
+
+fn flag_value<'a>(flags: &'a [String], name: &str) -> Option<&'a str> {
+    flags
+        .iter()
+        .position(|f| f == name)
+        .and_then(|i| flags.get(i + 1))
+        .map(String::as_str)
+}
+
+/// Parse every `*.jsonl` under `events/`. Files whose name contains `__auto-` are
+/// heartbeat logs (mechanical); the rest are span logs (semantic, task from filename).
+fn load_events(dir: &Path) -> Result<LoadedEvents> {
+    let mut spans = Vec::new();
+    let mut beats: Vec<Beat> = Vec::new();
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return Ok((spans, beats)), // no events yet
+    };
+
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+
+        if stem.contains("__auto-") {
+            let sess = stem.rsplit("auto-").next().unwrap_or("").to_string();
+            for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                if let Ok(ev) = serde_json::from_str::<RawEvent>(line)
+                    && let Some(secs) = parse_ts(&ev.ts)
+                {
+                    let s = if ev.session.is_empty() {
+                        sess.clone()
+                    } else {
+                        ev.session
+                    };
+                    beats.push((secs, s));
+                }
+            }
+        } else {
+            let task = task_from_stem(stem);
+            let mut events = Vec::new();
+            let mut session = String::new();
+            for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                if let Ok(ev) = serde_json::from_str::<RawEvent>(line)
+                    && let Some(secs) = parse_ts(&ev.ts)
+                {
+                    if session.is_empty() && !ev.session.is_empty() {
+                        session = ev.session.clone();
+                    }
+                    events.push(SpanEvent {
+                        secs,
+                        event: ev.event,
+                        activity: ev.activity,
+                    });
+                }
+            }
+            if !events.is_empty() {
+                events.sort_by_key(|e| e.secs);
+                spans.push(SpanFile {
+                    task,
+                    session,
+                    events,
+                });
+            }
+        }
+    }
+    Ok((spans, beats))
+}
+
+/// Extract the task slug from `<stamp>__<task>__<uuid>` (task may itself contain `__`).
+fn task_from_stem(stem: &str) -> String {
+    let parts: Vec<&str> = stem.split("__").collect();
+    if parts.len() >= 3 {
+        parts[1..parts.len() - 1].join("__")
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn compute_totals(spans: &[SpanFile], beats: &[Beat], idle_cap: i64) -> Totals {
+    let mut t = Totals::default();
+
+    for span in spans {
+        let first = span.events.first().map(|e| e.secs).unwrap_or(0);
+        let last = span.events.last().map(|e| e.secs).unwrap_or(0);
+        let has_out = span.events.last().map(|e| e.event.as_str()) == Some("out");
+
+        // Match heartbeats to this span: by session if we have one that matches,
+        // otherwise by time window (correct for a single concurrent agent).
+        let session_match =
+            !span.session.is_empty() && beats.iter().any(|(_, s)| *s == span.session);
+        let mut matched: Vec<i64> = beats
+            .iter()
+            .filter(|(bs, s)| {
+                *bs >= first
+                    && if session_match {
+                        *s == span.session
+                    } else {
+                        true
+                    }
+            })
+            .map(|(bs, _)| *bs)
+            .collect();
+
+        let end = if has_out {
+            matched.retain(|b| *b <= last);
+            last
+        } else {
+            let max_beat = matched.iter().copied().max().unwrap_or(last);
+            t.unclosed += 1;
+            max_beat.max(last)
+        };
+
+        // Densified, de-duplicated timeline within [first, end].
+        let mut points: Vec<i64> = span
+            .events
+            .iter()
+            .map(|e| e.secs)
+            .chain(matched)
+            .filter(|p| *p >= first && *p <= end)
+            .collect();
+        points.push(end);
+        points.sort_unstable();
+        points.dedup();
+
+        for pair in points.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            let activity = current_activity(&span.events, a);
+            let Some(activity) = activity else { continue };
+            let add = (b - a).clamp(0, idle_cap);
+            if add == 0 {
+                continue;
+            }
+            *t.per_activity.entry(activity.to_string()).or_insert(0) += add;
+            *t.per_task.entry(span.task.clone()).or_insert(0) += add;
+            t.grand += add;
+        }
+    }
+    t
+}
+
+/// Activity in effect at time `at`: the most recent `in`/`switch` event at or before it.
+fn current_activity(events: &[SpanEvent], at: i64) -> Option<&str> {
+    events
+        .iter()
+        .rfind(|e| e.secs <= at && (e.event == "in" || e.event == "switch"))
+        .map(|e| e.activity.as_str())
+}
+
+fn report_human(t: &Totals, idle_cap: i64) {
+    println!(
+        "bet — active time (idle gaps > {}s not counted)\n",
+        idle_cap
+    );
+    if t.grand == 0 {
+        println!("  (no time logged yet)");
+        return;
+    }
+    println!("  by activity:");
+    for (k, v) in &t.per_activity {
+        println!("    {:<12} {}", k, fmt_hms(*v));
+    }
+    println!("\n  by task:");
+    for (k, v) in &t.per_task {
+        println!("    {:<20} {}", k, fmt_hms(*v));
+    }
+    println!("\n  total active: {}", fmt_hms(t.grand));
+    if t.unclosed > 0 {
+        println!(
+            "  note: {} span(s) never clocked out (closed at last heartbeat)",
+            t.unclosed
+        );
+    }
+}
+
+fn report_json(t: &Totals) {
+    let activities: BTreeMap<&String, i64> = t.per_activity.iter().map(|(k, v)| (k, *v)).collect();
+    let tasks: BTreeMap<&String, i64> = t.per_task.iter().map(|(k, v)| (k, *v)).collect();
+    let out = serde_json::json!({
+        "seconds_by_activity": activities,
+        "seconds_by_task": tasks,
+        "total_active_seconds": t.grand,
+        "unclosed_spans": t.unclosed,
+    });
+    println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+}
+
+// ---------------------------------------------------------------------------
+// eta
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+struct TasksFile {
+    #[serde(default)]
+    task: Vec<TaskDef>,
+}
+
+#[derive(serde::Deserialize)]
+struct TaskDef {
+    slug: String,
+    size: f64,
+    status: String,
+}
+
+fn eta(root: &Path, totals: &Totals, hours_per_day: Option<f64>) -> Result<()> {
+    let path = root.join("timelog").join("tasks.toml");
+    let src =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let tasks: TasksFile = toml::from_str(&src).context("parsing timelog/tasks.toml")?;
+
+    let mut done_points = 0.0;
+    let mut done_secs: i64 = 0;
+    let mut remaining_points = 0.0;
+    let mut doing_secs: i64 = 0;
+
+    for t in &tasks.task {
+        let secs = totals.per_task.get(&t.slug).copied().unwrap_or(0);
+        match t.status.as_str() {
+            "done" => {
+                done_points += t.size;
+                done_secs += secs;
+            }
+            "doing" => {
+                remaining_points += t.size;
+                doing_secs += secs;
+            }
+            _ => remaining_points += t.size,
+        }
+    }
+
+    println!("bet — velocity & ETA\n");
+    println!("  total active logged: {}", fmt_hms(totals.grand));
+    println!("  points done: {done_points:.0}   remaining: {remaining_points:.0}");
+    if doing_secs > 0 {
+        println!(
+            "  (already spent on in-progress tasks: {})",
+            fmt_hms(doing_secs)
+        );
+    }
+
+    if done_points == 0.0 || done_secs == 0 {
+        println!(
+            "\n  ETA: insufficient data — need at least one task marked status=\"done\"\n\
+             \x20 with logged time. Mark the current task done in timelog/tasks.toml once it lands."
+        );
+        return Ok(());
+    }
+
+    let done_hours = done_secs as f64 / 3600.0;
+    let velocity = done_points / done_hours; // points per active-hour
+    let eta_hours = remaining_points / velocity;
+
+    println!("\n  velocity: {velocity:.2} points / active-hour");
+    println!("  ETA (remaining): {eta_hours:.1} active-hours");
+    if let Some(hpd) = hours_per_day
+        && hpd > 0.0
+    {
+        println!(
+            "  ETA (calendar @ {hpd:.1} active-h/day): {:.1} days",
+            eta_hours / hpd
+        );
+    }
+    println!(
+        "\n  (in-progress tasks count their full size toward remaining; sizes are\n\
+         \x20 estimates, so early ETAs are wide and tighten as more tasks close.)"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// setup-llvm
+// ---------------------------------------------------------------------------
+
+fn setup_llvm() -> Result<()> {
+    const LLVM: &str = "18";
+    println!(
+        "\
+bet pins LLVM {LLVM}. Building `backend` with `--features llvm` requires it installed:
+  macOS:   brew install llvm@{LLVM}     (export LLVM_SYS_181_PREFIX=\"$(brew --prefix llvm@{LLVM})\")
+  Ubuntu:  sudo apt-get install -y llvm-{LLVM}-dev libpolly-{LLVM}-dev
+  Windows: install the LLVM {LLVM} release, then set LLVM_SYS_181_PREFIX
+
+Step 0 does NOT build LLVM — the default workspace build has no LLVM dependency.
+This command is guidance-only until the backend work begins."
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// small helpers
+// ---------------------------------------------------------------------------
+
+/// Parse an RFC3339 UTC timestamp like `2026-07-02T21:06:47Z` into epoch seconds.
+fn parse_ts(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let s = s.strip_suffix('Z').unwrap_or(s);
+    let (date, time) = s.split_once('T')?;
+    let mut d = date.split('-');
+    let y: i64 = d.next()?.parse().ok()?;
+    let mo: i64 = d.next()?.parse().ok()?;
+    let da: i64 = d.next()?.parse().ok()?;
+    let mut t = time.split(':');
+    let h: i64 = t.next()?.parse().ok()?;
+    let mi: i64 = t.next()?.parse().ok()?;
+    let se: i64 = t.next().unwrap_or("0").parse().ok()?;
+    Some(days_from_civil(y, mo, da) * 86_400 + h * 3_600 + mi * 60 + se)
+}
+
+/// Days since 1970-01-01 (Howard Hinnant's `days_from_civil`).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = (m + 9) % 12; // Mar=0 .. Feb=11
+    let doy = (153 * mp + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn fmt_hms(secs: i64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{h}h {m:02}m {s:02}s")
+    } else if m > 0 {
+        format!("{m}m {s:02}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smoke() {
+        assert_eq!(2 + 2, 4);
+    }
+
+    #[test]
+    fn ts_epoch() {
+        // 2026-07-02T00:00:00Z — day 20636 since epoch, * 86400.
+        assert_eq!(parse_ts("2026-07-02T00:00:00Z"), Some(1_782_950_400));
+        // one hour later
+        assert_eq!(parse_ts("2026-07-02T01:00:00Z"), Some(1_782_954_000));
+        // unix epoch
+        assert_eq!(parse_ts("1970-01-01T00:00:00Z"), Some(0));
+    }
+
+    #[test]
+    fn idle_clamp() {
+        // A single in->out span longer than the cap contributes at most the cap
+        // when there are no heartbeats to densify it.
+        let spans = vec![SpanFile {
+            task: "t".into(),
+            session: String::new(),
+            events: vec![
+                SpanEvent {
+                    secs: 0,
+                    event: "in".into(),
+                    activity: "writing".into(),
+                },
+                SpanEvent {
+                    secs: 10_000,
+                    event: "out".into(),
+                    activity: "writing".into(),
+                },
+            ],
+        }];
+        let totals = compute_totals(&spans, &[], 300);
+        assert_eq!(totals.grand, 300);
+        assert_eq!(totals.per_activity.get("writing"), Some(&300));
+    }
+
+    #[test]
+    fn heartbeats_densify() {
+        // Same 10k-second span, but heartbeats every 60s keep it "active" so the
+        // clamp barely bites — total is close to the real span length.
+        let beats: Vec<(i64, String)> = (0..=10_000)
+            .step_by(60)
+            .map(|s| (s, String::new()))
+            .collect();
+        let spans = vec![SpanFile {
+            task: "t".into(),
+            session: String::new(),
+            events: vec![
+                SpanEvent {
+                    secs: 0,
+                    event: "in".into(),
+                    activity: "writing".into(),
+                },
+                SpanEvent {
+                    secs: 10_000,
+                    event: "out".into(),
+                    activity: "writing".into(),
+                },
+            ],
+        }];
+        let totals = compute_totals(&spans, &beats, 300);
+        assert!(totals.grand >= 9_900, "got {}", totals.grand);
+    }
+}

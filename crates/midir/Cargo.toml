@@ -1,0 +1,12 @@
+[package]
+name = "midir"
+description = "bet mid-level IR: types, builder, textual .mir format, validator (contract crate ★)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

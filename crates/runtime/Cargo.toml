@@ -1,0 +1,13 @@
+[package]
+name = "runtime"
+description = "bet real runtime: cribs, generations, scratch arenas, allocator context, slide scheduler, per-OS layer"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rt-abi = { path = "../rt-abi" }
+
+[lints]
+workspace = true
