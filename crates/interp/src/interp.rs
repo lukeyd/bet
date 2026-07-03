@@ -3,8 +3,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use frontend::ast::{
-    Arg, AssignOp, BinOp, Block, Expr, ExprKind, FnDecl, Item, MatchArm, Program, Stmt, StmtKind,
-    StructLit, Type, TypeKind, UnOp, VarDecl,
+    Arg, AssignOp, BinOp, Block, CopInit, Expr, ExprKind, FnDecl, Item, MatchArm, Program, RetType,
+    Stmt, StmtKind, StructLit, Type, TypeKind, UnOp, VarDecl,
 };
 
 use crate::error::RunError;
@@ -60,12 +60,78 @@ struct VariantInfo {
     arity: usize,
 }
 
-/// The interpreter: declaration tables plus the captured output buffer.
+/// One generational slot in an arena: the stored value, the generation currently stamped on
+/// the slot, and whether it is presently allocated. A `cop` stamps a `tag` with the slot's
+/// current `gen`; `evict` bumps every `gen` (invalidating all outstanding tags) and frees the
+/// slots. A `holla` check succeeds only when a tag's `gen` still equals its slot's `gen`.
+struct Slot {
+    value: Value,
+    generation: u64,
+    live: bool,
+}
+
+/// An in-process arena backing a `crib`. `typed` cribs (`crib e: Enemy[N]`) hand `cop` a
+/// generational [`Value::Tag`]; untyped bump cribs (`crib frame`) hand back the value directly.
+struct Arena {
+    slots: Vec<Slot>,
+    typed: bool,
+}
+
+impl Arena {
+    /// Allocate `value`, reusing the first freed slot (so post-`evict` a slot is reused at its
+    /// newer generation) or growing the slab. Returns the slot index and the generation to
+    /// stamp on the tag.
+    fn alloc(&mut self, value: Value) -> (usize, u64) {
+        if let Some((i, slot)) = self.slots.iter_mut().enumerate().find(|(_, s)| !s.live) {
+            slot.value = value;
+            slot.live = true;
+            (i, slot.generation)
+        } else {
+            self.slots.push(Slot {
+                value,
+                generation: 0,
+                live: true,
+            });
+            (self.slots.len() - 1, 0)
+        }
+    }
+
+    /// A checked resolve (the `holla` live arm): the slot value iff the tag is still current.
+    fn resolve(&self, slot: usize, generation: u64) -> Option<&Value> {
+        self.slots
+            .get(slot)
+            .filter(|s| s.live && s.generation == generation)
+            .map(|s| &s.value)
+    }
+
+    /// An unchecked resolve (`trust`): the slot value regardless of generation.
+    fn resolve_unchecked(&self, slot: usize) -> Option<&Value> {
+        self.slots.get(slot).map(|s| &s.value)
+    }
+
+    /// Free the whole arena in O(slots): every slot's generation is bumped, invalidating all
+    /// outstanding tags, and the slots become available for reuse.
+    fn evict(&mut self) {
+        for s in &mut self.slots {
+            s.generation = s.generation.wrapping_add(1);
+            s.live = false;
+        }
+    }
+}
+
+/// The interpreter: declaration tables, arenas, and the captured output buffer.
 pub struct Interp<'p> {
     funcs: HashMap<String, &'p FnDecl>,
     methods: HashMap<(String, String), &'p FnDecl>,
     variants: HashMap<String, VariantInfo>,
     globals: HashMap<String, Value>,
+    /// Every live `crib`, keyed by the id carried in a [`Value::Crib`] handle.
+    arenas: HashMap<usize, Arena>,
+    /// Monotonic id source for arenas (never reused, so ids stay unique across `evict`).
+    next_arena: usize,
+    /// The declared return type of each `finna` on the active call stack, so `bounce` can build
+    /// a correctly-shaped `(value, yikes)` early return.
+    ret_stack: Vec<&'p RetType>,
     out: Vec<u8>,
 }
 
@@ -77,9 +143,12 @@ impl<'p> Interp<'p> {
             methods: HashMap::new(),
             variants: HashMap::new(),
             globals: HashMap::new(),
+            arenas: HashMap::new(),
+            next_arena: 0,
+            ret_stack: Vec::new(),
             out: Vec::new(),
         };
-        // First pass: functions, methods, and moods variants (order-independent).
+        // First pass: functions, methods, moods variants, and top-level cribs (order-independent).
         for item in &program.items {
             match item {
                 Item::Func(f) => me.register_fn(f),
@@ -93,6 +162,12 @@ impl<'p> Interp<'p> {
                             },
                         );
                     }
+                }
+                // A top-level `crib` is a program-lifetime arena reachable by name from every
+                // function (corpus `08-memory`, `11-reference`); its name binds a handle globally.
+                Item::Crib(c) => {
+                    let id = me.new_arena(c.ty.is_some());
+                    me.globals.insert(c.name.clone(), Value::Crib(id));
                 }
                 _ => {}
             }
@@ -119,6 +194,20 @@ impl<'p> Interp<'p> {
             }
         }
         Ok(me)
+    }
+
+    /// Register a fresh arena and return its unique id (the payload of its [`Value::Crib`]).
+    fn new_arena(&mut self, typed: bool) -> usize {
+        let id = self.next_arena;
+        self.next_arena += 1;
+        self.arenas.insert(
+            id,
+            Arena {
+                slots: Vec::new(),
+                typed,
+            },
+        );
+        id
     }
 
     fn register_fn(&mut self, f: &'p FnDecl) {
@@ -174,7 +263,11 @@ impl<'p> Interp<'p> {
             let val = self.coerce(val, Some(&param.ty));
             env.declare(&param.name, val);
         }
-        match self.exec_block(&mut env, &f.body)? {
+        // Track this frame's return type so a `bounce` inside can shape its early return.
+        self.ret_stack.push(&f.ret);
+        let result = self.exec_block(&mut env, &f.body);
+        self.ret_stack.pop();
+        match result? {
             Flow::Return(vals) => Ok(vals),
             Flow::Normal => Ok(Vec::new()),
             Flow::Break | Flow::Continue => Err(RunError::Type(format!(
@@ -296,13 +389,127 @@ impl<'p> Interp<'p> {
                 let v = self.eval_expr(env, e)?;
                 Err(RunError::Yeet(v))
             }
-            // Memory-model, error-handling, and concurrency statements are out of this slice.
-            StmtKind::Crib(_) => Err(RunError::Unsupported("crib arena declaration".into())),
-            StmtKind::Holla { .. } => Err(RunError::Unsupported("holla tag deref".into())),
-            StmtKind::Sheesh { .. } => Err(RunError::Unsupported("sheesh recover".into())),
-            StmtKind::Evict(_) => Err(RunError::Unsupported("evict".into())),
+            // A function-local `crib`: a fresh arena, bound to its name in the current scope.
+            StmtKind::Crib(c) => {
+                let id = self.new_arena(c.ty.is_some());
+                env.declare(&c.name, Value::Crib(id));
+                Ok(Flow::Normal)
+            }
+            StmtKind::Holla {
+                binding,
+                tag,
+                crib,
+                live,
+                ghosted,
+            } => self.exec_holla(env, binding, tag, crib, live, ghosted),
+            StmtKind::Sheesh { body, recover } => self.exec_sheesh(env, body, recover),
+            StmtKind::Evict(e) => {
+                let id = self.eval_crib(env, e)?;
+                if let Some(arena) = self.arenas.get_mut(&id) {
+                    arena.evict();
+                }
+                Ok(Flow::Normal)
+            }
+            StmtKind::Bounce(e) => self.exec_bounce(env, e),
+            // Concurrency is out of this slice (corpus `13-concurrency` is `skip`).
             StmtKind::Slide(_) => Err(RunError::Unsupported("slide task spawn".into())),
-            StmtKind::Bounce(_) => Err(RunError::Unsupported("bounce error return".into())),
+        }
+    }
+
+    /// `holla binding = tag in crib { live } ghosted { ghosted }` — a checked tag resolve. The
+    /// live arm binds a snapshot of the referenced value; a stale tag runs the ghosted arm.
+    fn exec_holla(
+        &mut self,
+        env: &mut Env,
+        binding: &str,
+        tag: &Expr,
+        crib: &Expr,
+        live: &Block,
+        ghosted: &Block,
+    ) -> Result<Flow, RunError> {
+        let tag_val = self.eval_expr(env, tag)?;
+        let id = self.eval_crib(env, crib)?;
+        let (slot, generation) = match tag_val {
+            Value::Tag {
+                slot, generation, ..
+            } => (slot, generation),
+            other => {
+                return Err(RunError::Type(format!(
+                    "`holla` needs a tag, got {}",
+                    other.type_name()
+                )));
+            }
+        };
+        let resolved = self
+            .arenas
+            .get(&id)
+            .and_then(|a| a.resolve(slot, generation))
+            .cloned();
+        match resolved {
+            Some(val) => {
+                env.push();
+                env.declare(binding, val);
+                let flow = self.exec_block(env, live);
+                env.pop();
+                flow
+            }
+            None => self.exec_block(env, ghosted),
+        }
+    }
+
+    /// `sheesh { body } naw name { recover }` — run `body`, catching a propagating `yeet`. The
+    /// recover arm (if present) binds the yeeted value to `name`; without one, the panic is
+    /// swallowed.
+    fn exec_sheesh(
+        &mut self,
+        env: &mut Env,
+        body: &Block,
+        recover: &Option<(String, Block)>,
+    ) -> Result<Flow, RunError> {
+        match self.exec_block(env, body) {
+            Err(RunError::Yeet(v)) => match recover {
+                Some((name, rblock)) => {
+                    env.push();
+                    env.declare(name, v);
+                    let flow = self.exec_block(env, rblock);
+                    env.pop();
+                    flow
+                }
+                None => Ok(Flow::Normal),
+            },
+            other => other,
+        }
+    }
+
+    /// `bounce e` — early-return-on-error sugar. When `e` is `ghosted` it is a no-op; otherwise
+    /// it returns from the enclosing `finna` with the error in the last slot and type-defaulted
+    /// zeros in the leading value slots (matching the `(value, yikes)` return shape).
+    fn exec_bounce(&mut self, env: &mut Env, e: &Expr) -> Result<Flow, RunError> {
+        let v = self.eval_expr(env, e)?;
+        if matches!(v, Value::Ghosted) {
+            return Ok(Flow::Normal);
+        }
+        let ret_tys: &[Type] = match self.ret_stack.last() {
+            Some(RetType::Multi(tys)) => tys,
+            Some(RetType::Single(t)) => std::slice::from_ref(t),
+            _ => &[],
+        };
+        let mut vals: Vec<Value> = ret_tys
+            .split_last()
+            .map(|(_, leading)| leading.iter().map(default_value).collect())
+            .unwrap_or_default();
+        vals.push(v);
+        Ok(Flow::Return(vals))
+    }
+
+    /// Evaluate a `crib` position (a name or `mem.scratch()`) to its arena id.
+    fn eval_crib(&mut self, env: &mut Env, e: &Expr) -> Result<usize, RunError> {
+        match self.eval_expr(env, e)? {
+            Value::Crib(id) => Ok(id),
+            other => Err(RunError::Type(format!(
+                "expected a crib, got {}",
+                other.type_name()
+            ))),
         }
     }
 
@@ -434,9 +641,35 @@ impl<'p> Interp<'p> {
                     ))),
                 }
             }
-            ExprKind::Index { .. } => Err(RunError::Unsupported(
-                "assignment to an indexed element".into(),
-            )),
+            ExprKind::Index { base, index } => {
+                let i = match self.eval_expr(env, index)? {
+                    Value::Int(i) if i >= 0 => i as usize,
+                    other => {
+                        return Err(RunError::Type(format!(
+                            "index must be a non-negative int, got {}",
+                            other.type_name()
+                        )));
+                    }
+                };
+                let place = self.place_mut(env, base)?;
+                match place {
+                    Value::Array(xs) => {
+                        let len = xs.len();
+                        if let Some(slot) = xs.get_mut(i) {
+                            *slot = val;
+                            Ok(())
+                        } else {
+                            Err(RunError::Type(format!(
+                                "index {i} out of bounds (len {len})"
+                            )))
+                        }
+                    }
+                    other => Err(RunError::Type(format!(
+                        "cannot index-assign into {}",
+                        other.type_name()
+                    ))),
+                }
+            }
             _ => Err(RunError::Type("invalid assignment target".into())),
         }
     }
@@ -564,8 +797,59 @@ impl<'p> Interp<'p> {
                 }
                 Ok(Value::Array(xs))
             }
-            ExprKind::Cop { .. } => Err(RunError::Unsupported("cop arena allocation".into())),
-            ExprKind::Trust { .. } => Err(RunError::Unsupported("trust tag deref".into())),
+            ExprKind::Cop { init, crib } => self.eval_cop(env, init, crib),
+            ExprKind::Trust { tag, crib } => {
+                let tag_val = self.eval_expr(env, tag)?;
+                let id = self.eval_crib(env, crib)?;
+                let slot = match tag_val {
+                    Value::Tag { slot, .. } => slot,
+                    other => {
+                        return Err(RunError::Type(format!(
+                            "`trust` needs a tag, got {}",
+                            other.type_name()
+                        )));
+                    }
+                };
+                self.arenas
+                    .get(&id)
+                    .and_then(|a| a.resolve_unchecked(slot))
+                    .cloned()
+                    .ok_or_else(|| RunError::Type("`trust` on an out-of-range tag".into()))
+            }
+        }
+    }
+
+    /// `cop init in crib` — allocate `init` into the arena. A typed crib hands back a
+    /// generational [`Value::Tag`]; an untyped bump crib hands back the value directly (a
+    /// "direct reference"), matching corpus `08-memory`.
+    fn eval_cop(&mut self, env: &mut Env, init: &CopInit, crib: &Expr) -> Result<Value, RunError> {
+        let init_val = match init {
+            CopInit::Struct(lit) => self.eval_struct_lit(env, lit)?,
+            CopInit::Variant { name, args } => {
+                let info = self
+                    .variants
+                    .get(name)
+                    .ok_or_else(|| RunError::Undefined(name.clone()))?;
+                let (moods, arity) = (info.moods.clone(), info.arity);
+                self.construct_variant(env, name, &moods, arity, args)?
+            }
+        };
+        let id = self.eval_crib(env, crib)?;
+        let arena = self
+            .arenas
+            .get_mut(&id)
+            .ok_or_else(|| RunError::Type("cop into an unknown crib".into()))?;
+        if arena.typed {
+            let (slot, generation) = arena.alloc(init_val);
+            Ok(Value::Tag {
+                arena: id,
+                slot,
+                generation,
+            })
+        } else {
+            // Untyped bump arena: store it (so `evict` is meaningful) but return the value.
+            arena.alloc(init_val.clone());
+            Ok(init_val)
         }
     }
 
@@ -683,11 +967,20 @@ impl<'p> Interp<'p> {
     ) -> Result<Vec<Value>, RunError> {
         if let ExprKind::Name { name: modname, .. } = &receiver.kind {
             let shadowed = env.get(modname).is_some() || self.globals.contains_key(modname);
-            if !shadowed && modname == "spill" {
-                return self.call_spill(env, method, args).map(|()| Vec::new());
-            }
-            if !shadowed && modname == "str" {
-                return self.call_str(env, method, args).map(|v| vec![v]);
+            if !shadowed {
+                match modname.as_str() {
+                    "spill" => return self.call_spill(env, method, args).map(|()| Vec::new()),
+                    "str" => return self.call_str(env, method, args).map(|v| vec![v]),
+                    "bytes" => return self.call_bytes(env, method, args).map(|v| vec![v]),
+                    // `yikes.new(msg)` constructs an error value.
+                    "yikes" => return self.call_yikes(env, method, args).map(|v| vec![v]),
+                    // `mem.scratch()` is a fresh, untyped per-frame arena.
+                    "mem" if method == "scratch" => {
+                        let id = self.new_arena(false);
+                        return Ok(vec![Value::Crib(id)]);
+                    }
+                    _ => {}
+                }
             }
         }
         // Otherwise it's a user method call: evaluate the receiver, then dispatch.
@@ -749,6 +1042,19 @@ impl<'p> Interp<'p> {
         method: &str,
         args: &[Arg],
     ) -> Result<Vec<Value>, RunError> {
+        // `.tea(context)` on an error value wraps it, prefixing the context (Go's `%w`).
+        if let Value::Yikes(msg) = &recv {
+            if method == "tea" {
+                let ctx = match self.eval_args(env, args)?.as_slice() {
+                    [Value::Str(c)] => c.clone(),
+                    _ => {
+                        return Err(RunError::Type("`.tea` takes a single str context".into()));
+                    }
+                };
+                return Ok(vec![Value::Yikes(format!("{ctx}: {msg}"))]);
+            }
+            return Err(RunError::Undefined(format!("yikes.{method}")));
+        }
         let ty = match &recv {
             Value::Struct { ty, .. } => ty.clone(),
             other => {
@@ -854,6 +1160,48 @@ impl<'p> Interp<'p> {
         }
     }
 
+    /// The `yikes` error constructor: `yikes.new(msg)` builds an error value.
+    fn call_yikes(&mut self, env: &mut Env, method: &str, args: &[Arg]) -> Result<Value, RunError> {
+        match method {
+            "new" => match self.eval_args(env, args)?.as_slice() {
+                [Value::Str(m)] => Ok(Value::Yikes(m.clone())),
+                _ => Err(RunError::Type(
+                    "`yikes.new` takes a single str message".into(),
+                )),
+            },
+            other => Err(RunError::Unsupported(format!("yikes.{other}"))),
+        }
+    }
+
+    /// A minimal `bytes` module: `bytes.readU32le(buf, off)` decodes a little-endian u32 out of
+    /// a `[]u8` (corpus `10-stdlib/bytes-parse`).
+    fn call_bytes(&mut self, env: &mut Env, method: &str, args: &[Arg]) -> Result<Value, RunError> {
+        let vals = self.eval_args(env, args)?;
+        match (method, vals.as_slice()) {
+            ("readU32le", [Value::Array(bytes), Value::Int(off)]) if *off >= 0 => {
+                let off = *off as usize;
+                let mut acc: u32 = 0;
+                for k in 0..4 {
+                    let byte = match bytes.get(off + k) {
+                        Some(Value::Int(b)) => (*b as u32) & 0xFF,
+                        Some(Value::Byte(b)) => *b as u32,
+                        _ => {
+                            return Err(RunError::Type(
+                                "bytes.readU32le needs 4 in-range byte elements".into(),
+                            ));
+                        }
+                    };
+                    acc |= byte << (8 * k as u32);
+                }
+                Ok(Value::Int(acc as i64))
+            }
+            ("readU32le", _) => Err(RunError::Type(
+                "bytes.readU32le(buf, off) called with the wrong argument shape".into(),
+            )),
+            (other, _) => Err(RunError::Unsupported(format!("bytes.{other}"))),
+        }
+    }
+
     // ---- coercion -------------------------------------------------------------
 
     /// Apply a binding's declared type to a value where it is observable at runtime — namely,
@@ -880,6 +1228,22 @@ fn exactly_one(mut vals: Vec<Value>) -> Result<Value, RunError> {
             expected: 1,
             got: n,
         }),
+    }
+}
+
+/// The zero value for a declared type, used to fill the leading value slots of a `bounce`
+/// early return. Only the shapes that appear as non-error return slots need real defaults;
+/// anything else falls back to `ghosted`.
+fn default_value(ty: &Type) -> Value {
+    match &ty.kind {
+        TypeKind::Named(name, _) => match name.as_str() {
+            "i8" | "i16" | "i32" | "i64" | "int" | "u8" | "u16" | "u32" | "u64" => Value::Int(0),
+            "f32" | "f64" | "float" => Value::Float(0.0),
+            "bool" => Value::Bool(false),
+            "str" => Value::Str(String::new()),
+            _ => Value::Ghosted,
+        },
+        _ => Value::Ghosted,
     }
 }
 
