@@ -2,7 +2,8 @@
 //! the pipeline to a native executable (`.mir` input goes straight to the backend; `.bet` input
 //! through the frontend first), linking against the bootstrap `rt-stub` archive (see `link`).
 //! `bet run <input.bet>` parses a program and executes it on the tree-walking interpreter,
-//! writing its output to stdout — no LLVM required. `fmt` lands later.
+//! writing its output to stdout — no LLVM required. `bet fmt <input.bet>` prints the program
+//! in canonical form (`--check` just verifies it, exiting non-zero if it differs).
 
 mod link;
 
@@ -15,13 +16,17 @@ bet — the bet compiler driver
 USAGE:
     bet build <input.bet|input.mir> [-o <output>]
     bet run   <input.bet>
+    bet fmt   [--check] <input.bet>
 
 `build` compiles a program to a native executable, linking it against the bootstrap runtime.
 Requires a codegen-enabled build (`--features llvm`); without it, `build` reports that no code
 generator is present.
 
 `run` parses a `.bet` program and executes it on the tree-walking interpreter, writing its
-output to stdout. No codegen or LLVM is required.";
+output to stdout. No codegen or LLVM is required.
+
+`fmt` parses a `.bet` program and prints its canonical formatting to stdout. With `--check` it
+prints nothing and instead exits non-zero when the file is not already canonically formatted.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -38,6 +43,7 @@ fn run(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("build") => build(&args[1..]),
         Some("run") => run_program(&args[1..]),
+        Some("fmt") => fmt_source(&args[1..]),
         Some("-h") | Some("--help") | None => {
             println!("{USAGE}");
             Ok(())
@@ -65,6 +71,43 @@ fn run_program(args: &[String]) -> Result<(), String> {
         std::fs::read_to_string(&input).map_err(|e| format!("reading {}: {e}", input.display()))?;
     let program = frontend::parse(&src).map_err(|e| e.to_string())?;
     interp::run(&program).map_err(|e| e.to_string())
+}
+
+/// `bet fmt [--check] <input.bet>` — pretty-print a program in its one canonical form.
+///
+/// Without `--check` the formatted source is written to stdout. With `--check` nothing is
+/// printed on success; if the on-disk file differs from its canonical formatting the command
+/// returns an error (a non-zero process exit), matching `gofmt -l`'s "is this formatted?" gate.
+fn fmt_source(args: &[String]) -> Result<(), String> {
+    let mut input: Option<PathBuf> = None;
+    let mut check = false;
+    for arg in args {
+        match arg.as_str() {
+            "--check" => check = true,
+            flag if flag.starts_with('-') => return Err(format!("unknown flag `{flag}`")),
+            _ => {
+                if input.is_some() {
+                    return Err("more than one input file given".into());
+                }
+                input = Some(PathBuf::from(arg));
+            }
+        }
+    }
+    let input = input.ok_or("`bet fmt` needs an input file")?;
+    let src =
+        std::fs::read_to_string(&input).map_err(|e| format!("reading {}: {e}", input.display()))?;
+    let formatted = fmt::format_source(&src)?;
+    if check {
+        if src != formatted {
+            return Err(format!(
+                "{} is not formatted (run `bet fmt` to rewrite it)",
+                input.display()
+            ));
+        }
+    } else {
+        print!("{formatted}");
+    }
+    Ok(())
 }
 
 fn build(args: &[String]) -> Result<(), String> {
