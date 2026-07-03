@@ -1,0 +1,16 @@
+// crib_global.mir — a module-level `crib` (global arena). `make` reads the global crib handle
+// (`crib_global(@slots)`) and cops an `Enemy` into it. Exercises the crib-global table's text
+// round-trip and the backend's global storage + `CribGlobal` load. (M3, backend.)
+
+struct Enemy { flex hp: i64 }
+
+crib @slots: Enemy[8]
+
+fn make() -> tag Enemy {
+  let %0: crib Enemy
+  let %1: tag Enemy
+  bb0:
+    %0 = crib_global(@slots)
+    %1 = cop(%0, Enemy{0: 50i64})
+    return %1
+}

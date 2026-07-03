@@ -107,6 +107,11 @@ fn crib_mir_compiles() {
     compile_fixture("crib.mir");
 }
 
+#[test]
+fn crib_global_mir_compiles() {
+    compile_fixture("crib_global.mir");
+}
+
 // --- Step-3 gap-fill: sums, tuples/multi-return, arrays. ---
 
 #[test]

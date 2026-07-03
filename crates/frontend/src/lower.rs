@@ -73,6 +73,8 @@ struct LowerCtx {
     funcs: HashMap<String, FuncSig>,
     externs: HashMap<String, (ExternId, Vec<TyId>, Vec<TyId>)>,
     globals: HashMap<String, ConstVal>,
+    /// Module-level `crib` name → its `(CribGlobalId, crib T)` handle type.
+    crib_globals: HashMap<String, (CribGlobalId, TyId)>,
     /// `bet_print(rawptr, u64) -> void` — the stdout entry point (always present).
     print_extern: ExternId,
     /// Deduped externs synthesized on demand, keyed by `(name, ret-type)`.
@@ -112,6 +114,7 @@ impl LowerCtx {
             funcs: HashMap::new(),
             externs: HashMap::new(),
             globals: HashMap::new(),
+            crib_globals: HashMap::new(),
             print_extern,
             extern_cache: HashMap::new(),
             fb: None,
@@ -434,20 +437,27 @@ impl LowerCtx {
     // === lowering: items & functions =========================================
 
     fn lower_items(&mut self, prog: &ast::Program) -> Result<(), String> {
+        // Pass 1: register module-level cribs (global arenas) so any function may reference one.
+        for item in &prog.items {
+            if let Item::Crib(c) = item {
+                let (elem, capacity) = self.crib_elem_and_cap(c.ty.as_ref())?;
+                let crib_ty = self.m.intern_ty(TyKind::Crib(elem));
+                let id = self.m.add_crib_global(CribGlobal {
+                    name: c.name.clone(),
+                    elem,
+                    capacity,
+                });
+                self.crib_globals.insert(c.name.clone(), (id, crib_ty));
+            }
+        }
+        // Pass 2: lower function bodies.
         for item in &prog.items {
             match item {
                 Item::Pull(_) | Item::Extern(_) | Item::Drip(_) | Item::Moods(_) => {}
                 // Module-level facts already collected; nothing to emit (inlined at use).
                 Item::Const(_) => {}
+                Item::Crib(_) => {} // registered in pass 1
                 Item::Func(f) => self.lower_func(f)?,
-                Item::Crib(_) => {
-                    return Err(
-                        "module-level `crib` (a global arena) is not yet lowered — the IR has no \
-                         global mutable storage; declare cribs function-locally or pass them as \
-                         parameters"
-                            .into(),
-                    );
-                }
                 Item::Var(_) => {
                     return Err("module-level `lowkey` is not yet lowered".into());
                 }
@@ -1195,6 +1205,12 @@ impl LowerCtx {
         }
         if let Some(cv) = self.lookup_const(name) {
             return Ok((Operand::Const(cv.value), cv.ty));
+        }
+        // A module-level crib: load its handle from the backing global.
+        if let Some(&(id, crib_ty)) = self.crib_globals.get(name) {
+            let tmp = self.new_local(crib_ty);
+            self.fb().assign(Place::local(tmp), Rvalue::CribGlobal(id));
+            return Ok((Operand::Copy(Place::local(tmp)), crib_ty));
         }
         // A bare name that is a nullary `moods` variant is a value constructor.
         if self.variants.contains_key(name) {

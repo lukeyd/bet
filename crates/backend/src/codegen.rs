@@ -50,7 +50,7 @@ use inkwell::types::{
     BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FunctionType, PointerType, StructType,
 };
 use inkwell::values::{
-    BasicMetadataValueEnum, BasicValueEnum, FunctionValue, IntValue, PointerValue,
+    BasicMetadataValueEnum, BasicValueEnum, FunctionValue, GlobalValue, IntValue, PointerValue,
 };
 use inkwell::{AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel};
 
@@ -103,8 +103,10 @@ pub fn compile(module: &Module, opts: &EmitOptions) -> Result<Vec<u8>, BackendEr
         tm,
         funcs: Vec::new(),
         externs: Vec::new(),
+        crib_globals: Vec::new(),
     };
     cg.declare_externs()?;
+    cg.declare_crib_globals();
     cg.declare_funcs()?;
     cg.define_funcs()?;
     if let Some(entry) = &opts.entry {
@@ -126,6 +128,8 @@ struct Cg<'c> {
     funcs: Vec<FunctionValue<'c>>,
     /// Indexed by `ExternId`.
     externs: Vec<FunctionValue<'c>>,
+    /// Indexed by `CribGlobalId` — the LLVM global holding each module-level crib's handle.
+    crib_globals: Vec<GlobalValue<'c>>,
 }
 
 impl<'c> Cg<'c> {
@@ -302,6 +306,19 @@ impl<'c> Cg<'c> {
         Ok(())
     }
 
+    /// Reserve one LLVM global per module-level `crib`, holding its runtime `CribHandle`
+    /// (a pointer), zero-initialized. Filled in at startup by `synthesize_main`.
+    fn declare_crib_globals(&mut self) {
+        for c in self.m.crib_globals() {
+            let g = self
+                .llm
+                .add_global(self.ptr_ty(), None, &format!("crib.{}", c.name));
+            g.set_linkage(Linkage::Internal);
+            g.set_initializer(&self.ptr_ty().const_null());
+            self.crib_globals.push(g);
+        }
+    }
+
     fn declare_funcs(&mut self) -> Result<(), BackendError> {
         for func in self.m.funcs() {
             let fty = self.fn_type(&func.params, &func.rets)?;
@@ -441,6 +458,14 @@ impl<'c> Cg<'c> {
                 Ok(Some(self.build_fat_ptr(d, l)?))
             }
             Rvalue::CribNew { elem, capacity } => Ok(Some(self.lower_crib_new(*elem, *capacity)?)),
+            Rvalue::CribGlobal(id) => {
+                let g = self.crib_globals[id.index()];
+                let v = self
+                    .builder
+                    .build_load(self.ptr_ty(), g.as_pointer_value(), "crib.g")
+                    .map_err(lower_err)?;
+                Ok(Some(v))
+            }
             Rvalue::Call(callee, args) => self.lower_call(func, locals, callee, args),
             Rvalue::Cop(crib, init) => self.lower_cop(func, locals, crib, init),
             Rvalue::Trust(crib, tag) => Ok(Some(self.lower_trust(func, locals, crib, tag)?)),
@@ -1497,6 +1522,13 @@ impl<'c> Cg<'c> {
         let shutdown = self.get_or_add("bet_rt_shutdown", void_fty);
 
         self.builder.build_call(init, &[], "").map_err(lower_err)?;
+        // Initialize every module-level crib once, after the runtime is up.
+        for (i, c) in self.m.crib_globals().iter().enumerate() {
+            let handle = self.lower_crib_new(c.elem, c.capacity)?;
+            self.builder
+                .build_store(self.crib_globals[i].as_pointer_value(), handle)
+                .map_err(lower_err)?;
+        }
         self.builder
             .build_call(bet_main, &[], "")
             .map_err(lower_err)?;
