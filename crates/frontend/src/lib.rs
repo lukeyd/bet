@@ -1,12 +1,15 @@
 //! `frontend` — bet's surface-language front end: lexer → parser → (typecheck) → `midir`.
 //! Reused by the driver, the interpreter, the formatter, and the LSP.
 //!
-//! Step-2 (tracer bullet) scope: exactly enough to lower `tests/corpus/01-basics/hello.bet`
-//! (`pull "spill"` + `finna main() { spill.it("hi") }`) to a validated `midir` module. The
-//! real lexer/parser/typechecker — the full frozen grammar — lands with the frontend fan-out.
+//! Two public entry points:
+//! - [`parse`] — lex + parse arbitrary `bet` source to a full [`ast::Program`] covering the
+//!   frozen surface grammar (`spec/grammar.ebnf` v0.1.1). This is the contract the interpreter
+//!   consumes.
+//! - [`compile`] — the Step-2 tracer-bullet pipeline: parse, then lower the `spill.it("…")`
+//!   subset to a validated `midir` module (used by the `driver`'s LLVM path). Lowering of the
+//!   wider grammar to `midir` is still to come; `parse` already accepts it.
 
 pub mod ast;
-
 mod lexer;
 mod lower;
 mod parser;
@@ -14,6 +17,17 @@ mod parser;
 /// Re-exported so callers (e.g. the `driver`) can hold the produced module without naming
 /// the `midir` crate directly.
 pub use midir::Module;
+
+/// Parse `bet` source into a surface [`ast::Program`].
+///
+/// This is the front end's primary entry point: it runs the full lexer (numeric tower,
+/// string/byte literals, every operator, Go-style ASI) and the recursive-descent parser over
+/// the frozen grammar. Downstream consumers (the interpreter, lowering, tooling) build on the
+/// returned tree.
+pub fn parse(src: &str) -> Result<ast::Program, CompileError> {
+    let tokens = lexer::tokenize(src).map_err(CompileError::Lex)?;
+    parser::parse(&tokens).map_err(CompileError::Parse)
+}
 
 /// A failure anywhere in the front-end pipeline.
 #[derive(Debug, Clone, PartialEq)]
@@ -36,9 +50,12 @@ impl std::fmt::Display for CompileError {
 impl std::error::Error for CompileError {}
 
 /// Compile bet source to a validated `midir` module.
+///
+/// Tracer-bullet scope: lowers the `spill.it("…")` print subset (see [`lower`]). Broader
+/// programs parse via [`parse`] but return a lowering [`CompileError::Lower`] here until the
+/// full AST→IR pass lands.
 pub fn compile(src: &str) -> Result<Module, CompileError> {
-    let tokens = lexer::tokenize(src).map_err(CompileError::Lex)?;
-    let program = parser::parse(&tokens).map_err(CompileError::Parse)?;
+    let program = parse(src)?;
     let module = lower::lower(&program).map_err(CompileError::Lower)?;
     midir::validate(&module).map_err(|errs| {
         CompileError::Lower(

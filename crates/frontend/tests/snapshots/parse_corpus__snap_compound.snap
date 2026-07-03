@@ -1,0 +1,312 @@
+---
+source: crates/frontend/tests/parse_corpus.rs
+expression: program
+---
+Program {
+    items: [
+        Pull(
+            Pull {
+                module: "spill",
+                span: 85..97,
+            },
+        ),
+        Func(
+            FnDecl {
+                vis: Hush,
+                receiver: None,
+                name: "main",
+                generics: [],
+                params: [],
+                ret: None,
+                body: Block {
+                    stmts: [
+                        Stmt {
+                            kind: Var(
+                                VarDecl {
+                                    vis: Hush,
+                                    targets: [
+                                        "n",
+                                    ],
+                                    ty: None,
+                                    values: [
+                                        Expr {
+                                            kind: Int(
+                                                10,
+                                            ),
+                                            span: 129..131,
+                                        },
+                                    ],
+                                    span: 118..131,
+                                },
+                            ),
+                            span: 118..131,
+                        },
+                        Stmt {
+                            kind: Assign {
+                                targets: [
+                                    Expr {
+                                        kind: Name {
+                                            name: "n",
+                                            generics: [],
+                                        },
+                                        span: 136..137,
+                                    },
+                                ],
+                                op: AddEq,
+                                values: [
+                                    Expr {
+                                        kind: Int(
+                                            5,
+                                        ),
+                                        span: 141..142,
+                                    },
+                                ],
+                            },
+                            span: 136..142,
+                        },
+                        Stmt {
+                            kind: Assign {
+                                targets: [
+                                    Expr {
+                                        kind: Name {
+                                            name: "n",
+                                            generics: [],
+                                        },
+                                        span: 158..159,
+                                    },
+                                ],
+                                op: SubEq,
+                                values: [
+                                    Expr {
+                                        kind: Int(
+                                            3,
+                                        ),
+                                        span: 163..164,
+                                    },
+                                ],
+                            },
+                            span: 158..164,
+                        },
+                        Stmt {
+                            kind: Assign {
+                                targets: [
+                                    Expr {
+                                        kind: Name {
+                                            name: "n",
+                                            generics: [],
+                                        },
+                                        span: 180..181,
+                                    },
+                                ],
+                                op: MulEq,
+                                values: [
+                                    Expr {
+                                        kind: Int(
+                                            2,
+                                        ),
+                                        span: 185..186,
+                                    },
+                                ],
+                            },
+                            span: 180..186,
+                        },
+                        Stmt {
+                            kind: Assign {
+                                targets: [
+                                    Expr {
+                                        kind: Name {
+                                            name: "n",
+                                            generics: [],
+                                        },
+                                        span: 202..203,
+                                    },
+                                ],
+                                op: DivEq,
+                                values: [
+                                    Expr {
+                                        kind: Int(
+                                            4,
+                                        ),
+                                        span: 207..208,
+                                    },
+                                ],
+                            },
+                            span: 202..208,
+                        },
+                        Stmt {
+                            kind: Assign {
+                                targets: [
+                                    Expr {
+                                        kind: Name {
+                                            name: "n",
+                                            generics: [],
+                                        },
+                                        span: 223..224,
+                                    },
+                                ],
+                                op: RemEq,
+                                values: [
+                                    Expr {
+                                        kind: Int(
+                                            4,
+                                        ),
+                                        span: 228..229,
+                                    },
+                                ],
+                            },
+                            span: 223..229,
+                        },
+                        Stmt {
+                            kind: Assign {
+                                targets: [
+                                    Expr {
+                                        kind: Name {
+                                            name: "n",
+                                            generics: [],
+                                        },
+                                        span: 244..245,
+                                    },
+                                ],
+                                op: ShlEq,
+                                values: [
+                                    Expr {
+                                        kind: Int(
+                                            3,
+                                        ),
+                                        span: 250..251,
+                                    },
+                                ],
+                            },
+                            span: 244..251,
+                        },
+                        Stmt {
+                            kind: Assign {
+                                targets: [
+                                    Expr {
+                                        kind: Name {
+                                            name: "n",
+                                            generics: [],
+                                        },
+                                        span: 266..267,
+                                    },
+                                ],
+                                op: ShrEq,
+                                values: [
+                                    Expr {
+                                        kind: Int(
+                                            1,
+                                        ),
+                                        span: 272..273,
+                                    },
+                                ],
+                            },
+                            span: 266..273,
+                        },
+                        Stmt {
+                            kind: Assign {
+                                targets: [
+                                    Expr {
+                                        kind: Name {
+                                            name: "n",
+                                            generics: [],
+                                        },
+                                        span: 287..288,
+                                    },
+                                ],
+                                op: AndEq,
+                                values: [
+                                    Expr {
+                                        kind: Int(
+                                            12,
+                                        ),
+                                        span: 292..294,
+                                    },
+                                ],
+                            },
+                            span: 287..294,
+                        },
+                        Stmt {
+                            kind: Assign {
+                                targets: [
+                                    Expr {
+                                        kind: Name {
+                                            name: "n",
+                                            generics: [],
+                                        },
+                                        span: 308..309,
+                                    },
+                                ],
+                                op: OrEq,
+                                values: [
+                                    Expr {
+                                        kind: Int(
+                                            1,
+                                        ),
+                                        span: 313..314,
+                                    },
+                                ],
+                            },
+                            span: 308..314,
+                        },
+                        Stmt {
+                            kind: Assign {
+                                targets: [
+                                    Expr {
+                                        kind: Name {
+                                            name: "n",
+                                            generics: [],
+                                        },
+                                        span: 329..330,
+                                    },
+                                ],
+                                op: XorEq,
+                                values: [
+                                    Expr {
+                                        kind: Int(
+                                            3,
+                                        ),
+                                        span: 334..335,
+                                    },
+                                ],
+                            },
+                            span: 329..335,
+                        },
+                        Stmt {
+                            kind: Expr(
+                                Expr {
+                                    kind: Method {
+                                        receiver: Expr {
+                                            kind: Name {
+                                                name: "spill",
+                                                generics: [],
+                                            },
+                                            span: 351..356,
+                                        },
+                                        method: "it",
+                                        generics: [],
+                                        args: [
+                                            Arg {
+                                                label: None,
+                                                value: Expr {
+                                                    kind: Name {
+                                                        name: "n",
+                                                        generics: [],
+                                                    },
+                                                    span: 360..361,
+                                                },
+                                            },
+                                        ],
+                                    },
+                                    span: 351..362,
+                                },
+                            ),
+                            span: 351..362,
+                        },
+                    ],
+                    span: 112..364,
+                },
+                span: 99..364,
+            },
+        ),
+    ],
+}

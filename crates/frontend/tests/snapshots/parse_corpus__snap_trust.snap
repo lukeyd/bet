@@ -1,0 +1,194 @@
+---
+source: crates/frontend/tests/parse_corpus.rs
+expression: program
+---
+Program {
+    items: [
+        Pull(
+            Pull {
+                module: "spill",
+                span: 166..178,
+            },
+        ),
+        Drip(
+            DripDecl {
+                vis: Hush,
+                name: "Enemy",
+                generics: [],
+                fields: [
+                    FieldDecl {
+                        vis: Some(
+                            Flex,
+                        ),
+                        name: "hp",
+                        ty: Type {
+                            kind: Named(
+                                "int",
+                                [],
+                            ),
+                            span: 202..205,
+                        },
+                        span: 193..205,
+                    },
+                ],
+                span: 180..207,
+            },
+        ),
+        Crib(
+            CribDecl {
+                vis: Hush,
+                name: "enemies",
+                ty: Some(
+                    Type {
+                        kind: Array(
+                            Type {
+                                kind: Named(
+                                    "Enemy",
+                                    [],
+                                ),
+                                span: 223..228,
+                            },
+                            8,
+                        ),
+                        span: 223..231,
+                    },
+                ),
+                span: 209..231,
+            },
+        ),
+        Func(
+            FnDecl {
+                vis: Hush,
+                receiver: None,
+                name: "main",
+                generics: [],
+                params: [],
+                ret: None,
+                body: Block {
+                    stmts: [
+                        Stmt {
+                            kind: Var(
+                                VarDecl {
+                                    vis: Hush,
+                                    targets: [
+                                        "e",
+                                    ],
+                                    ty: None,
+                                    values: [
+                                        Expr {
+                                            kind: Cop {
+                                                init: Struct(
+                                                    StructLit {
+                                                        name: "Enemy",
+                                                        generics: [],
+                                                        fields: [
+                                                            FieldInit {
+                                                                name: "hp",
+                                                                value: Expr {
+                                                                    kind: Int(
+                                                                        77,
+                                                                    ),
+                                                                    span: 278..280,
+                                                                },
+                                                                span: 274..280,
+                                                            },
+                                                        ],
+                                                        span: 267..282,
+                                                    },
+                                                ),
+                                                crib: Expr {
+                                                    kind: Name {
+                                                        name: "enemies",
+                                                        generics: [],
+                                                    },
+                                                    span: 286..293,
+                                                },
+                                            },
+                                            span: 263..293,
+                                        },
+                                    ],
+                                    span: 252..293,
+                                },
+                            ),
+                            span: 252..293,
+                        },
+                        Stmt {
+                            kind: Var(
+                                VarDecl {
+                                    vis: Hush,
+                                    targets: [
+                                        "ref",
+                                    ],
+                                    ty: None,
+                                    values: [
+                                        Expr {
+                                            kind: Trust {
+                                                tag: Expr {
+                                                    kind: Name {
+                                                        name: "e",
+                                                        generics: [],
+                                                    },
+                                                    span: 311..312,
+                                                },
+                                                crib: Expr {
+                                                    kind: Name {
+                                                        name: "enemies",
+                                                        generics: [],
+                                                    },
+                                                    span: 324..331,
+                                                },
+                                            },
+                                            span: 311..331,
+                                        },
+                                    ],
+                                    span: 298..331,
+                                },
+                            ),
+                            span: 298..331,
+                        },
+                        Stmt {
+                            kind: Expr(
+                                Expr {
+                                    kind: Method {
+                                        receiver: Expr {
+                                            kind: Name {
+                                                name: "spill",
+                                                generics: [],
+                                            },
+                                            span: 362..367,
+                                        },
+                                        method: "it",
+                                        generics: [],
+                                        args: [
+                                            Arg {
+                                                label: None,
+                                                value: Expr {
+                                                    kind: Field {
+                                                        base: Expr {
+                                                            kind: Name {
+                                                                name: "ref",
+                                                                generics: [],
+                                                            },
+                                                            span: 371..374,
+                                                        },
+                                                        name: "hp",
+                                                        generics: [],
+                                                    },
+                                                    span: 371..377,
+                                                },
+                                            },
+                                        ],
+                                    },
+                                    span: 362..378,
+                                },
+                            ),
+                            span: 362..378,
+                        },
+                    ],
+                    span: 246..406,
+                },
+                span: 233..406,
+            },
+        ),
+    ],
+}

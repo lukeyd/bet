@@ -1,0 +1,231 @@
+---
+source: crates/frontend/tests/parse_corpus.rs
+expression: program
+---
+Program {
+    items: [
+        Pull(
+            Pull {
+                module: "spill",
+                span: 59..71,
+            },
+        ),
+        Func(
+            FnDecl {
+                vis: Hush,
+                receiver: None,
+                name: "divmod",
+                generics: [],
+                params: [
+                    Param {
+                        name: "a",
+                        ty: Type {
+                            kind: Named(
+                                "int",
+                                [],
+                            ),
+                            span: 89..92,
+                        },
+                        span: 86..92,
+                    },
+                    Param {
+                        name: "b",
+                        ty: Type {
+                            kind: Named(
+                                "int",
+                                [],
+                            ),
+                            span: 97..100,
+                        },
+                        span: 94..100,
+                    },
+                ],
+                ret: Multi(
+                    [
+                        Type {
+                            kind: Named(
+                                "int",
+                                [],
+                            ),
+                            span: 106..109,
+                        },
+                        Type {
+                            kind: Named(
+                                "int",
+                                [],
+                            ),
+                            span: 111..114,
+                        },
+                    ],
+                ),
+                body: Block {
+                    stmts: [
+                        Stmt {
+                            kind: Bet(
+                                [
+                                    Expr {
+                                        kind: Binary(
+                                            Div,
+                                            Expr {
+                                                kind: Name {
+                                                    name: "a",
+                                                    generics: [],
+                                                },
+                                                span: 126..127,
+                                            },
+                                            Expr {
+                                                kind: Name {
+                                                    name: "b",
+                                                    generics: [],
+                                                },
+                                                span: 130..131,
+                                            },
+                                        ),
+                                        span: 126..131,
+                                    },
+                                    Expr {
+                                        kind: Binary(
+                                            Rem,
+                                            Expr {
+                                                kind: Name {
+                                                    name: "a",
+                                                    generics: [],
+                                                },
+                                                span: 133..134,
+                                            },
+                                            Expr {
+                                                kind: Name {
+                                                    name: "b",
+                                                    generics: [],
+                                                },
+                                                span: 137..138,
+                                            },
+                                        ),
+                                        span: 133..138,
+                                    },
+                                ],
+                            ),
+                            span: 122..138,
+                        },
+                    ],
+                    span: 116..140,
+                },
+                span: 73..140,
+            },
+        ),
+        Func(
+            FnDecl {
+                vis: Hush,
+                receiver: None,
+                name: "main",
+                generics: [],
+                params: [],
+                ret: None,
+                body: Block {
+                    stmts: [
+                        Stmt {
+                            kind: Var(
+                                VarDecl {
+                                    vis: Hush,
+                                    targets: [
+                                        "q",
+                                        "r",
+                                    ],
+                                    ty: None,
+                                    values: [
+                                        Expr {
+                                            kind: Call {
+                                                callee: Expr {
+                                                    kind: Name {
+                                                        name: "divmod",
+                                                        generics: [],
+                                                    },
+                                                    span: 175..181,
+                                                },
+                                                args: [
+                                                    Arg {
+                                                        label: None,
+                                                        value: Expr {
+                                                            kind: Int(
+                                                                17,
+                                                            ),
+                                                            span: 182..184,
+                                                        },
+                                                    },
+                                                    Arg {
+                                                        label: None,
+                                                        value: Expr {
+                                                            kind: Int(
+                                                                5,
+                                                            ),
+                                                            span: 186..187,
+                                                        },
+                                                    },
+                                                ],
+                                            },
+                                            span: 175..188,
+                                        },
+                                    ],
+                                    span: 161..188,
+                                },
+                            ),
+                            span: 161..188,
+                        },
+                        Stmt {
+                            kind: Expr(
+                                Expr {
+                                    kind: Method {
+                                        receiver: Expr {
+                                            kind: Name {
+                                                name: "spill",
+                                                generics: [],
+                                            },
+                                            span: 193..198,
+                                        },
+                                        method: "f",
+                                        generics: [],
+                                        args: [
+                                            Arg {
+                                                label: None,
+                                                value: Expr {
+                                                    kind: Str(
+                                                        "{} r {}\n",
+                                                    ),
+                                                    span: 201..212,
+                                                },
+                                            },
+                                            Arg {
+                                                label: None,
+                                                value: Expr {
+                                                    kind: Name {
+                                                        name: "q",
+                                                        generics: [],
+                                                    },
+                                                    span: 214..215,
+                                                },
+                                            },
+                                            Arg {
+                                                label: None,
+                                                value: Expr {
+                                                    kind: Name {
+                                                        name: "r",
+                                                        generics: [],
+                                                    },
+                                                    span: 217..218,
+                                                },
+                                            },
+                                        ],
+                                    },
+                                    span: 193..219,
+                                },
+                            ),
+                            span: 193..219,
+                        },
+                    ],
+                    span: 155..232,
+                },
+                span: 142..232,
+            },
+        ),
+    ],
+}

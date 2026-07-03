@@ -1,0 +1,60 @@
+---
+source: crates/frontend/tests/parse_corpus.rs
+expression: program
+---
+Program {
+    items: [
+        Pull(
+            Pull {
+                module: "spill",
+                span: 46..58,
+            },
+        ),
+        Func(
+            FnDecl {
+                vis: Hush,
+                receiver: None,
+                name: "main",
+                generics: [],
+                params: [],
+                ret: None,
+                body: Block {
+                    stmts: [
+                        Stmt {
+                            kind: Expr(
+                                Expr {
+                                    kind: Method {
+                                        receiver: Expr {
+                                            kind: Name {
+                                                name: "spill",
+                                                generics: [],
+                                            },
+                                            span: 127..132,
+                                        },
+                                        method: "it",
+                                        generics: [],
+                                        args: [
+                                            Arg {
+                                                label: None,
+                                                value: Expr {
+                                                    kind: Str(
+                                                        "ok",
+                                                    ),
+                                                    span: 136..140,
+                                                },
+                                            },
+                                        ],
+                                    },
+                                    span: 127..141,
+                                },
+                            ),
+                            span: 127..141,
+                        },
+                    ],
+                    span: 73..172,
+                },
+                span: 60..172,
+            },
+        ),
+    ],
+}

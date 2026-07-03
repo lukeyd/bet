@@ -1,324 +1,315 @@
-//! `frontend::ast` — the surface abstract syntax tree.
+//! `frontend::ast` — the surface AST for `bet`.
 //!
-//! This module is the **second public contract of the frontend crate** (alongside
-//! [`crate::compile`]): the interpreter (`interp -> frontend`), the formatter (`fmt`),
-//! and the LSP (`lsp`) all consume this tree. It is a faithful, one-to-one image of the
-//! frozen surface grammar in `spec/grammar.ebnf` (v0.1.1) — every production there has a
-//! node here — and it holds *pure data only* (no parsing, typing, or lowering logic).
+//! This is the **contract** the parser produces and downstream consumers (the interpreter,
+//! the lowering pass, tooling) read. It mirrors `spec/grammar.ebnf` (FROZEN v0.1.1) node for
+//! node; every syntactic production there has a corresponding node here. Keep changes to this
+//! module ADDITIVE — the interpreter builds against this shape.
 //!
-//! ## Stability contract (Step 3 fan-out)
-//! Treat this shape like `midir`/`rt-abi`: during the fan-out it changes **additively
-//! only** (new variants/fields), and any breaking change is a coordinated note to the
-//! `interp`/`fmt`/`lsp` owners, never a silent edit. The parser (`crate::parser`) is the
-//! sole producer of these nodes; downstream crates are consumers.
-//!
-//! Grammar cross-references (`§Sn` / `§amend n`) are cited on each node.
+//! Every node that spans source carries a byte-offset [`Span`] so diagnostics and later passes
+//! can point back at the surface text.
 
-/// A half-open byte range `[start, end)` into the original source, for diagnostics.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+/// A half-open byte range `[start, end)` into the original source string.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Span {
     pub start: u32,
     pub end: u32,
 }
 
-/// Declaration visibility. Absence of `flex` means [`Vis::Hush`] (module-private) — the
-/// default settled in plan-amendment-01 §2.8.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+impl Span {
+    pub fn new(start: u32, end: u32) -> Span {
+        Span { start, end }
+    }
+
+    /// The dummy span used for synthesized nodes with no source text.
+    pub const DUMMY: Span = Span { start: 0, end: 0 };
+}
+
+impl std::fmt::Debug for Span {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Compact form keeps AST snapshots readable: `12..17` rather than `Span { .. }`.
+        write!(f, "{}..{}", self.start, self.end)
+    }
+}
+
+/// Declaration / field visibility. Absence of `flex` means `hush` (module-private) by default.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Vis {
-    /// `flex` — exported from the module.
+    /// `flex` — exported.
     Flex,
     /// `hush` — module-private (the default).
     Hush,
 }
 
-// ============================================================================
-// §S1 — Program & top-level items
-// ============================================================================
+// ---------------------------------------------------------------------------
+// Program & top-level items.
+// ---------------------------------------------------------------------------
 
-/// A whole compilation unit: `{ topItem }`.
-#[derive(Clone, Debug, PartialEq)]
+/// A whole compilation unit: a sequence of top-level items.
+#[derive(Clone, PartialEq, Debug)]
 pub struct Program {
     pub items: Vec<Item>,
 }
 
-/// One top-level item (`topItem = pull | topDecl`). `vis` is meaningful only for the
-/// declaration kinds; it is [`Vis::Hush`] for `Import`/`Extern`.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Item {
-    pub kind: ItemKind,
-    pub vis: Vis,
-    pub span: Span,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum ItemKind {
-    /// `pull "spill"` — import a module (§S1).
-    Import(String),
-    /// `finna ...` — function or method (§S2).
-    Fn(FnDecl),
-    /// `drip Name { ... }` — struct (§S2).
+/// A top-level item (`spec/grammar.ebnf` §S1).
+#[derive(Clone, PartialEq, Debug)]
+pub enum Item {
+    Pull(Pull),
+    Func(FnDecl),
     Drip(DripDecl),
-    /// `moods Name { ... }` — sum type (§S2, §amend 2.1).
     Moods(MoodsDecl),
-    /// `crib name [: T]` — arena declaration (§S2).
     Crib(CribDecl),
-    /// `facts NAME [: T] = expr` — constant (§S2).
     Const(ConstDecl),
-    /// `lowkey a, b [: T] = ...` — binding (§S2).
     Var(VarDecl),
-    /// `extern "C" finna f(...) -> T` — FFI declaration (§S1, §amend 2.6).
     Extern(ExternDecl),
 }
 
-// ============================================================================
-// §S2 — Declarations
-// ============================================================================
-
-/// `finna [receiver] name [generics] (params) [-> ret] block`.
-#[derive(Clone, Debug, PartialEq)]
-pub struct FnDecl {
-    pub name: String,
-    /// Method receiver `(p: Player)`, if any (§amend 2.8).
-    pub receiver: Option<Param>,
-    /// Monomorphized generic parameters `[T, U]` (§amend 2.2).
-    pub generics: Vec<String>,
-    pub params: Vec<Param>,
-    /// Return types: empty = `void`, one = single, many = multi-value return (§6).
-    pub ret: Vec<Type>,
-    pub body: Block,
+/// `pull "module"` — an import.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Pull {
+    pub module: String,
+    pub span: Span,
 }
 
-/// `ident ":" type` — a parameter or receiver binding.
-#[derive(Clone, Debug, PartialEq)]
+/// `[flex] finna [receiver] name[generics](params) [-> ret] block`.
+#[derive(Clone, PartialEq, Debug)]
+pub struct FnDecl {
+    pub vis: Vis,
+    pub receiver: Option<Receiver>,
+    pub name: String,
+    pub generics: Vec<String>,
+    pub params: Vec<Param>,
+    pub ret: RetType,
+    pub body: Block,
+    pub span: Span,
+}
+
+/// A method receiver: `(name: Type)` before the function name.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Receiver {
+    pub name: String,
+    pub ty: Type,
+    pub span: Span,
+}
+
+/// A `name: Type` parameter.
+#[derive(Clone, PartialEq, Debug)]
 pub struct Param {
     pub name: String,
     pub ty: Type,
+    pub span: Span,
 }
 
-/// `drip Name [generics] { field* }`.
-#[derive(Clone, Debug, PartialEq)]
+/// A function's declared return: nothing, one type, or a parenthesized multi-value list.
+#[derive(Clone, PartialEq, Debug)]
+pub enum RetType {
+    None,
+    Single(Type),
+    Multi(Vec<Type>),
+}
+
+/// `[flex] drip Name[generics] { field* }`.
+#[derive(Clone, PartialEq, Debug)]
 pub struct DripDecl {
+    pub vis: Vis,
     pub name: String,
     pub generics: Vec<String>,
     pub fields: Vec<FieldDecl>,
+    pub span: Span,
 }
 
-/// `[flex|hush] ident ":" type` — a struct field.
-#[derive(Clone, Debug, PartialEq)]
+/// A struct field: `[flex|hush] name: Type`. `vis: None` means the default (`hush`).
+#[derive(Clone, PartialEq, Debug)]
 pub struct FieldDecl {
+    pub vis: Option<Vis>,
     pub name: String,
     pub ty: Type,
-    pub vis: Vis,
+    pub span: Span,
 }
 
-/// `moods Name [generics] { variant, ... }` (§amend 2.1).
-#[derive(Clone, Debug, PartialEq)]
+/// `[flex] moods Name[generics] { variant, ... }`.
+#[derive(Clone, PartialEq, Debug)]
 pub struct MoodsDecl {
+    pub vis: Vis,
     pub name: String,
     pub generics: Vec<String>,
     pub variants: Vec<Variant>,
+    pub span: Span,
 }
 
-/// `ident [ "(" type, ... ")" ]` — a sum-type variant with an optional payload.
-#[derive(Clone, Debug, PartialEq)]
+/// A sum-type variant: `Name` or `Name(Type, ...)`.
+#[derive(Clone, PartialEq, Debug)]
 pub struct Variant {
     pub name: String,
     pub payload: Vec<Type>,
+    pub span: Span,
 }
 
-/// `crib ident [: type]` — untyped bump arena or typed slab (§7.2).
-#[derive(Clone, Debug, PartialEq)]
+/// `[flex] crib name [: Type]` — an arena declaration (typed slab or untyped bump).
+#[derive(Clone, PartialEq, Debug)]
 pub struct CribDecl {
+    pub vis: Vis,
     pub name: String,
     pub ty: Option<Type>,
+    pub span: Span,
 }
 
-/// `facts ident [: type] = expr` — a compile-time constant.
-#[derive(Clone, Debug, PartialEq)]
+/// `[flex] facts NAME [: Type] = expr` — a constant.
+#[derive(Clone, PartialEq, Debug)]
 pub struct ConstDecl {
+    pub vis: Vis,
     pub name: String,
     pub ty: Option<Type>,
     pub value: Expr,
+    pub span: Span,
 }
 
-/// `lowkey a, b [: type] = e1, e2` — a (possibly multi-value) binding.
-#[derive(Clone, Debug, PartialEq)]
+/// `[flex] lowkey a, b [: Type] = expr, ...` — a (possibly multi-value) binding.
+#[derive(Clone, PartialEq, Debug)]
 pub struct VarDecl {
-    pub names: Vec<String>,
+    pub vis: Vis,
+    pub targets: Vec<String>,
     pub ty: Option<Type>,
     pub values: Vec<Expr>,
+    pub span: Span,
 }
 
-/// `extern "abi" finna name(params) [-> ret]` (§amend 2.6).
-#[derive(Clone, Debug, PartialEq)]
+/// `extern "ABI" finna name(params) [-> Type]` — an FFI import.
+#[derive(Clone, PartialEq, Debug)]
 pub struct ExternDecl {
     pub abi: String,
     pub name: String,
     pub params: Vec<Param>,
-    pub ret: Option<Type>,
+    pub ret: RetType,
+    pub span: Span,
 }
 
-// ============================================================================
-// §S3 — Types
-// ============================================================================
+// ---------------------------------------------------------------------------
+// Types (§S3).
+// ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum Type {
-    /// `[]T` — slice.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Type {
+    pub kind: TypeKind,
+    pub span: Span,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub enum TypeKind {
+    /// `[]T`.
     Slice(Box<Type>),
-    /// `T[N]` — fixed-size array (grammar restricts the element to a name type).
-    Array { elem: Box<Type>, len: u64 },
-    /// `tag T` — a generational handle (8 bytes).
+    /// `T[N]` — a fixed-size array.
+    Array(Box<Type>, u64),
+    /// `tag T`.
     Tag(Box<Type>),
-    /// `crib T` — a crib reference (parameter/field position).
+    /// `crib T`.
     Crib(Box<Type>),
-    /// `finna(A, B) -> R` — a first-class function type (§amend 2.5).
-    Fn { params: Vec<Type>, ret: Box<Type> },
-    /// `rawptr` — the FFI-only raw pointer (§amend 2.6).
+    /// `finna(params) -> ret` — a function-pointer type.
+    Fn(Vec<Type>, Box<Type>),
+    /// `rawptr`.
     RawPtr,
-    /// `int`, `str`, `Enemy`, `stash[K, V]`, ... — a named type with optional generic args.
-    /// Predeclared names (`void`, the numeric tower, `bool`, `str`, `yikes`, ...) are
-    /// represented here with an empty arg list; resolution happens in typecheck.
-    Name { name: String, args: Vec<Type> },
+    /// `Name` or `Name[T, ...]` — a named/generic type (`int`, `stash[str, i64]`, `Enemy`).
+    Named(String, Vec<Type>),
 }
 
-// ============================================================================
-// §S4 — Statements
-// ============================================================================
+// ---------------------------------------------------------------------------
+// Statements (§S4).
+// ---------------------------------------------------------------------------
 
-/// `{ stmt* }` — a brace-delimited block.
-#[derive(Clone, Debug, PartialEq)]
+/// A `{ ... }` block of statements.
+#[derive(Clone, PartialEq, Debug)]
 pub struct Block {
     pub stmts: Vec<Stmt>,
+    pub span: Span,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct Stmt {
     pub kind: StmtKind,
     pub span: Span,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum StmtKind {
     Var(VarDecl),
     Const(ConstDecl),
     Crib(CribDecl),
-    /// `fr cond { } naw fr cond { } naw { }` — if / else-if / else.
+    /// `fr cond { .. } naw fr cond { .. } naw { .. }`.
     Fr(FrStmt),
-    /// `vibin cond { }` — while loop.
-    Vibin(VibinStmt),
-    /// `squad x in iter { }` — for-in loop.
-    Squad(SquadStmt),
-    /// `vibe e { arm* naw { } }` — pattern match (§amend 2.1).
-    Vibe(VibeStmt),
-    /// `holla x = handle in arena { } ghosted { }` — checked tag deref (§7.4).
-    Holla(HollaStmt),
-    /// `sheesh { } [naw ident { }]` — recover boundary (§6; binding form provisional).
-    Sheesh(SheeshStmt),
-    /// `evict crib` — O(1) mass free (§7.2).
+    /// `vibin cond { .. }` — a while loop.
+    Vibin {
+        cond: Expr,
+        body: Block,
+    },
+    /// `squad name in iter { .. }` — a for-each loop.
+    Squad {
+        var: String,
+        iter: Expr,
+        body: Block,
+    },
+    /// `vibe scrutinee { arm* naw { .. } }` — a pattern match.
+    Vibe {
+        scrutinee: Expr,
+        arms: Vec<MatchArm>,
+        default: Option<Block>,
+    },
+    /// `holla binding = tag in crib { live } ghosted { ghosted }`.
+    Holla {
+        binding: String,
+        tag: Expr,
+        crib: Expr,
+        live: Block,
+        ghosted: Block,
+    },
+    /// `sheesh { .. } [naw name { .. }]` — a panic-recovery boundary.
+    Sheesh {
+        body: Block,
+        recover: Option<(String, Block)>,
+    },
+    /// `evict crib`.
     Evict(Expr),
-    /// `slide task` — spawn a task (§8).
+    /// `slide call()` — spawn a task.
     Slide(Expr),
-    /// `bet [e1, e2]` — return 0..n values (§6).
+    /// `bet v, ...` — return zero or more values.
     Bet(Vec<Expr>),
-    /// `bounce err` — early error return (§amend 2.8).
+    /// `bounce err` — early-return-on-error sugar.
     Bounce(Expr),
-    /// `yeet(e)` — panic (§6).
+    /// `yeet(msg)` — panic.
     Yeet(Expr),
     /// `dip` — break.
     Dip,
     /// `skip` — continue.
     Skip,
-    /// `a, b op= e1, e2` — assignment.
-    Assign(AssignStmt),
-    /// A bare expression evaluated for effect (call / method / cop).
+    /// `lvalue, ... op expr, ...` — assignment / compound-assignment.
+    Assign {
+        targets: Vec<Expr>,
+        op: AssignOp,
+        values: Vec<Expr>,
+    },
+    /// A bare expression evaluated for effect (a call, `cop`, etc.).
     Expr(Expr),
 }
 
-/// `fr cond { } { naw fr cond { } } [ naw { } ]`.
-#[derive(Clone, Debug, PartialEq)]
+/// `fr` / `naw fr` / `naw` chain.
+#[derive(Clone, PartialEq, Debug)]
 pub struct FrStmt {
     pub cond: Expr,
     pub then: Block,
-    pub elifs: Vec<ElseIf>,
+    /// Zero or more `naw fr cond { .. }` else-if arms.
+    pub elifs: Vec<(Expr, Block)>,
+    /// An optional trailing `naw { .. }` else arm.
     pub els: Option<Block>,
 }
 
-/// One `naw fr cond { }` arm of an [`FrStmt`].
-#[derive(Clone, Debug, PartialEq)]
-pub struct ElseIf {
-    pub cond: Expr,
+/// A `vibe` arm: `Variant(bind, ...) { .. }`.
+#[derive(Clone, PartialEq, Debug)]
+pub struct MatchArm {
+    pub variant: String,
+    pub bindings: Vec<String>,
     pub body: Block,
+    pub span: Span,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct VibinStmt {
-    pub cond: Expr,
-    pub body: Block,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct SquadStmt {
-    pub binder: String,
-    pub iter: Expr,
-    pub body: Block,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct VibeStmt {
-    pub scrutinee: Expr,
-    /// Arms in source order; the `naw` wildcard (if present) is the arm whose pattern is
-    /// [`Pattern::Wildcard`].
-    pub arms: Vec<VibeArm>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct VibeArm {
-    pub pat: Pattern,
-    pub body: Block,
-}
-
-/// A `vibe` arm pattern. v1 patterns are a variant tag plus flat payload bindings, or the
-/// `naw` wildcard — no nested/guarded patterns yet (§amend 2.1).
-#[derive(Clone, Debug, PartialEq)]
-pub enum Pattern {
-    /// `Variant(a, b)` or `Variant` — binds the payload to the given names.
-    Variant { name: String, binds: Vec<String> },
-    /// `naw` — the exhaustiveness wildcard.
-    Wildcard,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct HollaStmt {
-    pub binder: String,
-    pub handle: Expr,
-    pub arena: Expr,
-    pub body: Block,
-    pub ghosted: Block,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct SheeshStmt {
-    pub body: Block,
-    pub recover: Option<Recover>,
-}
-
-/// The `naw ident { }` recover arm of a [`SheeshStmt`].
-#[derive(Clone, Debug, PartialEq)]
-pub struct Recover {
-    pub binder: String,
-    pub body: Block,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct AssignStmt {
-    pub targets: Vec<Expr>,
-    pub op: AssignOp,
-    pub values: Vec<Expr>,
-}
-
-/// `=` and the compound-assignment operators (§S4).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AssignOp {
     Eq,
     AddEq,
@@ -333,127 +324,76 @@ pub enum AssignOp {
     ShrEq,
 }
 
-// ============================================================================
-// §S5 / E1 — Expressions
-// ============================================================================
+// ---------------------------------------------------------------------------
+// Expressions (§S5 / E1).
+// ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct Expr {
     pub kind: ExprKind,
     pub span: Span,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum ExprKind {
-    // --- literals (§L3) ---
-    /// An integer literal's raw magnitude; width/signedness resolved in typecheck. A `u64`
-    /// holds every `intLit` (dec/hex/bin); negatives come from a [`UnOp::Neg`] wrapper.
-    Int(u64),
+    /// An integer literal (decimal / hex / binary), value normalized to `i128`.
+    Int(i128),
+    /// A floating-point literal.
     Float(f64),
+    /// A UTF-8 string literal (escapes already decoded).
     Str(String),
+    /// A single-byte (`u8`) literal (`'A'`).
     Byte(u8),
+    /// `nocap` / `cap`.
     Bool(bool),
-    /// `ghosted` — nil / no-error literal.
+    /// `ghosted` — the nil / no-error literal.
     Ghosted,
-
-    // --- names & access ---
-    /// `x` or a generic target `foo[T, U]`.
-    Name {
-        name: String,
-        args: Vec<Type>,
-    },
-    /// `recv.field` or `recv.method[T]` (a following [`ExprKind::Call`] makes it a call).
+    /// A name reference, optionally with a generic-argument list (`pickFirst[int]`).
+    Name { name: String, generics: Vec<Type> },
+    /// `op operand` — `!`, `~`, or unary `-`.
+    Unary(UnOp, Box<Expr>),
+    /// `lhs op rhs`.
+    Binary(BinOp, Box<Expr>, Box<Expr>),
+    /// `expr as Type`.
+    Cast(Box<Expr>, Type),
+    /// `base.name[generics]` — field access (or generic-instantiated member).
     Field {
-        recv: Box<Expr>,
+        base: Box<Expr>,
         name: String,
         generics: Vec<Type>,
     },
-    /// `recv[index]`.
-    Index {
-        recv: Box<Expr>,
-        index: Box<Expr>,
-    },
-    /// `callee(args)`.
-    Call {
-        callee: Box<Expr>,
+    /// `receiver.method[generics](args)` — a method call.
+    Method {
+        receiver: Box<Expr>,
+        method: String,
+        generics: Vec<Type>,
         args: Vec<Arg>,
     },
-
-    // --- operators (§E1) ---
-    Unary {
-        op: UnOp,
-        operand: Box<Expr>,
-    },
-    Binary {
-        op: BinOp,
-        lhs: Box<Expr>,
-        rhs: Box<Expr>,
-    },
-    /// `e as T` — explicit cast (§amend 2.4).
-    Cast {
-        expr: Box<Expr>,
-        ty: Type,
-    },
-
-    // --- memory (§7) ---
-    /// `cop init in crib` — allocate into an arena (§7.2/§7.3).
-    Cop {
-        init: CopInit,
-        crib: Box<Expr>,
-    },
-    /// `handle.trust() in arena` — unchecked tag deref (§7.5).
-    Trust {
-        handle: Box<Expr>,
-        arena: Box<Expr>,
-    },
-
-    // --- composite literals ---
+    /// `callee(args)` — a function call.
+    Call { callee: Box<Expr>, args: Vec<Arg> },
+    /// `base[index]` — indexing.
+    Index { base: Box<Expr>, index: Box<Expr> },
+    /// `tag.trust() in crib` — unchecked tag resolution.
+    Trust { tag: Box<Expr>, crib: Box<Expr> },
+    /// `Name{ field: expr, ... }` — a struct literal.
     Struct(StructLit),
-    /// `[e1, e2, ...]` — array literal; element type inferred (§S5).
+    /// `[a, b, c]` — an array/slice literal.
     Array(Vec<Expr>),
+    /// `cop init in crib` — allocate into a crib.
+    Cop { init: Box<CopInit>, crib: Box<Expr> },
 }
 
-/// The thing being allocated by a `cop` expression: a struct literal (`Player{...}`) or a
-/// moods-variant constructor (`Lit(2)`, `Dot`).
-#[derive(Clone, Debug, PartialEq)]
-pub enum CopInit {
-    Struct(StructLit),
-    Variant { name: String, args: Vec<Expr> },
-}
-
-/// `Name{ field: expr, ... }` — a struct literal (§S5). `ty` is always a name type.
-#[derive(Clone, Debug, PartialEq)]
-pub struct StructLit {
-    pub ty: Type,
-    pub fields: Vec<FieldInit>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct FieldInit {
-    pub name: String,
-    pub value: Expr,
-}
-
-/// A call argument with an optional label (`in: crib`).
-#[derive(Clone, Debug, PartialEq)]
-pub struct Arg {
-    pub label: Option<String>,
-    pub value: Expr,
-}
-
-/// Prefix unary operators `! ~ -` (§E1).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum UnOp {
-    /// `!` logical not.
-    Not,
-    /// `~` bitwise not.
-    BitNot,
-    /// `-` arithmetic negation.
+    /// `-x`.
     Neg,
+    /// `!b`.
+    Not,
+    /// `~x`.
+    BitNot,
 }
 
-/// Binary operators (§E1). Precedence/associativity live in the parser, not here.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BinOp {
     Or,
     And,
@@ -473,4 +413,36 @@ pub enum BinOp {
     Mul,
     Div,
     Rem,
+}
+
+/// A call argument, with an optional `label:`.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Arg {
+    pub label: Option<String>,
+    pub value: Expr,
+}
+
+/// `Name[generics]{ field: expr, ... }`.
+#[derive(Clone, PartialEq, Debug)]
+pub struct StructLit {
+    pub name: String,
+    pub generics: Vec<Type>,
+    pub fields: Vec<FieldInit>,
+    pub span: Span,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct FieldInit {
+    pub name: String,
+    pub value: Expr,
+    pub span: Span,
+}
+
+/// The initializer of a `cop` (§S5 `copInit`).
+#[derive(Clone, PartialEq, Debug)]
+pub enum CopInit {
+    /// `Player{ hp: 100 }`.
+    Struct(StructLit),
+    /// `Add(l, r)` or a nullary `Dot` — a `moods` variant constructor.
+    Variant { name: String, args: Vec<Arg> },
 }
