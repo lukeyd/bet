@@ -357,6 +357,11 @@ impl<'a> Checker<'a> {
                 width: IntWidth::W64,
                 signed: false,
             }),
+            Rvalue::MakeStr { data, len } => {
+                self.operand_kind(func, data);
+                self.operand_kind(func, len);
+                Some(TyKind::Str)
+            }
         }
     }
 

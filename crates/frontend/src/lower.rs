@@ -1970,13 +1970,100 @@ impl LowerCtx {
             }
             return self.emit_call(sig.id, &sig.rets, call_args);
         }
-        // Otherwise evaluate the receiver: a `stash` (Map) value gets the hash-map methods; a
-        // struct with a `finna(..)` field gets an indirect call through the field.
+        // Otherwise evaluate the receiver: a `stash` (Map) value gets the hash-map methods, a
+        // `yikes` gets `.tea`, and a struct with a `finna(..)` field an indirect call.
         let (bop, bty) = self.lower_expr(receiver, None)?;
         if let TyKind::Map(k, v) = *self.m.ty(bty) {
             return self.lower_stash_method(bop, k, v, method, args);
         }
+        if self.is_yikes(bty) {
+            return self.lower_yikes_method(bop, method, args);
+        }
         self.lower_fn_field_call(bop, bty, method, args)
+    }
+
+    /// `y.tea(context)` — wrap an error, prefixing `"<context>: "` to its message (Go's `%w`).
+    fn lower_yikes_method(
+        &mut self,
+        yop: Operand,
+        method: &str,
+        args: &[ast::Arg],
+    ) -> Result<(Operand, TyId), String> {
+        match method {
+            "tea" => {
+                if args.len() != 1 {
+                    return Err("`yikes.tea` takes a single str context".into());
+                }
+                let strt = self.m.t_str();
+                let (ctx, _) = self.lower_expr(&args[0].value, Some(strt))?;
+                let place = self
+                    .operand_place(yop)
+                    .ok_or_else(|| "`.tea` needs an addressable yikes".to_string())?;
+                let msg = Operand::Copy(extend(&place, Proj::Field(1)));
+                let sep = Operand::Const(Const::Str(": ".into()));
+                let prefixed = self.concat_str(ctx, sep)?;
+                let full = self.concat_str(prefixed, msg)?;
+                Ok(self.build_yikes(true, full))
+            }
+            other => Err(format!("unknown `yikes` method `{other}`")),
+        }
+    }
+
+    /// Concatenate two `str` values into a fresh `str` via `bet_str_concat`. The result length
+    /// is the sum of the two byte lengths (`bet_str_concat` copies `a` then `b`).
+    fn concat_str(&mut self, a: Operand, b: Operand) -> Result<Operand, String> {
+        let rawptr = self.m.intern_ty(TyKind::RawPtr);
+        let usize_t = self.m.t_int(IntWidth::W64, false);
+        let strt = self.m.t_str();
+
+        let ap = self.new_local(rawptr);
+        self.fb()
+            .assign(Place::local(ap), Rvalue::StrPtr(a.clone()));
+        let al = self.new_local(usize_t);
+        self.fb().assign(Place::local(al), Rvalue::StrLen(a));
+        let bp = self.new_local(rawptr);
+        self.fb()
+            .assign(Place::local(bp), Rvalue::StrPtr(b.clone()));
+        let bl = self.new_local(usize_t);
+        self.fb().assign(Place::local(bl), Rvalue::StrLen(b));
+
+        let ext = self.get_extern(
+            "bet_str_concat",
+            vec![rawptr, usize_t, rawptr, usize_t],
+            vec![rawptr],
+        );
+        let out_ptr = self.new_local(rawptr);
+        self.fb().assign(
+            Place::local(out_ptr),
+            Rvalue::Call(
+                Callee::Extern(ext),
+                vec![
+                    Operand::Copy(Place::local(ap)),
+                    Operand::Copy(Place::local(al)),
+                    Operand::Copy(Place::local(bp)),
+                    Operand::Copy(Place::local(bl)),
+                ],
+            ),
+        );
+        let out_len = self.new_local(usize_t);
+        self.fb().assign(
+            Place::local(out_len),
+            Rvalue::BinOp(
+                BinOp::Add,
+                Operand::Copy(Place::local(al)),
+                Operand::Copy(Place::local(bl)),
+                ArithMode::Wrap,
+            ),
+        );
+        let result = self.new_local(strt);
+        self.fb().assign(
+            Place::local(result),
+            Rvalue::MakeStr {
+                data: Operand::Copy(Place::local(out_ptr)),
+                len: Operand::Copy(Place::local(out_len)),
+            },
+        );
+        Ok(Operand::Copy(Place::local(result)))
     }
 
     /// `recv.field(args)` where `field` is a function-pointer field of the receiver's (already

@@ -478,6 +478,11 @@ impl<'c> Cg<'c> {
                 let size = self.td.get_store_size(&bt);
                 Ok(Some(self.cx.i64_type().const_int(size, false).into()))
             }
+            Rvalue::MakeStr { data, len } => {
+                let d = self.lower_operand(func, locals, data)?;
+                let l = self.lower_operand(func, locals, len)?;
+                Ok(Some(self.build_fat_ptr(d, l)?))
+            }
             Rvalue::Call(callee, args) => self.lower_call(func, locals, callee, args),
             Rvalue::Cop(crib, init) => self.lower_cop(func, locals, crib, init),
             Rvalue::Trust(crib, tag) => Ok(Some(self.lower_trust(func, locals, crib, tag)?)),

@@ -259,7 +259,7 @@ compiled = "pass"
 path = "07-errors/tea-wrap"
 covers = ["errors.tea"]
 interp = "pass"
-compiled = "skip"
+compiled = "pass"
 
 [[program]]
 path = "07-errors/bounce"
@@ -362,7 +362,7 @@ compiled = "skip"
 path = "11-reference/mini-compiler"
 covers = ["reference.compiler"]
 interp = "pass"
-compiled = "skip"
+compiled = "pass"
 
 [[program]]
 path = "11-reference/doom-thinker"

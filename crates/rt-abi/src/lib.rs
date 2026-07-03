@@ -153,6 +153,18 @@ unsafe extern "C" {
     /// `trust()` in release builds).
     pub fn bet_slot_ptr(crib: CribHandle, slot: u32) -> *mut u8;
 
+    // --- strings ---
+
+    /// Allocate `a_len + b_len` bytes, copy the two byte runs (`a` then `b`) into it, and return
+    /// the buffer. The caller owns the result and computes its length as `a_len + b_len`. Backs
+    /// `str` concatenation (`.tea`, `+` on strings).
+    pub fn bet_str_concat(
+        a_ptr: *const u8,
+        a_len: usize,
+        b_ptr: *const u8,
+        b_len: usize,
+    ) -> *mut u8;
+
     // --- stash (hash maps) ---
 
     /// Create an empty hash map whose values are `val_size`-byte blobs. Keys are arbitrary
