@@ -1,11 +1,18 @@
 name: backend-llvm
 
-# Ready-but-not-wired: manual only. The default `ci.yml` never builds LLVM, so no PR runner
-# needs it. This job builds `backend` with the `llvm` feature and runs the tracer-bullet
-# tests — backend codegen (`.mir` -> object) plus the driver end-to-end (`bet build` a
-# program, run the binary, assert its stdout) — against the pinned LLVM, on all three OSes
-# (spec milestone 2). Windows is best-effort for now (`continue-on-error`): getting LLVM 18
-# with the libraries llvm-sys needs, plus MSVC linking, is the least-settled leg.
+# Ready-but-not-wired: manual only (workflow_dispatch). The default `ci.yml` never builds
+# LLVM, so no PR runner needs it. This job builds `backend --features llvm` and runs the
+# tracer-bullet tests — backend codegen (`.mir` -> object) plus the driver end-to-end
+# (`bet build` a program, run the binary, assert its stdout) — against the pinned LLVM 18
+# (spec milestone 2), on Linux and macOS.
+#
+# Windows LLVM CI is a tracked follow-up. `llvm-sys` 180 needs an LLVM 18 that ships
+# `llvm-config` + the LLVM libraries, but the standard Windows distributions (Chocolatey and
+# the official installer) are clang-toolchain-only -- the build fails with "No suitable
+# version of LLVM was found". It needs a prebuilt-with-libraries LLVM or a from-source build.
+# The driver's MSVC link path (crates/driver/src/link.rs) is already in place for when that
+# lands; enabling Windows here is then just adding it back to the matrix with a working
+# LLVM-18-with-libs install step.
 on:
   workflow_dispatch: {}
 
@@ -18,12 +25,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { os: ubuntu-24.04, experimental: false }
-          - { os: macos-14, experimental: false }
-          - { os: windows-2022, experimental: true }
+        os: [ubuntu-24.04, macos-14]
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.experimental }}
     steps:
       - uses: actions/checkout@v4
 
@@ -45,16 +48,6 @@ jobs:
           echo "LLVM_SYS_180_PREFIX=$PREFIX" >> "$GITHUB_ENV"
           echo "LIBRARY_PATH=$(brew --prefix)/lib" >> "$GITHUB_ENV"
           echo "$PREFIX/bin" >> "$GITHUB_PATH"
-
-      - name: install LLVM 18 (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        # The runner ships a newer LLVM preinstalled; llvm-sys 180 needs exactly 18.x, so
-        # force a downgrade to the pinned version.
-        run: |
-          choco install llvm --version=18.1.8 -y --no-progress --force --allow-downgrade
-          echo "LLVM_SYS_180_PREFIX=C:\Program Files\LLVM" >> $env:GITHUB_ENV
-          echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH
 
       - name: install pinned toolchain
         run: rustup show
