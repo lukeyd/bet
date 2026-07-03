@@ -19,6 +19,9 @@ fmt      = { path = "../fmt" }
 # A normal (rlib) dep so cargo builds `librt_stub.a` alongside `bet` and the driver can read
 # its link name; the driver links compiled programs against that archive (see src/link.rs).
 rt-stub  = { path = "../rt-stub" }
+# The real runtime archive (`libruntime.a`), the drop-in the driver links against when
+# `bet build --runtime real` is given. Same rt-abi symbols as rt-stub (see src/link.rs).
+runtime  = { path = "../runtime" }
 
 [features]
 default = []

@@ -70,6 +70,7 @@ fn run_program(args: &[String]) -> Result<(), String> {
 fn build(args: &[String]) -> Result<(), String> {
     let mut input: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
+    let mut runtime = link::Runtime::Stub;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -77,6 +78,14 @@ fn build(args: &[String]) -> Result<(), String> {
                 i += 1;
                 let path = args.get(i).ok_or("`-o` needs a path")?;
                 output = Some(PathBuf::from(path));
+            }
+            "--runtime" => {
+                i += 1;
+                runtime = match args.get(i).map(String::as_str) {
+                    Some("stub") => link::Runtime::Stub,
+                    Some("real") => link::Runtime::Real,
+                    _ => return Err("`--runtime` needs `stub` or `real`".into()),
+                };
             }
             flag if flag.starts_with('-') => return Err(format!("unknown flag `{flag}`")),
             path => {
@@ -96,7 +105,7 @@ fn build(args: &[String]) -> Result<(), String> {
         ..Default::default()
     };
     let object = compile_object(&input, &opts)?;
-    link::link_executable(&object, &output)?;
+    link::link_executable(&object, &output, runtime)?;
     Ok(())
 }
 

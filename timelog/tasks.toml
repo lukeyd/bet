@@ -162,7 +162,7 @@ status = "done"
 slug = "runtime-swap"
 name = "Runtime swap: driver runtime-selection (rt-stub vs runtime), graph-allowlist driver->runtime, recover-across-boundary"
 size = 5
-status = "todo"
+status = "done"
 
 [[task]]
 slug = "scheduler"

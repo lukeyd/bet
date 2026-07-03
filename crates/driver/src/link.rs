@@ -9,9 +9,30 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Which runtime archive a compiled program is linked against. Both expose the identical
+/// `rt-abi` symbol set, so this is a pure link-line choice.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Runtime {
+    /// The bootstrap stub (`librt_stub.a`) — headless, deterministic, the CI/default.
+    #[default]
+    Stub,
+    /// The real runtime (`libruntime.a`) — growable arenas, recovery, the per-OS layer.
+    Real,
+}
+
+impl Runtime {
+    /// The archive link name (`-l<name>` / `<name>.lib`) for this choice.
+    fn link_name(self) -> &'static str {
+        match self {
+            Runtime::Stub => rt_stub::staticlib_link_name(),
+            Runtime::Real => runtime::staticlib_link_name(),
+        }
+    }
+}
+
 /// Link `obj` (native object bytes) into an executable at `out` (`.exe` is appended on Windows
-/// when no extension is given). Returns the path actually produced.
-pub fn link_executable(obj: &[u8], out: &Path) -> Result<PathBuf, String> {
+/// when no extension is given), against the chosen `runtime`. Returns the path actually produced.
+pub fn link_executable(obj: &[u8], out: &Path, runtime: Runtime) -> Result<PathBuf, String> {
     let out: PathBuf = if cfg!(windows) && out.extension().is_none() {
         out.with_extension("exe")
     } else {
@@ -28,19 +49,19 @@ pub fn link_executable(obj: &[u8], out: &Path) -> Result<PathBuf, String> {
         .ok_or("the bet binary has no parent directory")?;
 
     let result = if cfg!(windows) {
-        link_msvc(&obj_path, libdir, &out)
+        link_msvc(&obj_path, libdir, &out, runtime)
     } else {
-        link_unix(&obj_path, libdir, &out)
+        link_unix(&obj_path, libdir, &out, runtime)
     };
     let _ = std::fs::remove_file(&obj_path); // best-effort cleanup
     result.map(|()| out)
 }
 
-fn link_unix(obj: &Path, libdir: &Path, out: &Path) -> Result<(), String> {
+fn link_unix(obj: &Path, libdir: &Path, out: &Path, runtime: Runtime) -> Result<(), String> {
     let mut cmd = Command::new("cc");
     cmd.arg(obj)
         .arg(format!("-L{}", libdir.display()))
-        .arg(format!("-l{}", rt_stub::staticlib_link_name()));
+        .arg(format!("-l{}", runtime.link_name()));
     for lib in unix_sys_libs() {
         cmd.arg(lib);
     }
@@ -48,11 +69,11 @@ fn link_unix(obj: &Path, libdir: &Path, out: &Path) -> Result<(), String> {
     run_linker(cmd, "cc")
 }
 
-fn link_msvc(obj: &Path, libdir: &Path, out: &Path) -> Result<(), String> {
-    // clang (from the LLVM toolchain) drives the link, pulling the MSVC CRT. `rt_stub.lib`
-    // bundles the Rust std the program needs; std references the Windows system libraries
-    // below, passed as a safe superset (the linker only pulls what's actually referenced).
-    let staticlib = libdir.join(format!("{}.lib", rt_stub::staticlib_link_name()));
+fn link_msvc(obj: &Path, libdir: &Path, out: &Path, runtime: Runtime) -> Result<(), String> {
+    // clang (from the LLVM toolchain) drives the link, pulling the MSVC CRT. The runtime archive
+    // bundles the Rust std the program needs; std references the Windows system libraries below,
+    // passed as a safe superset (the linker only pulls what's actually referenced).
+    let staticlib = libdir.join(format!("{}.lib", runtime.link_name()));
     let mut cmd = Command::new("clang");
     cmd.arg(obj).arg(&staticlib);
     for lib in WINDOWS_SYS_LIBS {
