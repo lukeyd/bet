@@ -9,5 +9,11 @@ publish.workspace = true
 [dependencies]
 frontend = { path = "../frontend" }
 
+# The round-trip test re-parses formatted output and compares the ASTs structurally, so it needs
+# the frontend directly. `fmt -> frontend` is already an allowed edge (graph-allowlist.toml), and
+# dev-dep edges are unrestricted anyway (`cargo xtask graph-check`).
+[dev-dependencies]
+frontend = { path = "../frontend" }
+
 [lints]
 workspace = true
