@@ -2343,7 +2343,7 @@ impl LowerCtx {
     fn is_module(&self, name: &str) -> bool {
         matches!(
             name,
-            "spill" | "str" | "math" | "mem" | "bytes" | "fmt" | "stash" | "yikes"
+            "spill" | "str" | "math" | "mem" | "bytes" | "fmt" | "stash" | "yikes" | "fs"
         )
     }
 
@@ -2441,6 +2441,54 @@ impl LowerCtx {
                     );
                 }
                 Ok((Operand::Copy(Place::local(acc)), u32t))
+            }
+            // `fs.peepText(path)` — the whole file at `path` as a `str` (empty on any error).
+            // (A future `(str, yikes)` form can layer the error channel on top.)
+            ("fs", "peepText") => {
+                if args.len() != 1 {
+                    return Err("`fs.peepText` takes a single path string".into());
+                }
+                let rawptr = self.m.intern_ty(TyKind::RawPtr);
+                let usize_t = self.m.t_int(IntWidth::W64, false);
+                let strt = self.m.t_str();
+                let (path, _) = self.lower_expr(&args[0].value, Some(strt))?;
+                let pp = self.new_local(rawptr);
+                self.fb()
+                    .assign(Place::local(pp), Rvalue::StrPtr(path.clone()));
+                let pl = self.new_local(usize_t);
+                self.fb().assign(Place::local(pl), Rvalue::StrLen(path));
+                // An out-parameter local for the read length; pass its address.
+                let out_len = self.new_local(usize_t);
+                self.fb().assign(
+                    Place::local(out_len),
+                    Rvalue::Use(Operand::Const(Const::Int(0, usize_t))),
+                );
+                let out_ptr = self.new_local(rawptr);
+                self.fb()
+                    .assign(Place::local(out_ptr), Rvalue::AddrOf(Place::local(out_len)));
+                let ext =
+                    self.get_extern("bet_fs_read", vec![rawptr, usize_t, rawptr], vec![rawptr]);
+                let data = self.new_local(rawptr);
+                self.fb().assign(
+                    Place::local(data),
+                    Rvalue::Call(
+                        Callee::Extern(ext),
+                        vec![
+                            Operand::Copy(Place::local(pp)),
+                            Operand::Copy(Place::local(pl)),
+                            Operand::Copy(Place::local(out_ptr)),
+                        ],
+                    ),
+                );
+                let result = self.new_local(strt);
+                self.fb().assign(
+                    Place::local(result),
+                    Rvalue::MakeStr {
+                        data: Operand::Copy(Place::local(data)),
+                        len: Operand::Copy(Place::local(out_len)),
+                    },
+                );
+                Ok((Operand::Copy(Place::local(result)), strt))
             }
             // `str.glow(s)` — an ASCII-uppercased copy of `s`.
             ("str", "glow") => {
