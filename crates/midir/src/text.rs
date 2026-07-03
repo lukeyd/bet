@@ -315,6 +315,9 @@ impl Printer<'_> {
                 self.operand(data),
                 self.operand(len)
             ),
+            Rvalue::CribNew { elem, capacity } => {
+                format!("crib_new[{}; {}]", self.ty(*elem), capacity)
+            }
         }
     }
 
@@ -1260,6 +1263,15 @@ impl Parser {
                 let len = self.operand()?;
                 self.expect(&Tok::RParen)?;
                 Ok(Rvalue::MakeSlice { data, len, elem })
+            }
+            "crib_new" => {
+                self.pos += 1;
+                self.expect(&Tok::LBracket)?;
+                let elem = self.ty()?;
+                self.expect(&Tok::Semi)?;
+                let capacity = self.bare_u64()? as u32;
+                self.expect(&Tok::RBracket)?;
+                Ok(Rvalue::CribNew { elem, capacity })
             }
             "discriminant" => {
                 self.pos += 1;

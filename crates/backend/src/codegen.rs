@@ -43,7 +43,8 @@ use inkwell::builder::{Builder, BuilderError};
 use inkwell::context::Context;
 use inkwell::module::{Linkage, Module as LlvmModule};
 use inkwell::targets::{
-    CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine, TargetTriple,
+    CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetData, TargetMachine,
+    TargetTriple,
 };
 use inkwell::types::{
     BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FunctionType, PointerType, StructType,
@@ -64,11 +65,42 @@ pub fn compile(module: &Module, opts: &EmitOptions) -> Result<Vec<u8>, BackendEr
     let cx = Context::create();
     let llm = cx.create_module("bet");
     let builder = cx.create_builder();
+
+    // Build the target machine up front so codegen can query type sizes/alignments from the
+    // data layout (crib element layout: `bet_crib_new` / `bet_bump_alloc`).
+    Target::initialize_native(&InitializationConfig::default()).map_err(BackendError::Target)?;
+    let triple = match &opts.target {
+        Some(t) => TargetTriple::create(t),
+        None => TargetMachine::get_default_triple(),
+    };
+    let target = Target::from_triple(&triple).map_err(|e| BackendError::Target(e.to_string()))?;
+    let opt = match opts.opt {
+        OptLevel::O0 => OptimizationLevel::None,
+        OptLevel::O2 => OptimizationLevel::Default,
+    };
+    let cpu = TargetMachine::get_host_cpu_name().to_string();
+    let features = TargetMachine::get_host_cpu_features().to_string();
+    let tm = target
+        .create_target_machine(
+            &triple,
+            &cpu,
+            &features,
+            opt,
+            RelocMode::PIC,
+            CodeModel::Default,
+        )
+        .ok_or_else(|| BackendError::Target("could not create target machine".into()))?;
+    let td = tm.get_target_data();
+    llm.set_triple(&triple);
+    llm.set_data_layout(&td.get_data_layout());
+
     let mut cg = Cg {
         cx: &cx,
         m: module,
         llm,
         builder,
+        td,
+        tm,
         funcs: Vec::new(),
         externs: Vec::new(),
     };
@@ -86,6 +118,10 @@ struct Cg<'c> {
     m: &'c Module,
     llm: LlvmModule<'c>,
     builder: Builder<'c>,
+    /// The target data layout — the source of truth for type sizes/alignments.
+    td: TargetData,
+    /// The target machine, used to emit the final object.
+    tm: TargetMachine,
     /// Indexed by `FuncId`.
     funcs: Vec<FunctionValue<'c>>,
     /// Indexed by `ExternId`.
@@ -404,6 +440,7 @@ impl<'c> Cg<'c> {
                 let l = self.lower_operand(func, locals, len)?;
                 Ok(Some(self.build_fat_ptr(d, l)?))
             }
+            Rvalue::CribNew { elem, capacity } => Ok(Some(self.lower_crib_new(*elem, *capacity)?)),
             Rvalue::Call(callee, args) => self.lower_call(func, locals, callee, args),
             Rvalue::Cop(crib, init) => self.lower_cop(func, locals, crib, init),
             Rvalue::Trust(crib, tag) => Ok(Some(self.lower_trust(func, locals, crib, tag)?)),
@@ -818,8 +855,60 @@ impl<'c> Cg<'c> {
 
     // --- tag / holla / crib memory model ---
 
-    /// `cop init in crib` for a **typed** crib: reserve a slot (`bet_cop`), resolve its
-    /// storage (`bet_holla_check`), initialize the struct fields, and yield the `tag` (`i64`).
+    /// The slab stride (alloc size) and alignment of a crib element, from the data layout. The
+    /// stride matches the `slot * elem_size` arithmetic in the runtime's typed cribs.
+    fn crib_elem_layout(&self, elem: TyId) -> Result<(u64, u32), BackendError> {
+        let bt = self.basic_ty(elem)?;
+        Ok((self.td.get_abi_size(&bt), self.td.get_abi_alignment(&bt)))
+    }
+
+    /// `crib name: T[N]` / `crib name` — allocate a fresh crib via its `rt-abi` entry point. A
+    /// typed crib passes the element's `(size, align)` from the data layout; a bump crib
+    /// (`elem` = void) passes a byte reserve.
+    fn lower_crib_new(
+        &self,
+        elem: TyId,
+        capacity: u32,
+    ) -> Result<BasicValueEnum<'c>, BackendError> {
+        let i64t = self.cx.i64_type();
+        let i32t = self.cx.i32_type();
+        let call = if matches!(self.m.ty(elem), TyKind::Void) {
+            let reserve = if capacity == 0 {
+                64 * 1024
+            } else {
+                capacity as u64
+            };
+            let f = self.get_or_add(
+                "bet_crib_new_bump",
+                self.ptr_ty().fn_type(&[i64t.into()], false),
+            );
+            self.builder
+                .build_call(f, &[i64t.const_int(reserve, false).into()], "crib.bump")
+                .map_err(lower_err)?
+        } else {
+            let (size, align) = self.crib_elem_layout(elem)?;
+            let f = self.get_or_add(
+                "bet_crib_new",
+                self.ptr_ty()
+                    .fn_type(&[i64t.into(), i64t.into(), i32t.into()], false),
+            );
+            let args = [
+                i64t.const_int(size, false).into(),
+                i64t.const_int(align as u64, false).into(),
+                i32t.const_int(capacity as u64, false).into(),
+            ];
+            self.builder
+                .build_call(f, &args, "crib.typed")
+                .map_err(lower_err)?
+        };
+        call.try_as_basic_value()
+            .left()
+            .ok_or_else(|| BackendError::Lower("crib_new returned void".into()))
+    }
+
+    /// `cop init in crib`. A **typed** crib reserves a slot (`bet_cop`), resolves its storage
+    /// (`bet_holla_check`), initializes the fields, and yields the `tag`. A **bump** crib
+    /// (`Crib(void)`) bump-allocates the struct (`bet_bump_alloc`) and yields a raw `ref`.
     fn lower_cop(
         &self,
         func: &Func,
@@ -829,39 +918,70 @@ impl<'c> Cg<'c> {
     ) -> Result<Option<BasicValueEnum<'c>>, BackendError> {
         let CopInit::StructLit(sid, fields) = init else {
             return Err(BackendError::Lower(
-                "`cop` of sum variants / bump cribs is not supported yet".into(),
+                "`cop` of sum variants is not supported yet".into(),
             ));
         };
         let crib_v = self.lower_operand(func, locals, crib)?.into_pointer_value();
-
-        let cop = self.get_or_add(
-            "bet_cop",
-            self.cx.i64_type().fn_type(&[self.ptr_ty().into()], false),
-        );
-        let tag = self
-            .builder
-            .build_call(cop, &[crib_v.into()], "cop")
-            .map_err(lower_err)?
-            .try_as_basic_value()
-            .left()
-            .ok_or_else(|| BackendError::Lower("bet_cop returned void".into()))?
-            .into_int_value();
-
-        let holla = self.get_or_add(
-            "bet_holla_check",
-            self.ptr_ty()
-                .fn_type(&[self.ptr_ty().into(), self.cx.i64_type().into()], false),
-        );
-        let storage = self
-            .builder
-            .build_call(holla, &[crib_v.into(), tag.into()], "cop.slot")
-            .map_err(lower_err)?
-            .try_as_basic_value()
-            .left()
-            .ok_or_else(|| BackendError::Lower("bet_holla_check returned void".into()))?
-            .into_pointer_value();
-
         let sty = self.struct_llvm_ty(*sid)?;
+
+        // Is this a bump (untyped) crib? Its handle has type `Crib(void)`.
+        let is_bump = match self.operand_ty(func, crib)? {
+            Some(t) => {
+                matches!(self.m.ty(t), TyKind::Crib(e) if matches!(self.m.ty(*e), TyKind::Void))
+            }
+            None => false,
+        };
+
+        // Resolve the storage pointer (and, for a typed crib, the tag to yield).
+        let (storage, result) = if is_bump {
+            let bt: BasicTypeEnum = sty.into();
+            let i64t = self.cx.i64_type();
+            let size = i64t.const_int(self.td.get_abi_size(&bt), false);
+            let align = i64t.const_int(self.td.get_abi_alignment(&bt) as u64, false);
+            let f = self.get_or_add(
+                "bet_bump_alloc",
+                self.ptr_ty()
+                    .fn_type(&[self.ptr_ty().into(), i64t.into(), i64t.into()], false),
+            );
+            let storage = self
+                .builder
+                .build_call(f, &[crib_v.into(), size.into(), align.into()], "bump")
+                .map_err(lower_err)?
+                .try_as_basic_value()
+                .left()
+                .ok_or_else(|| BackendError::Lower("bet_bump_alloc returned void".into()))?
+                .into_pointer_value();
+            // A bump `cop` yields a live `ref` (the raw storage pointer) directly.
+            (storage, storage.into())
+        } else {
+            let cop = self.get_or_add(
+                "bet_cop",
+                self.cx.i64_type().fn_type(&[self.ptr_ty().into()], false),
+            );
+            let tag = self
+                .builder
+                .build_call(cop, &[crib_v.into()], "cop")
+                .map_err(lower_err)?
+                .try_as_basic_value()
+                .left()
+                .ok_or_else(|| BackendError::Lower("bet_cop returned void".into()))?
+                .into_int_value();
+            let holla = self.get_or_add(
+                "bet_holla_check",
+                self.ptr_ty()
+                    .fn_type(&[self.ptr_ty().into(), self.cx.i64_type().into()], false),
+            );
+            let storage = self
+                .builder
+                .build_call(holla, &[crib_v.into(), tag.into()], "cop.slot")
+                .map_err(lower_err)?
+                .try_as_basic_value()
+                .left()
+                .ok_or_else(|| BackendError::Lower("bet_holla_check returned void".into()))?
+                .into_pointer_value();
+            (storage, tag.into())
+        };
+
         for (fidx, op) in fields {
             let v = self.lower_operand(func, locals, op)?;
             let fptr = self
@@ -870,7 +990,7 @@ impl<'c> Cg<'c> {
                 .map_err(|_| BackendError::Lower(format!("bad field index {fidx} in cop")))?;
             self.builder.build_store(fptr, v).map_err(lower_err)?;
         }
-        Ok(Some(tag.into()))
+        Ok(Some(result))
     }
 
     /// `tag.trust() in crib` — unchecked resolve to a `ref` (a raw slot pointer). Extracts the
@@ -1397,44 +1517,16 @@ impl<'c> Cg<'c> {
 
     // --- object emission ---
 
-    fn emit_object(&self, opts: &EmitOptions) -> Result<Vec<u8>, BackendError> {
-        Target::initialize_native(&InitializationConfig::default())
-            .map_err(BackendError::Target)?;
-
-        let triple = match &opts.target {
-            Some(t) => TargetTriple::create(t),
-            None => TargetMachine::get_default_triple(),
-        };
-        let target =
-            Target::from_triple(&triple).map_err(|e| BackendError::Target(e.to_string()))?;
-        let opt = match opts.opt {
-            OptLevel::O0 => OptimizationLevel::None,
-            OptLevel::O2 => OptimizationLevel::Default,
-        };
-        let cpu = TargetMachine::get_host_cpu_name().to_string();
-        let features = TargetMachine::get_host_cpu_features().to_string();
-        let tm = target
-            .create_target_machine(
-                &triple,
-                &cpu,
-                &features,
-                opt,
-                RelocMode::PIC,
-                CodeModel::Default,
-            )
-            .ok_or_else(|| BackendError::Target("could not create target machine".into()))?;
-
-        self.llm.set_triple(&triple);
-        self.llm
-            .set_data_layout(&tm.get_target_data().get_data_layout());
-
+    fn emit_object(&self, _opts: &EmitOptions) -> Result<Vec<u8>, BackendError> {
+        // The triple and data layout were set on the module in `compile`.
         if let Err(e) = self.llm.verify() {
             return Err(BackendError::Lower(format!(
                 "generated LLVM module failed verification: {e}"
             )));
         }
 
-        let buf = tm
+        let buf = self
+            .tm
             .write_to_memory_buffer(&self.llm, FileType::Object)
             .map_err(|e| BackendError::Target(e.to_string()))?;
         Ok(buf.as_slice().to_vec())
