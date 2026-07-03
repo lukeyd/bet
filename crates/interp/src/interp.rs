@@ -3,8 +3,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use frontend::ast::{
-    Arg, AssignOp, AssignStmt, BinOp, Block, Expr, ExprKind, FnDecl, ItemKind, Pattern, Program,
-    Stmt, StmtKind, StructLit, Type, UnOp, VarDecl,
+    Arg, AssignOp, BinOp, Block, Expr, ExprKind, FnDecl, Item, MatchArm, Program, Stmt, StmtKind,
+    StructLit, Type, TypeKind, UnOp, VarDecl,
 };
 
 use crate::error::RunError;
@@ -81,9 +81,9 @@ impl<'p> Interp<'p> {
         };
         // First pass: functions, methods, and moods variants (order-independent).
         for item in &program.items {
-            match &item.kind {
-                ItemKind::Fn(f) => me.register_fn(f),
-                ItemKind::Moods(m) => {
+            match item {
+                Item::Func(f) => me.register_fn(f),
+                Item::Moods(m) => {
                     for v in &m.variants {
                         me.variants.insert(
                             v.name.clone(),
@@ -99,19 +99,19 @@ impl<'p> Interp<'p> {
         }
         // Second pass: module-level constants/variables, which may reference the above.
         for item in &program.items {
-            match &item.kind {
-                ItemKind::Const(c) => {
+            match item {
+                Item::Const(c) => {
                     let mut env = Env::default();
                     env.push();
                     let val = me.eval_expr(&mut env, &c.value)?;
                     let val = me.coerce(val, c.ty.as_ref());
                     me.globals.insert(c.name.clone(), val);
                 }
-                ItemKind::Var(v) => {
+                Item::Var(v) => {
                     let mut env = Env::default();
                     env.push();
                     let vals = me.bind_values(&mut env, v)?;
-                    for (name, val) in v.names.iter().zip(vals) {
+                    for (name, val) in v.targets.iter().zip(vals) {
                         me.globals.insert(name.clone(), val);
                     }
                 }
@@ -203,7 +203,7 @@ impl<'p> Interp<'p> {
         match &stmt.kind {
             StmtKind::Var(v) => {
                 let vals = self.bind_values(env, v)?;
-                for (name, val) in v.names.iter().zip(vals) {
+                for (name, val) in v.targets.iter().zip(vals) {
                     let val = self.coerce(val, v.ty.as_ref());
                     env.declare(name, val);
                 }
@@ -220,8 +220,8 @@ impl<'p> Interp<'p> {
                     return self.exec_block(env, &fr.then);
                 }
                 for elif in &fr.elifs {
-                    if self.eval_bool(env, &elif.cond)? {
-                        return self.exec_block(env, &elif.body);
+                    if self.eval_bool(env, &elif.0)? {
+                        return self.exec_block(env, &elif.1);
                     }
                 }
                 match &fr.els {
@@ -229,9 +229,9 @@ impl<'p> Interp<'p> {
                     None => Ok(Flow::Normal),
                 }
             }
-            StmtKind::Vibin(w) => {
-                while self.eval_bool(env, &w.cond)? {
-                    match self.exec_block(env, &w.body)? {
+            StmtKind::Vibin { cond, body } => {
+                while self.eval_bool(env, cond)? {
+                    match self.exec_block(env, body)? {
                         Flow::Break => break,
                         Flow::Return(v) => return Ok(Flow::Return(v)),
                         Flow::Normal | Flow::Continue => {}
@@ -239,9 +239,9 @@ impl<'p> Interp<'p> {
                 }
                 Ok(Flow::Normal)
             }
-            StmtKind::Squad(s) => {
-                let iter = self.eval_expr(env, &s.iter)?;
-                let items = match iter {
+            StmtKind::Squad { var, iter, body } => {
+                let iter_val = self.eval_expr(env, iter)?;
+                let items = match iter_val {
                     Value::Array(xs) => xs,
                     other => {
                         return Err(RunError::Type(format!(
@@ -252,8 +252,8 @@ impl<'p> Interp<'p> {
                 };
                 for item in items {
                     env.push();
-                    env.declare(&s.binder, item);
-                    let flow = self.exec_block(env, &s.body);
+                    env.declare(var, item);
+                    let flow = self.exec_block(env, body);
                     env.pop();
                     match flow? {
                         Flow::Break => break,
@@ -263,9 +263,13 @@ impl<'p> Interp<'p> {
                 }
                 Ok(Flow::Normal)
             }
-            StmtKind::Vibe(vibe) => {
-                let scrutinee = self.eval_expr(env, &vibe.scrutinee)?;
-                self.exec_vibe(env, &scrutinee, vibe)
+            StmtKind::Vibe {
+                scrutinee,
+                arms,
+                default,
+            } => {
+                let scrutinee = self.eval_expr(env, scrutinee)?;
+                self.exec_vibe(env, &scrutinee, arms, default)
             }
             StmtKind::Bet(exprs) => {
                 let mut vals = Vec::with_capacity(exprs.len());
@@ -276,8 +280,12 @@ impl<'p> Interp<'p> {
             }
             StmtKind::Dip => Ok(Flow::Break),
             StmtKind::Skip => Ok(Flow::Continue),
-            StmtKind::Assign(a) => {
-                self.exec_assign(env, a)?;
+            StmtKind::Assign {
+                targets,
+                op,
+                values,
+            } => {
+                self.exec_assign(env, targets, *op, values)?;
                 Ok(Flow::Normal)
             }
             StmtKind::Expr(e) => {
@@ -290,8 +298,8 @@ impl<'p> Interp<'p> {
             }
             // Memory-model, error-handling, and concurrency statements are out of this slice.
             StmtKind::Crib(_) => Err(RunError::Unsupported("crib arena declaration".into())),
-            StmtKind::Holla(_) => Err(RunError::Unsupported("holla tag deref".into())),
-            StmtKind::Sheesh(_) => Err(RunError::Unsupported("sheesh recover".into())),
+            StmtKind::Holla { .. } => Err(RunError::Unsupported("holla tag deref".into())),
+            StmtKind::Sheesh { .. } => Err(RunError::Unsupported("sheesh recover".into())),
             StmtKind::Evict(_) => Err(RunError::Unsupported("evict".into())),
             StmtKind::Slide(_) => Err(RunError::Unsupported("slide task spawn".into())),
             StmtKind::Bounce(_) => Err(RunError::Unsupported("bounce error return".into())),
@@ -302,7 +310,8 @@ impl<'p> Interp<'p> {
         &mut self,
         env: &mut Env,
         scrutinee: &Value,
-        vibe: &frontend::ast::VibeStmt,
+        arms: &[MatchArm],
+        default: &Option<Block>,
     ) -> Result<Flow, RunError> {
         let (var_name, payload) = match scrutinee {
             Value::Variant { name, payload, .. } => (name.as_str(), payload.as_slice()),
@@ -313,36 +322,42 @@ impl<'p> Interp<'p> {
                 )));
             }
         };
-        for arm in &vibe.arms {
-            match &arm.pat {
-                Pattern::Variant { name, binds } if name == var_name => {
-                    if binds.len() != payload.len() {
-                        return Err(RunError::Arity {
-                            what: format!("pattern `{name}`"),
-                            expected: payload.len(),
-                            got: binds.len(),
-                        });
-                    }
-                    env.push();
-                    for (bind, val) in binds.iter().zip(payload) {
-                        env.declare(bind, val.clone());
-                    }
-                    let flow = self.exec_block(env, &arm.body);
-                    env.pop();
-                    return flow;
+        for arm in arms {
+            if arm.variant == var_name {
+                if arm.bindings.len() != payload.len() {
+                    return Err(RunError::Arity {
+                        what: format!("pattern `{}`", arm.variant),
+                        expected: payload.len(),
+                        got: arm.bindings.len(),
+                    });
                 }
-                Pattern::Wildcard => return self.exec_block(env, &arm.body),
-                Pattern::Variant { .. } => {}
+                env.push();
+                for (bind, val) in arm.bindings.iter().zip(payload) {
+                    env.declare(bind, val.clone());
+                }
+                let flow = self.exec_block(env, &arm.body);
+                env.pop();
+                return flow;
             }
         }
-        Err(RunError::NonExhaustive(format!("variant `{var_name}`")))
+        // No arm's variant matched: fall through to the `naw` default block, or error.
+        match default {
+            Some(body) => self.exec_block(env, body),
+            None => Err(RunError::NonExhaustive(format!("variant `{var_name}`"))),
+        }
     }
 
-    fn exec_assign(&mut self, env: &mut Env, a: &AssignStmt) -> Result<(), RunError> {
-        if a.op != AssignOp::Eq {
+    fn exec_assign(
+        &mut self,
+        env: &mut Env,
+        targets: &[Expr],
+        op: AssignOp,
+        values: &[Expr],
+    ) -> Result<(), RunError> {
+        if op != AssignOp::Eq {
             // Compound assignment is always one target and one value (grammar §S4).
-            let (target, value) = match (a.targets.first(), a.values.first()) {
-                (Some(t), Some(v)) if a.targets.len() == 1 && a.values.len() == 1 => (t, v),
+            let (target, value) = match (targets.first(), values.first()) {
+                (Some(t), Some(v)) if targets.len() == 1 && values.len() == 1 => (t, v),
                 _ => {
                     return Err(RunError::Type(
                         "compound assignment takes exactly one target and value".into(),
@@ -351,36 +366,36 @@ impl<'p> Interp<'p> {
             };
             let old = self.eval_expr(env, target)?;
             let rhs = self.eval_expr(env, value)?;
-            let new = binary_op(compound_binop(a.op), &old, &rhs)?;
+            let new = binary_op(compound_binop(op), &old, &rhs)?;
             return self.assign_place(env, target, new);
         }
 
         // Plain `=`: either pairwise, or a single multi-value call spread across targets.
-        if a.targets.len() == a.values.len() {
-            let mut computed = Vec::with_capacity(a.values.len());
-            for v in &a.values {
+        if targets.len() == values.len() {
+            let mut computed = Vec::with_capacity(values.len());
+            for v in values {
                 computed.push(self.eval_expr(env, v)?);
             }
-            for (target, val) in a.targets.iter().zip(computed) {
+            for (target, val) in targets.iter().zip(computed) {
                 self.assign_place(env, target, val)?;
             }
             Ok(())
-        } else if a.values.len() == 1 {
-            let vals = self.eval_call_expr(env, &a.values[0])?;
-            if vals.len() != a.targets.len() {
+        } else if values.len() == 1 {
+            let vals = self.eval_call_expr(env, &values[0])?;
+            if vals.len() != targets.len() {
                 return Err(RunError::Destructure {
-                    expected: a.targets.len(),
+                    expected: targets.len(),
                     got: vals.len(),
                 });
             }
-            for (target, val) in a.targets.iter().zip(vals) {
+            for (target, val) in targets.iter().zip(vals) {
                 self.assign_place(env, target, val)?;
             }
             Ok(())
         } else {
             Err(RunError::Destructure {
-                expected: a.targets.len(),
-                got: a.values.len(),
+                expected: targets.len(),
+                got: values.len(),
             })
         }
     }
@@ -399,8 +414,8 @@ impl<'p> Interp<'p> {
                     Err(RunError::Undefined(name.clone()))
                 }
             }
-            ExprKind::Field { recv, name, .. } => {
-                let place = self.place_mut(env, recv)?;
+            ExprKind::Field { base, name, .. } => {
+                let place = self.place_mut(env, base)?;
                 match place {
                     Value::Struct { ty, fields } => {
                         if let Some(slot) = fields.get_mut(name) {
@@ -432,8 +447,8 @@ impl<'p> Interp<'p> {
             ExprKind::Name { name, .. } => env
                 .get_mut(name)
                 .ok_or_else(|| RunError::Undefined(name.clone())),
-            ExprKind::Field { recv, name, .. } => {
-                let base = self.place_mut(env, recv)?;
+            ExprKind::Field { base, name, .. } => {
+                let base = self.place_mut(env, base)?;
                 match base {
                     Value::Struct { ty, fields } => {
                         let ty = ty.clone();
@@ -454,7 +469,7 @@ impl<'p> Interp<'p> {
 
     /// Evaluate the right-hand side of a binding: pairwise, or a spread multi-value call.
     fn bind_values(&mut self, env: &mut Env, v: &VarDecl) -> Result<Vec<Value>, RunError> {
-        if v.names.len() == v.values.len() {
+        if v.targets.len() == v.values.len() {
             let mut out = Vec::with_capacity(v.values.len());
             for e in &v.values {
                 out.push(self.eval_expr(env, e)?);
@@ -462,16 +477,16 @@ impl<'p> Interp<'p> {
             Ok(out)
         } else if v.values.len() == 1 {
             let vals = self.eval_call_expr(env, &v.values[0])?;
-            if vals.len() != v.names.len() {
+            if vals.len() != v.targets.len() {
                 return Err(RunError::Destructure {
-                    expected: v.names.len(),
+                    expected: v.targets.len(),
                     got: vals.len(),
                 });
             }
             Ok(vals)
         } else {
             Err(RunError::Destructure {
-                expected: v.names.len(),
+                expected: v.targets.len(),
                 got: v.values.len(),
             })
         }
@@ -482,15 +497,17 @@ impl<'p> Interp<'p> {
     /// Evaluate an expression that must yield exactly one value.
     fn eval_expr(&mut self, env: &mut Env, e: &Expr) -> Result<Value, RunError> {
         match &e.kind {
-            ExprKind::Int(u) => Ok(Value::Int(*u as i64)),
+            // Literals arrive normalized to `i128`; the value model stores an `i64`, so a
+            // literal above `i64::MAX` truncates two's-complement (as the old `u64` path did).
+            ExprKind::Int(i) => Ok(Value::Int(*i as i64)),
             ExprKind::Float(f) => Ok(Value::Float(*f)),
             ExprKind::Str(s) => Ok(Value::Str(s.clone())),
             ExprKind::Byte(b) => Ok(Value::Byte(*b)),
             ExprKind::Bool(b) => Ok(Value::Bool(*b)),
             ExprKind::Ghosted => Ok(Value::Ghosted),
             ExprKind::Name { name, .. } => self.eval_name(env, name),
-            ExprKind::Field { recv, name, .. } => {
-                let base = self.eval_expr(env, recv)?;
+            ExprKind::Field { base, name, .. } => {
+                let base = self.eval_expr(env, base)?;
                 match base {
                     Value::Struct { ty, fields } => {
                         fields.get(name).cloned().ok_or(RunError::UnknownField {
@@ -504,8 +521,8 @@ impl<'p> Interp<'p> {
                     ))),
                 }
             }
-            ExprKind::Index { recv, index } => {
-                let base = self.eval_expr(env, recv)?;
+            ExprKind::Index { base, index } => {
+                let base = self.eval_expr(env, base)?;
                 let idx = self.eval_expr(env, index)?;
                 let i = match idx {
                     Value::Int(i) if i >= 0 => i as usize,
@@ -526,16 +543,16 @@ impl<'p> Interp<'p> {
                     ))),
                 }
             }
-            ExprKind::Call { .. } => {
+            ExprKind::Call { .. } | ExprKind::Method { .. } => {
                 let vals = self.eval_call_expr(env, e)?;
                 exactly_one(vals)
             }
-            ExprKind::Unary { op, operand } => {
+            ExprKind::Unary(op, operand) => {
                 let v = self.eval_expr(env, operand)?;
                 unary_op(*op, &v)
             }
-            ExprKind::Binary { op, lhs, rhs } => self.eval_binary(env, *op, lhs, rhs),
-            ExprKind::Cast { expr, ty } => {
+            ExprKind::Binary(op, lhs, rhs) => self.eval_binary(env, *op, lhs, rhs),
+            ExprKind::Cast(expr, ty) => {
                 let v = self.eval_expr(env, expr)?;
                 cast(v, ty)
             }
@@ -618,7 +635,8 @@ impl<'p> Interp<'p> {
     }
 
     fn eval_struct_lit(&mut self, env: &mut Env, lit: &StructLit) -> Result<Value, RunError> {
-        let ty = type_head(&lit.ty).to_string();
+        // The struct's runtime type is its base name; generic args are erased at runtime.
+        let ty = lit.name.clone();
         let mut fields = BTreeMap::new();
         for f in &lit.fields {
             let val = self.eval_expr(env, &f.value)?;
@@ -631,7 +649,7 @@ impl<'p> Interp<'p> {
 
     /// Evaluate a bare-expression statement, tolerating a call that returns 0 or many values.
     fn eval_call_or_expr(&mut self, env: &mut Env, e: &Expr) -> Result<(), RunError> {
-        if matches!(e.kind, ExprKind::Call { .. }) {
+        if matches!(e.kind, ExprKind::Call { .. } | ExprKind::Method { .. }) {
             self.eval_call_expr(env, e)?;
         } else {
             self.eval_expr(env, e)?;
@@ -639,29 +657,51 @@ impl<'p> Interp<'p> {
         Ok(())
     }
 
-    /// Evaluate a call expression, returning all of its result values.
+    /// Evaluate a call (or method call) expression, returning all of its result values.
     fn eval_call_expr(&mut self, env: &mut Env, e: &Expr) -> Result<Vec<Value>, RunError> {
-        let ExprKind::Call { callee, args } = &e.kind else {
-            return Ok(vec![self.eval_expr(env, e)?]);
-        };
-
-        // Module builtins and method calls both start with a `.field` callee.
-        if let ExprKind::Field { recv, name, .. } = &callee.kind {
-            if let ExprKind::Name { name: modname, .. } = &recv.kind {
-                let shadowed = env.get(modname).is_some() || self.globals.contains_key(modname);
-                if !shadowed && modname == "spill" {
-                    return self.call_spill(env, name, args).map(|()| Vec::new());
-                }
-                if !shadowed && modname == "str" {
-                    return self.call_str(env, name, args).map(|v| vec![v]);
-                }
-            }
-            // Otherwise it's a method call: evaluate the receiver, then dispatch.
-            let recv_val = self.eval_expr(env, recv)?;
-            return self.call_method(env, recv_val, name, args);
+        match &e.kind {
+            ExprKind::Method {
+                receiver,
+                method,
+                args,
+                ..
+            } => self.eval_method_call(env, receiver, method, args),
+            ExprKind::Call { callee, args } => self.eval_plain_call(env, callee, args),
+            // Any other expression yields exactly one value.
+            _ => Ok(vec![self.eval_expr(env, e)?]),
         }
+    }
 
-        // A named callee: local fn value, variant constructor, or free function.
+    /// Dispatch `receiver.method(args)`: first the `spill`/`str` module builtins (unless the
+    /// module name is shadowed by a binding), otherwise a user method keyed by receiver type.
+    fn eval_method_call(
+        &mut self,
+        env: &mut Env,
+        receiver: &Expr,
+        method: &str,
+        args: &[Arg],
+    ) -> Result<Vec<Value>, RunError> {
+        if let ExprKind::Name { name: modname, .. } = &receiver.kind {
+            let shadowed = env.get(modname).is_some() || self.globals.contains_key(modname);
+            if !shadowed && modname == "spill" {
+                return self.call_spill(env, method, args).map(|()| Vec::new());
+            }
+            if !shadowed && modname == "str" {
+                return self.call_str(env, method, args).map(|v| vec![v]);
+            }
+        }
+        // Otherwise it's a user method call: evaluate the receiver, then dispatch.
+        let recv_val = self.eval_expr(env, receiver)?;
+        self.call_method(env, recv_val, method, args)
+    }
+
+    /// Dispatch a `callee(args)` call: a local fn value, variant constructor, or free function.
+    fn eval_plain_call(
+        &mut self,
+        env: &mut Env,
+        callee: &Expr,
+        args: &[Arg],
+    ) -> Result<Vec<Value>, RunError> {
         if let ExprKind::Name { name, .. } = &callee.kind {
             if let Some(v) = env.get(name).cloned() {
                 return match v {
@@ -819,8 +859,8 @@ impl<'p> Interp<'p> {
     /// Apply a binding's declared type to a value where it is observable at runtime — namely,
     /// wrapping an integer into a sized-integer type (mirrors an explicit `as` cast).
     fn coerce(&self, val: Value, ty: Option<&Type>) -> Value {
-        match (ty, &val) {
-            (Some(Type::Name { name, .. }), Value::Int(i)) => match int_type(name) {
+        match (ty.map(|t| &t.kind), &val) {
+            (Some(TypeKind::Named(name, _)), Value::Int(i)) => match int_type(name) {
                 Some((bits, signed)) => Value::Int(wrap_int(*i as i128, bits, signed)),
                 None => val,
             },
@@ -845,12 +885,12 @@ fn exactly_one(mut vals: Vec<Value>) -> Result<Value, RunError> {
 
 /// The bare name at the head of a type (`Player`, `Pair`, `int`), ignoring generic args.
 fn type_head(ty: &Type) -> &str {
-    match ty {
-        Type::Name { name, .. } => name,
-        Type::Slice(inner) | Type::Tag(inner) | Type::Crib(inner) => type_head(inner),
-        Type::Array { elem, .. } => type_head(elem),
-        Type::Fn { .. } => "finna",
-        Type::RawPtr => "rawptr",
+    match &ty.kind {
+        TypeKind::Named(name, _) => name,
+        TypeKind::Slice(inner) | TypeKind::Tag(inner) | TypeKind::Crib(inner) => type_head(inner),
+        TypeKind::Array(elem, _) => type_head(elem),
+        TypeKind::Fn(..) => "finna",
+        TypeKind::RawPtr => "rawptr",
     }
 }
 
@@ -1004,7 +1044,7 @@ fn float_binary(op: BinOp, a: f64, b: f64) -> Result<Value, RunError> {
 }
 
 fn cast(v: Value, ty: &Type) -> Result<Value, RunError> {
-    let Type::Name { name, .. } = ty else {
+    let TypeKind::Named(name, _) = &ty.kind else {
         return Err(RunError::Unsupported(format!("cast to {ty:?}")));
     };
     if let Some((bits, signed)) = int_type(name) {

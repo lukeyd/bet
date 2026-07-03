@@ -30,45 +30,39 @@
 //! use frontend::ast::*;
 //! // A program whose `main` prints "hi\n".
 //! let program = Program {
-//!     items: vec![Item {
+//!     items: vec![Item::Func(FnDecl {
 //!         vis: Vis::Hush,
-//!         span: Span::default(),
-//!         kind: ItemKind::Fn(FnDecl {
-//!             name: "main".into(),
-//!             receiver: None,
-//!             generics: vec![],
-//!             params: vec![],
-//!             ret: vec![],
-//!             body: Block {
-//!                 stmts: vec![Stmt {
-//!                     span: Span::default(),
-//!                     kind: StmtKind::Expr(Expr {
-//!                         span: Span::default(),
-//!                         kind: ExprKind::Call {
-//!                             callee: Box::new(Expr {
-//!                                 span: Span::default(),
-//!                                 kind: ExprKind::Field {
-//!                                     recv: Box::new(Expr {
-//!                                         span: Span::default(),
-//!                                         kind: ExprKind::Name { name: "spill".into(), args: vec![] },
-//!                                     }),
-//!                                     name: "it".into(),
-//!                                     generics: vec![],
-//!                                 },
-//!                             }),
-//!                             args: vec![Arg {
-//!                                 label: None,
-//!                                 value: Expr {
-//!                                     span: Span::default(),
-//!                                     kind: ExprKind::Str("hi".into()),
-//!                                 },
-//!                             }],
-//!                         },
-//!                     }),
-//!                 }],
-//!             },
-//!         }),
-//!     }],
+//!         receiver: None,
+//!         name: "main".into(),
+//!         generics: vec![],
+//!         params: vec![],
+//!         ret: RetType::None,
+//!         body: Block {
+//!             stmts: vec![Stmt {
+//!                 span: Span::DUMMY,
+//!                 kind: StmtKind::Expr(Expr {
+//!                     span: Span::DUMMY,
+//!                     kind: ExprKind::Method {
+//!                         receiver: Box::new(Expr {
+//!                             span: Span::DUMMY,
+//!                             kind: ExprKind::Name { name: "spill".into(), generics: vec![] },
+//!                         }),
+//!                         method: "it".into(),
+//!                         generics: vec![],
+//!                         args: vec![Arg {
+//!                             label: None,
+//!                             value: Expr {
+//!                                 span: Span::DUMMY,
+//!                                 kind: ExprKind::Str("hi".into()),
+//!                             },
+//!                         }],
+//!                     },
+//!                 }),
+//!             }],
+//!             span: Span::DUMMY,
+//!         },
+//!         span: Span::DUMMY,
+//!     })],
 //! };
 //! assert_eq!(interp::run_to_string(&program).unwrap(), "hi\n");
 //! ```

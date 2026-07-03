@@ -13,13 +13,13 @@ use interp::{RunError, run_to_string};
 // ============================================================================
 
 fn sp() -> Span {
-    Span::default()
+    Span::DUMMY
 }
 fn ex(kind: ExprKind) -> Expr {
     Expr { kind, span: sp() }
 }
 fn int(u: u64) -> Expr {
-    ex(ExprKind::Int(u))
+    ex(ExprKind::Int(u as i128))
 }
 fn float(f: f64) -> Expr {
     ex(ExprKind::Float(f))
@@ -36,26 +36,26 @@ fn ghosted() -> Expr {
 fn name(n: &str) -> Expr {
     ex(ExprKind::Name {
         name: n.into(),
-        args: vec![],
+        generics: vec![],
     })
 }
 /// A generic reference `foo[T]` — the type args are ignored at runtime (monomorphization).
-fn name_g(n: &str, args: Vec<Type>) -> Expr {
+fn name_g(n: &str, generics: Vec<Type>) -> Expr {
     ex(ExprKind::Name {
         name: n.into(),
-        args,
+        generics,
     })
 }
 fn field(recv: Expr, n: &str) -> Expr {
     ex(ExprKind::Field {
-        recv: Box::new(recv),
+        base: Box::new(recv),
         name: n.into(),
         generics: vec![],
     })
 }
 fn index(recv: Expr, idx: Expr) -> Expr {
     ex(ExprKind::Index {
-        recv: Box::new(recv),
+        base: Box::new(recv),
         index: Box::new(idx),
     })
 }
@@ -68,44 +68,50 @@ fn call(callee: Expr, args: Vec<Expr>) -> Expr {
             .collect(),
     })
 }
-fn bin(op: BinOp, l: Expr, r: Expr) -> Expr {
-    ex(ExprKind::Binary {
-        op,
-        lhs: Box::new(l),
-        rhs: Box::new(r),
+/// A method call `receiver.method(args)` — the dedicated form for builtins (`spill.*`, `str.*`)
+/// and user methods with a receiver.
+fn method_call(receiver: Expr, method: &str, args: Vec<Expr>) -> Expr {
+    ex(ExprKind::Method {
+        receiver: Box::new(receiver),
+        method: method.into(),
+        generics: vec![],
+        args: args
+            .into_iter()
+            .map(|value| Arg { label: None, value })
+            .collect(),
     })
+}
+fn bin(op: BinOp, l: Expr, r: Expr) -> Expr {
+    ex(ExprKind::Binary(op, Box::new(l), Box::new(r)))
 }
 fn un(op: UnOp, e: Expr) -> Expr {
-    ex(ExprKind::Unary {
-        op,
-        operand: Box::new(e),
-    })
+    ex(ExprKind::Unary(op, Box::new(e)))
 }
 fn cast(e: Expr, ty: Type) -> Expr {
-    ex(ExprKind::Cast {
-        expr: Box::new(e),
-        ty,
-    })
+    ex(ExprKind::Cast(Box::new(e), ty))
 }
 fn array(elems: Vec<Expr>) -> Expr {
     ex(ExprKind::Array(elems))
 }
 fn struct_lit(ty: &str, fields: Vec<(&str, Expr)>) -> Expr {
     ex(ExprKind::Struct(StructLit {
-        ty: tn(ty),
+        name: ty.into(),
+        generics: vec![],
         fields: fields
             .into_iter()
             .map(|(name, value)| FieldInit {
                 name: name.into(),
                 value,
+                span: sp(),
             })
             .collect(),
+        span: sp(),
     }))
 }
 fn tn(n: &str) -> Type {
-    Type::Name {
-        name: n.into(),
-        args: vec![],
+    Type {
+        kind: TypeKind::Named(n.into(), vec![]),
+        span: sp(),
     }
 }
 
@@ -122,35 +128,39 @@ fn bet(vals: Vec<Expr>) -> Stmt {
 }
 fn let_(names: &[&str], ty: Option<Type>, values: Vec<Expr>) -> Stmt {
     st(StmtKind::Var(VarDecl {
-        names: names.iter().map(|s| s.to_string()).collect(),
+        vis: Vis::Hush,
+        targets: names.iter().map(|s| s.to_string()).collect(),
         ty,
         values,
+        span: sp(),
     }))
 }
 fn const_(n: &str, ty: Option<Type>, value: Expr) -> Stmt {
     st(StmtKind::Const(ConstDecl {
+        vis: Vis::Hush,
         name: n.into(),
         ty,
         value,
+        span: sp(),
     }))
 }
 fn assign(targets: Vec<Expr>, op: AssignOp, values: Vec<Expr>) -> Stmt {
-    st(StmtKind::Assign(AssignStmt {
+    st(StmtKind::Assign {
         targets,
         op,
         values,
-    }))
+    })
 }
 fn block(stmts: Vec<Stmt>) -> Block {
-    Block { stmts }
+    Block { stmts, span: sp() }
 }
 fn spill_it(e: Expr) -> Stmt {
-    expr_stmt(call(field(name("spill"), "it"), vec![e]))
+    expr_stmt(method_call(name("spill"), "it", vec![e]))
 }
 fn spill_f(fmt: &str, args: Vec<Expr>) -> Stmt {
     let mut all = vec![string(fmt)];
     all.extend(args);
-    expr_stmt(call(field(name("spill"), "f"), all))
+    expr_stmt(method_call(name("spill"), "f", all))
 }
 
 // -- items -------------------------------------------------------------------
@@ -159,87 +169,91 @@ fn param(n: &str, ty: &str) -> Param {
     Param {
         name: n.into(),
         ty: tn(ty),
+        span: sp(),
+    }
+}
+/// Convert a plain list of return types into the AST's `RetType` shape (unused at runtime).
+fn ret_of(tys: Vec<Type>) -> RetType {
+    match tys.len() {
+        0 => RetType::None,
+        1 => RetType::Single(tys.into_iter().next().expect("len 1")),
+        _ => RetType::Multi(tys),
     }
 }
 fn func(name: &str, params: Vec<Param>, ret: Vec<Type>, body: Vec<Stmt>) -> Item {
-    Item {
+    Item::Func(FnDecl {
         vis: Vis::Hush,
+        receiver: None,
+        name: name.into(),
+        generics: vec![],
+        params,
+        ret: ret_of(ret),
+        body: block(body),
         span: sp(),
-        kind: ItemKind::Fn(FnDecl {
-            name: name.into(),
-            receiver: None,
-            generics: vec![],
-            params,
-            ret,
-            body: block(body),
-        }),
-    }
+    })
 }
 fn method(recv: Param, name: &str, params: Vec<Param>, ret: Vec<Type>, body: Vec<Stmt>) -> Item {
-    Item {
+    Item::Func(FnDecl {
         vis: Vis::Hush,
-        span: sp(),
-        kind: ItemKind::Fn(FnDecl {
-            name: name.into(),
-            receiver: Some(recv),
-            generics: vec![],
-            params,
-            ret,
-            body: block(body),
+        receiver: Some(Receiver {
+            name: recv.name,
+            ty: recv.ty,
+            span: sp(),
         }),
-    }
+        name: name.into(),
+        generics: vec![],
+        params,
+        ret: ret_of(ret),
+        body: block(body),
+        span: sp(),
+    })
 }
 fn main_fn(body: Vec<Stmt>) -> Item {
     func("main", vec![], vec![], body)
 }
 fn drip(name: &str, fields: &[(&str, &str)]) -> Item {
-    Item {
+    Item::Drip(DripDecl {
         vis: Vis::Hush,
+        name: name.into(),
+        generics: vec![],
+        fields: fields
+            .iter()
+            .map(|(n, t)| FieldDecl {
+                vis: Some(Vis::Flex),
+                name: (*n).into(),
+                ty: tn(t),
+                span: sp(),
+            })
+            .collect(),
         span: sp(),
-        kind: ItemKind::Drip(DripDecl {
-            name: name.into(),
-            generics: vec![],
-            fields: fields
-                .iter()
-                .map(|(n, t)| FieldDecl {
-                    name: (*n).into(),
-                    ty: tn(t),
-                    vis: Vis::Flex,
-                })
-                .collect(),
-        }),
-    }
+    })
 }
 fn moods(name: &str, variants: &[(&str, usize)]) -> Item {
-    Item {
+    Item::Moods(MoodsDecl {
         vis: Vis::Hush,
+        name: name.into(),
+        generics: vec![],
+        variants: variants
+            .iter()
+            .map(|(n, arity)| Variant {
+                name: (*n).into(),
+                payload: vec![tn("int"); *arity],
+                span: sp(),
+            })
+            .collect(),
         span: sp(),
-        kind: ItemKind::Moods(MoodsDecl {
-            name: name.into(),
-            generics: vec![],
-            variants: variants
-                .iter()
-                .map(|(n, arity)| Variant {
-                    name: (*n).into(),
-                    payload: vec![tn("int"); *arity],
-                })
-                .collect(),
-        }),
-    }
+    })
 }
 fn program(items: Vec<Item>) -> Program {
     Program { items }
 }
-fn arm(pat: Pattern, body: Vec<Stmt>) -> VibeArm {
-    VibeArm {
-        pat,
+/// A real `vibe` arm `Variant(binds) { body }` (the `naw` wildcard is a separate default block).
+fn arm(variant: &str, binds: &[&str], body: Vec<Stmt>) -> MatchArm {
+    MatchArm {
+        variant: variant.into(),
+        bindings: binds.iter().map(|s| s.to_string()).collect(),
         body: block(body),
-    }
-}
-fn pvar(name: &str, binds: &[&str]) -> Pattern {
-    Pattern::Variant {
-        name: name.into(),
-        binds: binds.iter().map(|s| s.to_string()).collect(),
+        span: sp(),
     }
 }
 
@@ -388,9 +402,10 @@ fn strings_stdlib() {
     let out = run_main(vec![
         let_(&["s"], None, vec![string("hello")]),
         spill_it(name("s")),
-        spill_it(call(field(name("str"), "glow"), vec![name("s")])),
-        spill_it(call(
-            field(name("str"), "slaps"),
+        spill_it(method_call(name("str"), "glow", vec![name("s")])),
+        spill_it(method_call(
+            name("str"),
+            "slaps",
             vec![name("s"), string("hello")],
         )),
     ]);
@@ -417,10 +432,7 @@ fn fr(cond: Expr, then: Vec<Stmt>, elifs: Vec<(Expr, Vec<Stmt>)>, els: Option<Ve
         then: block(then),
         elifs: elifs
             .into_iter()
-            .map(|(cond, body)| ElseIf {
-                cond,
-                body: block(body),
-            })
+            .map(|(cond, body)| (cond, block(body)))
             .collect(),
         els: els.map(block),
     }))
@@ -458,7 +470,7 @@ fn vibin_while() {
     let out = run_main(vec![
         let_(&["i"], None, vec![int(1)]),
         let_(&["total"], None, vec![int(0)]),
-        st(StmtKind::Vibin(VibinStmt {
+        st(StmtKind::Vibin {
             cond: bin(BinOp::Le, name("i"), int(5)),
             body: block(vec![
                 assign(
@@ -472,7 +484,7 @@ fn vibin_while() {
                     vec![bin(BinOp::Add, name("i"), int(1))],
                 ),
             ]),
-        })),
+        }),
         spill_it(name("total")),
     ]);
     assert_eq!(out, "15\n");
@@ -484,15 +496,15 @@ fn squad_for_in() {
     let out = run_main(vec![
         let_(&["xs"], None, vec![array(vec![int(10), int(20), int(30)])]),
         let_(&["sum"], None, vec![int(0)]),
-        st(StmtKind::Squad(SquadStmt {
-            binder: "x".into(),
+        st(StmtKind::Squad {
+            var: "x".into(),
             iter: name("xs"),
             body: block(vec![assign(
                 vec![name("sum")],
                 AssignOp::Eq,
                 vec![bin(BinOp::Add, name("sum"), name("x"))],
             )]),
-        })),
+        }),
         spill_it(name("sum")),
     ]);
     assert_eq!(out, "60\n");
@@ -504,7 +516,7 @@ fn nested_loops_dip_skip() {
     let out = run_main(vec![
         let_(&["sum"], None, vec![int(0)]),
         let_(&["i"], None, vec![int(0)]),
-        st(StmtKind::Vibin(VibinStmt {
+        st(StmtKind::Vibin {
             cond: bin(BinOp::Lt, name("i"), int(100)),
             body: block(vec![
                 assign(
@@ -530,7 +542,7 @@ fn nested_loops_dip_skip() {
                     vec![bin(BinOp::Add, name("sum"), name("i"))],
                 ),
             ]),
-        })),
+        }),
         spill_it(name("sum")),
     ]);
     assert_eq!(out, "25\n");
@@ -602,7 +614,7 @@ fn receivers_method() {
             None,
             vec![struct_lit("Counter", vec![("n", int(10))])],
         ),
-        spill_it(call(field(name("c"), "bump"), vec![int(5)])),
+        spill_it(method_call(name("c"), "bump", vec![int(5)])),
     ]);
     assert_eq!(
         run_to_string(&program(vec![counter, bump, main])).unwrap(),
@@ -627,9 +639,9 @@ fn first_class_fn() {
         vec![tn("int")],
         vec![bet(vec![bin(BinOp::Add, name("x"), int(1))])],
     );
-    let fn_ty = Type::Fn {
-        params: vec![tn("int")],
-        ret: Box::new(tn("int")),
+    let fn_ty = Type {
+        kind: TypeKind::Fn(vec![tn("int")], Box::new(tn("int"))),
+        span: sp(),
     };
     let apply = func(
         "apply",
@@ -637,6 +649,7 @@ fn first_class_fn() {
             Param {
                 name: "f".into(),
                 ty: fn_ty.clone(),
+                span: sp(),
             },
             param("x", "int"),
         ],
@@ -664,7 +677,7 @@ fn generics_fn_monomorphized() {
         vec![tn("T")],
         vec![bet(vec![name("a")])],
     );
-    if let ItemKind::Fn(f) = &mut pf.kind {
+    if let Item::Func(f) = &mut pf {
         f.generics = vec!["T".into()];
     }
     let main = main_fn(vec![
@@ -717,43 +730,45 @@ fn drip_generic_uses_base_name() {
     // Pair[int]{a:3,b:4}; pi.a + pi.b -> 7 ; Pair[str]{a:"x",b:"y"}; ps.b -> y
     let pair = {
         let mut d = drip("Pair", &[("a", "T"), ("b", "T")]);
-        if let ItemKind::Drip(dd) = &mut d.kind {
+        if let Item::Drip(dd) = &mut d {
             dd.generics = vec!["T".into()];
         }
         d
     };
     // Struct literal with a generic type head Pair[int].
     let pair_int = ex(ExprKind::Struct(StructLit {
-        ty: Type::Name {
-            name: "Pair".into(),
-            args: vec![tn("int")],
-        },
+        name: "Pair".into(),
+        generics: vec![tn("int")],
         fields: vec![
             FieldInit {
                 name: "a".into(),
                 value: int(3),
+                span: sp(),
             },
             FieldInit {
                 name: "b".into(),
                 value: int(4),
+                span: sp(),
             },
         ],
+        span: sp(),
     }));
     let pair_str = ex(ExprKind::Struct(StructLit {
-        ty: Type::Name {
-            name: "Pair".into(),
-            args: vec![tn("str")],
-        },
+        name: "Pair".into(),
+        generics: vec![tn("str")],
         fields: vec![
             FieldInit {
                 name: "a".into(),
                 value: string("x"),
+                span: sp(),
             },
             FieldInit {
                 name: "b".into(),
                 value: string("y"),
+                span: sp(),
             },
         ],
+        span: sp(),
     }));
     let main = main_fn(vec![
         let_(&["pi"], None, vec![pair_int]),
@@ -781,11 +796,12 @@ fn moods_basics_vibe_payloads() {
         "area",
         vec![param("s", "Shape")],
         vec![tn("int")],
-        vec![st(StmtKind::Vibe(VibeStmt {
+        vec![st(StmtKind::Vibe {
             scrutinee: name("s"),
             arms: vec![
                 arm(
-                    pvar("Circle", &["r"]),
+                    "Circle",
+                    &["r"],
                     vec![bet(vec![bin(
                         BinOp::Mul,
                         bin(BinOp::Mul, int(3), name("r")),
@@ -793,12 +809,14 @@ fn moods_basics_vibe_payloads() {
                     )])],
                 ),
                 arm(
-                    pvar("Rect", &["w", "h"]),
+                    "Rect",
+                    &["w", "h"],
                     vec![bet(vec![bin(BinOp::Mul, name("w"), name("h"))])],
                 ),
-                arm(pvar("Dot", &[]), vec![bet(vec![int(0)])]),
+                arm("Dot", &[], vec![bet(vec![int(0)])]),
             ],
-        }))],
+            default: None,
+        })],
     );
     let main = main_fn(vec![
         spill_it(call(name("area"), vec![call(name("Circle"), vec![int(2)])])),
@@ -826,14 +844,14 @@ fn moods_exhaustive_wildcard() {
         "describe",
         vec![param("t", "Token")],
         vec![tn("str")],
-        vec![st(StmtKind::Vibe(VibeStmt {
+        vec![st(StmtKind::Vibe {
             scrutinee: name("t"),
             arms: vec![
-                arm(pvar("Num", &["n"]), vec![bet(vec![string("number")])]),
-                arm(pvar("Plus", &[]), vec![bet(vec![string("op")])]),
-                arm(Pattern::Wildcard, vec![bet(vec![string("other op")])]),
+                arm("Num", &["n"], vec![bet(vec![string("number")])]),
+                arm("Plus", &[], vec![bet(vec![string("op")])]),
             ],
-        }))],
+            default: Some(block(vec![bet(vec![string("other op")])])),
+        })],
     );
     let main = main_fn(vec![
         spill_it(call(
@@ -860,11 +878,12 @@ fn expr_eval_moods_in_drip_field() {
         "eval",
         vec![param("c", "Calc")],
         vec![tn("int")],
-        vec![st(StmtKind::Vibe(VibeStmt {
+        vec![st(StmtKind::Vibe {
             scrutinee: field(name("c"), "op"),
             arms: vec![
                 arm(
-                    pvar("Add", &[]),
+                    "Add",
+                    &[],
                     vec![bet(vec![bin(
                         BinOp::Add,
                         field(name("c"), "lhs"),
@@ -872,7 +891,8 @@ fn expr_eval_moods_in_drip_field() {
                     )])],
                 ),
                 arm(
-                    pvar("Sub", &[]),
+                    "Sub",
+                    &[],
                     vec![bet(vec![bin(
                         BinOp::Sub,
                         field(name("c"), "lhs"),
@@ -880,7 +900,8 @@ fn expr_eval_moods_in_drip_field() {
                     )])],
                 ),
                 arm(
-                    pvar("Mul", &[]),
+                    "Mul",
+                    &[],
                     vec![bet(vec![bin(
                         BinOp::Mul,
                         field(name("c"), "lhs"),
@@ -888,7 +909,8 @@ fn expr_eval_moods_in_drip_field() {
                     )])],
                 ),
             ],
-        }))],
+            default: None,
+        })],
     );
     let mk = |opname: &str, l: u64, r: u64| {
         call(
@@ -962,10 +984,10 @@ fn undefined_name_is_an_error() {
 fn unsupported_memory_construct_reports_cleanly() {
     // A `cop` allocation is grammatical but out of this slice — clean Unsupported, no panic.
     let cop = ex(ExprKind::Cop {
-        init: CopInit::Variant {
+        init: Box::new(CopInit::Variant {
             name: "Dot".into(),
             args: vec![],
-        },
+        }),
         crib: Box::new(name("arena")),
     });
     let err = run_to_string(&program(vec![main_fn(vec![expr_stmt(cop)])]));
