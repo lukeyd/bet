@@ -352,6 +352,33 @@ pub unsafe extern "C" fn bet_str_eq(
 }
 
 // ---------------------------------------------------------------------------
+// Filesystem.
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_fs_read(
+    path_ptr: *const u8,
+    path_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let path_bytes = unsafe { std::slice::from_raw_parts(path_ptr, path_len) };
+    let Ok(path) = std::str::from_utf8(path_bytes) else {
+        unsafe { *out_len = 0 };
+        return std::ptr::null_mut();
+    };
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            unsafe { *out_len = bytes.len() };
+            Box::into_raw(bytes.into_boxed_slice()) as *mut u8
+        }
+        Err(_) => {
+            unsafe { *out_len = 0 };
+            std::ptr::null_mut()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Stash (hash maps).
 // ---------------------------------------------------------------------------
 
@@ -598,4 +625,58 @@ pub unsafe extern "C" fn bet_gg_poll(out: *mut Event) -> bool {
 pub unsafe extern "C" fn bet_gg_ticks() -> u64 {
     static START: OnceLock<Instant> = OnceLock::new();
     START.get_or_init(Instant::now).elapsed().as_nanos() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fs_read_round_trips_a_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("bet_fs_read_test_{}.txt", std::process::id()));
+        let contents = b"hello from fs.peep\nsecond line\n";
+        std::fs::write(&path, contents).unwrap();
+
+        let path_str = path.to_str().unwrap();
+        let mut out_len: usize = 0;
+        let ptr = unsafe {
+            bet_fs_read(
+                path_str.as_ptr(),
+                path_str.len(),
+                &mut out_len as *mut usize,
+            )
+        };
+        assert!(!ptr.is_null(), "reading an existing file should succeed");
+        assert_eq!(out_len, contents.len());
+        let read = unsafe { std::slice::from_raw_parts(ptr, out_len) };
+        assert_eq!(read, contents);
+        // Reclaim the leaked buffer so the test does not leak.
+        drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, out_len)) });
+    }
+
+    #[test]
+    fn fs_read_missing_file_returns_null() {
+        let missing = "/nonexistent/bet/path/does/not/exist.xyz";
+        let mut out_len: usize = 7;
+        let ptr =
+            unsafe { bet_fs_read(missing.as_ptr(), missing.len(), &mut out_len as *mut usize) };
+        assert!(ptr.is_null());
+        assert_eq!(out_len, 0);
+    }
+
+    #[test]
+    fn str_ops_concat_upper_eq() {
+        let a = b"foo";
+        let b = b"bar";
+        let cat = unsafe { bet_str_concat(a.as_ptr(), a.len(), b.as_ptr(), b.len()) };
+        let joined = unsafe { std::slice::from_raw_parts(cat, a.len() + b.len()) };
+        assert_eq!(joined, b"foobar");
+
+        let up = unsafe { bet_str_upper(a.as_ptr(), a.len()) };
+        assert_eq!(unsafe { std::slice::from_raw_parts(up, a.len()) }, b"FOO");
+
+        assert!(unsafe { bet_str_eq(a.as_ptr(), a.len(), a.as_ptr(), a.len()) });
+        assert!(!unsafe { bet_str_eq(a.as_ptr(), a.len(), b.as_ptr(), b.len()) });
+    }
 }

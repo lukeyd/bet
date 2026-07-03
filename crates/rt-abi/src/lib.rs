@@ -170,6 +170,13 @@ unsafe extern "C" {
     /// Byte-equality of two strings. Backs `str.slaps`.
     pub fn bet_str_eq(a_ptr: *const u8, a_len: usize, b_ptr: *const u8, b_len: usize) -> bool;
 
+    // --- filesystem ---
+
+    /// Read the whole file at the `path_len`-byte path `path_ptr` into a freshly allocated
+    /// buffer, writing its length to `out_len` and returning the buffer. Returns null (and
+    /// leaves `out_len` = 0) on any error. The caller owns the buffer. Backs `fs.peep`.
+    pub fn bet_fs_read(path_ptr: *const u8, path_len: usize, out_len: *mut usize) -> *mut u8;
+
     // --- stash (hash maps) ---
 
     /// Create an empty hash map whose values are `val_size`-byte blobs. Keys are arbitrary

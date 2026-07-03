@@ -472,6 +472,33 @@ pub unsafe extern "C" fn bet_str_eq(
 }
 
 // ---------------------------------------------------------------------------
+// Filesystem.
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_fs_read(
+    path_ptr: *const u8,
+    path_len: usize,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let path_bytes = unsafe { std::slice::from_raw_parts(path_ptr, path_len) };
+    let Ok(path) = std::str::from_utf8(path_bytes) else {
+        unsafe { *out_len = 0 };
+        return std::ptr::null_mut();
+    };
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            unsafe { *out_len = bytes.len() };
+            Box::into_raw(bytes.into_boxed_slice()) as *mut u8
+        }
+        Err(_) => {
+            unsafe { *out_len = 0 };
+            std::ptr::null_mut()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Stash (hash maps). A type-erased byte-key/blob-value map; one implementation backs every
 // `stash[K, V]` (the frontend serializes keys/values to bytes per operation).
 // ---------------------------------------------------------------------------
