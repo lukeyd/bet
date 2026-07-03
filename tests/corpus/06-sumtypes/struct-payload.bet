@@ -1,0 +1,27 @@
+// struct-payload — a moods variant whose payload is a multi-word `drip` (16 bytes).
+// A naive one-word-per-field union corrupts a payload field wider than a machine word;
+// this pins the generalized sum-payload layout (the payload union is sized to the widest
+// variant and each variant's fields are placed by their natural struct layout).
+pull "spill"
+
+drip Vec2 {
+    flex x: int
+    flex y: int
+}
+
+moods Shape {
+    Point(Vec2),
+    Scalar(int)
+}
+
+finna sumOf(s: Shape) -> int {
+    vibe s {
+        Point(p) { bet p.x + p.y }
+        Scalar(n) { bet n }
+    }
+}
+
+finna main() {
+    spill.it(sumOf(Point(Vec2{ x: 10, y: 20 })))   // 30
+    spill.it(sumOf(Scalar(7)))                      // 7
+}
