@@ -1026,9 +1026,93 @@ impl<'p> Interp<'p> {
                 }
             }
         }
+        // `stack`/`pop` mutate an array in place, so they need an addressable receiver rather
+        // than an evaluated copy (squadops).
+        if matches!(method, "stack" | "pop") {
+            let arg_vals = self.eval_args(env, args)?;
+            if let Ok(Value::Array(xs)) = self.place_mut(env, receiver) {
+                return match method {
+                    "stack" => {
+                        let v = arg_vals
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| RunError::Type("`stack` takes a value".into()))?;
+                        xs.push(v);
+                        Ok(Vec::new())
+                    }
+                    // "pop"
+                    _ => {
+                        let v = xs
+                            .pop()
+                            .ok_or_else(|| RunError::Type("`pop` on an empty array".into()))?;
+                        Ok(vec![v])
+                    }
+                };
+            }
+        }
         // Otherwise it's a user method call: evaluate the receiver, then dispatch.
         let recv_val = self.eval_expr(env, receiver)?;
         self.call_method(env, recv_val, method, args)
+    }
+
+    /// Pure `squad` collection methods on an array value: `gang` (length), `vibeCheck` (filter
+    /// by a predicate), `glowUp` (map through a function).
+    fn call_array_method(
+        &mut self,
+        env: &mut Env,
+        xs: Vec<Value>,
+        method: &str,
+        args: &[Arg],
+    ) -> Result<Vec<Value>, RunError> {
+        match method {
+            "gang" => Ok(vec![Value::Int(xs.len() as i64)]),
+            "vibeCheck" => {
+                let f = self.one_fn_arg(env, method, args)?;
+                let mut out = Vec::new();
+                for x in xs {
+                    if matches!(self.apply_fn_value(&f, vec![x.clone()])?, Value::Bool(true)) {
+                        out.push(x);
+                    }
+                }
+                Ok(vec![Value::Array(out)])
+            }
+            "glowUp" => {
+                let f = self.one_fn_arg(env, method, args)?;
+                let mut out = Vec::with_capacity(xs.len());
+                for x in xs {
+                    out.push(self.apply_fn_value(&f, vec![x])?);
+                }
+                Ok(vec![Value::Array(out)])
+            }
+            other => Err(RunError::Undefined(format!("array.{other}"))),
+        }
+    }
+
+    /// Evaluate the single function argument of a collection method (`vibeCheck`/`glowUp`).
+    fn one_fn_arg(&mut self, env: &mut Env, method: &str, args: &[Arg]) -> Result<Value, RunError> {
+        match args {
+            [a] => self.eval_expr(env, &a.value),
+            _ => Err(RunError::Type(format!(
+                "`{method}` takes one `finna` argument"
+            ))),
+        }
+    }
+
+    /// Apply a first-class function value (or a function name) to pre-evaluated argument values,
+    /// returning its single result — the higher-order callback in `vibeCheck`/`glowUp`.
+    fn apply_fn_value(&mut self, f: &Value, arg_vals: Vec<Value>) -> Result<Value, RunError> {
+        let Value::Fn(fname) = f else {
+            return Err(RunError::Type(format!(
+                "expected a `finna` value, got {}",
+                f.type_name()
+            )));
+        };
+        let decl = *self
+            .funcs
+            .get(fname)
+            .ok_or_else(|| RunError::Undefined(fname.clone()))?;
+        let mut out = self.call_fn(decl, arg_vals, None)?;
+        Ok(out.drain(..).next().unwrap_or(Value::Ghosted))
     }
 
     /// Dispatch a `callee(args)` call: a local fn value, variant constructor, or free function.
@@ -1123,6 +1207,12 @@ impl<'p> Interp<'p> {
         if let Value::Stash(map) = &recv {
             let map = map.clone();
             return self.call_stash(env, map, method, args);
+        }
+        // Pure collection methods on an array (squadops): `gang`, `vibeCheck`, `glowUp`. The
+        // mutating `stack`/`pop` are handled earlier in `eval_method_call` (they need a place).
+        if let Value::Array(xs) = &recv {
+            let xs = xs.clone();
+            return self.call_array_method(env, xs, method, args);
         }
         let ty = match &recv {
             Value::Struct { ty, .. } => ty.clone(),
