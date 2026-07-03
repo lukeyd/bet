@@ -1843,12 +1843,32 @@ impl LowerCtx {
         }
         let elem =
             elem_ty.ok_or_else(|| "empty array literal needs a type annotation".to_string())?;
-        let aty = self.m.intern_ty(TyKind::Array(elem, elems.len() as u64));
+        let n = elems.len() as u64;
+        let aty = self.m.intern_ty(TyKind::Array(elem, n));
         let tmp = self.new_local(aty);
         self.fb().assign(
             Place::local(tmp),
             Rvalue::Aggregate(AggKind::Array(elem), ops),
         );
+        // In a slice context (`[]T`), materialize a slice over the freshly built array's storage.
+        if matches!(hint.map(|h| self.m.ty(h)), Some(TyKind::Slice(_))) {
+            let rawptr = self.m.intern_ty(TyKind::RawPtr);
+            let usize_t = self.m.t_int(IntWidth::W64, false);
+            let data = self.new_local(rawptr);
+            self.fb()
+                .assign(Place::local(data), Rvalue::AddrOf(Place::local(tmp)));
+            let slice_ty = self.m.intern_ty(TyKind::Slice(elem));
+            let sl = self.new_local(slice_ty);
+            self.fb().assign(
+                Place::local(sl),
+                Rvalue::MakeSlice {
+                    data: Operand::Copy(Place::local(data)),
+                    len: Operand::Const(Const::Int(n as i128, usize_t)),
+                    elem,
+                },
+            );
+            return Ok((Operand::Copy(Place::local(sl)), slice_ty));
+        }
         Ok((Operand::Copy(Place::local(tmp)), aty))
     }
 
@@ -2292,6 +2312,80 @@ impl LowerCtx {
                     Rvalue::BinOp(BinOp::Add, a, b, ArithMode::Wrap),
                 );
                 Ok((Operand::Copy(Place::local(tmp)), aty))
+            }
+            // `bytes.readU32le(buf, off)` — a little-endian u32 from `buf[off..off+4]`.
+            ("bytes", "readU32le") => {
+                if args.len() != 2 {
+                    return Err("`bytes.readU32le` takes a byte slice and an offset".into());
+                }
+                let i64t = self.m.t_i64();
+                let u32t = self.m.t_int(IntWidth::W32, false);
+                let (buf, bufty) = self.lower_expr(&args[0].value, None)?;
+                let elem = match self.m.ty(bufty) {
+                    TyKind::Slice(e) | TyKind::Array(e, _) => *e,
+                    other => {
+                        return Err(format!("`bytes.readU32le` needs a byte slice ({other:?})"));
+                    }
+                };
+                let buf_place = self
+                    .operand_place(buf)
+                    .ok_or_else(|| "`bytes.readU32le` buffer must be addressable".to_string())?;
+                let (off, _) = self.lower_expr(&args[1].value, Some(i64t))?;
+
+                let acc = self.new_local(u32t);
+                self.fb().assign(
+                    Place::local(acc),
+                    Rvalue::Use(Operand::Const(Const::Int(0, u32t))),
+                );
+                for k in 0..4u32 {
+                    // idx = off + k
+                    let idx = self.new_local(i64t);
+                    self.fb().assign(
+                        Place::local(idx),
+                        Rvalue::BinOp(
+                            BinOp::Add,
+                            off.clone(),
+                            Operand::Const(Const::Int(k as i128, i64t)),
+                            ArithMode::Wrap,
+                        ),
+                    );
+                    // byte = buf[idx] (element type `elem`), zero-extended to u32
+                    let byte_place =
+                        extend(&buf_place, Proj::Index(Operand::Copy(Place::local(idx))));
+                    let widened = self.new_local(u32t);
+                    let kind = self.cast_kind(elem, u32t).unwrap_or(CastKind::IntZext);
+                    self.fb().assign(
+                        Place::local(widened),
+                        Rvalue::Cast(Operand::Copy(byte_place), u32t, kind),
+                    );
+                    // shifted = widened << (8 * k)
+                    let shifted = self.new_local(u32t);
+                    self.fb().assign(
+                        Place::local(shifted),
+                        Rvalue::BinOp(
+                            BinOp::Shl,
+                            Operand::Copy(Place::local(widened)),
+                            Operand::Const(Const::Int((8 * k) as i128, u32t)),
+                            ArithMode::Na,
+                        ),
+                    );
+                    // acc |= shifted
+                    let next = self.new_local(u32t);
+                    self.fb().assign(
+                        Place::local(next),
+                        Rvalue::BinOp(
+                            BinOp::BitOr,
+                            Operand::Copy(Place::local(acc)),
+                            Operand::Copy(Place::local(shifted)),
+                            ArithMode::Na,
+                        ),
+                    );
+                    self.fb().assign(
+                        Place::local(acc),
+                        Rvalue::Use(Operand::Copy(Place::local(next))),
+                    );
+                }
+                Ok((Operand::Copy(Place::local(acc)), u32t))
             }
             // `str.glow(s)` — an ASCII-uppercased copy of `s`.
             ("str", "glow") => {

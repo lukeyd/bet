@@ -348,7 +348,7 @@ compiled = "pass"
 path = "10-stdlib/bytes-parse"
 covers = ["stdlib.bytes", "values.array-literal"]
 interp = "pass"
-compiled = "skip"
+compiled = "pass"
 
 [[program]]
 path = "10-stdlib/squadops"
