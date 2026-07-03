@@ -353,6 +353,10 @@ impl<'a> Checker<'a> {
                 let elem = self.module.crib_global(*id).elem;
                 Some(TyKind::Crib(elem))
             }
+            Rvalue::SizeOf(_) => Some(TyKind::Int {
+                width: IntWidth::W64,
+                signed: false,
+            }),
         }
     }
 

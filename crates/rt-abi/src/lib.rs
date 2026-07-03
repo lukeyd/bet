@@ -51,6 +51,14 @@ pub struct CribHandle(pub *mut c_void);
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TaskHandle(pub u64);
 
+/// An opaque handle to a `stash` (hash map). Created by [`bet_map_new`]. Keys are arbitrary
+/// byte sequences (a `str`'s bytes, an integer's little-endian bytes, ...) and values are
+/// fixed-size blobs whose width is fixed at creation — the map is intentionally type-erased at
+/// the ABI so one runtime implementation backs every `stash[K, V]` monomorphization.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MapHandle(pub *mut c_void);
+
 /// An opaque allocator-context handle (the Odin-style "current allocator"). The stub's
 /// current allocator is always the system heap; the handle exists so the contract is stable.
 #[repr(transparent)]
@@ -144,6 +152,29 @@ unsafe extern "C" {
     /// Unchecked resolve: a raw pointer to a slot's storage with no generation check (backs
     /// `trust()` in release builds).
     pub fn bet_slot_ptr(crib: CribHandle, slot: u32) -> *mut u8;
+
+    // --- stash (hash maps) ---
+
+    /// Create an empty hash map whose values are `val_size`-byte blobs. Keys are arbitrary
+    /// byte sequences supplied per operation.
+    pub fn bet_map_new(val_size: usize) -> MapHandle;
+    /// Insert or overwrite the entry for the `key_len`-byte key at `key_ptr` with the
+    /// `val_size` value bytes at `val_ptr` (`val_size` fixed at [`bet_map_new`]).
+    pub fn bet_map_put(map: MapHandle, key_ptr: *const u8, key_len: usize, val_ptr: *const u8);
+    /// Look up the `key_len`-byte key at `key_ptr`. On a hit, copy the value bytes into
+    /// `out_val` and return `true`; on a miss leave `out_val` untouched and return `false`.
+    pub fn bet_map_get(
+        map: MapHandle,
+        key_ptr: *const u8,
+        key_len: usize,
+        out_val: *mut u8,
+    ) -> bool;
+    /// Remove the entry for the given key, returning `true` if one was present.
+    pub fn bet_map_del(map: MapHandle, key_ptr: *const u8, key_len: usize) -> bool;
+    /// The number of entries in the map.
+    pub fn bet_map_len(map: MapHandle) -> usize;
+    /// Destroy a map and release its backing memory.
+    pub fn bet_map_free(map: MapHandle);
 
     // --- concurrency (slide) ---
 

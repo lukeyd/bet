@@ -360,6 +360,9 @@ pub enum Rvalue {
     },
     /// The handle of a module-level `crib` (loads the backing global). Yields `crib elem`.
     CribGlobal(CribGlobalId),
+    /// The size in bytes of a type, as `u64` — the target-layout store size. Lets the frontend
+    /// pass value/key sizes to runtime primitives (e.g. `bet_map_new`) without knowing the ABI.
+    SizeOf(TyId),
 }
 
 #[derive(Clone, PartialEq, Debug)]

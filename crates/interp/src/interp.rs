@@ -1,6 +1,8 @@
 //! The tree-walking evaluator: registers a program's declarations, then executes `main`.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
+use std::rc::Rc;
 
 use frontend::ast::{
     Arg, AssignOp, BinOp, Block, CopInit, Expr, ExprKind, FnDecl, Item, MatchArm, Program, RetType,
@@ -998,6 +1000,10 @@ impl<'p> Interp<'p> {
                     "bytes" => return self.call_bytes(env, method, args).map(|v| vec![v]),
                     // `yikes.new(msg)` constructs an error value.
                     "yikes" => return self.call_yikes(env, method, args).map(|v| vec![v]),
+                    // `stash.new[K, V]()` constructs an empty hash map.
+                    "stash" if method == "new" => {
+                        return Ok(vec![Value::Stash(Rc::new(RefCell::new(Vec::new())))]);
+                    }
                     // `mem.scratch()` is a fresh, untyped per-frame arena.
                     "mem" if method == "scratch" => {
                         let id = self.new_arena(false);
@@ -1079,6 +1085,11 @@ impl<'p> Interp<'p> {
             }
             return Err(RunError::Undefined(format!("yikes.{method}")));
         }
+        // `stash` methods dispatch on the reference-counted map (mutations are shared).
+        if let Value::Stash(map) = &recv {
+            let map = map.clone();
+            return self.call_stash(env, map, method, args);
+        }
         let ty = match &recv {
             Value::Struct { ty, .. } => ty.clone(),
             other => {
@@ -1104,6 +1115,57 @@ impl<'p> Interp<'p> {
         };
         let arg_vals = self.eval_args(env, args)?;
         self.call_fn(f, arg_vals, Some(recv))
+    }
+
+    /// Dispatch a `stash` method on its shared map: `put`, `peep`, `yeet`, or `gang`. Mutations
+    /// go through the `Rc<RefCell<..>>`, so they are visible to every holder of the map.
+    fn call_stash(
+        &mut self,
+        env: &mut Env,
+        map: Rc<RefCell<Vec<(Value, Value)>>>,
+        method: &str,
+        args: &[Arg],
+    ) -> Result<Vec<Value>, RunError> {
+        let arg_vals = self.eval_args(env, args)?;
+        match method {
+            "put" => {
+                let (k, v) = match arg_vals.as_slice() {
+                    [k, v] => (k.clone(), v.clone()),
+                    _ => return Err(RunError::Type("`stash.put` takes a key and a value".into())),
+                };
+                let mut m = map.borrow_mut();
+                if let Some(e) = m.iter_mut().find(|(ek, _)| *ek == k) {
+                    e.1 = v;
+                } else {
+                    m.push((k, v));
+                }
+                Ok(vec![])
+            }
+            "peep" => {
+                let k = match arg_vals.as_slice() {
+                    [k] => k,
+                    _ => return Err(RunError::Type("`stash.peep` takes a single key".into())),
+                };
+                let m = map.borrow();
+                match m.iter().find(|(ek, _)| ek == k) {
+                    Some((_, v)) => Ok(vec![v.clone(), Value::Bool(true)]),
+                    // On a miss the value slot is unused (the caller checks the flag first).
+                    None => Ok(vec![Value::Ghosted, Value::Bool(false)]),
+                }
+            }
+            "yeet" => {
+                let k = match arg_vals.as_slice() {
+                    [k] => k,
+                    _ => return Err(RunError::Type("`stash.yeet` takes a single key".into())),
+                };
+                let mut m = map.borrow_mut();
+                let before = m.len();
+                m.retain(|(ek, _)| ek != k);
+                Ok(vec![Value::Bool(m.len() != before)])
+            }
+            "gang" => Ok(vec![Value::Int(map.borrow().len() as i64)]),
+            other => Err(RunError::Undefined(format!("stash.{other}"))),
+        }
     }
 
     fn construct_variant(
