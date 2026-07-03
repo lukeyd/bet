@@ -1786,23 +1786,65 @@ impl LowerCtx {
             return Err("generic method calls are not yet lowered".into());
         }
         // A user method: the receiver becomes the leading argument.
-        let sig = self
-            .funcs
-            .get(method)
-            .cloned()
+        if let Some(sig) = self.funcs.get(method).cloned() {
+            if !sig.ok || !sig.has_receiver {
+                return Err(format!("`{method}` is not a lowerable method"));
+            }
+            let mut call_args = Vec::with_capacity(args.len() + 1);
+            let (recv, _) = self.lower_expr(receiver, Some(sig.params[0]))?;
+            call_args.push(recv);
+            for (i, a) in args.iter().enumerate() {
+                let hint = sig.params.get(i + 1).copied();
+                let (op, _) = self.lower_expr(&a.value, hint)?;
+                call_args.push(op);
+            }
+            return self.emit_call(sig.id, &sig.rets, call_args);
+        }
+        // Otherwise: a struct field holding a `finna(..)` pointer, called through the receiver
+        // (`m.think(e)` where `think` is a function-pointer field). The receiver is NOT passed —
+        // the field's own signature governs the arguments.
+        self.lower_fn_field_call(receiver, method, args)
+    }
+
+    /// `recv.field(args)` where `field` is a function-pointer field of the receiver's struct
+    /// (auto-dereferencing a `ref Struct`). Lowered to an indirect call through the field.
+    fn lower_fn_field_call(
+        &mut self,
+        receiver: &Expr,
+        method: &str,
+        args: &[ast::Arg],
+    ) -> Result<(Operand, TyId), String> {
+        let (bop, bty) = self.lower_expr(receiver, None)?;
+        let base_place = self
+            .operand_place(bop)
             .ok_or_else(|| format!("unknown method `{method}`"))?;
-        if !sig.ok || !sig.has_receiver {
-            return Err(format!("`{method}` is not a lowerable method"));
-        }
-        let mut call_args = Vec::with_capacity(args.len() + 1);
-        let (recv, _) = self.lower_expr(receiver, Some(sig.params[0]))?;
-        call_args.push(recv);
-        for (i, a) in args.iter().enumerate() {
-            let hint = sig.params.get(i + 1).copied();
-            let (op, _) = self.lower_expr(&a.value, hint)?;
-            call_args.push(op);
-        }
-        self.emit_call(sig.id, &sig.rets, call_args)
+        let (sid, place) = match self.m.ty(bty) {
+            TyKind::Struct(s) => (*s, base_place),
+            TyKind::Ref(e) => match self.m.ty(*e) {
+                TyKind::Struct(s) => (*s, extend(&base_place, Proj::Deref)),
+                _ => return Err(format!("unknown method `{method}`")),
+            },
+            _ => return Err(format!("unknown method `{method}`")),
+        };
+        let def = self.m.struct_def(sid);
+        let idx = def
+            .fields
+            .iter()
+            .position(|f| f.name == method)
+            .ok_or_else(|| format!("unknown method `{method}`"))?;
+        let fty = def.fields[idx].ty;
+        let sig = match self.m.ty(fty) {
+            TyKind::FnPtr(s) => self.m.sig(*s).clone(),
+            other => {
+                return Err(format!(
+                    "`{method}` is not a method or function-pointer field ({other:?})"
+                ));
+            }
+        };
+        let fptr_op = Operand::Copy(extend(&place, Proj::Field(idx as u32)));
+        let call_args = self.lower_args(args, &sig.params)?;
+        let ret_ty = self.rets_to_ty(&sig.rets);
+        self.emit_call_result(Callee::Indirect(fptr_op), &sig.rets, call_args, ret_ty)
     }
 
     fn is_module(&self, name: &str) -> bool {
