@@ -83,10 +83,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_string_print() {
-        // `42` isn't in this minimal frontend's token/statement set — it must be rejected
-        // (as a lex error today), not silently mislowered.
+    fn prints_computed_scalar() {
+        // A computed integer now lowers to a typed runtime print (`bet_print_i64`); this used
+        // to be a clean lowering error before the `spill` value-print pass landed.
         let src = "finna main() {\n    spill.it(42)\n}\n";
-        assert!(compile(src).is_err());
+        let m = compile(src).expect("spill.it(<int>) should lower now");
+        assert!(
+            m.externs().iter().any(|e| e.name == "bet_print_i64"),
+            "expected a synthesized bet_print_i64 extern"
+        );
     }
 }

@@ -5,12 +5,14 @@
 //!
 //! * `snapshot_lower!` pins the emitted `.mir` text (via `midir::print`) for a diverse slice
 //!   of the ready subset — arithmetic/overflow modes, control flow, short-circuit booleans,
-//!   functions, structs, `vibe`/`moods`, and the memory model. Sources are minimal programs
-//!   that mirror the corpus's computational shapes; the corpus programs whose bodies only
-//!   *print computed values* can't round-trip yet (the compiled path has no int-format
-//!   primitive), so their library functions are exercised directly here.
+//!   functions, structs, `vibe`/`moods`, the memory model, and the `spill.it` / `spill.f`
+//!   value-print lowering (type-directed `bet_print_i64`/`u64`/`f64`, the `bool` branch, and
+//!   `{}` format splitting). Sources are minimal programs mirroring the corpus's shapes.
 //! * `ready_corpus_programs_lower` is the regression guard: the corpus programs that lower end
-//!   to end today must keep compiling to a validated module.
+//!   to end today must keep compiling to a validated module. Now that computed scalars print,
+//!   this is most of the value/control/function/bit-math corpus; the holdouts still need
+//!   frontier features (generics, arrays, module-level cribs, `sheesh`/`slide`, dynamic
+//!   strings).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -118,21 +120,60 @@ snapshot_lower! {
                            holla r = e in arena { bet r.hp } ghosted { bet -1 }\n}",
     lower_evict => "drip Node { flex v: int }\n\
                     finna clear(arena: crib Node) { evict arena }",
+
+    // --- spill value-print lowering (Track C) ---
+    // `spill.it("literal")` keeps its byte-identical single-`bet_print` shape.
+    lower_spill_literal => "finna main() { spill.it(\"hi\") }",
+    // A computed signed int sign-extends to i64 and calls `bet_print_i64`, then a newline.
+    lower_spill_signed => "finna show(n: i32) { spill.it(n) }",
+    // An unsigned int (here a `u8`) zero-extends to u64 and calls `bet_print_u64`.
+    lower_spill_unsigned => "finna show(n: u8) { spill.it(n) }",
+    // A same-width `int` (i64) needs no coercion.
+    lower_spill_int64 => "finna main() { spill.it(7 + 3) }",
+    // `f64` prints directly; `f32` widens via `fpext` first.
+    lower_spill_f64 => "finna show(x: f64) { spill.it(x) }",
+    lower_spill_f32 => "finna show(x: f32) { spill.it(x) }",
+    // `bool` branches: `nocap` on the true edge, `cap` on the false edge, joined at a merge.
+    lower_spill_bool => "finna show(b: bool) { spill.it(b) }",
+    // `ghosted` prints its literal display form.
+    lower_spill_ghosted => "finna main() { spill.it(ghosted) }",
+    // `spill.f` splits the format on `{}` (with `{{`/`}}` escapes) and prints each segment /
+    // argument in order, with no synthesized trailing newline.
+    lower_spill_format => "finna show(a: int, b: int) { spill.f(\"x={} y={}\\n\", a, b) }",
+    lower_spill_format_escapes => "finna show(n: int) { spill.f(\"{{{}}}\", n) }",
 }
 
 // --- corpus programs that lower end to end today (regression guard) ---
 
 #[test]
 fn ready_corpus_programs_lower() {
-    // Programs whose every function lowers with today's subset. (Most corpus `main`s print
-    // computed integers, which needs the not-yet-built int-format primitive; those are covered
-    // per-function by the synthetic snapshots above.)
+    // Programs whose every function lowers end to end with today's subset. Value-printing
+    // `main`s now lower (via the `spill` type-directed print pass); the holdouts still need
+    // frontier features. `03-control/fr-naw.bet` is intentionally NOT here: its `main` prints
+    // a *computed* `str`, which is a deliberate backend gap (a clean lowering error).
     let ready = [
         "01-basics/hello.bet",
         "01-basics/comments.bet",
         "01-basics/spill-format.bet",
-        "03-control/fr-naw.bet",
+        "02-values/arithmetic.bet",
+        "02-values/bool-logic.bet",
+        "02-values/casts.bet",
+        "02-values/compound-assign.bet",
+        "02-values/lowkey-facts.bet",
+        "02-values/numeric-tower.bet",
+        "03-control/nested-loops.bet",
+        "03-control/vibin.bet",
+        "04-functions/finna-basics.bet",
+        "04-functions/first-class-fn.bet",
         "04-functions/multi-return.bet",
+        "04-functions/receivers.bet",
+        "06-sumtypes/expr-eval.bet",
+        "06-sumtypes/moods-basics.bet",
+        "09-bit-math/bam-angles.bet",
+        "09-bit-math/bit-ops.bet",
+        "09-bit-math/fixed-point.bet",
+        "09-bit-math/wrapping.bet",
+        "12-ffi/extern-abs.bet",
     ];
     for rel in ready {
         let src = fs::read_to_string(corpus_dir().join(rel)).expect("readable .bet");
@@ -163,10 +204,10 @@ fn lowered_corpus_is_valid_and_covers_the_expected_set() {
             }
         }
     }
-    // Five whole programs lower end to end today (see `ready_corpus_programs_lower`). This is a
-    // floor: it may only go up as the frontier shrinks.
+    // With the `spill` value-print pass, 22 whole programs lower end to end today (see
+    // `ready_corpus_programs_lower`). This is a floor: it may only go up as the frontier shrinks.
     assert!(
-        lowered >= 5,
-        "expected at least 5 corpus programs to lower, got {lowered}"
+        lowered >= 22,
+        "expected at least 22 corpus programs to lower, got {lowered}"
     );
 }
