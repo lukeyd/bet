@@ -487,9 +487,20 @@ impl<'c> Cg<'c> {
             }
             CastKind::FloatResize => {
                 let src = v.into_float_value();
-                let src_bits = src.get_type().get_bit_width();
                 let dst_ty = tgt.into_float_type();
-                let dst_bits = dst_ty.get_bit_width();
+                // inkwell's `FloatType` exposes no `get_bit_width()`, so take the widths
+                // from the IR types instead (F32 = 32, F64 = 64), same as the int casts
+                // above read signedness from `self.m.ty(..)`.
+                let float_bits = |k: &TyKind| match k {
+                    TyKind::F32 => 32u32,
+                    TyKind::F64 => 64u32,
+                    _ => 0,
+                };
+                let dst_bits = float_bits(self.m.ty(target));
+                let src_bits = self
+                    .operand_ty(func, op)?
+                    .map(|t| float_bits(self.m.ty(t)))
+                    .unwrap_or(dst_bits);
                 if dst_bits > src_bits {
                     b.build_float_ext(src, dst_ty, "fpext")
                         .map_err(lower_err)?
