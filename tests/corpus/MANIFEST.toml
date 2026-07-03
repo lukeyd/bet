@@ -353,8 +353,7 @@ compiled = "pass"
 [[program]]
 path = "10-stdlib/squadops"
 covers = ["stdlib.squadops"]
-# Unsupported: `stack`/`pop` mutate the receiver in place, which value-copy receivers can't do.
-interp = "unsupported"
+interp = "pass"
 compiled = "skip"
 
 # --- 11 reference oracles ---------------------------------------------------
