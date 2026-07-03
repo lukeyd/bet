@@ -1,0 +1,17 @@
+// compound-assign — the augmented assignment operators mutate a binding in place.
+pull "spill"
+
+finna main() {
+    lowkey n = 10
+    n += 5      // 15
+    n -= 3      // 12
+    n *= 2      // 24
+    n /= 4      // 6
+    n %= 4      // 2
+    n <<= 3     // 16
+    n >>= 1     // 8
+    n &= 12     // 8
+    n |= 1      // 9
+    n ^= 3      // 10
+    spill.it(n)
+}

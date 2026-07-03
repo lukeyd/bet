@@ -5,7 +5,9 @@
 #
 # Mirrors the allowed dependency graph in bootstrap-plan.md §3. Notably forbidden:
 # `backend -> frontend` (backend may only know the IR) and anything -> `runtime`
-# (only the rt-abi contract is shared).
+# (the real, shipping runtime is a leaf nothing depends on). `driver -> rt-stub` is
+# allowed: the driver owns runtime *selection*, and links compiled programs against the
+# bootstrap `rt-stub` archive; `rt-stub` is the stub of the rt-abi contract, not `runtime`.
 [allow]
 midir    = []
 rt-abi   = []
@@ -16,5 +18,5 @@ backend  = ["midir", "rt-abi"]
 interp   = ["frontend", "rt-abi"]
 fmt      = ["frontend"]
 lsp      = ["frontend"]
-driver   = ["frontend", "backend", "interp", "fmt"]
+driver   = ["frontend", "backend", "interp", "fmt", "rt-stub"]
 xtask    = []

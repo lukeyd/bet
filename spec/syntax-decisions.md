@@ -99,6 +99,10 @@ checkable. This is a corpus/harness convention, not a language restriction.
   (amendment §2.2)
 - **`scratch` is not a keyword** — the per-frame arena is reached as `mem.scratch()`; only
   `crib cop evict tag holla trust` get dedicated memory-model syntax.
+- **Maps are `stash[K, V]`**, not `map[K]V`. The vestigial `map[K]V` type production was
+  removed from the grammar (v0.1.1) — `map` was never a reserved keyword, and amendment §8
+  settled the surface spelling as the generic `stash`. The mid-level IR keeps `TyKind::Map`
+  as the lowering target for `stash[K, V]`.
 
 ### 10. Collection literals `[a, b, c]`
 

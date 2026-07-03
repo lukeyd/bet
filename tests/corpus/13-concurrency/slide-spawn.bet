@@ -1,0 +1,11 @@
+// slide-spawn — spawn a concurrent task with `slide`. The worker performs no observable
+// I/O, so the program's stdout is deterministic regardless of how the task is scheduled.
+pull "spill"
+
+finna worker() {
+}
+
+finna main() {
+    slide worker()
+    spill.it("main")
+}

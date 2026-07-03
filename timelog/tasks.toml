@@ -34,10 +34,22 @@ size = 8
 status = "done"
 
 [[task]]
+slug = "semantics"
+name = "Phase 0: formalize spec/semantics.md (dynamic semantics)"
+size = 3
+status = "done"
+
+[[task]]
+slug = "step1-gaps"
+name = "Step 1 completion: midir extern/str lowering + by-value sums + validator hardening + corpus coverage"
+size = 8
+status = "done"
+
+[[task]]
 slug = "tracer-bullet"
 name = "Step 2: spill.it(\"hi\") end-to-end (frontend->midir->backend->stub) on 3 OSes"
 size = 5
-status = "todo"
+status = "done"
 
 [[task]]
 slug = "frontend"

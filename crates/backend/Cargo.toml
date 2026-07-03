@@ -7,8 +7,9 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-midir  = { path = "../midir" }
-rt-abi = { path = "../rt-abi" }
+midir     = { path = "../midir" }
+rt-abi    = { path = "../rt-abi" }
+thiserror = { workspace = true }
 # LLVM is laid in but NOT built by default: `inkwell`/`llvm-sys` are pinned and
 # lockfile-audited yet only compiled under `--features llvm`, so the default
 # workspace build needs no LLVM install. Wire it in when backend work begins.

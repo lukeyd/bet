@@ -273,6 +273,13 @@ impl Printer<'_> {
                     Callee::Indirect(op) => {
                         format!("call_indirect {}({})", self.operand(op), a.join(", "))
                     }
+                    Callee::Extern(e) => {
+                        format!(
+                            "call_extern @{}({})",
+                            self.m.extern_def(*e).name,
+                            a.join(", ")
+                        )
+                    }
                 }
             }
             Rvalue::Aggregate(kind, ops) => {
@@ -282,6 +289,11 @@ impl Printer<'_> {
                         format!("make {}({})", self.m.struct_def(*s).name, a.join(", "))
                     }
                     AggKind::Tuple => format!("tuple({})", a.join(", ")),
+                    AggKind::Sum { sum, variant } => {
+                        let def = self.m.sum_def(*sum);
+                        let vname = &def.variants[*variant as usize].name;
+                        format!("make {}::{}({})", def.name, vname, a.join(", "))
+                    }
                 }
             }
             Rvalue::Discriminant(op) => format!("discriminant({})", self.operand(op)),
@@ -291,6 +303,8 @@ impl Printer<'_> {
             Rvalue::Trust(crib, tag) => {
                 format!("trust({}, {})", self.operand(crib), self.operand(tag))
             }
+            Rvalue::StrPtr(op) => format!("str_ptr({})", self.operand(op)),
+            Rvalue::StrLen(op) => format!("str_len({})", self.operand(op)),
         }
     }
 
@@ -662,7 +676,7 @@ fn lex_str(bytes: &[char], i: &mut usize) -> Result<Tok, ParseError> {
 /// Parse `.mir` text into a module.
 pub fn parse(src: &str) -> Result<Module, ParseError> {
     let toks = lex(src)?;
-    let (struct_ids, sum_ids, func_ids) = prescan(&toks);
+    let (struct_ids, sum_ids, func_ids, extern_ids) = prescan(&toks);
     let mut p = Parser {
         toks,
         pos: 0,
@@ -670,26 +684,46 @@ pub fn parse(src: &str) -> Result<Module, ParseError> {
         struct_ids,
         sum_ids,
         func_ids,
+        extern_ids,
     };
     p.module()?;
     Ok(p.m)
 }
 
-/// Assign ids to every named struct/sum/fn up front, so bodies may refer to names that are
-/// self-referential or defined later. Ids follow appearance order per kind (matching the
-/// printer, which emits each kind contiguously in id order).
-fn prescan(
-    toks: &[Tok],
-) -> (
+/// The four name→id maps produced by [`prescan`], keyed by declaration name.
+type PrescanIds = (
     HashMap<String, StructId>,
     HashMap<String, SumId>,
     HashMap<String, FuncId>,
-) {
-    let (mut structs, mut sums, mut funcs) = (HashMap::new(), HashMap::new(), HashMap::new());
-    let (mut sn, mut un, mut fnc) = (0u32, 0u32, 0u32);
+    HashMap<String, ExternId>,
+);
+
+/// Assign ids to every named struct/sum/fn/extern up front, so bodies may refer to names that
+/// are self-referential or defined later. Ids follow appearance order per kind (matching the
+/// printer, which emits each kind contiguously in id order).
+fn prescan(toks: &[Tok]) -> PrescanIds {
+    let (mut structs, mut sums, mut funcs, mut externs) = (
+        HashMap::new(),
+        HashMap::new(),
+        HashMap::new(),
+        HashMap::new(),
+    );
+    let (mut sn, mut un, mut fnc, mut en) = (0u32, 0u32, 0u32, 0u32);
     let mut i = 0;
-    while i + 1 < toks.len() {
-        if let (Tok::Ident(kw), Tok::Ident(name)) = (&toks[i], &toks[i + 1]) {
+    while i < toks.len() {
+        // `extern "C" fn NAME` — register the extern and skip its `fn NAME` so it is not
+        // also miscounted as a function (which would give it a dangling FuncId).
+        if matches!(&toks[i], Tok::Ident(kw) if kw == "extern")
+            && matches!(toks.get(i + 1), Some(Tok::Str(_)))
+            && matches!(toks.get(i + 2), Some(Tok::Ident(f)) if f == "fn")
+            && let Some(Tok::Ident(name)) = toks.get(i + 3)
+        {
+            externs.entry(name.clone()).or_insert(ExternId(en));
+            en += 1;
+            i += 4;
+            continue;
+        }
+        if let (Tok::Ident(kw), Some(Tok::Ident(name))) = (&toks[i], toks.get(i + 1)) {
             match kw.as_str() {
                 "struct" => {
                     structs.entry(name.clone()).or_insert(StructId(sn));
@@ -708,7 +742,7 @@ fn prescan(
         }
         i += 1;
     }
-    (structs, sums, funcs)
+    (structs, sums, funcs, externs)
 }
 
 struct Parser {
@@ -718,6 +752,7 @@ struct Parser {
     struct_ids: HashMap<String, StructId>,
     sum_ids: HashMap<String, SumId>,
     func_ids: HashMap<String, FuncId>,
+    extern_ids: HashMap<String, ExternId>,
 }
 
 impl Parser {
@@ -1137,15 +1172,52 @@ impl Parser {
                 let args = self.arg_list()?;
                 Ok(Rvalue::Call(Callee::Indirect(callee), args))
             }
+            "call_extern" => {
+                self.pos += 1;
+                self.expect(&Tok::At)?;
+                let name = self.expect_ident()?;
+                let e = *self
+                    .extern_ids
+                    .get(&name)
+                    .ok_or_else(|| self.err(&format!("unknown extern `{name}`")))?;
+                let args = self.arg_list()?;
+                Ok(Rvalue::Call(Callee::Extern(e), args))
+            }
+            "str_ptr" => {
+                self.pos += 1;
+                self.expect(&Tok::LParen)?;
+                let op = self.operand()?;
+                self.expect(&Tok::RParen)?;
+                Ok(Rvalue::StrPtr(op))
+            }
+            "str_len" => {
+                self.pos += 1;
+                self.expect(&Tok::LParen)?;
+                let op = self.operand()?;
+                self.expect(&Tok::RParen)?;
+                Ok(Rvalue::StrLen(op))
+            }
             "make" => {
                 self.pos += 1;
                 let name = self.expect_ident()?;
-                let sid = *self
-                    .struct_ids
-                    .get(&name)
-                    .ok_or_else(|| self.err(&format!("unknown struct `{name}`")))?;
-                let args = self.arg_list()?;
-                Ok(Rvalue::Aggregate(AggKind::Struct(sid), args))
+                if self.eat(&Tok::ColonColon) {
+                    // `make Name::Variant(args)` — a by-value sum value.
+                    let sid = *self
+                        .sum_ids
+                        .get(&name)
+                        .ok_or_else(|| self.err(&format!("unknown sum `{name}`")))?;
+                    let vname = self.expect_ident()?;
+                    let variant = self.variant_index(sid, &vname)?;
+                    let args = self.arg_list()?;
+                    Ok(Rvalue::Aggregate(AggKind::Sum { sum: sid, variant }, args))
+                } else {
+                    let sid = *self
+                        .struct_ids
+                        .get(&name)
+                        .ok_or_else(|| self.err(&format!("unknown struct `{name}`")))?;
+                    let args = self.arg_list()?;
+                    Ok(Rvalue::Aggregate(AggKind::Struct(sid), args))
+                }
             }
             "tuple" => {
                 self.pos += 1;
