@@ -1,0 +1,11 @@
+// array-index — a fixed array literal indexed by a computed position.
+// Exercises the inline `[T; N]` array value and the `base[i]` place projection through codegen.
+pull "spill"
+
+finna main() {
+    lowkey xs = [10, 20, 30, 40]
+    lowkey i = 1
+    spill.it(xs[0])       // 10
+    spill.it(xs[i + 1])   // 30
+    spill.it(xs[3])       // 40
+}

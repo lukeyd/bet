@@ -289,6 +289,9 @@ impl Printer<'_> {
                         format!("make {}({})", self.m.struct_def(*s).name, a.join(", "))
                     }
                     AggKind::Tuple => format!("tuple({})", a.join(", ")),
+                    AggKind::Array(elem) => {
+                        format!("array[{}]({})", self.ty(*elem), a.join(", "))
+                    }
                     AggKind::Sum { sum, variant } => {
                         let def = self.m.sum_def(*sum);
                         let vname = &def.variants[*variant as usize].name;
@@ -305,6 +308,13 @@ impl Printer<'_> {
             }
             Rvalue::StrPtr(op) => format!("str_ptr({})", self.operand(op)),
             Rvalue::StrLen(op) => format!("str_len({})", self.operand(op)),
+            Rvalue::AddrOf(place) => format!("addr_of({})", self.place(place)),
+            Rvalue::MakeSlice { data, len, elem } => format!(
+                "make_slice[{}]({}, {})",
+                self.ty(*elem),
+                self.operand(data),
+                self.operand(len)
+            ),
         }
     }
 
@@ -1223,6 +1233,33 @@ impl Parser {
                 self.pos += 1;
                 let args = self.arg_list()?;
                 Ok(Rvalue::Aggregate(AggKind::Tuple, args))
+            }
+            "array" => {
+                self.pos += 1;
+                self.expect(&Tok::LBracket)?;
+                let elem = self.ty()?;
+                self.expect(&Tok::RBracket)?;
+                let args = self.arg_list()?;
+                Ok(Rvalue::Aggregate(AggKind::Array(elem), args))
+            }
+            "addr_of" => {
+                self.pos += 1;
+                self.expect(&Tok::LParen)?;
+                let place = self.place()?;
+                self.expect(&Tok::RParen)?;
+                Ok(Rvalue::AddrOf(place))
+            }
+            "make_slice" => {
+                self.pos += 1;
+                self.expect(&Tok::LBracket)?;
+                let elem = self.ty()?;
+                self.expect(&Tok::RBracket)?;
+                self.expect(&Tok::LParen)?;
+                let data = self.operand()?;
+                self.expect(&Tok::Comma)?;
+                let len = self.operand()?;
+                self.expect(&Tok::RParen)?;
+                Ok(Rvalue::MakeSlice { data, len, elem })
             }
             "discriminant" => {
                 self.pos += 1;

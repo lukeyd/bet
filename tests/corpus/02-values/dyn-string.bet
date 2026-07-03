@@ -1,0 +1,18 @@
+// dyn-string — a computed (non-literal) `str` value carried through a call, a local, and print.
+// Exercises the fat `{ ptr, len }` string representation: `str` as a param, return, and local.
+pull "spill"
+
+finna pick(which: bool) -> str {
+    fr which {
+        bet "yes"
+    } naw {
+        bet "no"
+    }
+}
+
+finna main() {
+    lowkey a: str = pick(nocap)
+    lowkey b: str = pick(cap)
+    spill.it(a)   // yes
+    spill.it(b)   // no
+}
