@@ -139,6 +139,9 @@ pub struct Interp<'p> {
     methods: HashMap<(String, String), &'p FnDecl>,
     variants: HashMap<String, VariantInfo>,
     globals: HashMap<String, Value>,
+    /// Names declared via `extern "C" finna` — resolved to a small built-in shim table so the
+    /// interpreter can run FFI programs the compiled path links against libc for (`12-ffi`).
+    externs: std::collections::HashSet<String>,
     /// Every live `crib`, keyed by the id carried in a [`Value::Crib`] handle.
     arenas: HashMap<usize, Arena>,
     /// Monotonic id source for arenas (never reused, so ids stay unique across `evict`).
@@ -157,6 +160,7 @@ impl<'p> Interp<'p> {
             methods: HashMap::new(),
             variants: HashMap::new(),
             globals: HashMap::new(),
+            externs: std::collections::HashSet::new(),
             arenas: HashMap::new(),
             next_arena: 0,
             ret_stack: Vec::new(),
@@ -182,6 +186,9 @@ impl<'p> Interp<'p> {
                 Item::Crib(c) => {
                     let id = me.new_arena(c.ty.is_some());
                     me.globals.insert(c.name.clone(), Value::Crib(id));
+                }
+                Item::Extern(e) => {
+                    me.externs.insert(e.name.clone());
                 }
                 _ => {}
             }
@@ -1047,6 +1054,9 @@ impl<'p> Interp<'p> {
             if self.funcs.contains_key(name) {
                 return self.call_named_fn(env, name, args);
             }
+            if self.externs.contains(name) {
+                return self.call_extern_shim(env, name, args);
+            }
             return Err(RunError::Undefined(name.clone()));
         }
 
@@ -1054,6 +1064,24 @@ impl<'p> Interp<'p> {
         match self.eval_expr(env, callee)? {
             Value::Fn(fname) => self.call_named_fn(env, &fname, args),
             other => Err(RunError::NotCallable(other.type_name().to_string())),
+        }
+    }
+
+    /// A small built-in shim for the `extern "C"` functions the corpus links against libc for.
+    /// The interpreter has no real FFI, so it emulates the handful of pure libc calls used by
+    /// `12-ffi`; anything else is a clean "no interpreter shim" error rather than a crash.
+    fn call_extern_shim(
+        &mut self,
+        env: &mut Env,
+        name: &str,
+        args: &[Arg],
+    ) -> Result<Vec<Value>, RunError> {
+        let vals = self.eval_args(env, args)?;
+        match (name, vals.as_slice()) {
+            ("abs", [Value::Int(x)]) => Ok(vec![Value::Int(x.abs())]),
+            (other, _) => Err(RunError::Unsupported(format!(
+                "no interpreter shim for extern `{other}`"
+            ))),
         }
     }
 
