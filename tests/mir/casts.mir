@@ -1,0 +1,51 @@
+// casts.mir — every numeric cast kind the backend lowers: integer widen (sext/zext),
+// narrow (trunc), int<->float (itof/ftoi), and float resize (f64<->f32). (Step 3, backend.)
+
+fn widen(%0: i32) -> i64 {
+  let %1: i64
+  bb0:
+    %1 = cast.sext(%0 as i64)
+    return %1
+}
+
+fn uwiden(%0: u8) -> u32 {
+  let %1: u32
+  bb0:
+    %1 = cast.zext(%0 as u32)
+    return %1
+}
+
+fn narrow(%0: i64) -> i32 {
+  let %1: i32
+  bb0:
+    %1 = cast.trunc(%0 as i32)
+    return %1
+}
+
+fn to_float(%0: i64) -> f64 {
+  let %1: f64
+  bb0:
+    %1 = cast.itof(%0 as f64)
+    return %1
+}
+
+fn to_uint(%0: f64) -> u64 {
+  let %1: u64
+  bb0:
+    %1 = cast.ftoi(%0 as u64)
+    return %1
+}
+
+fn shrink(%0: f64) -> f32 {
+  let %1: f32
+  bb0:
+    %1 = cast.fresize(%0 as f32)
+    return %1
+}
+
+fn grow(%0: f32) -> f64 {
+  let %1: f64
+  bb0:
+    %1 = cast.fresize(%0 as f64)
+    return %1
+}

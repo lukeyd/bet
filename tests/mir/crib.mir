@@ -1,0 +1,43 @@
+// crib.mir — the tag/holla/crib memory model end to end. `make` allocates a struct into a
+// typed crib with `cop` (→ bet_cop + field init) and yields its tag; `read` resolves the tag
+// with a checked `holla` (→ bet_holla_check) and reads through the live ref; `bump` resolves
+// it unchecked with `trust` (→ bet_slot_ptr) and mutates through the ref; `clear` mass-frees
+// the crib with `evict` (→ bet_evict); `nothing` returns `ghosted` as a null tag. (Step 3.)
+
+struct Cell { flex value: i64 }
+
+fn make(%0: crib Cell) -> tag Cell {
+  let %1: tag Cell
+  bb0:
+    %1 = cop(%0, Cell{0: 7i64})
+    return %1
+}
+
+fn read(%0: tag Cell, %1: crib Cell) -> i64 {
+  let %2: ref Cell
+  bb0:
+    holla_check(%0, %1, %2) -> bb1 else bb2
+  bb1:
+    return %2.deref.field(0)
+  bb2:
+    return -1i64
+}
+
+fn bump(%0: tag Cell, %1: crib Cell) -> void {
+  let %2: ref Cell
+  bb0:
+    %2 = trust(%1, %0)
+    %2.deref.field(0) = add.trap(%2.deref.field(0), 1i64)
+    return
+}
+
+fn clear(%0: crib Cell) -> void {
+  bb0:
+    evict %0
+    return
+}
+
+fn nothing() -> tag Cell {
+  bb0:
+    return ghosted
+}

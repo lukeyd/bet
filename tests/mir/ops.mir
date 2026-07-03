@@ -1,0 +1,78 @@
+// ops.mir — integer arithmetic, bitwise, shifts, comparisons, and unary ops in the IR.
+// Exercises the full scalar-integer BinOp/UnOp surface the backend lowers: signed and
+// unsigned div/rem, all bitwise/shift ops (which carry arith mode `na`), the six
+// comparisons (result type bool), and `neg`/`bitnot`/`not`. (Step 3, backend.)
+
+fn arith(%0: i64, %1: i64) -> i64 {
+  let %2: i64
+  let %3: i64
+  let %4: i64
+  let %5: i64
+  let %6: i64
+  bb0:
+    %2 = add.trap(%0, %1)
+    %3 = sub.trap(%2, %1)
+    %4 = mul.trap(%3, %1)
+    %5 = div.trap(%4, %1)
+    %6 = rem.trap(%5, %1)
+    return %6
+}
+
+fn umath(%0: u32, %1: u32) -> u32 {
+  let %2: u32
+  let %3: u32
+  bb0:
+    %2 = div.wrap(%0, %1)
+    %3 = rem.wrap(%2, %1)
+    return %3
+}
+
+fn bits(%0: u32, %1: u32) -> u32 {
+  let %2: u32
+  let %3: u32
+  let %4: u32
+  let %5: u32
+  let %6: u32
+  bb0:
+    %2 = bitand.na(%0, %1)
+    %3 = bitor.na(%2, %1)
+    %4 = bitxor.na(%3, %1)
+    %5 = shl.na(%4, 2u32)
+    %6 = shr.na(%5, 1u32)
+    return %6
+}
+
+fn cmp(%0: i64, %1: i64) -> bool {
+  let %2: bool
+  bb0:
+    %2 = lt.na(%0, %1)
+    return %2
+}
+
+fn ucmp(%0: u32, %1: u32) -> bool {
+  let %2: bool
+  bb0:
+    %2 = ge.na(%0, %1)
+    return %2
+}
+
+fn negate(%0: i64) -> i64 {
+  let %1: i64
+  bb0:
+    %1 = neg(%0)
+    return %1
+}
+
+fn complement(%0: u32) -> u32 {
+  let %1: u32
+  bb0:
+    %1 = bitnot(%0)
+    return %1
+}
+
+fn negate_bool(%0: bool) -> bool {
+  let %1: bool
+  bb0:
+    %1 = not(%0)
+    return %1
+}
