@@ -1,0 +1,24 @@
+// generic-nested — a generic function whose parameter is itself a generic struct, and a
+// generic function that calls another generic instance. Exercises monomorphization nesting:
+// `unbox[T]` takes a `Box[T]`, and `first[T]` calls `unbox[T]` — the work-list must drain
+// instances that spawn further instances.
+pull "spill"
+
+drip Box[T] {
+    flex val: T
+}
+
+finna unbox[T](b: Box[T]) -> T {
+    bet b.val
+}
+
+finna first[T](a: Box[T], b: Box[T]) -> T {
+    bet unbox[T](a)
+}
+
+finna main() {
+    lowkey bi = Box[int]{ val: 42 }
+    lowkey bs = Box[str]{ val: "hi" }
+    spill.it(unbox[int](bi))              // 42
+    spill.it(first[str](bs, bs))          // hi
+}

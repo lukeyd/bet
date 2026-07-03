@@ -190,7 +190,13 @@ compiled = "pass"
 path = "04-functions/generics-fn"
 covers = ["functions.generics"]
 interp = "pass"
-compiled = "skip"
+compiled = "pass"
+
+[[program]]
+path = "04-functions/generic-nested"
+covers = ["functions.generics", "structs.generic"]
+interp = "pass"
+compiled = "pass"
 
 # --- 05 structs -------------------------------------------------------------
 [[program]]
@@ -209,7 +215,7 @@ compiled = "pass"
 path = "05-structs/drip-generic"
 covers = ["structs.generic"]
 interp = "pass"
-compiled = "skip"
+compiled = "pass"
 
 # --- 06 sum types -----------------------------------------------------------
 [[program]]
