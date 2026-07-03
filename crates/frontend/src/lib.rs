@@ -5,6 +5,8 @@
 //! (`pull "spill"` + `finna main() { spill.it("hi") }`) to a validated `midir` module. The
 //! real lexer/parser/typechecker — the full frozen grammar — lands with the frontend fan-out.
 
+pub mod ast;
+
 mod lexer;
 mod lower;
 mod parser;

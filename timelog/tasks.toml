@@ -52,28 +52,34 @@ size = 5
 status = "done"
 
 [[task]]
+slug = "step3-kickoff"
+name = "Step 3 kickoff: status-doc refresh, frontend::ast contract skeleton, backend-llvm PR gating"
+size = 2
+status = "done"
+
+[[task]]
 slug = "frontend"
 name = "Fan-out: frontend library — lexer, parser, AST, typecheck, midir emit"
 size = 21
-status = "todo"
+status = "doing"
 
 [[task]]
 slug = "backend"
 name = "Fan-out: backend — midir -> LLVM IR, pass pipeline, lld linking, 6 targets"
 size = 21
-status = "todo"
+status = "doing"
 
 [[task]]
 slug = "runtime"
 name = "Fan-out: runtime — cribs, generations, scratch, allocator ctx, scheduler, OS layer"
 size = 21
-status = "todo"
+status = "doing"
 
 [[task]]
 slug = "interp"
 name = "Fan-out: tree-walking interpreter + differential test partner"
 size = 13
-status = "todo"
+status = "doing"
 
 [[task]]
 slug = "stdlib"
