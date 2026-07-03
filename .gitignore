@@ -9,6 +9,9 @@
 # Release artifacts (`cargo xtask dist`)
 /dist
 
+# Claude Code agent worktrees (transient isolated checkouts; never committed)
+/.claude/worktrees/
+
 # OS / editor cruft
 .DS_Store
 .idea/
