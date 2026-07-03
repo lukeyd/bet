@@ -1,0 +1,5 @@
+# Force LF on every text file so snapshot / corpus tests are byte-identical across platforms.
+# A CRLF checkout on Windows shifts the byte-offset spans embedded in the frontend parse
+# snapshots (and would corrupt the byte-exact `.expected` diffs), which is why the Windows CI
+# `test` leg failed on `frontend::parse_corpus`. Binary files are auto-detected and left alone.
+* text=auto eol=lf
