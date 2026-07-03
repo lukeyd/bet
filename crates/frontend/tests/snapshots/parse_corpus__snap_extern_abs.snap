@@ -1,0 +1,124 @@
+---
+source: crates/frontend/tests/parse_corpus.rs
+expression: program
+---
+Program {
+    items: [
+        Pull(
+            Pull {
+                module: "spill",
+                span: 170..182,
+            },
+        ),
+        Extern(
+            ExternDecl {
+                abi: "C",
+                name: "abs",
+                params: [
+                    Param {
+                        name: "x",
+                        ty: Type {
+                            kind: Named(
+                                "i32",
+                                [],
+                            ),
+                            span: 208..211,
+                        },
+                        span: 205..211,
+                    },
+                ],
+                ret: Single(
+                    Type {
+                        kind: Named(
+                            "i32",
+                            [],
+                        ),
+                        span: 216..219,
+                    },
+                ),
+                span: 184..219,
+            },
+        ),
+        Func(
+            FnDecl {
+                vis: Hush,
+                receiver: None,
+                name: "main",
+                generics: [],
+                params: [],
+                ret: None,
+                body: Block {
+                    stmts: [
+                        Stmt {
+                            kind: Expr(
+                                Expr {
+                                    kind: Method {
+                                        receiver: Expr {
+                                            kind: Name {
+                                                name: "spill",
+                                                generics: [],
+                                            },
+                                            span: 240..245,
+                                        },
+                                        method: "it",
+                                        generics: [],
+                                        args: [
+                                            Arg {
+                                                label: None,
+                                                value: Expr {
+                                                    kind: Call {
+                                                        callee: Expr {
+                                                            kind: Name {
+                                                                name: "abs",
+                                                                generics: [],
+                                                            },
+                                                            span: 249..252,
+                                                        },
+                                                        args: [
+                                                            Arg {
+                                                                label: None,
+                                                                value: Expr {
+                                                                    kind: Cast(
+                                                                        Expr {
+                                                                            kind: Unary(
+                                                                                Neg,
+                                                                                Expr {
+                                                                                    kind: Int(
+                                                                                        7,
+                                                                                    ),
+                                                                                    span: 254..255,
+                                                                                },
+                                                                            ),
+                                                                            span: 253..255,
+                                                                        },
+                                                                        Type {
+                                                                            kind: Named(
+                                                                                "i32",
+                                                                                [],
+                                                                            ),
+                                                                            span: 259..262,
+                                                                        },
+                                                                    ),
+                                                                    span: 253..262,
+                                                                },
+                                                            },
+                                                        ],
+                                                    },
+                                                    span: 249..263,
+                                                },
+                                            },
+                                        ],
+                                    },
+                                    span: 240..264,
+                                },
+                            ),
+                            span: 240..264,
+                        },
+                    ],
+                    span: 234..273,
+                },
+                span: 221..273,
+            },
+        ),
+    ],
+}

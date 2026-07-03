@@ -1,0 +1,355 @@
+---
+source: crates/frontend/tests/parse_corpus.rs
+expression: program
+---
+Program {
+    items: [
+        Pull(
+            Pull {
+                module: "spill",
+                span: 66..78,
+            },
+        ),
+        Func(
+            FnDecl {
+                vis: Hush,
+                receiver: None,
+                name: "main",
+                generics: [],
+                params: [],
+                ret: None,
+                body: Block {
+                    stmts: [
+                        Stmt {
+                            kind: Var(
+                                VarDecl {
+                                    vis: Hush,
+                                    targets: [
+                                        "a",
+                                    ],
+                                    ty: Some(
+                                        Type {
+                                            kind: Named(
+                                                "u8",
+                                                [],
+                                            ),
+                                            span: 109..111,
+                                        },
+                                    ),
+                                    values: [
+                                        Expr {
+                                            kind: Int(
+                                                12,
+                                            ),
+                                            span: 114..120,
+                                        },
+                                    ],
+                                    span: 99..120,
+                                },
+                            ),
+                            span: 99..120,
+                        },
+                        Stmt {
+                            kind: Var(
+                                VarDecl {
+                                    vis: Hush,
+                                    targets: [
+                                        "b",
+                                    ],
+                                    ty: Some(
+                                        Type {
+                                            kind: Named(
+                                                "u8",
+                                                [],
+                                            ),
+                                            span: 146..148,
+                                        },
+                                    ),
+                                    values: [
+                                        Expr {
+                                            kind: Int(
+                                                10,
+                                            ),
+                                            span: 151..157,
+                                        },
+                                    ],
+                                    span: 136..157,
+                                },
+                            ),
+                            span: 136..157,
+                        },
+                        Stmt {
+                            kind: Expr(
+                                Expr {
+                                    kind: Method {
+                                        receiver: Expr {
+                                            kind: Name {
+                                                name: "spill",
+                                                generics: [],
+                                            },
+                                            span: 173..178,
+                                        },
+                                        method: "it",
+                                        generics: [],
+                                        args: [
+                                            Arg {
+                                                label: None,
+                                                value: Expr {
+                                                    kind: Binary(
+                                                        BitAnd,
+                                                        Expr {
+                                                            kind: Name {
+                                                                name: "a",
+                                                                generics: [],
+                                                            },
+                                                            span: 182..183,
+                                                        },
+                                                        Expr {
+                                                            kind: Name {
+                                                                name: "b",
+                                                                generics: [],
+                                                            },
+                                                            span: 186..187,
+                                                        },
+                                                    ),
+                                                    span: 182..187,
+                                                },
+                                            },
+                                        ],
+                                    },
+                                    span: 173..188,
+                                },
+                            ),
+                            span: 173..188,
+                        },
+                        Stmt {
+                            kind: Expr(
+                                Expr {
+                                    kind: Method {
+                                        receiver: Expr {
+                                            kind: Name {
+                                                name: "spill",
+                                                generics: [],
+                                            },
+                                            span: 218..223,
+                                        },
+                                        method: "it",
+                                        generics: [],
+                                        args: [
+                                            Arg {
+                                                label: None,
+                                                value: Expr {
+                                                    kind: Binary(
+                                                        BitOr,
+                                                        Expr {
+                                                            kind: Name {
+                                                                name: "a",
+                                                                generics: [],
+                                                            },
+                                                            span: 227..228,
+                                                        },
+                                                        Expr {
+                                                            kind: Name {
+                                                                name: "b",
+                                                                generics: [],
+                                                            },
+                                                            span: 231..232,
+                                                        },
+                                                    ),
+                                                    span: 227..232,
+                                                },
+                                            },
+                                        ],
+                                    },
+                                    span: 218..233,
+                                },
+                            ),
+                            span: 218..233,
+                        },
+                        Stmt {
+                            kind: Expr(
+                                Expr {
+                                    kind: Method {
+                                        receiver: Expr {
+                                            kind: Name {
+                                                name: "spill",
+                                                generics: [],
+                                            },
+                                            span: 264..269,
+                                        },
+                                        method: "it",
+                                        generics: [],
+                                        args: [
+                                            Arg {
+                                                label: None,
+                                                value: Expr {
+                                                    kind: Binary(
+                                                        BitXor,
+                                                        Expr {
+                                                            kind: Name {
+                                                                name: "a",
+                                                                generics: [],
+                                                            },
+                                                            span: 273..274,
+                                                        },
+                                                        Expr {
+                                                            kind: Name {
+                                                                name: "b",
+                                                                generics: [],
+                                                            },
+                                                            span: 277..278,
+                                                        },
+                                                    ),
+                                                    span: 273..278,
+                                                },
+                                            },
+                                        ],
+                                    },
+                                    span: 264..279,
+                                },
+                            ),
+                            span: 264..279,
+                        },
+                        Stmt {
+                            kind: Expr(
+                                Expr {
+                                    kind: Method {
+                                        receiver: Expr {
+                                            kind: Name {
+                                                name: "spill",
+                                                generics: [],
+                                            },
+                                            span: 309..314,
+                                        },
+                                        method: "it",
+                                        generics: [],
+                                        args: [
+                                            Arg {
+                                                label: None,
+                                                value: Expr {
+                                                    kind: Binary(
+                                                        Shl,
+                                                        Expr {
+                                                            kind: Name {
+                                                                name: "a",
+                                                                generics: [],
+                                                            },
+                                                            span: 318..319,
+                                                        },
+                                                        Expr {
+                                                            kind: Int(
+                                                                1,
+                                                            ),
+                                                            span: 323..324,
+                                                        },
+                                                    ),
+                                                    span: 318..324,
+                                                },
+                                            },
+                                        ],
+                                    },
+                                    span: 309..325,
+                                },
+                            ),
+                            span: 309..325,
+                        },
+                        Stmt {
+                            kind: Expr(
+                                Expr {
+                                    kind: Method {
+                                        receiver: Expr {
+                                            kind: Name {
+                                                name: "spill",
+                                                generics: [],
+                                            },
+                                            span: 356..361,
+                                        },
+                                        method: "it",
+                                        generics: [],
+                                        args: [
+                                            Arg {
+                                                label: None,
+                                                value: Expr {
+                                                    kind: Binary(
+                                                        Shr,
+                                                        Expr {
+                                                            kind: Name {
+                                                                name: "a",
+                                                                generics: [],
+                                                            },
+                                                            span: 365..366,
+                                                        },
+                                                        Expr {
+                                                            kind: Int(
+                                                                2,
+                                                            ),
+                                                            span: 370..371,
+                                                        },
+                                                    ),
+                                                    span: 365..371,
+                                                },
+                                            },
+                                        ],
+                                    },
+                                    span: 356..372,
+                                },
+                            ),
+                            span: 356..372,
+                        },
+                        Stmt {
+                            kind: Expr(
+                                Expr {
+                                    kind: Method {
+                                        receiver: Expr {
+                                            kind: Name {
+                                                name: "spill",
+                                                generics: [],
+                                            },
+                                            span: 401..406,
+                                        },
+                                        method: "it",
+                                        generics: [],
+                                        args: [
+                                            Arg {
+                                                label: None,
+                                                value: Expr {
+                                                    kind: Binary(
+                                                        BitAnd,
+                                                        Expr {
+                                                            kind: Unary(
+                                                                BitNot,
+                                                                Expr {
+                                                                    kind: Name {
+                                                                        name: "a",
+                                                                        generics: [],
+                                                                    },
+                                                                    span: 412..413,
+                                                                },
+                                                            ),
+                                                            span: 410..414,
+                                                        },
+                                                        Expr {
+                                                            kind: Int(
+                                                                15,
+                                                            ),
+                                                            span: 417..420,
+                                                        },
+                                                    ),
+                                                    span: 410..420,
+                                                },
+                                            },
+                                        ],
+                                    },
+                                    span: 401..421,
+                                },
+                            ),
+                            span: 401..421,
+                        },
+                    ],
+                    span: 93..478,
+                },
+                span: 80..478,
+            },
+        ),
+    ],
+}

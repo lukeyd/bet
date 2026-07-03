@@ -2,9 +2,12 @@
 
 `bet` is a compiled, statically-typed language with slang-keyword vocabulary and an
 arena/`tag`/`holla` memory model, implemented in Rust over an LLVM backend. Design
-docs: `language-spec.md`, `bootstrap-plan.md`, `plan-amendment-01.md`. This repo is
-currently at **Step 0** (workspace skeleton — every crate compiles empty; real code
-lands in Step 1+).
+docs: `language-spec.md`, `bootstrap-plan.md`, `plan-amendment-01.md`. Steps 0–2 are
+complete (skeleton, the three contract artifacts, and the `spill.it("hi")` tracer
+bullet running end-to-end). The repo is now at **Step 3 — the parallel fan-out**:
+frontend, backend, runtime, and interp build out concurrently, coordinating only
+through the `midir`/`rt-abi` contract crates and the golden corpus. See
+`timelog/tasks.toml` for live per-workstream status.
 
 ## Time tracking (MANDATORY)
 

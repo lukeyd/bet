@@ -1,0 +1,93 @@
+---
+source: crates/frontend/tests/parse_corpus.rs
+expression: program
+---
+Program {
+    items: [
+        Pull(
+            Pull {
+                module: "spill",
+                span: 181..193,
+            },
+        ),
+        Func(
+            FnDecl {
+                vis: Hush,
+                receiver: None,
+                name: "worker",
+                generics: [],
+                params: [],
+                ret: None,
+                body: Block {
+                    stmts: [],
+                    span: 210..213,
+                },
+                span: 195..213,
+            },
+        ),
+        Func(
+            FnDecl {
+                vis: Hush,
+                receiver: None,
+                name: "main",
+                generics: [],
+                params: [],
+                ret: None,
+                body: Block {
+                    stmts: [
+                        Stmt {
+                            kind: Slide(
+                                Expr {
+                                    kind: Call {
+                                        callee: Expr {
+                                            kind: Name {
+                                                name: "worker",
+                                                generics: [],
+                                            },
+                                            span: 240..246,
+                                        },
+                                        args: [],
+                                    },
+                                    span: 240..248,
+                                },
+                            ),
+                            span: 234..248,
+                        },
+                        Stmt {
+                            kind: Expr(
+                                Expr {
+                                    kind: Method {
+                                        receiver: Expr {
+                                            kind: Name {
+                                                name: "spill",
+                                                generics: [],
+                                            },
+                                            span: 253..258,
+                                        },
+                                        method: "it",
+                                        generics: [],
+                                        args: [
+                                            Arg {
+                                                label: None,
+                                                value: Expr {
+                                                    kind: Str(
+                                                        "main",
+                                                    ),
+                                                    span: 262..268,
+                                                },
+                                            },
+                                        ],
+                                    },
+                                    span: 253..269,
+                                },
+                            ),
+                            span: 253..269,
+                        },
+                    ],
+                    span: 228..271,
+                },
+                span: 215..271,
+            },
+        ),
+    ],
+}

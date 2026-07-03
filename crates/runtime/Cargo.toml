@@ -6,6 +6,14 @@ version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+# Built both as a Rust `rlib` (so the driver can depend on it normally and read its link
+# name) and as a `staticlib` (so `cargo build` emits `libruntime.a`, the drop-in replacement
+# for `librt_stub.a` that the driver links compiled programs against). Mirrors `rt-stub`'s
+# crate-type setup so swapping stub -> real runtime is a pure link-line change — the ABI
+# signatures are identical.
+[lib]
+crate-type = ["staticlib", "rlib"]
+
 [dependencies]
 rt-abi = { path = "../rt-abi" }
 

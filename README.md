@@ -6,8 +6,11 @@ game-development-first memory model (arena "cribs" + generational `tag`/`holla` 
 no tracing GC in the hot path). Compiles to native machine code via LLVM, with the runtime
 statically linked into every binary. Implemented in Rust.
 
-> **Status: Step 0 — workspace skeleton.** Every crate compiles empty; CI, conventions,
-> and the dependency-graph guard are in place. Real code lands in Step 1+. Design docs:
+> **Status: Step 3 — the parallel fan-out.** Steps 0–2 are done: the workspace skeleton
+> + CI, the three contract artifacts (`midir`, `rt-abi`/`rt-stub`, frozen grammar + golden
+> corpus), and the `spill.it("hi")` tracer bullet running end-to-end. Now the frontend,
+> backend, runtime, and interpreter build out concurrently, coordinating only through the
+> `midir`/`rt-abi` contracts and the corpus. Design docs:
 > [`language-spec.md`](language-spec.md), [`bootstrap-plan.md`](bootstrap-plan.md),
 > [`plan-amendment-01.md`](plan-amendment-01.md).
 

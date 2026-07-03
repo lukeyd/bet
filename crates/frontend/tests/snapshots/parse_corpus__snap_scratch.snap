@@ -1,0 +1,196 @@
+---
+source: crates/frontend/tests/parse_corpus.rs
+expression: program
+---
+Program {
+    items: [
+        Pull(
+            Pull {
+                module: "spill",
+                span: 148..160,
+            },
+        ),
+        Pull(
+            Pull {
+                module: "mem",
+                span: 161..171,
+            },
+        ),
+        Drip(
+            DripDecl {
+                vis: Hush,
+                name: "Vec2",
+                generics: [],
+                fields: [
+                    FieldDecl {
+                        vis: Some(
+                            Flex,
+                        ),
+                        name: "x",
+                        ty: Type {
+                            kind: Named(
+                                "int",
+                                [],
+                            ),
+                            span: 197..200,
+                        },
+                        span: 189..200,
+                    },
+                    FieldDecl {
+                        vis: Some(
+                            Flex,
+                        ),
+                        name: "y",
+                        ty: Type {
+                            kind: Named(
+                                "int",
+                                [],
+                            ),
+                            span: 213..216,
+                        },
+                        span: 205..216,
+                    },
+                ],
+                span: 173..218,
+            },
+        ),
+        Func(
+            FnDecl {
+                vis: Hush,
+                receiver: None,
+                name: "main",
+                generics: [],
+                params: [],
+                ret: None,
+                body: Block {
+                    stmts: [
+                        Stmt {
+                            kind: Var(
+                                VarDecl {
+                                    vis: Hush,
+                                    targets: [
+                                        "p",
+                                    ],
+                                    ty: None,
+                                    values: [
+                                        Expr {
+                                            kind: Cop {
+                                                init: Struct(
+                                                    StructLit {
+                                                        name: "Vec2",
+                                                        generics: [],
+                                                        fields: [
+                                                            FieldInit {
+                                                                name: "x",
+                                                                value: Expr {
+                                                                    kind: Int(
+                                                                        5,
+                                                                    ),
+                                                                    span: 263..264,
+                                                                },
+                                                                span: 260..264,
+                                                            },
+                                                            FieldInit {
+                                                                name: "y",
+                                                                value: Expr {
+                                                                    kind: Int(
+                                                                        9,
+                                                                    ),
+                                                                    span: 269..270,
+                                                                },
+                                                                span: 266..270,
+                                                            },
+                                                        ],
+                                                        span: 254..272,
+                                                    },
+                                                ),
+                                                crib: Expr {
+                                                    kind: Method {
+                                                        receiver: Expr {
+                                                            kind: Name {
+                                                                name: "mem",
+                                                                generics: [],
+                                                            },
+                                                            span: 276..279,
+                                                        },
+                                                        method: "scratch",
+                                                        generics: [],
+                                                        args: [],
+                                                    },
+                                                    span: 276..289,
+                                                },
+                                            },
+                                            span: 250..289,
+                                        },
+                                    ],
+                                    span: 239..289,
+                                },
+                            ),
+                            span: 239..289,
+                        },
+                        Stmt {
+                            kind: Expr(
+                                Expr {
+                                    kind: Method {
+                                        receiver: Expr {
+                                            kind: Name {
+                                                name: "spill",
+                                                generics: [],
+                                            },
+                                            span: 294..299,
+                                        },
+                                        method: "it",
+                                        generics: [],
+                                        args: [
+                                            Arg {
+                                                label: None,
+                                                value: Expr {
+                                                    kind: Binary(
+                                                        Add,
+                                                        Expr {
+                                                            kind: Field {
+                                                                base: Expr {
+                                                                    kind: Name {
+                                                                        name: "p",
+                                                                        generics: [],
+                                                                    },
+                                                                    span: 303..304,
+                                                                },
+                                                                name: "x",
+                                                                generics: [],
+                                                            },
+                                                            span: 303..306,
+                                                        },
+                                                        Expr {
+                                                            kind: Field {
+                                                                base: Expr {
+                                                                    kind: Name {
+                                                                        name: "p",
+                                                                        generics: [],
+                                                                    },
+                                                                    span: 309..310,
+                                                                },
+                                                                name: "y",
+                                                                generics: [],
+                                                            },
+                                                            span: 309..312,
+                                                        },
+                                                    ),
+                                                    span: 303..312,
+                                                },
+                                            },
+                                        ],
+                                    },
+                                    span: 294..313,
+                                },
+                            ),
+                            span: 294..313,
+                        },
+                    ],
+                    span: 233..324,
+                },
+                span: 220..324,
+            },
+        ),
+    ],
+}

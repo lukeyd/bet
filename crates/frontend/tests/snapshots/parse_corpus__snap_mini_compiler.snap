@@ -1,0 +1,1295 @@
+---
+source: crates/frontend/tests/parse_corpus.rs
+expression: program
+---
+Program {
+    items: [
+        Pull(
+            Pull {
+                module: "spill",
+                span: 238..250,
+            },
+        ),
+        Pull(
+            Pull {
+                module: "stash",
+                span: 251..263,
+            },
+        ),
+        Moods(
+            MoodsDecl {
+                vis: Hush,
+                name: "Expr",
+                generics: [],
+                variants: [
+                    Variant {
+                        name: "Lit",
+                        payload: [
+                            Type {
+                                kind: Named(
+                                    "int",
+                                    [],
+                                ),
+                                span: 286..289,
+                            },
+                        ],
+                        span: 282..290,
+                    },
+                    Variant {
+                        name: "Var",
+                        payload: [
+                            Type {
+                                kind: Named(
+                                    "str",
+                                    [],
+                                ),
+                                span: 300..303,
+                            },
+                        ],
+                        span: 296..304,
+                    },
+                    Variant {
+                        name: "Add",
+                        payload: [
+                            Type {
+                                kind: Tag(
+                                    Type {
+                                        kind: Named(
+                                            "Expr",
+                                            [],
+                                        ),
+                                        span: 318..322,
+                                    },
+                                ),
+                                span: 314..322,
+                            },
+                            Type {
+                                kind: Tag(
+                                    Type {
+                                        kind: Named(
+                                            "Expr",
+                                            [],
+                                        ),
+                                        span: 328..332,
+                                    },
+                                ),
+                                span: 324..332,
+                            },
+                        ],
+                        span: 310..333,
+                    },
+                    Variant {
+                        name: "Mul",
+                        payload: [
+                            Type {
+                                kind: Tag(
+                                    Type {
+                                        kind: Named(
+                                            "Expr",
+                                            [],
+                                        ),
+                                        span: 347..351,
+                                    },
+                                ),
+                                span: 343..351,
+                            },
+                            Type {
+                                kind: Tag(
+                                    Type {
+                                        kind: Named(
+                                            "Expr",
+                                            [],
+                                        ),
+                                        span: 357..361,
+                                    },
+                                ),
+                                span: 353..361,
+                            },
+                        ],
+                        span: 339..362,
+                    },
+                ],
+                span: 265..364,
+            },
+        ),
+        Crib(
+            CribDecl {
+                vis: Hush,
+                name: "ast",
+                ty: Some(
+                    Type {
+                        kind: Array(
+                            Type {
+                                kind: Named(
+                                    "Expr",
+                                    [],
+                                ),
+                                span: 376..380,
+                            },
+                            64,
+                        ),
+                        span: 376..384,
+                    },
+                ),
+                span: 366..384,
+            },
+        ),
+        Func(
+            FnDecl {
+                vis: Hush,
+                receiver: None,
+                name: "eval",
+                generics: [],
+                params: [
+                    Param {
+                        name: "e",
+                        ty: Type {
+                            kind: Tag(
+                                Type {
+                                    kind: Named(
+                                        "Expr",
+                                        [],
+                                    ),
+                                    span: 404..408,
+                                },
+                            ),
+                            span: 400..408,
+                        },
+                        span: 397..408,
+                    },
+                    Param {
+                        name: "env",
+                        ty: Type {
+                            kind: Named(
+                                "stash",
+                                [
+                                    Type {
+                                        kind: Named(
+                                            "str",
+                                            [],
+                                        ),
+                                        span: 421..424,
+                                    },
+                                    Type {
+                                        kind: Named(
+                                            "int",
+                                            [],
+                                        ),
+                                        span: 426..429,
+                                    },
+                                ],
+                            ),
+                            span: 415..430,
+                        },
+                        span: 410..430,
+                    },
+                ],
+                ret: Multi(
+                    [
+                        Type {
+                            kind: Named(
+                                "int",
+                                [],
+                            ),
+                            span: 436..439,
+                        },
+                        Type {
+                            kind: Named(
+                                "yikes",
+                                [],
+                            ),
+                            span: 441..446,
+                        },
+                    ],
+                ),
+                body: Block {
+                    stmts: [
+                        Stmt {
+                            kind: Holla {
+                                binding: "node",
+                                tag: Expr {
+                                    kind: Name {
+                                        name: "e",
+                                        generics: [],
+                                    },
+                                    span: 467..468,
+                                },
+                                crib: Expr {
+                                    kind: Name {
+                                        name: "ast",
+                                        generics: [],
+                                    },
+                                    span: 472..475,
+                                },
+                                live: Block {
+                                    stmts: [
+                                        Stmt {
+                                            kind: Vibe {
+                                                scrutinee: Expr {
+                                                    kind: Name {
+                                                        name: "node",
+                                                        generics: [],
+                                                    },
+                                                    span: 491..495,
+                                                },
+                                                arms: [
+                                                    MatchArm {
+                                                        variant: "Lit",
+                                                        bindings: [
+                                                            "n",
+                                                        ],
+                                                        body: Block {
+                                                            stmts: [
+                                                                Stmt {
+                                                                    kind: Bet(
+                                                                        [
+                                                                            Expr {
+                                                                                kind: Name {
+                                                                                    name: "n",
+                                                                                    generics: [],
+                                                                                },
+                                                                                span: 539..540,
+                                                                            },
+                                                                            Expr {
+                                                                                kind: Ghosted,
+                                                                                span: 542..549,
+                                                                            },
+                                                                        ],
+                                                                    ),
+                                                                    span: 535..549,
+                                                                },
+                                                            ],
+                                                            span: 517..563,
+                                                        },
+                                                        span: 510..563,
+                                                    },
+                                                    MatchArm {
+                                                        variant: "Var",
+                                                        bindings: [
+                                                            "name",
+                                                        ],
+                                                        body: Block {
+                                                            stmts: [
+                                                                Stmt {
+                                                                    kind: Var(
+                                                                        VarDecl {
+                                                                            vis: Hush,
+                                                                            targets: [
+                                                                                "v",
+                                                                                "found",
+                                                                            ],
+                                                                            ty: None,
+                                                                            values: [
+                                                                                Expr {
+                                                                                    kind: Method {
+                                                                                        receiver: Expr {
+                                                                                            kind: Name {
+                                                                                                name: "env",
+                                                                                                generics: [],
+                                                                                            },
+                                                                                            span: 622..625,
+                                                                                        },
+                                                                                        method: "peep",
+                                                                                        generics: [],
+                                                                                        args: [
+                                                                                            Arg {
+                                                                                                label: None,
+                                                                                                value: Expr {
+                                                                                                    kind: Name {
+                                                                                                        name: "name",
+                                                                                                        generics: [],
+                                                                                                    },
+                                                                                                    span: 631..635,
+                                                                                                },
+                                                                                            },
+                                                                                        ],
+                                                                                    },
+                                                                                    span: 622..636,
+                                                                                },
+                                                                            ],
+                                                                            span: 604..636,
+                                                                        },
+                                                                    ),
+                                                                    span: 604..636,
+                                                                },
+                                                                Stmt {
+                                                                    kind: Fr(
+                                                                        FrStmt {
+                                                                            cond: Expr {
+                                                                                kind: Unary(
+                                                                                    Not,
+                                                                                    Expr {
+                                                                                        kind: Name {
+                                                                                            name: "found",
+                                                                                            generics: [],
+                                                                                        },
+                                                                                        span: 657..662,
+                                                                                    },
+                                                                                ),
+                                                                                span: 656..662,
+                                                                            },
+                                                                            then: Block {
+                                                                                stmts: [
+                                                                                    Stmt {
+                                                                                        kind: Bet(
+                                                                                            [
+                                                                                                Expr {
+                                                                                                    kind: Int(
+                                                                                                        0,
+                                                                                                    ),
+                                                                                                    span: 689..690,
+                                                                                                },
+                                                                                                Expr {
+                                                                                                    kind: Method {
+                                                                                                        receiver: Expr {
+                                                                                                            kind: Method {
+                                                                                                                receiver: Expr {
+                                                                                                                    kind: Name {
+                                                                                                                        name: "yikes",
+                                                                                                                        generics: [],
+                                                                                                                    },
+                                                                                                                    span: 692..697,
+                                                                                                                },
+                                                                                                                method: "new",
+                                                                                                                generics: [],
+                                                                                                                args: [
+                                                                                                                    Arg {
+                                                                                                                        label: None,
+                                                                                                                        value: Expr {
+                                                                                                                            kind: Str(
+                                                                                                                                "undefined variable",
+                                                                                                                            ),
+                                                                                                                            span: 702..722,
+                                                                                                                        },
+                                                                                                                    },
+                                                                                                                ],
+                                                                                                            },
+                                                                                                            span: 692..723,
+                                                                                                        },
+                                                                                                        method: "tea",
+                                                                                                        generics: [],
+                                                                                                        args: [
+                                                                                                            Arg {
+                                                                                                                label: None,
+                                                                                                                value: Expr {
+                                                                                                                    kind: Name {
+                                                                                                                        name: "name",
+                                                                                                                        generics: [],
+                                                                                                                    },
+                                                                                                                    span: 728..732,
+                                                                                                                },
+                                                                                                            },
+                                                                                                        ],
+                                                                                                    },
+                                                                                                    span: 692..733,
+                                                                                                },
+                                                                                            ],
+                                                                                        ),
+                                                                                        span: 685..733,
+                                                                                    },
+                                                                                ],
+                                                                                span: 663..751,
+                                                                            },
+                                                                            elifs: [],
+                                                                            els: None,
+                                                                        },
+                                                                    ),
+                                                                    span: 653..751,
+                                                                },
+                                                                Stmt {
+                                                                    kind: Bet(
+                                                                        [
+                                                                            Expr {
+                                                                                kind: Name {
+                                                                                    name: "v",
+                                                                                    generics: [],
+                                                                                },
+                                                                                span: 772..773,
+                                                                            },
+                                                                            Expr {
+                                                                                kind: Ghosted,
+                                                                                span: 775..782,
+                                                                            },
+                                                                        ],
+                                                                    ),
+                                                                    span: 768..782,
+                                                                },
+                                                            ],
+                                                            span: 586..796,
+                                                        },
+                                                        span: 576..796,
+                                                    },
+                                                    MatchArm {
+                                                        variant: "Add",
+                                                        bindings: [
+                                                            "l",
+                                                            "r",
+                                                        ],
+                                                        body: Block {
+                                                            stmts: [
+                                                                Stmt {
+                                                                    kind: Var(
+                                                                        VarDecl {
+                                                                            vis: Hush,
+                                                                            targets: [
+                                                                                "a",
+                                                                                "y",
+                                                                            ],
+                                                                            ty: None,
+                                                                            values: [
+                                                                                Expr {
+                                                                                    kind: Call {
+                                                                                        callee: Expr {
+                                                                                            kind: Name {
+                                                                                                name: "eval",
+                                                                                                generics: [],
+                                                                                            },
+                                                                                            span: 851..855,
+                                                                                        },
+                                                                                        args: [
+                                                                                            Arg {
+                                                                                                label: None,
+                                                                                                value: Expr {
+                                                                                                    kind: Name {
+                                                                                                        name: "l",
+                                                                                                        generics: [],
+                                                                                                    },
+                                                                                                    span: 856..857,
+                                                                                                },
+                                                                                            },
+                                                                                            Arg {
+                                                                                                label: None,
+                                                                                                value: Expr {
+                                                                                                    kind: Name {
+                                                                                                        name: "env",
+                                                                                                        generics: [],
+                                                                                                    },
+                                                                                                    span: 859..862,
+                                                                                                },
+                                                                                            },
+                                                                                        ],
+                                                                                    },
+                                                                                    span: 851..863,
+                                                                                },
+                                                                            ],
+                                                                            span: 837..863,
+                                                                        },
+                                                                    ),
+                                                                    span: 837..863,
+                                                                },
+                                                                Stmt {
+                                                                    kind: Bounce(
+                                                                        Expr {
+                                                                            kind: Name {
+                                                                                name: "y",
+                                                                                generics: [],
+                                                                            },
+                                                                            span: 887..888,
+                                                                        },
+                                                                    ),
+                                                                    span: 880..888,
+                                                                },
+                                                                Stmt {
+                                                                    kind: Var(
+                                                                        VarDecl {
+                                                                            vis: Hush,
+                                                                            targets: [
+                                                                                "b",
+                                                                                "y2",
+                                                                            ],
+                                                                            ty: None,
+                                                                            values: [
+                                                                                Expr {
+                                                                                    kind: Call {
+                                                                                        callee: Expr {
+                                                                                            kind: Name {
+                                                                                                name: "eval",
+                                                                                                generics: [],
+                                                                                            },
+                                                                                            span: 920..924,
+                                                                                        },
+                                                                                        args: [
+                                                                                            Arg {
+                                                                                                label: None,
+                                                                                                value: Expr {
+                                                                                                    kind: Name {
+                                                                                                        name: "r",
+                                                                                                        generics: [],
+                                                                                                    },
+                                                                                                    span: 925..926,
+                                                                                                },
+                                                                                            },
+                                                                                            Arg {
+                                                                                                label: None,
+                                                                                                value: Expr {
+                                                                                                    kind: Name {
+                                                                                                        name: "env",
+                                                                                                        generics: [],
+                                                                                                    },
+                                                                                                    span: 928..931,
+                                                                                                },
+                                                                                            },
+                                                                                        ],
+                                                                                    },
+                                                                                    span: 920..932,
+                                                                                },
+                                                                            ],
+                                                                            span: 905..932,
+                                                                        },
+                                                                    ),
+                                                                    span: 905..932,
+                                                                },
+                                                                Stmt {
+                                                                    kind: Bounce(
+                                                                        Expr {
+                                                                            kind: Name {
+                                                                                name: "y2",
+                                                                                generics: [],
+                                                                            },
+                                                                            span: 956..958,
+                                                                        },
+                                                                    ),
+                                                                    span: 949..958,
+                                                                },
+                                                                Stmt {
+                                                                    kind: Bet(
+                                                                        [
+                                                                            Expr {
+                                                                                kind: Binary(
+                                                                                    Add,
+                                                                                    Expr {
+                                                                                        kind: Name {
+                                                                                            name: "a",
+                                                                                            generics: [],
+                                                                                        },
+                                                                                        span: 979..980,
+                                                                                    },
+                                                                                    Expr {
+                                                                                        kind: Name {
+                                                                                            name: "b",
+                                                                                            generics: [],
+                                                                                        },
+                                                                                        span: 983..984,
+                                                                                    },
+                                                                                ),
+                                                                                span: 979..984,
+                                                                            },
+                                                                            Expr {
+                                                                                kind: Ghosted,
+                                                                                span: 986..993,
+                                                                            },
+                                                                        ],
+                                                                    ),
+                                                                    span: 975..993,
+                                                                },
+                                                            ],
+                                                            span: 819..1007,
+                                                        },
+                                                        span: 809..1007,
+                                                    },
+                                                    MatchArm {
+                                                        variant: "Mul",
+                                                        bindings: [
+                                                            "l",
+                                                            "r",
+                                                        ],
+                                                        body: Block {
+                                                            stmts: [
+                                                                Stmt {
+                                                                    kind: Var(
+                                                                        VarDecl {
+                                                                            vis: Hush,
+                                                                            targets: [
+                                                                                "a",
+                                                                                "y",
+                                                                            ],
+                                                                            ty: None,
+                                                                            values: [
+                                                                                Expr {
+                                                                                    kind: Call {
+                                                                                        callee: Expr {
+                                                                                            kind: Name {
+                                                                                                name: "eval",
+                                                                                                generics: [],
+                                                                                            },
+                                                                                            span: 1062..1066,
+                                                                                        },
+                                                                                        args: [
+                                                                                            Arg {
+                                                                                                label: None,
+                                                                                                value: Expr {
+                                                                                                    kind: Name {
+                                                                                                        name: "l",
+                                                                                                        generics: [],
+                                                                                                    },
+                                                                                                    span: 1067..1068,
+                                                                                                },
+                                                                                            },
+                                                                                            Arg {
+                                                                                                label: None,
+                                                                                                value: Expr {
+                                                                                                    kind: Name {
+                                                                                                        name: "env",
+                                                                                                        generics: [],
+                                                                                                    },
+                                                                                                    span: 1070..1073,
+                                                                                                },
+                                                                                            },
+                                                                                        ],
+                                                                                    },
+                                                                                    span: 1062..1074,
+                                                                                },
+                                                                            ],
+                                                                            span: 1048..1074,
+                                                                        },
+                                                                    ),
+                                                                    span: 1048..1074,
+                                                                },
+                                                                Stmt {
+                                                                    kind: Bounce(
+                                                                        Expr {
+                                                                            kind: Name {
+                                                                                name: "y",
+                                                                                generics: [],
+                                                                            },
+                                                                            span: 1098..1099,
+                                                                        },
+                                                                    ),
+                                                                    span: 1091..1099,
+                                                                },
+                                                                Stmt {
+                                                                    kind: Var(
+                                                                        VarDecl {
+                                                                            vis: Hush,
+                                                                            targets: [
+                                                                                "b",
+                                                                                "y2",
+                                                                            ],
+                                                                            ty: None,
+                                                                            values: [
+                                                                                Expr {
+                                                                                    kind: Call {
+                                                                                        callee: Expr {
+                                                                                            kind: Name {
+                                                                                                name: "eval",
+                                                                                                generics: [],
+                                                                                            },
+                                                                                            span: 1131..1135,
+                                                                                        },
+                                                                                        args: [
+                                                                                            Arg {
+                                                                                                label: None,
+                                                                                                value: Expr {
+                                                                                                    kind: Name {
+                                                                                                        name: "r",
+                                                                                                        generics: [],
+                                                                                                    },
+                                                                                                    span: 1136..1137,
+                                                                                                },
+                                                                                            },
+                                                                                            Arg {
+                                                                                                label: None,
+                                                                                                value: Expr {
+                                                                                                    kind: Name {
+                                                                                                        name: "env",
+                                                                                                        generics: [],
+                                                                                                    },
+                                                                                                    span: 1139..1142,
+                                                                                                },
+                                                                                            },
+                                                                                        ],
+                                                                                    },
+                                                                                    span: 1131..1143,
+                                                                                },
+                                                                            ],
+                                                                            span: 1116..1143,
+                                                                        },
+                                                                    ),
+                                                                    span: 1116..1143,
+                                                                },
+                                                                Stmt {
+                                                                    kind: Bounce(
+                                                                        Expr {
+                                                                            kind: Name {
+                                                                                name: "y2",
+                                                                                generics: [],
+                                                                            },
+                                                                            span: 1167..1169,
+                                                                        },
+                                                                    ),
+                                                                    span: 1160..1169,
+                                                                },
+                                                                Stmt {
+                                                                    kind: Bet(
+                                                                        [
+                                                                            Expr {
+                                                                                kind: Binary(
+                                                                                    Mul,
+                                                                                    Expr {
+                                                                                        kind: Name {
+                                                                                            name: "a",
+                                                                                            generics: [],
+                                                                                        },
+                                                                                        span: 1190..1191,
+                                                                                    },
+                                                                                    Expr {
+                                                                                        kind: Name {
+                                                                                            name: "b",
+                                                                                            generics: [],
+                                                                                        },
+                                                                                        span: 1194..1195,
+                                                                                    },
+                                                                                ),
+                                                                                span: 1190..1195,
+                                                                            },
+                                                                            Expr {
+                                                                                kind: Ghosted,
+                                                                                span: 1197..1204,
+                                                                            },
+                                                                        ],
+                                                                    ),
+                                                                    span: 1186..1204,
+                                                                },
+                                                            ],
+                                                            span: 1030..1218,
+                                                        },
+                                                        span: 1020..1218,
+                                                    },
+                                                ],
+                                                default: None,
+                                            },
+                                            span: 486..1228,
+                                        },
+                                    ],
+                                    span: 476..1234,
+                                },
+                                ghosted: Block {
+                                    stmts: [
+                                        Stmt {
+                                            kind: Bet(
+                                                [
+                                                    Expr {
+                                                        kind: Int(
+                                                            0,
+                                                        ),
+                                                        span: 1257..1258,
+                                                    },
+                                                    Expr {
+                                                        kind: Method {
+                                                            receiver: Expr {
+                                                                kind: Name {
+                                                                    name: "yikes",
+                                                                    generics: [],
+                                                                },
+                                                                span: 1260..1265,
+                                                            },
+                                                            method: "new",
+                                                            generics: [],
+                                                            args: [
+                                                                Arg {
+                                                                    label: None,
+                                                                    value: Expr {
+                                                                        kind: Str(
+                                                                            "dangling AST node",
+                                                                        ),
+                                                                        span: 1270..1289,
+                                                                    },
+                                                                },
+                                                            ],
+                                                        },
+                                                        span: 1260..1290,
+                                                    },
+                                                ],
+                                            ),
+                                            span: 1253..1290,
+                                        },
+                                    ],
+                                    span: 1243..1296,
+                                },
+                            },
+                            span: 454..1296,
+                        },
+                    ],
+                    span: 448..1298,
+                },
+                span: 386..1298,
+            },
+        ),
+        Func(
+            FnDecl {
+                vis: Hush,
+                receiver: None,
+                name: "main",
+                generics: [],
+                params: [],
+                ret: None,
+                body: Block {
+                    stmts: [
+                        Stmt {
+                            kind: Var(
+                                VarDecl {
+                                    vis: Hush,
+                                    targets: [
+                                        "env",
+                                    ],
+                                    ty: None,
+                                    values: [
+                                        Expr {
+                                            kind: Method {
+                                                receiver: Expr {
+                                                    kind: Name {
+                                                        name: "stash",
+                                                        generics: [],
+                                                    },
+                                                    span: 1332..1337,
+                                                },
+                                                method: "new",
+                                                generics: [
+                                                    Type {
+                                                        kind: Named(
+                                                            "str",
+                                                            [],
+                                                        ),
+                                                        span: 1342..1345,
+                                                    },
+                                                    Type {
+                                                        kind: Named(
+                                                            "int",
+                                                            [],
+                                                        ),
+                                                        span: 1347..1350,
+                                                    },
+                                                ],
+                                                args: [],
+                                            },
+                                            span: 1332..1353,
+                                        },
+                                    ],
+                                    span: 1319..1353,
+                                },
+                            ),
+                            span: 1319..1353,
+                        },
+                        Stmt {
+                            kind: Expr(
+                                Expr {
+                                    kind: Method {
+                                        receiver: Expr {
+                                            kind: Name {
+                                                name: "env",
+                                                generics: [],
+                                            },
+                                            span: 1358..1361,
+                                        },
+                                        method: "put",
+                                        generics: [],
+                                        args: [
+                                            Arg {
+                                                label: None,
+                                                value: Expr {
+                                                    kind: Str(
+                                                        "x",
+                                                    ),
+                                                    span: 1366..1369,
+                                                },
+                                            },
+                                            Arg {
+                                                label: None,
+                                                value: Expr {
+                                                    kind: Int(
+                                                        5,
+                                                    ),
+                                                    span: 1371..1372,
+                                                },
+                                            },
+                                        ],
+                                    },
+                                    span: 1358..1373,
+                                },
+                            ),
+                            span: 1358..1373,
+                        },
+                        Stmt {
+                            kind: Var(
+                                VarDecl {
+                                    vis: Hush,
+                                    targets: [
+                                        "x",
+                                    ],
+                                    ty: None,
+                                    values: [
+                                        Expr {
+                                            kind: Cop {
+                                                init: Variant {
+                                                    name: "Var",
+                                                    args: [
+                                                        Arg {
+                                                            label: None,
+                                                            value: Expr {
+                                                                kind: Str(
+                                                                    "x",
+                                                                ),
+                                                                span: 1466..1469,
+                                                            },
+                                                        },
+                                                    ],
+                                                },
+                                                crib: Expr {
+                                                    kind: Name {
+                                                        name: "ast",
+                                                        generics: [],
+                                                    },
+                                                    span: 1474..1477,
+                                                },
+                                            },
+                                            span: 1458..1477,
+                                        },
+                                    ],
+                                    span: 1443..1477,
+                                },
+                            ),
+                            span: 1443..1477,
+                        },
+                        Stmt {
+                            kind: Var(
+                                VarDecl {
+                                    vis: Hush,
+                                    targets: [
+                                        "two",
+                                    ],
+                                    ty: None,
+                                    values: [
+                                        Expr {
+                                            kind: Cop {
+                                                init: Variant {
+                                                    name: "Lit",
+                                                    args: [
+                                                        Arg {
+                                                            label: None,
+                                                            value: Expr {
+                                                                kind: Int(
+                                                                    2,
+                                                                ),
+                                                                span: 1505..1506,
+                                                            },
+                                                        },
+                                                    ],
+                                                },
+                                                crib: Expr {
+                                                    kind: Name {
+                                                        name: "ast",
+                                                        generics: [],
+                                                    },
+                                                    span: 1511..1514,
+                                                },
+                                            },
+                                            span: 1497..1514,
+                                        },
+                                    ],
+                                    span: 1482..1514,
+                                },
+                            ),
+                            span: 1482..1514,
+                        },
+                        Stmt {
+                            kind: Var(
+                                VarDecl {
+                                    vis: Hush,
+                                    targets: [
+                                        "three",
+                                    ],
+                                    ty: None,
+                                    values: [
+                                        Expr {
+                                            kind: Cop {
+                                                init: Variant {
+                                                    name: "Lit",
+                                                    args: [
+                                                        Arg {
+                                                            label: None,
+                                                            value: Expr {
+                                                                kind: Int(
+                                                                    3,
+                                                                ),
+                                                                span: 1542..1543,
+                                                            },
+                                                        },
+                                                    ],
+                                                },
+                                                crib: Expr {
+                                                    kind: Name {
+                                                        name: "ast",
+                                                        generics: [],
+                                                    },
+                                                    span: 1548..1551,
+                                                },
+                                            },
+                                            span: 1534..1551,
+                                        },
+                                    ],
+                                    span: 1519..1551,
+                                },
+                            ),
+                            span: 1519..1551,
+                        },
+                        Stmt {
+                            kind: Var(
+                                VarDecl {
+                                    vis: Hush,
+                                    targets: [
+                                        "sum",
+                                    ],
+                                    ty: None,
+                                    values: [
+                                        Expr {
+                                            kind: Cop {
+                                                init: Variant {
+                                                    name: "Add",
+                                                    args: [
+                                                        Arg {
+                                                            label: None,
+                                                            value: Expr {
+                                                                kind: Name {
+                                                                    name: "x",
+                                                                    generics: [],
+                                                                },
+                                                                span: 1579..1580,
+                                                            },
+                                                        },
+                                                        Arg {
+                                                            label: None,
+                                                            value: Expr {
+                                                                kind: Name {
+                                                                    name: "two",
+                                                                    generics: [],
+                                                                },
+                                                                span: 1582..1585,
+                                                            },
+                                                        },
+                                                    ],
+                                                },
+                                                crib: Expr {
+                                                    kind: Name {
+                                                        name: "ast",
+                                                        generics: [],
+                                                    },
+                                                    span: 1590..1593,
+                                                },
+                                            },
+                                            span: 1571..1593,
+                                        },
+                                    ],
+                                    span: 1556..1593,
+                                },
+                            ),
+                            span: 1556..1593,
+                        },
+                        Stmt {
+                            kind: Var(
+                                VarDecl {
+                                    vis: Hush,
+                                    targets: [
+                                        "root",
+                                    ],
+                                    ty: None,
+                                    values: [
+                                        Expr {
+                                            kind: Cop {
+                                                init: Variant {
+                                                    name: "Mul",
+                                                    args: [
+                                                        Arg {
+                                                            label: None,
+                                                            value: Expr {
+                                                                kind: Name {
+                                                                    name: "sum",
+                                                                    generics: [],
+                                                                },
+                                                                span: 1621..1624,
+                                                            },
+                                                        },
+                                                        Arg {
+                                                            label: None,
+                                                            value: Expr {
+                                                                kind: Name {
+                                                                    name: "three",
+                                                                    generics: [],
+                                                                },
+                                                                span: 1626..1631,
+                                                            },
+                                                        },
+                                                    ],
+                                                },
+                                                crib: Expr {
+                                                    kind: Name {
+                                                        name: "ast",
+                                                        generics: [],
+                                                    },
+                                                    span: 1636..1639,
+                                                },
+                                            },
+                                            span: 1613..1639,
+                                        },
+                                    ],
+                                    span: 1598..1639,
+                                },
+                            ),
+                            span: 1598..1639,
+                        },
+                        Stmt {
+                            kind: Var(
+                                VarDecl {
+                                    vis: Hush,
+                                    targets: [
+                                        "result",
+                                        "y",
+                                    ],
+                                    ty: None,
+                                    values: [
+                                        Expr {
+                                            kind: Call {
+                                                callee: Expr {
+                                                    kind: Name {
+                                                        name: "eval",
+                                                        generics: [],
+                                                    },
+                                                    span: 1664..1668,
+                                                },
+                                                args: [
+                                                    Arg {
+                                                        label: None,
+                                                        value: Expr {
+                                                            kind: Name {
+                                                                name: "root",
+                                                                generics: [],
+                                                            },
+                                                            span: 1669..1673,
+                                                        },
+                                                    },
+                                                    Arg {
+                                                        label: None,
+                                                        value: Expr {
+                                                            kind: Name {
+                                                                name: "env",
+                                                                generics: [],
+                                                            },
+                                                            span: 1675..1678,
+                                                        },
+                                                    },
+                                                ],
+                                            },
+                                            span: 1664..1679,
+                                        },
+                                    ],
+                                    span: 1645..1679,
+                                },
+                            ),
+                            span: 1645..1679,
+                        },
+                        Stmt {
+                            kind: Fr(
+                                FrStmt {
+                                    cond: Expr {
+                                        kind: Binary(
+                                            Ne,
+                                            Expr {
+                                                kind: Name {
+                                                    name: "y",
+                                                    generics: [],
+                                                },
+                                                span: 1687..1688,
+                                            },
+                                            Expr {
+                                                kind: Ghosted,
+                                                span: 1692..1699,
+                                            },
+                                        ),
+                                        span: 1687..1699,
+                                    },
+                                    then: Block {
+                                        stmts: [
+                                            Stmt {
+                                                kind: Expr(
+                                                    Expr {
+                                                        kind: Method {
+                                                            receiver: Expr {
+                                                                kind: Name {
+                                                                    name: "spill",
+                                                                    generics: [],
+                                                                },
+                                                                span: 1710..1715,
+                                                            },
+                                                            method: "it",
+                                                            generics: [],
+                                                            args: [
+                                                                Arg {
+                                                                    label: None,
+                                                                    value: Expr {
+                                                                        kind: Name {
+                                                                            name: "y",
+                                                                            generics: [],
+                                                                        },
+                                                                        span: 1719..1720,
+                                                                    },
+                                                                },
+                                                            ],
+                                                        },
+                                                        span: 1710..1721,
+                                                    },
+                                                ),
+                                                span: 1710..1721,
+                                            },
+                                        ],
+                                        span: 1700..1727,
+                                    },
+                                    elifs: [],
+                                    els: Some(
+                                        Block {
+                                            stmts: [
+                                                Stmt {
+                                                    kind: Expr(
+                                                        Expr {
+                                                            kind: Method {
+                                                                receiver: Expr {
+                                                                    kind: Name {
+                                                                        name: "spill",
+                                                                        generics: [],
+                                                                    },
+                                                                    span: 1742..1747,
+                                                                },
+                                                                method: "it",
+                                                                generics: [],
+                                                                args: [
+                                                                    Arg {
+                                                                        label: None,
+                                                                        value: Expr {
+                                                                            kind: Name {
+                                                                                name: "result",
+                                                                                generics: [],
+                                                                            },
+                                                                            span: 1751..1757,
+                                                                        },
+                                                                    },
+                                                                ],
+                                                            },
+                                                            span: 1742..1758,
+                                                        },
+                                                    ),
+                                                    span: 1742..1758,
+                                                },
+                                            ],
+                                            span: 1732..1788,
+                                        },
+                                    ),
+                                },
+                            ),
+                            span: 1684..1788,
+                        },
+                    ],
+                    span: 1313..1790,
+                },
+                span: 1300..1790,
+            },
+        ),
+    ],
+}

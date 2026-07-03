@@ -10,5 +10,8 @@ publish.workspace = true
 midir = { path = "../midir" }
 logos = { workspace = true }
 
+[dev-dependencies]
+insta = { workspace = true }
+
 [lints]
 workspace = true

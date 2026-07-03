@@ -1,10 +1,13 @@
 name: backend-llvm
 
-# Ready-but-not-wired: manual only (workflow_dispatch). The default `ci.yml` never builds
-# LLVM, so no PR runner needs it. This job builds `backend --features llvm` and runs the
-# tracer-bullet tests — backend codegen (`.mir` -> object) plus the driver end-to-end
-# (`bet build` a program, run the binary, assert its stdout) — against the pinned LLVM 18
-# (spec milestone 2), on Linux and macOS.
+# The default `ci.yml` never builds LLVM (keeps the 6-way matrix fast and LLVM-free). This
+# job builds `backend --features llvm` and runs the tracer-bullet tests — backend codegen
+# (`.mir` -> object) plus the driver end-to-end (`bet build` a program, run the binary,
+# assert its stdout) — against the pinned LLVM 18 (spec milestone 2), on Linux and macOS.
+#
+# Step-3 gating: runs on pushes to main and on PRs that touch the codegen/link/runtime-ABI
+# path (below), so backend and frontend-lowering regressions are caught without paying the
+# LLVM build cost on unrelated/docs PRs. Still manually dispatchable for one-off checks.
 #
 # Windows LLVM CI is a tracked follow-up. `llvm-sys` 180 needs an LLVM 18 that ships
 # `llvm-config` + the LLVM libraries, but the standard Windows distributions (Chocolatey and
@@ -15,6 +18,39 @@ name: backend-llvm
 # LLVM-18-with-libs install step.
 on:
   workflow_dispatch: {}
+  push:
+    branches: [main]
+    # Keep this list in sync with the pull_request paths below (GitHub Actions does not
+    # reliably support YAML anchors, so the two lists are duplicated on purpose).
+    paths:
+      - "crates/backend/**"
+      - "crates/driver/**"
+      - "crates/frontend/**"
+      - "crates/midir/**"
+      - "crates/rt-abi/**"
+      - "crates/rt-stub/**"
+      - "tests/mir/**"
+      - "tests/corpus/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/backend-llvm.yml"
+  pull_request:
+    paths:
+      - "crates/backend/**"
+      - "crates/driver/**"
+      - "crates/frontend/**"
+      - "crates/midir/**"
+      - "crates/rt-abi/**"
+      - "crates/rt-stub/**"
+      - "tests/mir/**"
+      - "tests/corpus/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/backend-llvm.yml"
+
+concurrency:
+  group: backend-llvm-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always

@@ -1,0 +1,177 @@
+---
+source: crates/frontend/tests/parse_corpus.rs
+expression: program
+---
+Program {
+    items: [
+        Pull(
+            Pull {
+                module: "spill",
+                span: 49..61,
+            },
+        ),
+        Func(
+            FnDecl {
+                vis: Hush,
+                receiver: None,
+                name: "main",
+                generics: [],
+                params: [],
+                ret: None,
+                body: Block {
+                    stmts: [
+                        Stmt {
+                            kind: Var(
+                                VarDecl {
+                                    vis: Hush,
+                                    targets: [
+                                        "xs",
+                                    ],
+                                    ty: None,
+                                    values: [
+                                        Expr {
+                                            kind: Array(
+                                                [
+                                                    Expr {
+                                                        kind: Int(
+                                                            10,
+                                                        ),
+                                                        span: 95..97,
+                                                    },
+                                                    Expr {
+                                                        kind: Int(
+                                                            20,
+                                                        ),
+                                                        span: 99..101,
+                                                    },
+                                                    Expr {
+                                                        kind: Int(
+                                                            30,
+                                                        ),
+                                                        span: 103..105,
+                                                    },
+                                                ],
+                                            ),
+                                            span: 94..106,
+                                        },
+                                    ],
+                                    span: 82..106,
+                                },
+                            ),
+                            span: 82..106,
+                        },
+                        Stmt {
+                            kind: Var(
+                                VarDecl {
+                                    vis: Hush,
+                                    targets: [
+                                        "sum",
+                                    ],
+                                    ty: None,
+                                    values: [
+                                        Expr {
+                                            kind: Int(
+                                                0,
+                                            ),
+                                            span: 124..125,
+                                        },
+                                    ],
+                                    span: 111..125,
+                                },
+                            ),
+                            span: 111..125,
+                        },
+                        Stmt {
+                            kind: Squad {
+                                var: "x",
+                                iter: Expr {
+                                    kind: Name {
+                                        name: "xs",
+                                        generics: [],
+                                    },
+                                    span: 141..143,
+                                },
+                                body: Block {
+                                    stmts: [
+                                        Stmt {
+                                            kind: Assign {
+                                                targets: [
+                                                    Expr {
+                                                        kind: Name {
+                                                            name: "sum",
+                                                            generics: [],
+                                                        },
+                                                        span: 154..157,
+                                                    },
+                                                ],
+                                                op: Eq,
+                                                values: [
+                                                    Expr {
+                                                        kind: Binary(
+                                                            Add,
+                                                            Expr {
+                                                                kind: Name {
+                                                                    name: "sum",
+                                                                    generics: [],
+                                                                },
+                                                                span: 160..163,
+                                                            },
+                                                            Expr {
+                                                                kind: Name {
+                                                                    name: "x",
+                                                                    generics: [],
+                                                                },
+                                                                span: 166..167,
+                                                            },
+                                                        ),
+                                                        span: 160..167,
+                                                    },
+                                                ],
+                                            },
+                                            span: 154..167,
+                                        },
+                                    ],
+                                    span: 144..173,
+                                },
+                            },
+                            span: 130..173,
+                        },
+                        Stmt {
+                            kind: Expr(
+                                Expr {
+                                    kind: Method {
+                                        receiver: Expr {
+                                            kind: Name {
+                                                name: "spill",
+                                                generics: [],
+                                            },
+                                            span: 178..183,
+                                        },
+                                        method: "it",
+                                        generics: [],
+                                        args: [
+                                            Arg {
+                                                label: None,
+                                                value: Expr {
+                                                    kind: Name {
+                                                        name: "sum",
+                                                        generics: [],
+                                                    },
+                                                    span: 187..190,
+                                                },
+                                            },
+                                        ],
+                                    },
+                                    span: 178..191,
+                                },
+                            ),
+                            span: 178..191,
+                        },
+                    ],
+                    span: 76..201,
+                },
+                span: 63..201,
+            },
+        ),
+    ],
+}

@@ -1,0 +1,341 @@
+---
+source: crates/frontend/tests/parse_corpus.rs
+expression: program
+---
+Program {
+    items: [
+        Pull(
+            Pull {
+                module: "spill",
+                span: 155..167,
+            },
+        ),
+        Drip(
+            DripDecl {
+                vis: Hush,
+                name: "Enemy",
+                generics: [],
+                fields: [
+                    FieldDecl {
+                        vis: Some(
+                            Flex,
+                        ),
+                        name: "hp",
+                        ty: Type {
+                            kind: Named(
+                                "int",
+                                [],
+                            ),
+                            span: 191..194,
+                        },
+                        span: 182..194,
+                    },
+                ],
+                span: 169..196,
+            },
+        ),
+        Crib(
+            CribDecl {
+                vis: Hush,
+                name: "enemies",
+                ty: Some(
+                    Type {
+                        kind: Array(
+                            Type {
+                                kind: Named(
+                                    "Enemy",
+                                    [],
+                                ),
+                                span: 212..217,
+                            },
+                            8,
+                        ),
+                        span: 212..220,
+                    },
+                ),
+                span: 198..220,
+            },
+        ),
+        Func(
+            FnDecl {
+                vis: Hush,
+                receiver: None,
+                name: "hpOf",
+                generics: [],
+                params: [
+                    Param {
+                        name: "e",
+                        ty: Type {
+                            kind: Tag(
+                                Type {
+                                    kind: Named(
+                                        "Enemy",
+                                        [],
+                                    ),
+                                    span: 240..245,
+                                },
+                            ),
+                            span: 236..245,
+                        },
+                        span: 233..245,
+                    },
+                ],
+                ret: Single(
+                    Type {
+                        kind: Named(
+                            "int",
+                            [],
+                        ),
+                        span: 250..253,
+                    },
+                ),
+                body: Block {
+                    stmts: [
+                        Stmt {
+                            kind: Holla {
+                                binding: "ref",
+                                tag: Expr {
+                                    kind: Name {
+                                        name: "e",
+                                        generics: [],
+                                    },
+                                    span: 272..273,
+                                },
+                                crib: Expr {
+                                    kind: Name {
+                                        name: "enemies",
+                                        generics: [],
+                                    },
+                                    span: 277..284,
+                                },
+                                live: Block {
+                                    stmts: [
+                                        Stmt {
+                                            kind: Bet(
+                                                [
+                                                    Expr {
+                                                        kind: Field {
+                                                            base: Expr {
+                                                                kind: Name {
+                                                                    name: "ref",
+                                                                    generics: [],
+                                                                },
+                                                                span: 299..302,
+                                                            },
+                                                            name: "hp",
+                                                            generics: [],
+                                                        },
+                                                        span: 299..305,
+                                                    },
+                                                ],
+                                            ),
+                                            span: 295..305,
+                                        },
+                                    ],
+                                    span: 285..311,
+                                },
+                                ghosted: Block {
+                                    stmts: [
+                                        Stmt {
+                                            kind: Bet(
+                                                [
+                                                    Expr {
+                                                        kind: Unary(
+                                                            Neg,
+                                                            Expr {
+                                                                kind: Int(
+                                                                    1,
+                                                                ),
+                                                                span: 335..336,
+                                                            },
+                                                        ),
+                                                        span: 334..336,
+                                                    },
+                                                ],
+                                            ),
+                                            span: 330..336,
+                                        },
+                                    ],
+                                    span: 320..342,
+                                },
+                            },
+                            span: 260..342,
+                        },
+                    ],
+                    span: 254..344,
+                },
+                span: 222..344,
+            },
+        ),
+        Func(
+            FnDecl {
+                vis: Hush,
+                receiver: None,
+                name: "main",
+                generics: [],
+                params: [],
+                ret: None,
+                body: Block {
+                    stmts: [
+                        Stmt {
+                            kind: Var(
+                                VarDecl {
+                                    vis: Hush,
+                                    targets: [
+                                        "a",
+                                    ],
+                                    ty: None,
+                                    values: [
+                                        Expr {
+                                            kind: Cop {
+                                                init: Struct(
+                                                    StructLit {
+                                                        name: "Enemy",
+                                                        generics: [],
+                                                        fields: [
+                                                            FieldInit {
+                                                                name: "hp",
+                                                                value: Expr {
+                                                                    kind: Int(
+                                                                        30,
+                                                                    ),
+                                                                    span: 391..393,
+                                                                },
+                                                                span: 387..393,
+                                                            },
+                                                        ],
+                                                        span: 380..395,
+                                                    },
+                                                ),
+                                                crib: Expr {
+                                                    kind: Name {
+                                                        name: "enemies",
+                                                        generics: [],
+                                                    },
+                                                    span: 399..406,
+                                                },
+                                            },
+                                            span: 376..406,
+                                        },
+                                    ],
+                                    span: 365..406,
+                                },
+                            ),
+                            span: 365..406,
+                        },
+                        Stmt {
+                            kind: Expr(
+                                Expr {
+                                    kind: Method {
+                                        receiver: Expr {
+                                            kind: Name {
+                                                name: "spill",
+                                                generics: [],
+                                            },
+                                            span: 411..416,
+                                        },
+                                        method: "it",
+                                        generics: [],
+                                        args: [
+                                            Arg {
+                                                label: None,
+                                                value: Expr {
+                                                    kind: Call {
+                                                        callee: Expr {
+                                                            kind: Name {
+                                                                name: "hpOf",
+                                                                generics: [],
+                                                            },
+                                                            span: 420..424,
+                                                        },
+                                                        args: [
+                                                            Arg {
+                                                                label: None,
+                                                                value: Expr {
+                                                                    kind: Name {
+                                                                        name: "a",
+                                                                        generics: [],
+                                                                    },
+                                                                    span: 425..426,
+                                                                },
+                                                            },
+                                                        ],
+                                                    },
+                                                    span: 420..427,
+                                                },
+                                            },
+                                        ],
+                                    },
+                                    span: 411..428,
+                                },
+                            ),
+                            span: 411..428,
+                        },
+                        Stmt {
+                            kind: Evict(
+                                Expr {
+                                    kind: Name {
+                                        name: "enemies",
+                                        generics: [],
+                                    },
+                                    span: 463..470,
+                                },
+                            ),
+                            span: 457..470,
+                        },
+                        Stmt {
+                            kind: Expr(
+                                Expr {
+                                    kind: Method {
+                                        receiver: Expr {
+                                            kind: Name {
+                                                name: "spill",
+                                                generics: [],
+                                            },
+                                            span: 533..538,
+                                        },
+                                        method: "it",
+                                        generics: [],
+                                        args: [
+                                            Arg {
+                                                label: None,
+                                                value: Expr {
+                                                    kind: Call {
+                                                        callee: Expr {
+                                                            kind: Name {
+                                                                name: "hpOf",
+                                                                generics: [],
+                                                            },
+                                                            span: 542..546,
+                                                        },
+                                                        args: [
+                                                            Arg {
+                                                                label: None,
+                                                                value: Expr {
+                                                                    kind: Name {
+                                                                        name: "a",
+                                                                        generics: [],
+                                                                    },
+                                                                    span: 547..548,
+                                                                },
+                                                            },
+                                                        ],
+                                                    },
+                                                    span: 542..549,
+                                                },
+                                            },
+                                        ],
+                                    },
+                                    span: 533..550,
+                                },
+                            ),
+                            span: 533..550,
+                        },
+                    ],
+                    span: 359..614,
+                },
+                span: 346..614,
+            },
+        ),
+    ],
+}

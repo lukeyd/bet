@@ -1,0 +1,26 @@
+// indirect.mir — first-class function values: an `@f` function-reference constant stored in
+// a `fn(..)` local, and `call_indirect` through a function-pointer operand (both a local and
+// a parameter). (Step 3, backend.)
+
+fn add1(%0: i64) -> i64 {
+  let %1: i64
+  bb0:
+    %1 = add.trap(%0, 1i64)
+    return %1
+}
+
+fn apply(%0: fn(i64) -> i64, %1: i64) -> i64 {
+  let %2: i64
+  bb0:
+    %2 = call_indirect %0(%1)
+    return %2
+}
+
+fn via_ref(%0: i64) -> i64 {
+  let %1: fn(i64) -> i64
+  let %2: i64
+  bb0:
+    %1 = @add1
+    %2 = call_indirect %1(%0)
+    return %2
+}

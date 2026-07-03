@@ -1,0 +1,31 @@
+// control.mir — the remaining terminators: multi-way `switch`, `panic` (which lowers to a
+// `bet_panic` call followed by `unreachable`), and a bare `unreachable`. (Step 3, backend.)
+
+fn classify(%0: i64) -> i64 {
+  bb0:
+    switch %0 [0 -> bb1, 1 -> bb2, 2 -> bb3] else bb4
+  bb1:
+    return 100i64
+  bb2:
+    return 200i64
+  bb3:
+    return 300i64
+  bb4:
+    return -1i64
+}
+
+fn guard(%0: bool) -> i64 {
+  bb0:
+    branch %0 -> bb1 else bb2
+  bb1:
+    panic "guard tripped\n"
+  bb2:
+    return 0i64
+}
+
+fn dead(%0: i64) -> i64 {
+  bb0:
+    goto bb1
+  bb1:
+    unreachable
+}

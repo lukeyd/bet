@@ -1,0 +1,35 @@
+// float.mir — floating-point arithmetic, comparison, and negation. Float BinOps carry
+// arith mode `na` (overflow modes apply only to integers). Comparisons yield bool.
+// (Step 3, backend.)
+
+fn favg(%0: f64, %1: f64) -> f64 {
+  let %2: f64
+  let %3: f64
+  bb0:
+    %2 = add.na(%0, %1)
+    %3 = div.na(%2, 2.0f64)
+    return %3
+}
+
+fn fmuladd(%0: f32, %1: f32, %2: f32) -> f32 {
+  let %3: f32
+  let %4: f32
+  bb0:
+    %3 = mul.na(%0, %1)
+    %4 = add.na(%3, %2)
+    return %4
+}
+
+fn fcmp(%0: f32, %1: f32) -> bool {
+  let %2: bool
+  bb0:
+    %2 = gt.na(%0, %1)
+    return %2
+}
+
+fn fneg(%0: f64) -> f64 {
+  let %1: f64
+  bb0:
+    %1 = neg(%0)
+    return %1
+}
