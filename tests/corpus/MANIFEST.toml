@@ -242,6 +242,12 @@ covers = ["sumtypes.struct-payload"]
 interp = "pass"
 compiled = "pass"
 
+[[program]]
+path = "06-sumtypes/crib-variants"
+covers = ["sumtypes.vibe-match", "memory.cop-evict"]
+interp = "pass"
+compiled = "pass"
+
 # --- 07 errors --------------------------------------------------------------
 [[program]]
 path = "07-errors/yikes-basics"

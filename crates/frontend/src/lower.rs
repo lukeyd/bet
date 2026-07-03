@@ -1380,19 +1380,26 @@ impl LowerCtx {
         default: Option<&ast::Block>,
     ) -> Result<(), String> {
         let (sop, sty) = self.lower_expr(scrutinee, None)?;
-        let sid = match self.m.ty(sty) {
-            TyKind::Sum(s) => *s,
+        let base_place = self
+            .operand_place(sop)
+            .ok_or_else(|| "`vibe` scrutinee must be addressable".to_string())?;
+        // Auto-deref a `ref Sum` scrutinee (as produced by `holla`/`trust` over a sum crib).
+        let (sid, sum_place) = match self.m.ty(sty) {
+            TyKind::Sum(s) => (*s, base_place),
+            TyKind::Ref(e) => match self.m.ty(*e) {
+                TyKind::Sum(s) => (*s, extend(&base_place, Proj::Deref)),
+                other => return Err(format!("`vibe` on a ref to non-sum ({other:?})")),
+            },
             other => return Err(format!("`vibe` scrutinee is not a sum type ({other:?})")),
         };
-        let sum_place = self
-            .operand_place(sop.clone())
-            .ok_or_else(|| "`vibe` scrutinee must be addressable".to_string())?;
 
         // discriminant(scrutinee) → a u32 tag we can switch on.
         let disc_ty = self.m.t_int(IntWidth::W32, false);
         let disc = self.new_local(disc_ty);
-        self.fb()
-            .assign(Place::local(disc), Rvalue::Discriminant(sop));
+        self.fb().assign(
+            Place::local(disc),
+            Rvalue::Discriminant(Operand::Copy(sum_place.clone())),
+        );
         let switch_block = self.cur;
 
         let merge = self.reserve_block();

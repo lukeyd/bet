@@ -1,0 +1,29 @@
+// crib-variants — `cop` a `moods` variant into a typed crib, resolve it via `holla`, and
+// `vibe` on the resulting `ref Sum` (auto-dereferenced). Exercises sum-variant allocation
+// through codegen and pattern-matching a reference into an arena.
+pull "spill"
+
+moods Shape {
+    Circle(int),
+    Square(int, int)
+}
+
+crib shapes: Shape[8]
+
+finna area(s: tag Shape) -> int {
+    holla sh = s in shapes {
+        vibe sh {
+            Circle(r) { bet r * r * 3 }
+            Square(w, h) { bet w * h }
+        }
+    } ghosted {
+        bet -1
+    }
+}
+
+finna main() {
+    lowkey c = cop Circle(5) in shapes
+    lowkey sq = cop Square(3, 4) in shapes
+    spill.it(area(c))     // 5*5*3 = 75
+    spill.it(area(sq))    // 3*4 = 12
+}
