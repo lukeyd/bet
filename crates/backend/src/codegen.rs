@@ -555,33 +555,30 @@ impl<'c> Cg<'c> {
         Ok(agg.into())
     }
 
-    /// Materialize a `moods` value: set the discriminant, then store each payload field into
-    /// the payload union through the active variant's natural struct layout (so a field wider
-    /// than a word is placed at the right offset). Uses a scratch alloca.
-    fn build_sum_value(
+    /// Store a `moods` value into `storage` (a pointer to sum-typed memory): set the
+    /// discriminant, then store each payload field through the active variant's natural struct
+    /// layout (so a field wider than a word lands at the right offset within the payload union).
+    fn store_sum_into(
         &self,
         func: &Func,
         locals: &[Option<PointerValue<'c>>],
+        storage: PointerValue<'c>,
         sum: SumId,
         variant: u32,
         ops: &[Operand],
-    ) -> Result<BasicValueEnum<'c>, BackendError> {
+    ) -> Result<(), BackendError> {
         let sty = self.sum_llvm_ty(sum);
-        let slot = self.builder.build_alloca(sty, "sum").map_err(lower_err)?;
-        // Tag = variant index.
         let tag_ptr = self
             .builder
-            .build_struct_gep(sty, slot, 0, "sum.tag")
+            .build_struct_gep(sty, storage, 0, "sum.tag")
             .map_err(|_| BackendError::Lower("sum tag gep".into()))?;
         let tag = self.cx.i32_type().const_int(variant as u64, false);
         self.builder.build_store(tag_ptr, tag).map_err(lower_err)?;
-        // Payload fields, placed by the active variant's natural struct layout within the
-        // payload union (field 1 of the sum).
         if !ops.is_empty() {
             let vps = self.variant_payload_struct(sum, variant)?;
             let payload_ptr = self
                 .builder
-                .build_struct_gep(sty, slot, 1, "sum.payload")
+                .build_struct_gep(sty, storage, 1, "sum.payload")
                 .map_err(|_| BackendError::Lower("sum payload gep".into()))?;
             for (j, op) in ops.iter().enumerate() {
                 let v = self.lower_operand(func, locals, op)?;
@@ -592,6 +589,21 @@ impl<'c> Cg<'c> {
                 self.builder.build_store(elem, v).map_err(lower_err)?;
             }
         }
+        Ok(())
+    }
+
+    /// Materialize a by-value `moods` value via a scratch alloca (a `store_sum_into` + reload).
+    fn build_sum_value(
+        &self,
+        func: &Func,
+        locals: &[Option<PointerValue<'c>>],
+        sum: SumId,
+        variant: u32,
+        ops: &[Operand],
+    ) -> Result<BasicValueEnum<'c>, BackendError> {
+        let sty = self.sum_llvm_ty(sum);
+        let slot = self.builder.build_alloca(sty, "sum").map_err(lower_err)?;
+        self.store_sum_into(func, locals, slot, sum, variant, ops)?;
         let val = self
             .builder
             .build_load(sty, slot, "sum.val")
@@ -953,12 +965,42 @@ impl<'c> Cg<'c> {
         crib: &Operand,
         init: &CopInit,
     ) -> Result<Option<BasicValueEnum<'c>>, BackendError> {
-        let CopInit::StructLit(sid, fields) = init else {
-            return Err(BackendError::Lower(
-                "`cop` of sum variants is not supported yet".into(),
-            ));
-        };
         let crib_v = self.lower_operand(func, locals, crib)?.into_pointer_value();
+
+        // A sum-variant `cop` into a typed crib: reserve a slot and store the variant value.
+        if let CopInit::SumVariant(sum, variant, ops) = init {
+            let cop = self.get_or_add(
+                "bet_cop",
+                self.cx.i64_type().fn_type(&[self.ptr_ty().into()], false),
+            );
+            let tag = self
+                .builder
+                .build_call(cop, &[crib_v.into()], "cop")
+                .map_err(lower_err)?
+                .try_as_basic_value()
+                .left()
+                .ok_or_else(|| BackendError::Lower("bet_cop returned void".into()))?
+                .into_int_value();
+            let holla = self.get_or_add(
+                "bet_holla_check",
+                self.ptr_ty()
+                    .fn_type(&[self.ptr_ty().into(), self.cx.i64_type().into()], false),
+            );
+            let storage = self
+                .builder
+                .build_call(holla, &[crib_v.into(), tag.into()], "cop.slot")
+                .map_err(lower_err)?
+                .try_as_basic_value()
+                .left()
+                .ok_or_else(|| BackendError::Lower("bet_holla_check returned void".into()))?
+                .into_pointer_value();
+            self.store_sum_into(func, locals, storage, *sum, *variant, ops)?;
+            return Ok(Some(tag.into()));
+        }
+
+        let CopInit::StructLit(sid, fields) = init else {
+            unreachable!("cop init is struct or sum")
+        };
         let sty = self.struct_llvm_ty(*sid)?;
 
         // Is this a bump (untyped) crib? Its handle has type `Crib(void)`.
