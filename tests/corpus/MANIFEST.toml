@@ -272,19 +272,19 @@ compiled = "pass"
 path = "08-memory/typed-crib-tag"
 covers = ["memory.tag"]
 interp = "pass"
-compiled = "skip"
+compiled = "pass"
 
 [[program]]
 path = "08-memory/holla-ghosted"
 covers = ["memory.holla-ghosted"]
 interp = "pass"
-compiled = "skip"
+compiled = "pass"
 
 [[program]]
 path = "08-memory/trust"
 covers = ["memory.trust"]
 interp = "pass"
-compiled = "skip"
+compiled = "pass"
 
 [[program]]
 path = "08-memory/scratch"
@@ -296,7 +296,7 @@ compiled = "pass"
 path = "08-memory/generation-reuse"
 covers = ["memory.generation-reuse"]
 interp = "pass"
-compiled = "skip"
+compiled = "pass"
 
 # --- 09 bit math ------------------------------------------------------------
 [[program]]

@@ -54,6 +54,15 @@ impl Printer<'_> {
         for g in self.m.globals() {
             self.global(g);
         }
+        for c in self.m.crib_globals() {
+            let _ = writeln!(
+                self.out,
+                "crib @{}: {}[{}]",
+                c.name,
+                self.ty(c.elem),
+                c.capacity
+            );
+        }
         for f in self.m.funcs() {
             self.out.push('\n');
             self.func(f);
@@ -317,6 +326,9 @@ impl Printer<'_> {
             ),
             Rvalue::CribNew { elem, capacity } => {
                 format!("crib_new[{}; {}]", self.ty(*elem), capacity)
+            }
+            Rvalue::CribGlobal(id) => {
+                format!("crib_global(@{})", self.m.crib_global(*id).name)
             }
         }
     }
@@ -689,7 +701,7 @@ fn lex_str(bytes: &[char], i: &mut usize) -> Result<Tok, ParseError> {
 /// Parse `.mir` text into a module.
 pub fn parse(src: &str) -> Result<Module, ParseError> {
     let toks = lex(src)?;
-    let (struct_ids, sum_ids, func_ids, extern_ids) = prescan(&toks);
+    let (struct_ids, sum_ids, func_ids, extern_ids, crib_global_ids) = prescan(&toks);
     let mut p = Parser {
         toks,
         pos: 0,
@@ -698,30 +710,33 @@ pub fn parse(src: &str) -> Result<Module, ParseError> {
         sum_ids,
         func_ids,
         extern_ids,
+        crib_global_ids,
     };
     p.module()?;
     Ok(p.m)
 }
 
-/// The four name→id maps produced by [`prescan`], keyed by declaration name.
+/// The name→id maps produced by [`prescan`], keyed by declaration name.
 type PrescanIds = (
     HashMap<String, StructId>,
     HashMap<String, SumId>,
     HashMap<String, FuncId>,
     HashMap<String, ExternId>,
+    HashMap<String, CribGlobalId>,
 );
 
 /// Assign ids to every named struct/sum/fn/extern up front, so bodies may refer to names that
 /// are self-referential or defined later. Ids follow appearance order per kind (matching the
 /// printer, which emits each kind contiguously in id order).
 fn prescan(toks: &[Tok]) -> PrescanIds {
-    let (mut structs, mut sums, mut funcs, mut externs) = (
+    let (mut structs, mut sums, mut funcs, mut externs, mut cribs) = (
+        HashMap::new(),
         HashMap::new(),
         HashMap::new(),
         HashMap::new(),
         HashMap::new(),
     );
-    let (mut sn, mut un, mut fnc, mut en) = (0u32, 0u32, 0u32, 0u32);
+    let (mut sn, mut un, mut fnc, mut en, mut cn) = (0u32, 0u32, 0u32, 0u32, 0u32);
     let mut i = 0;
     while i < toks.len() {
         // `extern "C" fn NAME` — register the extern and skip its `fn NAME` so it is not
@@ -734,6 +749,16 @@ fn prescan(toks: &[Tok]) -> PrescanIds {
             externs.entry(name.clone()).or_insert(ExternId(en));
             en += 1;
             i += 4;
+            continue;
+        }
+        // `crib @NAME: ...` — a module-level crib (global arena).
+        if matches!(&toks[i], Tok::Ident(kw) if kw == "crib")
+            && matches!(toks.get(i + 1), Some(Tok::At))
+            && let Some(Tok::Ident(name)) = toks.get(i + 2)
+        {
+            cribs.entry(name.clone()).or_insert(CribGlobalId(cn));
+            cn += 1;
+            i += 3;
             continue;
         }
         if let (Tok::Ident(kw), Some(Tok::Ident(name))) = (&toks[i], toks.get(i + 1)) {
@@ -755,7 +780,7 @@ fn prescan(toks: &[Tok]) -> PrescanIds {
         }
         i += 1;
     }
-    (structs, sums, funcs, externs)
+    (structs, sums, funcs, externs, cribs)
 }
 
 struct Parser {
@@ -766,6 +791,7 @@ struct Parser {
     sum_ids: HashMap<String, SumId>,
     func_ids: HashMap<String, FuncId>,
     extern_ids: HashMap<String, ExternId>,
+    crib_global_ids: HashMap<String, CribGlobalId>,
 }
 
 impl Parser {
@@ -836,10 +862,28 @@ impl Parser {
                 "sum" => self.sum_decl()?,
                 "extern" => self.extern_decl()?,
                 "const" => self.const_decl()?,
+                "crib" => self.crib_global_decl()?,
                 "fn" => self.fn_decl()?,
                 other => return Err(self.err(&format!("unknown top-level keyword `{other}`"))),
             }
         }
+        Ok(())
+    }
+
+    fn crib_global_decl(&mut self) -> Result<(), ParseError> {
+        self.eat_kw("crib");
+        self.expect(&Tok::At)?;
+        let name = self.expect_ident()?;
+        self.expect(&Tok::Colon)?;
+        let elem = self.ty()?;
+        self.expect(&Tok::LBracket)?;
+        let capacity = self.bare_u64()? as u32;
+        self.expect(&Tok::RBracket)?;
+        self.m.add_crib_global(CribGlobal {
+            name,
+            elem,
+            capacity,
+        });
         Ok(())
     }
 
@@ -1272,6 +1316,18 @@ impl Parser {
                 let capacity = self.bare_u64()? as u32;
                 self.expect(&Tok::RBracket)?;
                 Ok(Rvalue::CribNew { elem, capacity })
+            }
+            "crib_global" => {
+                self.pos += 1;
+                self.expect(&Tok::LParen)?;
+                self.expect(&Tok::At)?;
+                let name = self.expect_ident()?;
+                self.expect(&Tok::RParen)?;
+                let id = *self
+                    .crib_global_ids
+                    .get(&name)
+                    .ok_or_else(|| self.err(&format!("unknown module-level crib `{name}`")))?;
+                Ok(Rvalue::CribGlobal(id))
             }
             "discriminant" => {
                 self.pos += 1;

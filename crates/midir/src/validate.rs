@@ -349,6 +349,10 @@ impl<'a> Checker<'a> {
                 Some(TyKind::Slice(*elem))
             }
             Rvalue::CribNew { elem, .. } => Some(TyKind::Crib(*elem)),
+            Rvalue::CribGlobal(id) => {
+                let elem = self.module.crib_global(*id).elem;
+                Some(TyKind::Crib(elem))
+            }
         }
     }
 

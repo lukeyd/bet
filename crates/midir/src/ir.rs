@@ -42,6 +42,8 @@ define_id!(/// Index into the module's function table.
     FuncId);
 define_id!(/// Index into the module's global-constant (`facts`) table.
     GlobalId);
+define_id!(/// Index into the module's module-level `crib` (global arena) table.
+    CribGlobalId);
 define_id!(/// Index into the module's `extern` (FFI import) table.
     ExternId);
 define_id!(/// Index of a local within a [`Func`].
@@ -163,6 +165,18 @@ pub struct Global {
     pub name: String,
     pub ty: TyId,
     pub value: Const,
+}
+
+/// A module-level `crib` (a global arena). Unlike a `fact`, this is runtime-initialized
+/// mutable storage: the backend reserves a global holding the [`CribHandle`] and initializes
+/// it at startup. Referenced from a function body by [`Rvalue::CribGlobal`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CribGlobal {
+    pub name: String,
+    /// The element type (`void` for an untyped bump crib).
+    pub elem: TyId,
+    /// Slot count (typed) or byte reserve (bump); 0 = default.
+    pub capacity: u32,
 }
 
 /// An `extern "C"` function declaration (FFI import).
@@ -344,6 +358,8 @@ pub enum Rvalue {
         elem: TyId,
         capacity: u32,
     },
+    /// The handle of a module-level `crib` (loads the backing global). Yields `crib elem`.
+    CribGlobal(CribGlobalId),
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -501,6 +517,7 @@ pub struct Module {
     sums: Vec<SumDef>,
     externs: Vec<Extern>,
     globals: Vec<Global>,
+    crib_globals: Vec<CribGlobal>,
     funcs: Vec<Func>,
 }
 
@@ -602,6 +619,20 @@ impl Module {
 
     pub fn globals(&self) -> &[Global] {
         &self.globals
+    }
+
+    pub fn add_crib_global(&mut self, crib: CribGlobal) -> CribGlobalId {
+        let id = CribGlobalId(self.crib_globals.len() as u32);
+        self.crib_globals.push(crib);
+        id
+    }
+
+    pub fn crib_global(&self, id: CribGlobalId) -> &CribGlobal {
+        &self.crib_globals[id.index()]
+    }
+
+    pub fn crib_globals(&self) -> &[CribGlobal] {
+        &self.crib_globals
     }
 
     // --- functions ---
