@@ -8,6 +8,13 @@
 # real velocity data accrues so the ETA sharpens.
 #
 # Seeded from bootstrap-plan.md §2/§6 and language-spec.md §11.4 + plan-amendment-01 §7.
+# Remaining work restructured (2026-07-03) to match the approved "Open Doom's Gate" plan
+# (~/.claude/plans/plan-all-remaining-mossy-kay.md). The four initial fan-out tasks
+# (frontend/backend/runtime/interp) delivered their original core scope and are marked
+# done; their *remaining* work is broken out into the granular tasks below so the ETA
+# doesn't double-count. `doom` stays out of scope: it is the gate this plan stops at.
+
+# ─────────────────────────── Done (bootstrap + fan-out core) ───────────────────────────
 
 [[task]]
 slug = "step0-skeleton"
@@ -59,66 +66,154 @@ status = "done"
 
 [[task]]
 slug = "frontend"
-name = "Fan-out: frontend library — lexer, parser, AST, typecheck, midir emit"
+name = "Fan-out core: frontend library — lexer, parser, AST, typecheck, broad midir emit (remaining lowering broken out below)"
 size = 21
-status = "doing"
+status = "done"
 
 [[task]]
 slug = "backend"
-name = "Fan-out: backend — midir -> LLVM IR, pass pipeline, lld linking, 6 targets"
+name = "Fan-out core: backend — broad midir -> LLVM IR + lld linking (value-model/trap/slice gaps broken out below)"
 size = 21
-status = "doing"
+status = "done"
 
 [[task]]
 slug = "runtime"
-name = "Fan-out: runtime — cribs, generations, scratch, allocator ctx, scheduler, OS layer"
+name = "Fan-out core: runtime — cribs, generations, scratch, allocator ctx, OS layer (swap/scheduler/gg broken out below)"
+size = 21
+status = "done"
+
+[[task]]
+slug = "interp"
+name = "Fan-out core: tree-walking interpreter + differential partner (math/ffi/slide/stash catch-up broken out below)"
+size = 13
+status = "done"
+
+# ───────────────── Foundations — extract first, they unblock multiple tracks ─────────────────
+
+[[task]]
+slug = "fnd-slice"
+name = "Foundation: slice fat-pointer value model through lower + backend (unblocks arrays/[]u8/[]T/stash/gg buffers)"
+size = 8
+status = "todo"
+
+[[task]]
+slug = "fnd-sum"
+name = "Foundation: sum-payload layout generalization in backend (multi-word: str/tag/drip payloads)"
+size = 5
+status = "done"
+
+[[task]]
+slug = "fnd-alloc"
+name = "Foundation: allocator-context mechanism — decide (implicit-param vs ctx-struct) + plumbing for stash.new(in: crib)"
+size = 5
+status = "todo"
+
+# ─────────────────────── Track 1 — value model & compiled path ───────────────────────
+
+[[task]]
+slug = "compiled-path"
+name = "Compiled-path completion: dyn strings, indexing/array/slice literals, bounce, squad, multi-assign, backend overflow-trap + interp math/bits"
 size = 21
 status = "doing"
 
 [[task]]
-slug = "interp"
-name = "Fan-out: tree-walking interpreter + differential test partner"
-size = 13
-status = "doing"
-
-[[task]]
-slug = "stdlib"
-name = "Fan-out: stdlib (spill, fs, str, math, mem, stash, bytes, gg, ...)"
+slug = "bytes-io"
+name = "§2.7 slices & bytes: []u8, str byte-len/index/non-copy slice, str.bytes/fromBytes, fs.peep/peepText, bytes module"
 size = 13
 status = "todo"
 
 [[task]]
-slug = "tooling"
-name = "Fan-out: fmt (self-hosted), lsp, driver CLI, package manager"
+slug = "ffi-rawptr"
+name = "§2.4 finish / §2.5 validate / §2.6 FFI: rawptr conversion rules + interp FFI shim + interp slide parity"
+size = 8
+status = "todo"
+
+# ─────────────────────── Track 2 — language & collections ───────────────────────
+
+[[task]]
+slug = "generics"
+name = "§2.2 generics: ahead-of-time monomorphization pass in frontend (mangling, instantiation, cycles); interp parity"
+size = 21
+status = "todo"
+
+[[task]]
+slug = "stash"
+name = "§2.3 stash hash maps: new/put/peep/yeet/gang, generic + allocator-aware; midir Map lowering; interp support"
 size = 13
 status = "todo"
+
+# ─────────────────────── Track 3 — memory milestones ───────────────────────
 
 [[task]]
 slug = "milestone-3-arenas"
-name = "Milestone 3: crib/cop/evict arena allocation end-to-end through codegen"
+name = "Milestone 3: crib/cop/evict through codegen (bump-crib + sum-variant cop), 08-memory differential-green, bench harness on"
 size = 8
 status = "todo"
 
 [[task]]
 slug = "milestone-4-tag-holla"
-name = "Milestone 4: tag/holla end-to-end with debug-mode trust() checking"
+name = "Milestone 4: tag/holla end-to-end + debug-mode trust() generation-check (traps on stale tag)"
 size = 8
+status = "todo"
+
+# ─────────────────────── Track 4 — platform / runtime ───────────────────────
+
+[[task]]
+slug = "runtime-swap"
+name = "Runtime swap: driver runtime-selection (rt-stub vs runtime), graph-allowlist driver->runtime, recover-across-boundary"
+size = 5
+status = "todo"
+
+[[task]]
+slug = "scheduler"
+name = "M:N cooperative scheduler for slide (replaces OS threads); cross-thread crib semantics decision"
+size = 8
+status = "todo"
+
+[[task]]
+slug = "gg-platform"
+name = "gg platform layer: per-OS windowed framebuffer/audio-ring/input backends in runtime (macOS+Linux) + gg.* intrinsics in lower+interp"
+size = 21
 status = "todo"
 
 [[task]]
 slug = "milestone-6-pong"
-name = "Milestone 6: Pong demo"
+name = "Milestone 6: Pong demo (gamedev shakeout on gg before Doom) — windowed, input + audio"
+size = 8
+status = "todo"
+
+# ─────────────────────── Track 5 — infra / tooling / freeze ───────────────────────
+
+[[task]]
+slug = "milestone-5-fmt"
+name = "Milestone 5: self-hosted formatter (crates/fmt on frontend library); full corpus round-trips idempotently"
 size = 8
 status = "todo"
 
 [[task]]
-slug = "selfhost"
-name = "Milestone 7.1: self-host stage 1 (frontend rewritten in bet)"
-size = 34
+slug = "corpus-parity"
+name = "Corpus 22->full compiled parity + CI gates (real-runtime/gg) + 3-way differential harness (xtask corpus --self-compiled) + bench thresholds"
+size = 13
 status = "todo"
 
 [[task]]
+slug = "milestone-7-freeze"
+name = "Milestone 7: language freeze — SP0 5 decisions pulled forward into feature tasks; close remaining §12; corpus stable N weeks"
+size = 5
+status = "todo"
+
+# ─────────────────────── Capstone ───────────────────────
+
+[[task]]
+slug = "selfhost"
+name = "Milestone 7.1: self-host stage 1 (frontend rewritten in bet, compiled by Rust stage-0); interp==Rust-compiled==self-compiled on full corpus"
+size = 34
+status = "todo"
+
+# ─────────────────────── The gate this plan STOPS at (out of scope) ───────────────────────
+
+[[task]]
 slug = "doom"
-name = "Milestone 7.2: Doom port targeting gg platform layer"
+name = "Milestone 7.2: Doom port targeting gg — BLOCKED ON GATE; out of scope for the 'Open Doom's Gate' plan (do not start until gate is green)"
 size = 34
 status = "todo"

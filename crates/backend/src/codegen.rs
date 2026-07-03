@@ -20,15 +20,16 @@
 //! * **Function values**: `@f` [`Const::FnRef`] and [`Callee::Indirect`] indirect calls.
 //! * **Aggregates & sums**: [`Rvalue::Aggregate`] (`drip` structs, tuples, and by-value
 //!   `moods` sums), [`Rvalue::Discriminant`], a tagged-union [`TyKind::Sum`] layout
-//!   (`{ i32 tag, [N x i64] payload }`), fixed [`TyKind::Array`] values, and the
-//!   [`Proj::Index`]/[`Proj::Downcast`] place projections.
+//!   (`{ i32 tag, [W x i64] payload }`, where the payload union is sized to hold the widest
+//!   variant and each variant's fields are placed by their natural struct layout — so a
+//!   payload field wider than a word, e.g. a `drip`, is carried faithfully), fixed
+//!   [`TyKind::Array`] values, and the [`Proj::Index`]/[`Proj::Downcast`] place projections.
 //! * **Multi-value returns**: a [`TyKind::Tuple`] is an anonymous return struct;
 //!   [`Terminator::Return`] with several operands packs into it and callers destructure with
 //!   tuple `Field` projections.
 //!
 //! Anything outside this subset returns [`BackendError::Lower`] with a precise message; the
-//! remaining IR (slices' fat pointers, maps, bump `cop`, and non-word sum payloads) lands
-//! later.
+//! remaining IR (slices' fat pointers, maps, and bump `cop`) lands later.
 
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::{Builder, BuilderError};
@@ -137,28 +138,79 @@ impl<'c> Cg<'c> {
         Ok(self.cx.struct_type(&fields, false))
     }
 
-    /// The number of `i64` payload slots a `moods` needs (the widest variant's arity). Each
-    /// payload field gets its own word-sized slot; this is a simple tagged-union layout that
-    /// is correct for word-or-narrower scalar payloads (the whole corpus).
-    fn sum_max_payload(&self, sid: SumId) -> u32 {
+    /// An over-estimating count of 8-byte words needed to store a value of `ty`, used only to
+    /// size a `moods` payload union. Over-estimation is always safe: the union is a byte blob
+    /// that must merely be *big enough* for any variant. Max scalar/pointer alignment on our
+    /// targets is 8, so an `[N x i64]` blob is correctly aligned for any payload it holds.
+    fn ty_words(&self, ty: TyId) -> u32 {
+        match self.m.ty(ty) {
+            TyKind::Void => 0,
+            TyKind::Bool
+            | TyKind::Int { .. }
+            | TyKind::F32
+            | TyKind::F64
+            | TyKind::RawPtr
+            | TyKind::Tag(_)
+            | TyKind::Crib(_)
+            | TyKind::Ref(_)
+            | TyKind::FnPtr(_)
+            | TyKind::Map(_, _) => 1,
+            // `str` and slices are fat `(ptr, len)` values (two words).
+            TyKind::Str | TyKind::Slice(_) => 2,
+            TyKind::Array(elem, n) => self.ty_words(*elem).saturating_mul(*n as u32),
+            TyKind::Tuple(elems) => elems.iter().map(|&t| self.ty_words(t)).sum(),
+            TyKind::Struct(sid) => self
+                .m
+                .struct_def(*sid)
+                .fields
+                .iter()
+                .map(|f| self.ty_words(f.ty))
+                .sum(),
+            // A nested by-value sum is a tag word plus its own payload union.
+            TyKind::Sum(sid) => 1 + self.sum_payload_words(*sid),
+        }
+    }
+
+    /// The number of `i64` words the payload union of a `moods` needs: the max over variants
+    /// of the (over-estimated) word size of that variant's whole payload. Zero for a sum whose
+    /// every variant is nullary.
+    fn sum_payload_words(&self, sid: SumId) -> u32 {
         self.m
             .sum_def(sid)
             .variants
             .iter()
-            .map(|v| v.payload.len() as u32)
+            .map(|v| v.payload.iter().map(|&t| self.ty_words(t)).sum::<u32>())
             .max()
             .unwrap_or(0)
     }
 
-    /// The LLVM layout for a `moods`: `{ i32 tag, [maxfields x i64] payload }`. A nullary-only
-    /// sum (no payload anywhere) is just `{ i32 tag }`.
+    /// The LLVM struct laid over a single variant's payload fields, in their natural layout.
+    /// Constructing and reading a variant place each field through this struct, so a payload
+    /// field wider than a word lands at the right offset within the payload union.
+    fn variant_payload_struct(
+        &self,
+        sid: SumId,
+        variant: u32,
+    ) -> Result<StructType<'c>, BackendError> {
+        let v = &self.m.sum_def(sid).variants[variant as usize];
+        let fields: Vec<BasicTypeEnum> = v
+            .payload
+            .iter()
+            .map(|&t| self.basic_ty(t))
+            .collect::<Result<_, _>>()?;
+        Ok(self.cx.struct_type(&fields, false))
+    }
+
+    /// The LLVM layout for a `moods`: `{ i32 tag, [W x i64] payload }`, where `W` sizes the
+    /// payload union to the widest variant. A sum whose every variant is nullary is just
+    /// `{ i32 tag }`.
     fn sum_llvm_ty(&self, sid: SumId) -> StructType<'c> {
         let tag = self.cx.i32_type();
-        let max = self.sum_max_payload(sid);
-        if max == 0 {
+        let words = self.sum_payload_words(sid);
+        if words == 0 {
             self.cx.struct_type(&[tag.into()], false)
         } else {
-            let payload = self.cx.i64_type().array_type(max);
+            let payload = self.cx.i64_type().array_type(words);
             self.cx.struct_type(&[tag.into(), payload.into()], false)
         }
     }
@@ -402,8 +454,8 @@ impl<'c> Cg<'c> {
     }
 
     /// Materialize a `moods` value: set the discriminant, then store each payload field into
-    /// its word-sized slot. Uses a scratch alloca so narrower-than-`i64` payloads store
-    /// through their own field type.
+    /// the payload union through the active variant's natural struct layout (so a field wider
+    /// than a word is placed at the right offset). Uses a scratch alloca.
     fn build_sum_value(
         &self,
         func: &Func,
@@ -421,16 +473,20 @@ impl<'c> Cg<'c> {
             .map_err(|_| BackendError::Lower("sum tag gep".into()))?;
         let tag = self.cx.i32_type().const_int(variant as u64, false);
         self.builder.build_store(tag_ptr, tag).map_err(lower_err)?;
-        // Payload fields, each in its own i64-sized slot.
+        // Payload fields, placed by the active variant's natural struct layout within the
+        // payload union (field 1 of the sum).
         if !ops.is_empty() {
-            let arr_ty = self.cx.i64_type().array_type(self.sum_max_payload(sum));
-            let arr_ptr = self
+            let vps = self.variant_payload_struct(sum, variant)?;
+            let payload_ptr = self
                 .builder
                 .build_struct_gep(sty, slot, 1, "sum.payload")
                 .map_err(|_| BackendError::Lower("sum payload gep".into()))?;
             for (j, op) in ops.iter().enumerate() {
                 let v = self.lower_operand(func, locals, op)?;
-                let elem = self.gep_array_elem(arr_ty, arr_ptr, j as u64)?;
+                let elem = self
+                    .builder
+                    .build_struct_gep(vps, payload_ptr, j as u32, "sum.field")
+                    .map_err(|_| BackendError::Lower(format!("sum payload field {j} gep")))?;
                 self.builder.build_store(elem, v).map_err(lower_err)?;
             }
         }
@@ -453,23 +509,6 @@ impl<'c> Cg<'c> {
         self.builder
             .build_extract_value(sv, 0, "disc")
             .map_err(lower_err)
-    }
-
-    /// GEP to constant element `idx` of an `[N x i64]` array through its base pointer.
-    #[allow(unsafe_code)] // inkwell's GEP builders are `unsafe`; indices are in range by construction.
-    fn gep_array_elem(
-        &self,
-        arr_ty: inkwell::types::ArrayType<'c>,
-        arr_ptr: PointerValue<'c>,
-        idx: u64,
-    ) -> Result<PointerValue<'c>, BackendError> {
-        let zero = self.cx.i32_type().const_zero();
-        let i = self.cx.i32_type().const_int(idx, false);
-        unsafe {
-            self.builder
-                .build_in_bounds_gep(arr_ty, arr_ptr, &[zero, i], "elem")
-                .map_err(lower_err)
-        }
     }
 
     /// GEP to a dynamically-indexed element of a slice/array (`base[i]`).
@@ -886,9 +925,15 @@ impl<'c> Cg<'c> {
                 }
                 Proj::Field(i) => {
                     if let Some((sid, v)) = pending.take() {
-                        // Payload field of a downcast sum: `ptr` is the payload array pointer.
-                        let arr_ty = self.cx.i64_type().array_type(self.sum_max_payload(sid));
-                        ptr = self.gep_array_elem(arr_ty, ptr, *i as u64)?;
+                        // Payload field of a downcast sum: `ptr` points at the payload union;
+                        // place the field by the active variant's natural struct layout.
+                        let vps = self.variant_payload_struct(sid, v)?;
+                        ptr = self
+                            .builder
+                            .build_struct_gep(vps, ptr, *i, "sum.field")
+                            .map_err(|_| {
+                                BackendError::Lower(format!("sum payload field {i} gep"))
+                            })?;
                         let variant = &self.m.sum_def(sid).variants[v as usize];
                         ty = *variant.payload.get(*i as usize).ok_or_else(|| {
                             BackendError::Lower(format!(

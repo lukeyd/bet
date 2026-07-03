@@ -44,7 +44,7 @@ all = [
   # 05 structs
   "structs.drip", "structs.value-copy", "structs.visibility", "structs.generic",
   # 06 sum types
-  "sumtypes.moods", "sumtypes.vibe-match", "sumtypes.exhaustiveness",
+  "sumtypes.moods", "sumtypes.vibe-match", "sumtypes.exhaustiveness", "sumtypes.struct-payload",
   # 07 errors
   "errors.yikes", "errors.tea", "errors.bounce", "errors.yeet-sheesh",
   # 08 memory model
@@ -215,6 +215,12 @@ compiled = "skip"
 [[program]]
 path = "06-sumtypes/expr-eval"
 covers = ["sumtypes.moods", "sumtypes.vibe-match"]
+interp = "pass"
+compiled = "pass"
+
+[[program]]
+path = "06-sumtypes/struct-payload"
+covers = ["sumtypes.struct-payload"]
 interp = "pass"
 compiled = "pass"
 
