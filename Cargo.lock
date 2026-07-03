@@ -97,8 +97,6 @@ dependencies = [
  "fmt",
  "frontend",
  "interp",
- "rt-stub",
- "runtime",
 ]
 
 [[package]]

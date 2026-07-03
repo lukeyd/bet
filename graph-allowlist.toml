@@ -4,10 +4,11 @@
 # deliberate, reviewable act — edit this file in the same PR that adds the dep.
 #
 # Mirrors the allowed dependency graph in bootstrap-plan.md §3. Notably forbidden:
-# `backend -> frontend` (backend may only know the IR). `driver -> rt-stub` and
-# `driver -> runtime` are both allowed: the driver owns runtime *selection*, linking a
-# compiled program against either the bootstrap `rt-stub` archive (headless default) or the
-# real `runtime` archive (`--runtime real`). Both are staticlibs of the same rt-abi contract.
+# `backend -> frontend` (backend may only know the IR). The driver owns runtime *selection* but
+# does NOT depend on `rt-stub`/`runtime`: both export the same `#[no_mangle] bet_*` symbols, so
+# linking them into the `bet` binary collides (a hard duplicate-symbol error on rust-lld). The
+# driver names the archive as a string and links it into the *compiled program* at build time;
+# the staticlibs are built as their own workspace members.
 [allow]
 midir    = []
 rt-abi   = []
@@ -18,5 +19,5 @@ backend  = ["midir", "rt-abi"]
 interp   = ["frontend", "rt-abi"]
 fmt      = ["frontend"]
 lsp      = ["frontend"]
-driver   = ["frontend", "backend", "interp", "fmt", "rt-stub", "runtime"]
+driver   = ["frontend", "backend", "interp", "fmt"]
 xtask    = []
