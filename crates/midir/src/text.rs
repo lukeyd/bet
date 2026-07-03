@@ -331,6 +331,9 @@ impl Printer<'_> {
                 format!("crib_global(@{})", self.m.crib_global(*id).name)
             }
             Rvalue::SizeOf(ty) => format!("size_of[{}]", self.ty(*ty)),
+            Rvalue::MakeStr { data, len } => {
+                format!("make_str({}, {})", self.operand(data), self.operand(len))
+            }
         }
     }
 
@@ -1336,6 +1339,15 @@ impl Parser {
                 let ty = self.ty()?;
                 self.expect(&Tok::RBracket)?;
                 Ok(Rvalue::SizeOf(ty))
+            }
+            "make_str" => {
+                self.pos += 1;
+                self.expect(&Tok::LParen)?;
+                let data = self.operand()?;
+                self.expect(&Tok::Comma)?;
+                let len = self.operand()?;
+                self.expect(&Tok::RParen)?;
+                Ok(Rvalue::MakeStr { data, len })
             }
             "discriminant" => {
                 self.pos += 1;

@@ -312,6 +312,27 @@ pub unsafe extern "C" fn bet_slot_ptr(handle: CribHandle, slot: u32) -> *mut u8 
 }
 
 // ---------------------------------------------------------------------------
+// Strings.
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_str_concat(
+    a_ptr: *const u8,
+    a_len: usize,
+    b_ptr: *const u8,
+    b_len: usize,
+) -> *mut u8 {
+    let mut buf: Vec<u8> = Vec::with_capacity(a_len + b_len);
+    unsafe {
+        buf.extend_from_slice(std::slice::from_raw_parts(a_ptr, a_len));
+        buf.extend_from_slice(std::slice::from_raw_parts(b_ptr, b_len));
+    }
+    // Leak the buffer: `str` values are immutable and freed at program exit (the stub does not
+    // track string lifetimes — the real runtime's allocator context will).
+    Box::into_raw(buf.into_boxed_slice()) as *mut u8
+}
+
+// ---------------------------------------------------------------------------
 // Stash (hash maps).
 // ---------------------------------------------------------------------------
 

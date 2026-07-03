@@ -363,6 +363,12 @@ pub enum Rvalue {
     /// The size in bytes of a type, as `u64` — the target-layout store size. Lets the frontend
     /// pass value/key sizes to runtime primitives (e.g. `bet_map_new`) without knowing the ABI.
     SizeOf(TyId),
+    /// Build a fat `str` value from a data pointer and a byte length — the str counterpart of
+    /// [`Rvalue::MakeSlice`] (a `str` shares the `{ ptr, len }` layout).
+    MakeStr {
+        data: Operand,
+        len: Operand,
+    },
 }
 
 #[derive(Clone, PartialEq, Debug)]
