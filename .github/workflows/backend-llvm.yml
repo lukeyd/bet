@@ -2,35 +2,67 @@ name: backend-llvm
 
 # Ready-but-not-wired: manual only. The default `ci.yml` never builds LLVM, so no PR runner
 # needs it. This job builds `backend` with the `llvm` feature and runs the tracer-bullet
-# tests — backend codegen (`.mir` → object) plus the driver end-to-end (`bet build` a program,
-# run the binary, assert its stdout) — against the pinned LLVM. Linux-only for now; macOS and
-# Windows LLVM CI are the tracked fast-follow (Milestone 2 on all three OSes).
+# tests — backend codegen (`.mir` -> object) plus the driver end-to-end (`bet build` a
+# program, run the binary, assert its stdout) — against the pinned LLVM, on all three OSes
+# (spec milestone 2). Windows is best-effort for now (`continue-on-error`): getting LLVM 18
+# with the libraries llvm-sys needs, plus MSVC linking, is the least-settled leg.
 on:
   workflow_dispatch: {}
 
 env:
   CARGO_TERM_COLOR: always
-  # llvm-sys (180.x, for LLVM 18) locates the toolchain via this prefix; apt installs LLVM 18
-  # to /usr/lib/llvm-18. Keep the LLVM major in sync with inkwell's `llvm18-0` feature and
-  # `cargo xtask setup-llvm`.
-  LLVM_SYS_180_PREFIX: /usr/lib/llvm-18
 
 jobs:
   tracer-bullet:
-    runs-on: ubuntu-24.04
+    name: tracer-bullet (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, experimental: false }
+          - { os: macos-14, experimental: false }
+          - { os: windows-2022, experimental: true }
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental }}
     steps:
       - uses: actions/checkout@v4
-      - name: install LLVM 18 + C toolchain
-        # libzstd-dev: LLVM 18's static libs link against zstd. clang/cc: the link driver the
-        # backend shells out to for compiled programs.
-        run: sudo apt-get update && sudo apt-get install -y llvm-18-dev libpolly-18-dev libzstd-dev clang
+
+      # --- LLVM 18 (llvm-sys 180.x locates it via LLVM_SYS_180_PREFIX) ---
+      - name: install LLVM 18 (Linux)
+        if: runner.os == 'Linux'
+        # libzstd-dev: LLVM 18's static libs link against zstd. clang: the link driver.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18-dev libpolly-18-dev libzstd-dev clang
+          echo "LLVM_SYS_180_PREFIX=/usr/lib/llvm-18" >> "$GITHUB_ENV"
+
+      - name: install LLVM 18 (macOS)
+        if: runner.os == 'macOS'
+        # LIBRARY_PATH so the linker finds Homebrew's zstd (LLVM's static libs need it).
+        run: |
+          brew install llvm@18
+          PREFIX="$(brew --prefix llvm@18)"
+          echo "LLVM_SYS_180_PREFIX=$PREFIX" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=$(brew --prefix)/lib" >> "$GITHUB_ENV"
+          echo "$PREFIX/bin" >> "$GITHUB_PATH"
+
+      - name: install LLVM 18 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install llvm --version=18.1.8 -y --no-progress
+          echo "LLVM_SYS_180_PREFIX=C:\Program Files\LLVM" >> $env:GITHUB_ENV
+          echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH
+
       - name: install pinned toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
+
       - name: build backend with llvm
         run: cargo build -p backend --features llvm --locked
+
       - name: tracer-bullet tests (codegen + bet build -> run)
         run: cargo nextest run -p backend -p driver --features llvm --locked
