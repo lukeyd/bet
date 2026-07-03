@@ -304,7 +304,15 @@ impl<'a> Checker<'a> {
                 match crib_kind {
                     Some(TyKind::Crib(elem)) => {
                         if matches!(self.module.ty(elem), TyKind::Void) {
-                            Some(TyKind::RawPtr)
+                            // Bump crib: `cop` yields a live `ref` to the freshly allocated
+                            // aggregate (the backend returns the raw storage pointer).
+                            let aggregate = match init {
+                                CopInit::StructLit(sid, _) => TyKind::Struct(*sid),
+                                CopInit::SumVariant(sum, _, _) => TyKind::Sum(*sum),
+                            };
+                            self.find_ty(&aggregate)
+                                .map(TyKind::Ref)
+                                .or(Some(TyKind::RawPtr))
                         } else {
                             Some(TyKind::Tag(elem))
                         }
@@ -340,6 +348,7 @@ impl<'a> Checker<'a> {
                 self.operand_kind(func, len);
                 Some(TyKind::Slice(*elem))
             }
+            Rvalue::CribNew { elem, .. } => Some(TyKind::Crib(*elem)),
         }
     }
 
@@ -455,6 +464,16 @@ impl<'a> Checker<'a> {
             [one] => self.module.ty(*one).clone(),
             many => TyKind::Tuple(many.to_vec()),
         }
+    }
+
+    /// Find the id of an already-interned type by structural kind (a linear scan; the validator
+    /// is not hot). Used to name the `ref Struct`/`ref Sum` a bump `cop` produces.
+    fn find_ty(&self, kind: &TyKind) -> Option<TyId> {
+        self.module
+            .types()
+            .iter()
+            .position(|k| k == kind)
+            .map(|i| TyId(i as u32))
     }
 
     fn check_cop_init(&mut self, func: &Func, init: &CopInit) {

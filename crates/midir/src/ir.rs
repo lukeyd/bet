@@ -336,6 +336,14 @@ pub enum Rvalue {
         len: Operand,
         elem: TyId,
     },
+    /// `crib name: T[N]` / `crib name` — create a fresh crib, yielding a `crib elem` handle.
+    /// A typed crib (`elem` non-void) is a slab of `capacity` fixed-size slots; a bump crib
+    /// (`elem` = void) is an untyped arena where `capacity` is a byte reserve (0 = default).
+    /// The backend supplies element size/alignment from the target data layout.
+    CribNew {
+        elem: TyId,
+        capacity: u32,
+    },
 }
 
 #[derive(Clone, PartialEq, Debug)]

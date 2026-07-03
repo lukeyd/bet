@@ -4,7 +4,6 @@ expression: "lower_to_mir(\"drip Enemy { flex hp: int }\\n\\\n                  
 ---
 struct Enemy { flex hp: i64 }
 extern "C" fn bet_print(rawptr, u64) -> void
-extern "C" fn bet_crib_new(u64) -> crib Enemy
 
 fn go() -> i64 {
   let %0: crib Enemy
@@ -13,7 +12,7 @@ fn go() -> i64 {
   let %3: ref Enemy
   let %4: i64
   bb0:
-    %0 = call_extern @bet_crib_new(8u64)
+    %0 = crib_new[Enemy; 8]
     %1 = cop(%0, Enemy{0: 5i64})
     %2 = %1
     holla_check(%2, %0, %3) -> bb2 else bb3

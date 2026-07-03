@@ -266,7 +266,7 @@ compiled = "skip"
 path = "08-memory/crib-cop-evict"
 covers = ["memory.crib", "memory.cop-evict"]
 interp = "pass"
-compiled = "skip"
+compiled = "pass"
 
 [[program]]
 path = "08-memory/typed-crib-tag"
@@ -290,7 +290,7 @@ compiled = "skip"
 path = "08-memory/scratch"
 covers = ["memory.scratch"]
 interp = "pass"
-compiled = "skip"
+compiled = "pass"
 
 [[program]]
 path = "08-memory/generation-reuse"

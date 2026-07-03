@@ -655,38 +655,28 @@ impl LowerCtx {
     }
 
     fn lower_crib_decl(&mut self, c: &ast::CribDecl) -> Result<(), String> {
-        // A crib is created via its `rt-abi` entry point; the handle lives in a local of the
-        // `crib T` type. `crib name: T[N]` is a typed slab; `crib name` is an untyped bump crib.
-        let (crib_ty, extern_name, cap) = match &c.ty {
-            Some(t) => match &t.kind {
-                ast::TypeKind::Array(elem, n) => {
-                    let elem = self.map_type(elem)?;
-                    (self.m.intern_ty(TyKind::Crib(elem)), "bet_crib_new", *n)
-                }
-                _ => {
-                    let elem = self.map_type(t)?;
-                    (self.m.intern_ty(TyKind::Crib(elem)), "bet_crib_new", 0)
-                }
-            },
-            None => {
-                let voidt = self.m.t_void();
-                (
-                    self.m.intern_ty(TyKind::Crib(voidt)),
-                    "bet_crib_new_bump",
-                    0,
-                )
-            }
-        };
-        let u64t = self.m.t_int(IntWidth::W64, false);
-        let ext = self.get_extern(extern_name, vec![u64t], vec![crib_ty]);
+        // A crib handle lives in a local of the `crib T` type; the backend fills in the element
+        // size/alignment. `crib name: T[N]` is a typed slab of N slots; `crib name` (no type) is
+        // an untyped bump crib, represented with a `void` element.
+        let (elem, capacity) = self.crib_elem_and_cap(c.ty.as_ref())?;
+        let crib_ty = self.m.intern_ty(TyKind::Crib(elem));
         let l = self.new_local(crib_ty);
-        let cap_op = Operand::Const(Const::Int(cap as i128, u64t));
-        self.fb().assign(
-            Place::local(l),
-            Rvalue::Call(Callee::Extern(ext), vec![cap_op]),
-        );
+        self.fb()
+            .assign(Place::local(l), Rvalue::CribNew { elem, capacity });
         self.bind(&c.name, l);
         Ok(())
+    }
+
+    /// The element type and slot/byte capacity of a `crib` declaration: a `T[N]` typed slab,
+    /// a bare `T` typed crib (capacity 0), or an untyped bump crib (`void`, capacity 0).
+    fn crib_elem_and_cap(&mut self, ty: Option<&ast::Type>) -> Result<(TyId, u32), String> {
+        Ok(match ty {
+            Some(t) => match &t.kind {
+                ast::TypeKind::Array(elem, n) => (self.map_type(elem)?, *n as u32),
+                _ => (self.map_type(t)?, 0),
+            },
+            None => (self.m.t_void(), 0),
+        })
     }
 
     fn lower_bet(&mut self, vals: &[Expr]) -> Result<(), String> {
@@ -1587,6 +1577,19 @@ impl LowerCtx {
                 );
                 Ok((Operand::Copy(Place::local(tmp)), aty))
             }
+            // `mem.scratch()` — the thread's built-in per-frame bump arena (a `crib void`).
+            ("mem", "scratch") => {
+                if !args.is_empty() {
+                    return Err("`mem.scratch` takes no arguments".into());
+                }
+                let voidt = self.m.t_void();
+                let crib_ty = self.m.intern_ty(TyKind::Crib(voidt));
+                let ext = self.get_extern("bet_scratch", vec![], vec![crib_ty]);
+                let tmp = self.new_local(crib_ty);
+                self.fb()
+                    .assign(Place::local(tmp), Rvalue::Call(Callee::Extern(ext), vec![]));
+                Ok((Operand::Copy(Place::local(tmp)), crib_ty))
+            }
             ("spill", _) => {
                 Err("`spill.*` is a statement-level print, not a value expression".into())
             }
@@ -1750,13 +1753,10 @@ impl LowerCtx {
             TyKind::Crib(e) => *e,
             other => return Err(format!("`cop` into a non-crib value ({other:?})")),
         };
-        if matches!(self.m.ty(elem), TyKind::Void) {
-            return Err(
-                "`cop` into an untyped (bump) crib is not yet lowered (yields a rawptr the \
-                 backend does not model yet)"
-                    .into(),
-            );
-        }
+        // A typed crib hands back a `tag elem`; a bump (untyped) crib hands back a live `ref` to
+        // the freshly bump-allocated value (so `.field` access auto-derefs into the arena).
+        let is_bump = matches!(self.m.ty(elem), TyKind::Void);
+        let mut bump_struct: Option<StructId> = None;
         let cop_init = match init {
             ast::CopInit::Struct(lit) => {
                 let sid = *self
@@ -1780,9 +1780,15 @@ impl LowerCtx {
                     let (op, _) = self.lower_expr(&fi.value, Some(*fty))?;
                     fields.push((idx as u32, op));
                 }
+                bump_struct = Some(sid);
                 CopInit::StructLit(sid, fields)
             }
             ast::CopInit::Variant { name, args } => {
+                if is_bump {
+                    return Err(
+                        "`cop` of a variant into an untyped bump crib is not lowered".into(),
+                    );
+                }
                 let sid = match self.m.ty(elem) {
                     TyKind::Sum(s) => *s,
                     _ => return Err("`cop` of a variant into a non-sum crib".into()),
@@ -1802,11 +1808,18 @@ impl LowerCtx {
                 CopInit::SumVariant(sid, variant, ops)
             }
         };
-        let tag_ty = self.m.intern_ty(TyKind::Tag(elem));
-        let tmp = self.new_local(tag_ty);
+        // Bump crib → `ref Struct`; typed crib → `tag elem`.
+        let result_ty = match bump_struct {
+            Some(sid) if is_bump => {
+                let sty = self.m.intern_ty(TyKind::Struct(sid));
+                self.m.intern_ty(TyKind::Ref(sty))
+            }
+            _ => self.m.intern_ty(TyKind::Tag(elem)),
+        };
+        let tmp = self.new_local(result_ty);
         self.fb()
             .assign(Place::local(tmp), Rvalue::Cop(crib_op, cop_init));
-        Ok((Operand::Copy(Place::local(tmp)), tag_ty))
+        Ok((Operand::Copy(Place::local(tmp)), result_ty))
     }
 
     fn lower_trust(&mut self, tag: &Expr, crib: &Expr) -> Result<(Operand, TyId), String> {
