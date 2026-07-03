@@ -1,0 +1,13 @@
+// numeric-tower — sized integer types and the friendly defaults (int = i64).
+pull "spill"
+
+finna main() {
+    lowkey a: i32 = 2000000000
+    lowkey b: u8  = 255
+    lowkey c: i64 = 9000000000
+    lowkey d: int = -42
+    spill.it(a)
+    spill.it(b)
+    spill.it(c)
+    spill.it(d)
+}

@@ -1,0 +1,18 @@
+// typed-crib-tag — copping into a TYPED crib hands back a `tag` (an 8-byte slot +
+// generation handle), reached only through holla.
+pull "spill"
+
+drip Enemy {
+    flex hp: int
+}
+
+crib enemies: Enemy[1000]              // typed slab
+
+finna main() {
+    lowkey e: tag Enemy = cop Enemy{ hp: 50 } in enemies
+    holla ref = e in enemies {
+        spill.it(ref.hp)               // 50
+    } ghosted {
+        spill.it("gone")
+    }
+}

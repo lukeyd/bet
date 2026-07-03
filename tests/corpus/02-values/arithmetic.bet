@@ -1,0 +1,10 @@
+// arithmetic — the conventional operators; integer division truncates.
+pull "spill"
+
+finna main() {
+    spill.it(7 + 3)
+    spill.it(7 - 3)
+    spill.it(7 * 3)
+    spill.it(7 / 3)   // 2
+    spill.it(7 % 3)   // 1
+}

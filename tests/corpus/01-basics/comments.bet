@@ -1,0 +1,8 @@
+// comments — line and block comment forms.
+pull "spill"
+
+finna main() {
+    /* a block comment
+       spanning lines */
+    spill.it("ok")   // a trailing line comment
+}

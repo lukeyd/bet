@@ -1,0 +1,14 @@
+// drip-generic — a generic struct instantiated at two types.
+pull "spill"
+
+drip Pair[T] {
+    flex a: T
+    flex b: T
+}
+
+finna main() {
+    lowkey pi = Pair[int]{ a: 3, b: 4 }
+    lowkey ps = Pair[str]{ a: "x", b: "y" }
+    spill.it(pi.a + pi.b)   // 7
+    spill.it(ps.b)          // y
+}

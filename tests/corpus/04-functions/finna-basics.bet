@@ -1,0 +1,10 @@
+// finna-basics — a function with parameters and a return value.
+pull "spill"
+
+finna add(a: int, b: int) -> int {
+    bet a + b
+}
+
+finna main() {
+    spill.it(add(2, 40))   // 42
+}

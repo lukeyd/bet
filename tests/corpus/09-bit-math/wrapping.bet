@@ -1,0 +1,13 @@
+// wrapping — unsigned overflow wraps by default (defined). Signed overflow would
+// TRAP in a debug build; math.lap wraps explicitly instead, in any build. (§2.4)
+pull "spill"
+pull "math"
+
+finna main() {
+    lowkey a: u8 = 250
+    lowkey b: u8 = 10
+    spill.it(a + b)                // unsigned wraps: 260 -> 4
+
+    lowkey big: i8 = 100
+    spill.it(math.lap(big, big))   // explicit wrap in i8: 200 -> 200 - 256 = -56
+}

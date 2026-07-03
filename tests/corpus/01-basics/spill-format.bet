@@ -1,0 +1,6 @@
+// spill-format — formatted output with {} substitution.
+pull "spill"
+
+finna main() {
+    spill.f("hp: {} / {}\n", 80, 100)
+}

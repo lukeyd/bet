@@ -1,0 +1,12 @@
+// vibin — while loop: sum 1..=5.
+pull "spill"
+
+finna main() {
+    lowkey i = 1
+    lowkey total = 0
+    vibin i <= 5 {
+        total = total + i
+        i = i + 1
+    }
+    spill.it(total)   // 15
+}

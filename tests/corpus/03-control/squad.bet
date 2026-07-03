@@ -1,0 +1,11 @@
+// squad — for-each over a collection literal.
+pull "spill"
+
+finna main() {
+    lowkey xs = [10, 20, 30]
+    lowkey sum = 0
+    squad x in xs {
+        sum = sum + x
+    }
+    spill.it(sum)   // 60
+}

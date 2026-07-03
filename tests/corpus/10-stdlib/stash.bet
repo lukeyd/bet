@@ -1,0 +1,17 @@
+// stash — hash map: put, peep (present/absent), and gang (length).
+pull "spill"
+pull "stash"
+
+finna main() {
+    lowkey m = stash.new[str, int]()
+    m.put("hp", 100)
+    m.put("mp", 30)
+
+    lowkey v, ok = m.peep("hp")
+    fr ok { spill.it(v) } naw { spill.it("miss") }     // 100
+
+    lowkey v2, ok2 = m.peep("xp")
+    fr ok2 { spill.it(v2) } naw { spill.it("miss") }   // miss
+
+    spill.it(m.gang())   // 2
+}

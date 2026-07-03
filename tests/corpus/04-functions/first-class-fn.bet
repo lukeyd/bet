@@ -1,0 +1,15 @@
+// first-class-fn — passing functions as values and storing one in a variable.
+pull "spill"
+
+finna dub(x: int) -> int { bet x * 2 }
+finna inc(x: int) -> int { bet x + 1 }
+
+finna apply(f: finna(int) -> int, x: int) -> int {
+    bet f(x)
+}
+
+finna main() {
+    spill.it(apply(dub, 21))          // 42
+    lowkey g: finna(int) -> int = inc
+    spill.it(g(41))                   // 42
+}

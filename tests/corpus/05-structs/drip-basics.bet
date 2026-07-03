@@ -1,0 +1,15 @@
+// drip-basics — struct declaration, construction, field access, value-copy semantics.
+pull "spill"
+
+drip Player {
+    flex hp: int
+    flex name: str
+}
+
+finna main() {
+    lowkey p = Player{ hp: 100, name: "Ada" }
+    lowkey q = p          // value copy — structs are values
+    q.hp = 50
+    spill.f("{} has {} hp\n", p.name, p.hp)   // original unchanged
+    spill.it(q.hp)
+}

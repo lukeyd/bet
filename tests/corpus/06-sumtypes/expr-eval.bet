@@ -1,0 +1,25 @@
+// expr-eval — a sum type carried in a drip field, dispatched with an exhaustive
+// vibe. (The recursive, tag-linked AST version lives in 11-reference/mini-compiler.)
+pull "spill"
+
+moods Op { Add, Sub, Mul }
+
+drip Calc {
+    flex op: Op
+    flex lhs: int
+    flex rhs: int
+}
+
+finna eval(c: Calc) -> int {
+    vibe c.op {
+        Add { bet c.lhs + c.rhs }
+        Sub { bet c.lhs - c.rhs }
+        Mul { bet c.lhs * c.rhs }
+    }
+}
+
+finna main() {
+    spill.it(eval(Calc{ op: Add, lhs: 6, rhs: 7 }))    // 13
+    spill.it(eval(Calc{ op: Sub, lhs: 10, rhs: 4 }))   // 6
+    spill.it(eval(Calc{ op: Mul, lhs: 3, rhs: 9 }))    // 27
+}

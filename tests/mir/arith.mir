@@ -1,0 +1,19 @@
+// arith.mir — plain integer + bitwise ops in the mid-level IR.
+// Hand-written fixture: exercises binops with explicit arith modes, typed int
+// constants, temporaries, and a single-block return. (Step 1a, midir.)
+
+fn inc(%0: i64) -> i64 {
+  let %1: i64
+  bb0:
+    %1 = add.trap(%0, 1i64)
+    return %1
+}
+
+fn flags(%0: u32) -> u32 {
+  let %1: u32
+  let %2: u32
+  bb0:
+    %1 = bitand.na(%0, 4u32)
+    %2 = bitor.na(%1, 4096u32)
+    return %2
+}

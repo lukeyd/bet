@@ -1,0 +1,6 @@
+// hello — the tiniest program: print a string.
+pull "spill"
+
+finna main() {
+    spill.it("hi")
+}

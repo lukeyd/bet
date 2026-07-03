@@ -1,0 +1,26 @@
+// bounce — early-return-on-error sugar collapsing the three-line check.
+pull "spill"
+
+finna step(n: int) -> (int, yikes) {
+    fr n < 0 {
+        bet 0, yikes.new("negative")
+    } naw {
+        bet n * 2, ghosted
+    }
+}
+
+finna pipeline(n: int) -> (int, yikes) {
+    lowkey a, y = step(n)
+    bounce y
+    lowkey b, y2 = step(a)
+    bounce y2
+    bet b, ghosted
+}
+
+finna main() {
+    lowkey r, y = pipeline(3)
+    fr y != ghosted { spill.it(y) } naw { spill.it(r) }      // 12
+
+    lowkey r2, y2 = pipeline(-1)
+    fr y2 != ghosted { spill.it(y2) } naw { spill.it(r2) }   // negative
+}

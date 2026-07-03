@@ -1,0 +1,20 @@
+// yeet-sheesh — panic (yeet) recovered at a boundary (sheesh). Rare, discouraged.
+pull "spill"
+
+finna risky(n: int) {
+    fr n == 0 {
+        yeet("div by zero")
+    } naw {
+        spill.it(100 / n)
+    }
+}
+
+finna main() {
+    sheesh {
+        risky(5)             // 20
+        risky(0)             // panics
+        spill.it("after")    // never runs
+    } naw p {
+        spill.f("recovered: {}\n", p)
+    }
+}

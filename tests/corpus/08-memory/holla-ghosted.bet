@@ -1,0 +1,23 @@
+// holla-ghosted — checked tag access has two arms: the live branch binds a
+// guaranteed-valid reference; the ghosted branch runs when the tag is dead.
+pull "spill"
+
+drip Enemy { flex hp: int }
+
+crib enemies: Enemy[8]
+
+finna hpOf(e: tag Enemy) -> int {
+    holla ref = e in enemies {
+        bet ref.hp
+    } ghosted {
+        bet -1
+    }
+}
+
+finna main() {
+    lowkey a = cop Enemy{ hp: 30 } in enemies
+    spill.it(hpOf(a))         // 30 — live
+
+    evict enemies            // frees the slab; bumps every slot generation
+    spill.it(hpOf(a))        // -1 — `a` now dangles, holla takes the ghosted arm
+}

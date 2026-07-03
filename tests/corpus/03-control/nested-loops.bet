@@ -1,0 +1,14 @@
+// nested-loops — skip (continue) even numbers, dip (break) once the sum passes 20.
+pull "spill"
+
+finna main() {
+    lowkey sum = 0
+    lowkey i = 0
+    vibin i < 100 {
+        i = i + 1
+        fr sum > 20 { dip }
+        fr i % 2 == 0 { skip }
+        sum = sum + i
+    }
+    spill.it(sum)   // 25
+}

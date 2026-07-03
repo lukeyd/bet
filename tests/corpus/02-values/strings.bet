@@ -1,0 +1,10 @@
+// strings — basic str ops: upper (glow) and equality (slaps).
+pull "spill"
+pull "str"
+
+finna main() {
+    lowkey s = "hello"
+    spill.it(s)
+    spill.it(str.glow(s))              // HELLO
+    spill.it(str.slaps(s, "hello"))    // nocap
+}

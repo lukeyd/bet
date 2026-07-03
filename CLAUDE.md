@@ -45,7 +45,7 @@ are not counted).
   dependency edge, update the allowlist in the same change (and expect review).
 - **Green from the first commit.** Before you push: `cargo fmt --all --check`,
   `cargo clippy --workspace --all-targets -- -D warnings`, `cargo xtask graph-check`,
-  `cargo nextest run --workspace --no-tests=pass`.
+  `cargo xtask corpus --check`, `cargo nextest run --workspace --no-tests=pass`.
 - **No LLVM needed for the default build.** `backend`'s `inkwell` dependency is optional
   behind a non-default `llvm` feature; never pass `--all-features` in CI (it would pull LLVM).
 - Keep the keyword joke in the language; keep the Rust implementation boring and solid.

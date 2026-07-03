@@ -1,13 +1,281 @@
 (* ============================================================================
-   bet — surface grammar (EBNF)  ★ FROZEN ARTIFACT (placeholder)
+   bet — surface grammar (EBNF)  ★ FROZEN ARTIFACT (v0.1)
 
-   Status: NOT YET FROZEN. This file is formalized and frozen in Step 1c
-   (bootstrap-plan.md §1c), alongside writing the 30-50 program golden corpus —
-   writing real programs is what settles the open syntax questions (ASI rules,
-   default visibility=hush, numeric spellings) faster than debate.
+   Frozen in Step 1c (bootstrap-plan.md §1c) alongside the golden corpus. The
+   corpus (tests/corpus/) is the executable companion: every construct below is
+   exercised by at least one program, and writing those programs is what settled
+   the open syntax questions. Rationale for each settled decision lives in
+   spec/syntax-decisions.md; the semantics live in language-spec.md (§3-§8) and
+   plan-amendment-01.md (§2).
 
-   Keyword vocabulary and syntax overview: language-spec.md §3-§4.
-   New surface constructs from plan-amendment-01: `moods`/`vibe` (sum types +
-   pattern match, §2.1), generics `[T]` (§2.2), bit operators (§2.4), function
-   types `finna(T)->U` (§2.5), `extern`/`rawptr` (§2.6), `bounce` (§2.8).
+   This grammar is normative for surface syntax. Where it and prose disagree,
+   this file wins; report the conflict.
+
+   ----------------------------------------------------------------------------
+   Meta-notation (W3C/ISO-EBNF flavored):
+     A = B C        sequence (whitespace = concatenation)
+     A | B          alternation
+     [ X ]          optional (zero or one)
+     { X }          repetition (zero or more)
+     ( X )          grouping
+     "abc"          terminal (literal text)
+     "a".."z"       terminal range
+     (* ... *)      comment
+   Lexical rules (UPPER intent, lowerCamel here) produce tokens; the parser runs
+   over the token stream, with newlines handled per the ASI rules in §L5.
+   ============================================================================ *)
+
+
+(* ==========================================================================
+   PART L — LEXICAL GRAMMAR
+   ========================================================================== *)
+
+(* --- L1. Identifiers & keywords ------------------------------------------ *)
+
+letter   = "A".."Z" | "a".."z" | "_" ;
+digit    = "0".."9" ;
+hexDigit = digit | "a".."f" | "A".."F" ;
+binDigit = "0" | "1" ;
+
+ident    = letter { letter | digit } ;   (* a keyword (L2) is never an ident *)
+
+(* L2. Reserved keywords — cannot be used as identifiers.
+   Declarations / bindings : finna bet lowkey facts drip moods pull extern
+   Control flow            : fr naw vibin squad dip skip vibe
+   Concurrency / panic     : slide yeet sheesh
+   Booleans / nil          : nocap cap ghosted
+   Visibility              : flex hush
+   Memory model            : crib cop evict tag holla trust in
+   Casts                   : as
+   Contextual (keyword only in position): trust (postfix), naw (else / match
+     wildcard), ghosted (holla else-arm AND nil literal), in (cop/holla/squad).
+   NOT reserved (predeclared names, shadowable in principle but discouraged):
+     type names  int float bool str yikes void rawptr i8 i16 i32 i64 u8 u16 u32 u64
+                 f32 f64 vec2 vec3 vec4 mat4
+                 (`yikes` is the error type AND its constructor namespace
+                  `yikes.new(...)` — predeclared, not reserved, exactly as `str`
+                  is both a type and a module. `.tea(...)` is a method on a yikes.)
+     builtins    scratch (reached as mem.scratch()), the stdlib module nouns
+                 (spill fs str math squadops time net mem gg vec stash bytes).
+   `scratch` has no dedicated syntax — it is a stdlib call, not a keyword. *)
+
+(* --- L3. Literals -------------------------------------------------------- *)
+
+intLit   = decInt | hexInt | binInt ;
+decInt   = digit { digit | "_" } ;
+hexInt   = "0x" hexDigit { hexDigit | "_" } ;
+binInt   = "0b" binDigit { binDigit | "_" } ;
+
+floatLit = decInt "." decInt [ exponent ]
+         | decInt exponent ;
+exponent = ( "e" | "E" ) [ "+" | "-" ] decInt ;
+
+strLit   = '"' { strChar | escape } '"' ;         (* UTF-8; type str *)
+byteLit  = "'" ( byteChar | escape ) "'" ;        (* single byte; type u8 *)
+escape   = "\" ( "n" | "t" | "r" | "\" | '"' | "'" | "0"
+               | "x" hexDigit hexDigit ) ;
+strChar  = ? any source char except '"' , '\' , or newline ? ;
+byteChar = ? any source char except "'" , '\' , or newline ? ;
+
+boolLit  = "nocap" | "cap" ;                      (* true | false *)
+nilLit   = "ghosted" ;                            (* nil / none / no-error *)
+
+literal  = intLit | floatLit | strLit | byteLit | boolLit | nilLit ;
+
+(* --- L4. Operators & punctuation ----------------------------------------- *)
+(*  arithmetic   + - * / %
+    comparison   == != < <= > >=
+    logical      && || !
+    bitwise      & | ^ << >> ~
+    assignment   =  += -= *= /= %= &= |= ^= <<= >>=
+    structural   -> . , : [ ] ( ) { }
+   Bitwise/arith operators are conventional C-family, NOT slang (design
+   principle 5: escape hatches stay conventional). Precedence: §E1. *)
+
+(* --- L5. Comments -------------------------------------------------------- *)
+
+lineComment  = "//" { ? any char except newline ? } ;
+blockComment = "/*" { ? any char, incl. newline ? } "*/" ;   (* non-nesting *)
+
+(* --- L6. Statement termination (ASI, Go-style) --------------------------- *)
+(* Statements are newline-terminated; explicit ';' is accepted as a separator
+   but is non-idiomatic (the formatter strips it). A newline TERMINATES the
+   current statement iff the last token on the line is one that can end a
+   statement, namely:
+       - an identifier
+       - a literal (intLit floatLit strLit byteLit / nocap / cap / ghosted)
+       - a closing bracket:  ")"  "]"  "}"
+       - a statement keyword: "bet"  "dip"  "skip"  "bounce"
+   Otherwise the statement CONTINUES onto the next line — specifically when the
+   line ends in a binary/unary operator, "," , "." , "->", any "="-assignment
+   op, or an OPEN bracket "(" "[" "{".
+   Blocks are delimited by "{" "}" (never newline-inferred). Composite (struct)
+   literals are disallowed as the *unparenthesized* operand of an fr / vibin /
+   squad header, to keep "Ident {" unambiguous from a block (Go's rule); wrap in
+   parens when needed:  fr (Player{...}).sus() { ... }. *)
+
+
+(* ==========================================================================
+   PART S — SYNTACTIC GRAMMAR
+   ========================================================================== *)
+
+(* --- S1. Program & top-level --------------------------------------------- *)
+
+program  = { topItem } ;
+topItem  = pull | topDecl ;
+
+pull     = "pull" strLit ;                        (* import a module *)
+
+topDecl  = [ "flex" ] ( fnDecl | dripDecl | moodsDecl | cribDecl
+                      | constDecl | varDecl )
+         | externDecl ;
+(* `flex` = exported; absence = hush (module-private) by default. extern decls
+   are always FFI-visible, so they take no visibility modifier. *)
+
+externDecl = "extern" strLit "finna" ident "(" [ paramList ] ")" [ "->" type ] ;
+(* e.g.  extern "C" finna SDL_Init(flags: u32) -> i32                          *)
+
+
+(* --- S2. Declarations ---------------------------------------------------- *)
+
+fnDecl   = "finna" [ receiver ] ident [ genericParams ]
+           "(" [ paramList ] ")" [ "->" retType ] block ;
+receiver = "(" ident ":" type ")" ;               (* method receiver, §amend 2.8 *)
+genericParams = "[" ident { "," ident } "]" ;     (* monomorphized, §amend 2.2 *)
+paramList = param { "," param } ;
+param     = ident ":" type ;
+retType   = type
+          | "(" type { "," type } ")" ;           (* multi-value return, §6     *)
+
+dripDecl  = "drip" ident [ genericParams ] "{" { fieldDecl } "}" ;
+fieldDecl = [ "flex" | "hush" ] ident ":" type ;
+
+moodsDecl = "moods" ident [ genericParams ]
+            "{" variant { "," variant } [ "," ] "}" ;   (* sum type, §amend 2.1 *)
+variant   = ident [ "(" type { "," type } ")" ] ;
+
+cribDecl  = "crib" ident [ ":" type ] ;           (* untyped bump | typed slab  *)
+
+constDecl = "facts"  ident        [ ":" type ] "=" expr ;
+varDecl   = "lowkey" bindTargets  [ ":" type ] "=" exprList ;
+bindTargets = ident { "," ident } ;               (* multi-value bind: a, y = f() *)
+
+
+(* --- S3. Types ----------------------------------------------------------- *)
+
+type      = sliceType | arrayType | tagType | cribType | mapType | fnType
+          | "rawptr" | nameType ;
+sliceType = "[]" type ;                           (* []Bullet, []u8             *)
+arrayType = nameType "[" intLit "]" ;             (* Enemy[1000] (fixed)        *)
+tagType   = "tag" type ;                          (* tag Enemy (8-byte handle)  *)
+cribType  = "crib" type ;                         (* crib Enemy (param/field)   *)
+mapType   = "map" "[" type "]" type ;             (* map[str]int                *)
+fnType    = "finna" "(" [ typeList ] ")" "->" type ;  (* finna(tag Mobj)->void  *)
+nameType  = ident [ "[" typeList "]" ] ;          (* int, str, vec3, stash[str,i64] *)
+typeList  = type { "," type } ;
+
+
+(* --- S4. Statements ------------------------------------------------------ *)
+
+block = "{" { stmt } "}" ;
+
+stmt  = varDecl
+      | constDecl
+      | cribDecl                                      (* cribs are also function-local, §7.2 *)
+      | frStmt
+      | vibinStmt
+      | squadStmt
+      | vibeStmt
+      | hollaStmt
+      | sheeshStmt
+      | evictStmt
+      | slideStmt
+      | betStmt
+      | bounceStmt
+      | yeetStmt
+      | "dip"
+      | "skip"
+      | assignStmt
+      | exprStmt ;
+
+frStmt     = "fr" expr block { "naw" "fr" expr block } [ "naw" block ] ;
+vibinStmt  = "vibin" expr block ;
+squadStmt  = "squad" ident "in" expr block ;
+
+vibeStmt   = "vibe" expr "{" { vibeArm } [ nawArm ] "}" ;     (* §amend 2.1     *)
+vibeArm    = ident [ "(" bindList ")" ] block ;
+nawArm     = "naw" block ;                          (* wildcard / exhaustiveness *)
+bindList   = ident { "," ident } ;
+
+hollaStmt  = "holla" ident "=" expr "in" expr block "ghosted" block ; (* §7.4    *)
+sheeshStmt = "sheesh" block [ "naw" ident block ] ;   (* recover boundary; rare, *)
+                                                      (* binding form provisional *)
+
+evictStmt  = "evict" expr ;                           (* O(1) mass free, §7.2    *)
+slideStmt  = "slide" expr ;                           (* spawn task, §8          *)
+
+betStmt    = "bet" [ exprList ] ;                     (* return; 0..n values     *)
+bounceStmt = "bounce" expr ;                          (* early-return err, §amend 2.8 *)
+yeetStmt   = "yeet" "(" expr ")" ;                    (* panic, §6               *)
+
+assignStmt = lvalue { "," lvalue } assignOp exprList ;
+lvalue     = postfixExpr ;                            (* ident | field | index   *)
+assignOp   = "=" | "+=" | "-=" | "*=" | "/=" | "%="
+           | "&=" | "|=" | "^=" | "<<=" | ">>=" ;
+
+exprStmt   = expr ;                                   (* call / method / cop, for effect *)
+exprList   = expr { "," expr } ;
+
+
+(* --- S5 / E1. Expressions (precedence: lowest → highest) ----------------- *)
+(* C-family precedence with ONE deliberate fix: the bitwise operators & ^ |
+   bind TIGHTER than the comparisons (Go's rule, not C's), so `flags & M == 0`
+   means `(flags & M) == 0` — required verbatim by plan-amendment-01 §10.6 and
+   eliminating C's classic footgun. Bands, lowest → highest:
+     || < && < comparisons < | < ^ < & < (<< >>) < (+ -) < (* / %) < as
+     < unary(! ~ -) < postfix(. call [] ) < primary                          *)
+
+expr       = orExpr ;
+orExpr     = andExpr    { "||" andExpr } ;
+andExpr    = cmpExpr    { "&&" cmpExpr } ;
+cmpExpr    = bitOrExpr  { ( "==" | "!=" | "<" | "<=" | ">" | ">=" ) bitOrExpr } ;
+bitOrExpr  = bitXorExpr { "|" bitXorExpr } ;
+bitXorExpr = bitAndExpr { "^" bitAndExpr } ;
+bitAndExpr = shiftExpr  { "&" shiftExpr } ;
+shiftExpr  = addExpr    { ( "<<" | ">>" ) addExpr } ;
+addExpr    = mulExpr    { ( "+" | "-" ) mulExpr } ;
+mulExpr    = castExpr   { ( "*" | "/" | "%" ) castExpr } ;
+castExpr   = unaryExpr  { "as" type } ;               (* explicit cast, §amend 2.4 *)
+unaryExpr  = ( "!" | "~" | "-" ) unaryExpr
+           | postfixExpr ;
+
+postfixExpr = primary { postfixOp } ;
+postfixOp   = "." ident [ "[" typeList "]" ] [ callArgs ]  (* field | method [T] () *)
+            | callArgs                                     (* function call        *)
+            | "[" expr "]"                                 (* index                *)
+            | "." "trust" "(" ")" "in" primary ;           (* unchecked tag, §7.5  *)
+
+primary  = literal
+         | copExpr
+         | structLit
+         | arrayLit
+         | ident [ "[" typeList "]" ]                 (* var | generic fn target  *)
+         | "(" expr ")" ;
+
+arrayLit  = "[" [ expr { "," expr } [ "," ] ] "]" ;   (* [10, 20, 30], []u8 bytes *)
+            (* element type inferred from elements; an empty [] needs a type
+               annotation on the binding, e.g. `lowkey xs: []int = []`.        *)
+copExpr   = "cop" copInit "in" postfixExpr ;          (* allocate into a crib, §7.2/§7.3 *)
+copInit   = structLit                                 (* drip:   Player{ hp: 100 }    *)
+          | ident [ "(" [ argList ] ")" ] ;           (* moods variant: Lit(2), Dot   *)
+structLit = nameType "{" [ fieldInit { "," fieldInit } [ "," ] ] "}" ;
+fieldInit = ident ":" expr ;
+
+callArgs = "(" [ argList ] ")" ;
+argList  = arg { "," arg } ;
+arg      = [ ident ":" ] expr ;                       (* optional label: in: crib *)
+
+(* ============================================================================
+   END. Coverage note: every production above is exercised by tests/corpus/;
+   `cargo xtask corpus --check` enforces feature coverage against the manifest.
    ============================================================================ *)

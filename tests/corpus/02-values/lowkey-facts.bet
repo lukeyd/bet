@@ -1,0 +1,10 @@
+// lowkey-facts — mutable binding (inferred), reassignment, and a constant.
+pull "spill"
+
+finna main() {
+    lowkey x = 5          // inferred int
+    x = x + 1
+    facts MAX: int = 100
+    spill.it(x)
+    spill.it(MAX)
+}

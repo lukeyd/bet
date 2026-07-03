@@ -1,0 +1,12 @@
+// casts — explicit `as` conversions; no implicit narrowing.
+pull "spill"
+
+finna main() {
+    lowkey big: int = 300
+    lowkey small = big as u8      // 300 wraps into u8 -> 44
+    spill.it(small)
+
+    lowkey f: f64 = 3.9
+    lowkey n = f as int           // truncates toward zero -> 3
+    spill.it(n)
+}

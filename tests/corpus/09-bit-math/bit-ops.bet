@@ -1,0 +1,13 @@
+// bit-ops — the conventional bitwise operators: & | ^ << >> ~.
+pull "spill"
+
+finna main() {
+    lowkey a: u8 = 0b1100      // 12
+    lowkey b: u8 = 0b1010      // 10
+    spill.it(a & b)            // 0b1000 = 8
+    spill.it(a | b)            // 0b1110 = 14
+    spill.it(a ^ b)            // 0b0110 = 6
+    spill.it(a << 1)           // 0b11000 = 24
+    spill.it(a >> 2)           // 0b0011 = 3
+    spill.it((~a) & 0xF)       // ~00001100 = 11110011, low nibble = 0b0011 = 3
+}
