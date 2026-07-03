@@ -7,6 +7,8 @@
 //!   setup-llvm          print per-OS guidance for the pinned LLVM (backend --features llvm)
 //!   corpus --check      structural lint of tests/corpus (pairing + feature coverage)
 //!   corpus              execute each program via `bet run` and diff stdout vs .expected
+//!   corpus --compiled   compiled differential column: `bet build` + run each program and
+//!                       assert its stdout == .expected == the interpreter's stdout
 //!   dist                stub (lands with release work)
 
 use std::collections::BTreeMap;
@@ -21,8 +23,11 @@ usage: cargo xtask <command>
   timelog report [--json] [--idle-cap SECS]
   timelog eta    [--hours-per-day N] [--idle-cap SECS]
   setup-llvm                  per-OS LLVM install guidance
-  corpus [--check]            --check: structural lint of tests/corpus; else execute each
-                              program via `bet run` and diff stdout vs its .expected
+  corpus [--check|--compiled] --check:    structural lint of tests/corpus;
+                              --compiled: compiled differential column (needs an LLVM
+                                          codegen driver; skipped cleanly without one);
+                              else:       execute each program via `bet run` and diff
+                                          stdout vs its .expected
   dist                        (stub — release packaging)";
 
 fn main() -> ExitCode {
@@ -560,7 +565,9 @@ fn fmt_hms(secs: i64) -> String {
 // corpus — `--check` is the structural lint of tests/corpus (Step 1c); the bare
 // command executes each program on the interpreter (`bet run`) and diffs stdout
 // against its `.expected`, gated by the manifest's per-program `interp` field.
-// The compiled-side half of the differential runner lands with backend codegen.
+// `--compiled` is the other half of the differential runner: it `bet build`s each
+// opted-in program to a native executable and asserts stdout == .expected == interp
+// (the interp == compiled invariant), gated by the per-program `compiled` field.
 // ---------------------------------------------------------------------------
 
 #[derive(serde::Deserialize)]
@@ -584,6 +591,11 @@ struct CorpusProgram {
     /// runner (`cargo xtask corpus`). Defaults to `pass`.
     #[serde(default)]
     interp: InterpMode,
+    /// How the native code generator (`bet build` + running the executable) is expected to
+    /// handle this program under the compiled differential runner (`cargo xtask corpus
+    /// --compiled`). Defaults to `skip` — a program opts in to the compiled gate explicitly.
+    #[serde(default)]
+    compiled: CompiledMode,
 }
 
 /// The per-program interpreter expectation gated by `cargo xtask corpus`.
@@ -599,9 +611,27 @@ enum InterpMode {
     Skip,
 }
 
+/// The per-program compiled-codegen expectation gated by `cargo xtask corpus --compiled`.
+/// Only two states (no `unsupported` ratchet): a program is either held to the full
+/// differential invariant or left out of the compiled column entirely.
+#[derive(serde::Deserialize, Default, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+enum CompiledMode {
+    /// Must `bet build` to a native executable, run cleanly, and produce stdout that equals
+    /// `.expected` byte-for-byte AND equals the interpreter's stdout for the same program
+    /// (interp == compiled — the differential invariant). A failure here is a hard error.
+    Pass,
+    /// Not compiled or run. The default: codegen for this program is out of scope until the
+    /// backend/runtime grow to cover it (then flip it to `pass`).
+    #[default]
+    Skip,
+}
+
 fn corpus(args: &[String]) -> Result<()> {
     if args.iter().any(|a| a.as_str() == "--check") {
         corpus_check(&workspace_root())
+    } else if args.iter().any(|a| a.as_str() == "--compiled") {
+        corpus_compiled(&workspace_root())
     } else {
         corpus_run(&workspace_root())
     }
@@ -715,6 +745,190 @@ fn corpus_run(root: &Path) -> Result<()> {
             failures.join("\n")
         );
     }
+}
+
+/// The compiled column of the differential runner (`cargo xtask corpus --compiled`). For each
+/// `compiled = "pass"` program it `bet build`s a native executable, runs it, and asserts BOTH:
+///   (a) its stdout equals `.expected` byte-for-byte, AND
+///   (b) its stdout equals the interpreter's stdout for the same source
+///       (interp == compiled — the differential invariant).
+///
+/// Requires a codegen-capable driver: `bet` built `--features llvm`, which needs LLVM 18 located
+/// via `LLVM_SYS_180_PREFIX`. If that build fails or LLVM is not present, the WHOLE column is
+/// skipped with a clear note and a zero exit — so environments without LLVM (the default CI
+/// matrix included) are unaffected. When codegen IS available, any `compiled = "pass"` program
+/// that fails to build/run/match is a hard error (non-zero exit) — that is the ratchet.
+///
+/// NOTE (Track X): on this branch only `01-basics/hello` and `01-basics/comments` are `pass` —
+/// the `spill.it("literal")` tracer bullet, which compiles and runs end to end today. The
+/// broader compiled `pass` set (computed-value / formatted printing, e.g. `spill.f`) is curated
+/// by the orchestrator once Tracks R (rt-abi/runtime) and C (frontend/backend `spill` lowering)
+/// merge — flip the relevant `compiled = "skip"` entries to `pass` at that integration point.
+fn corpus_compiled(root: &Path) -> Result<()> {
+    let dir = root.join("tests").join("corpus");
+    let manifest_path = dir.join("MANIFEST.toml");
+    let src = std::fs::read_to_string(&manifest_path)
+        .with_context(|| format!("reading {}", manifest_path.display()))?;
+    let manifest: CorpusManifest =
+        toml::from_str(&src).context("parsing tests/corpus/MANIFEST.toml")?;
+
+    // Build the codegen-enabled driver once. If LLVM 18 isn't present (or the `--features llvm`
+    // build otherwise fails), skip the whole compiled column gracefully with a zero exit: the
+    // interp column and `--check` are the LLVM-free gates and must stay unaffected. We shell out
+    // to the built binary per program (keeps `xtask = []` — no workspace dep on the driver).
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let built = std::process::Command::new(&cargo)
+        .args(["build", "-p", "driver", "--features", "llvm"])
+        .current_dir(root)
+        .status()
+        .context("running `cargo build -p driver --features llvm`")?;
+    if !built.success() {
+        println!(
+            "compiled column skipped: no LLVM/codegen \
+             (`cargo build -p driver --features llvm` failed — install LLVM 18 and set \
+             LLVM_SYS_180_PREFIX to enable it). The interp column and `--check` are unaffected."
+        );
+        return Ok(());
+    }
+
+    // `bet build` links compiled programs against `librt_stub.a`, which cargo only stages next to
+    // the `bet` binary when the `rt-stub` *package* is built (an rlib-only dep does not emit the
+    // staticlib at the target root). Build it explicitly so the linker can find it.
+    let staged = std::process::Command::new(&cargo)
+        .args(["build", "-p", "rt-stub"])
+        .current_dir(root)
+        .status()
+        .context("running `cargo build -p rt-stub` (stages librt_stub.a next to `bet`)")?;
+    if !staged.success() {
+        bail!("`cargo build -p rt-stub` failed; cannot link compiled corpus programs");
+    }
+
+    let bin = root
+        .join("target")
+        .join("debug")
+        .join(format!("bet{}", std::env::consts::EXE_SUFFIX));
+
+    // A private scratch dir for the compiled executables (and their intermediate `.o`s), removed
+    // at the end. Namespaced by pid so concurrent runs never collide.
+    let tmp = std::env::temp_dir().join(format!("bet-corpus-compiled-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp)
+        .with_context(|| format!("creating scratch dir {}", tmp.display()))?;
+
+    let mut want_pass = 0usize;
+    let mut got_pass = 0usize;
+    let mut skipped = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+
+    for prog in &manifest.program {
+        match prog.compiled {
+            CompiledMode::Skip => skipped += 1,
+            CompiledMode::Pass => {
+                want_pass += 1;
+                match run_compiled_program(&bin, &dir, &tmp, &prog.path) {
+                    Ok(()) => got_pass += 1,
+                    Err(msg) => failures.push(msg),
+                }
+            }
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp); // best-effort cleanup
+
+    println!(
+        "compiled: {}/{} pass  ({} skip, {} total)",
+        got_pass,
+        want_pass,
+        skipped,
+        manifest.program.len(),
+    );
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        failures.sort();
+        bail!(
+            "compiled column found {} problem(s):\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+}
+
+/// Build, run, and differentially check one `compiled = "pass"` program. Returns `Ok(())` when
+/// the compiled executable's stdout equals both `.expected` and the interpreter's stdout;
+/// otherwise a preformatted `FAIL ...` line describing the first failing stage.
+fn run_compiled_program(bin: &Path, dir: &Path, tmp: &Path, stem: &str) -> Result<(), String> {
+    let bet = dir.join(format!("{stem}.bet"));
+    let expected_path = dir.join(format!("{stem}.expected"));
+    let expected = std::fs::read(&expected_path)
+        .map_err(|e| format!("  FAIL {stem} — reading {}: {e}", expected_path.display()))?;
+
+    // Stem can contain `/` (e.g. `01-basics/hello`); flatten it into a single scratch filename.
+    let exe = tmp.join(format!(
+        "{}{}",
+        stem.replace('/', "_"),
+        std::env::consts::EXE_SUFFIX
+    ));
+
+    // 1. Compile: `bet build <stem>.bet -o <exe>`.
+    let build = std::process::Command::new(bin)
+        .arg("build")
+        .arg(&bet)
+        .arg("-o")
+        .arg(&exe)
+        .output()
+        .map_err(|e| format!("  FAIL {stem} — spawning `bet build`: {e}"))?;
+    if !build.status.success() {
+        return Err(format!(
+            "  FAIL {stem} — `bet build` errored (exit {}): {}",
+            build.status.code().unwrap_or(-1),
+            short(&build.stderr),
+        ));
+    }
+
+    // 2. Run the freshly linked native executable.
+    let run = std::process::Command::new(&exe)
+        .output()
+        .map_err(|e| format!("  FAIL {stem} — spawning compiled `{}`: {e}", exe.display()))?;
+    if !run.status.success() {
+        return Err(format!(
+            "  FAIL {stem} — compiled program exited non-zero (exit {}): {}",
+            run.status.code().unwrap_or(-1),
+            short(&run.stderr),
+        ));
+    }
+
+    // 3a. Compiled stdout must equal the golden `.expected` byte-for-byte.
+    if run.stdout != expected {
+        return Err(format!(
+            "  FAIL {stem} — compiled stdout != .expected\n\
+             \x20        expected: {}\n         compiled: {}",
+            short(&expected),
+            short(&run.stdout),
+        ));
+    }
+
+    // 3b. The differential invariant: compiled stdout must equal the interpreter's stdout.
+    let interp = std::process::Command::new(bin)
+        .arg("run")
+        .arg(&bet)
+        .output()
+        .map_err(|e| format!("  FAIL {stem} — spawning `bet run` (interp): {e}"))?;
+    if !interp.status.success() {
+        return Err(format!(
+            "  FAIL {stem} — interp `bet run` errored (exit {}): {}",
+            interp.status.code().unwrap_or(-1),
+            short(&interp.stderr),
+        ));
+    }
+    if run.stdout != interp.stdout {
+        return Err(format!(
+            "  FAIL {stem} — interp != compiled (differential mismatch)\n\
+             \x20        interp:   {}\n         compiled: {}",
+            short(&interp.stdout),
+            short(&run.stdout),
+        ));
+    }
+    Ok(())
 }
 
 /// A compact, single-line rendering of captured output for a diff message: UTF-8 lossy with
@@ -900,11 +1114,13 @@ mod tests {
                     path: "cat/one".into(),
                     covers: vec!["a".into()],
                     interp: InterpMode::Pass,
+                    compiled: CompiledMode::Skip,
                 },
                 CorpusProgram {
                     path: "cat/two".into(),
                     covers: vec!["zzz".into()], // unknown feature
                     interp: InterpMode::Pass,
+                    compiled: CompiledMode::Skip,
                 },
             ],
         };
