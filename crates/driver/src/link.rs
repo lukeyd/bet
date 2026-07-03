@@ -21,11 +21,18 @@ pub enum Runtime {
 }
 
 impl Runtime {
-    /// The archive link name (`-l<name>` / `<name>.lib`) for this choice.
+    /// The archive link name (`-l<name>` / `<name>.lib`) for this choice — the base name of the
+    /// respective crate's staticlib (`librt_stub.a` / `libruntime.a`).
+    ///
+    /// These are string literals, *not* a dependency on the `rt-stub`/`runtime` crates: both
+    /// export the same `#[no_mangle] bet_*` runtime symbols, so linking either as an rlib into
+    /// the `bet` binary would collide on the symbol set (and linking *both* is a hard duplicate-
+    /// symbol error on `rust-lld`). The compiler must not carry the runtime's symbols — those
+    /// belong only in the *compiled program*, which links one archive by name at `bet build`.
     fn link_name(self) -> &'static str {
         match self {
-            Runtime::Stub => rt_stub::staticlib_link_name(),
-            Runtime::Real => runtime::staticlib_link_name(),
+            Runtime::Stub => "rt_stub",
+            Runtime::Real => "runtime",
         }
     }
 }
