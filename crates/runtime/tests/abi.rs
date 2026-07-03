@@ -180,6 +180,43 @@ fn lifecycle_and_print() {
     }
 }
 
+/// Parity: the number-formatting primitives (`bet_print_{i64,u64,f64}`) must produce the exact
+/// same bytes as `rt-stub`, with **no** trailing newline (the caller adds any newline). We
+/// assert the exact bytes via the shared `fmt_*` helpers the extern entry points use verbatim,
+/// then smoke-call the externs to prove they run. These assertions mirror `rt-stub`'s test.
+#[test]
+fn number_formatting_primitives() {
+    // Signed decimal.
+    assert_eq!(fmt_i64(-42), "-42");
+    assert_eq!(fmt_i64(0), "0");
+    assert_eq!(fmt_i64(i64::MIN), "-9223372036854775808");
+
+    // Unsigned decimal.
+    assert_eq!(fmt_u64(42), "42");
+    assert_eq!(fmt_u64(0), "0");
+    assert_eq!(fmt_u64(u64::MAX), "18446744073709551615");
+
+    // Float: a finite integral value gets a single trailing `.0` (matching the interpreter's
+    // `display_float`); everything else uses default `f64` formatting.
+    assert_eq!(fmt_f64(3.0), "3.0");
+    assert_eq!(fmt_f64(2.5), "2.5");
+    assert_eq!(fmt_f64(100.0), "100.0");
+    assert_eq!(fmt_f64(-7.0), "-7.0");
+    assert_eq!(fmt_f64(0.1), "0.1");
+    assert_eq!(fmt_f64(f64::INFINITY), "inf");
+    assert_eq!(fmt_f64(f64::NEG_INFINITY), "-inf");
+    assert_eq!(fmt_f64(f64::NAN), "NaN");
+
+    // Smoke-call the externs: they must run and print (no newline) without panicking.
+    unsafe {
+        bet_print_i64(-42);
+        bet_print_u64(42);
+        bet_print_f64(3.0);
+        bet_print_f64(2.5);
+        println!(); // terminate the line we just wrote for tidy captured output
+    }
+}
+
 // ===========================================================================
 // Real-arena block — properties the naive stub does not provide.
 // ===========================================================================

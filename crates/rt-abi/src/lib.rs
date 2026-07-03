@@ -167,6 +167,16 @@ unsafe extern "C" {
 
     /// Write `len` bytes at `ptr` to stdout.
     pub fn bet_print(ptr: *const u8, len: usize);
+    /// Write the signed decimal representation of `v` to stdout, with **no** trailing
+    /// newline. The caller (frontend lowering) appends any newline.
+    pub fn bet_print_i64(v: i64);
+    /// Write the unsigned decimal representation of `v` to stdout, with **no** trailing
+    /// newline. The caller appends any newline.
+    pub fn bet_print_u64(v: u64);
+    /// Write `v` to stdout, with **no** trailing newline, formatted to match the
+    /// interpreter's `display_float`: a finite integral value prints with a single trailing
+    /// `.0` (e.g. `3.0`), everything else uses the default `f64` formatting (e.g. `2.5`).
+    pub fn bet_print_f64(v: f64);
 
     // --- platform layer (headless in rt-stub; amendment §2.6/§6.1) ---
 
