@@ -109,6 +109,18 @@ impl Arena {
         self.slots.get(slot).map(|s| &s.value)
     }
 
+    /// Write a value back into a slot iff the tag is still current — the `holla` live-arm
+    /// writeback, so mutations to the bound reference persist into the crib (mutation-through-
+    /// `holla`, matching the compiled path where the binding is a live pointer into the slot).
+    fn write_slot(&mut self, slot: usize, generation: u64, value: Value) {
+        if let Some(s) = self.slots.get_mut(slot)
+            && s.live
+            && s.generation == generation
+        {
+            s.value = value;
+        }
+    }
+
     /// Free the whole arena in O(slots): every slot's generation is bumped, invalidating all
     /// outstanding tags, and the slots become available for reuse.
     fn evict(&mut self) {
@@ -447,9 +459,21 @@ impl<'p> Interp<'p> {
             .cloned();
         match resolved {
             Some(val) => {
+                let snapshot = val.clone();
                 env.push();
                 env.declare(binding, val);
                 let flow = self.exec_block(env, live);
+                // Persist a mutation of the bound reference back into the crib slot, so the
+                // `holla` binding behaves like the compiled path's live pointer into the slot.
+                // Only write back when the binding actually changed in this block: a nested
+                // call may have mutated the same slot through its own `holla`, and writing our
+                // untouched snapshot would clobber that (the reference is live, not a copy).
+                if let Some(updated) = env.get(binding).cloned()
+                    && updated != snapshot
+                    && let Some(a) = self.arenas.get_mut(&id)
+                {
+                    a.write_slot(slot, generation, updated);
+                }
                 env.pop();
                 flow
             }
@@ -1064,10 +1088,20 @@ impl<'p> Interp<'p> {
                 )));
             }
         };
-        let f = *self
-            .methods
-            .get(&(ty.clone(), method.to_string()))
-            .ok_or_else(|| RunError::Undefined(format!("{ty}.{method}")))?;
+        let f = match self.methods.get(&(ty.clone(), method.to_string())).copied() {
+            Some(f) => f,
+            None => {
+                // A function-pointer struct field called through the receiver: `m.think(e)`.
+                // The field's `finna` value governs the call; the receiver is not prepended.
+                if let Value::Struct { fields, .. } = &recv
+                    && let Some(Value::Fn(fname)) = fields.get(method)
+                {
+                    let fname = fname.clone();
+                    return self.call_named_fn(env, &fname, args);
+                }
+                return Err(RunError::Undefined(format!("{ty}.{method}")));
+            }
+        };
         let arg_vals = self.eval_args(env, args)?;
         self.call_fn(f, arg_vals, Some(recv))
     }

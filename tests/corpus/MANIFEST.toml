@@ -364,10 +364,8 @@ compiled = "skip"
 [[program]]
 path = "11-reference/doom-thinker"
 covers = ["reference.doom"]
-# Unsupported: needs mutation-through-`holla` (writing back into the crib slot) and calling a
-# function-pointer struct field as a method — both beyond the current value-copy model.
-interp = "unsupported"
-compiled = "skip"
+interp = "pass"
+compiled = "pass"
 
 # --- 12 ffi ------------------------------------------------------------------
 [[program]]
