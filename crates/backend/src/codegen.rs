@@ -28,8 +28,15 @@
 //!   [`Terminator::Return`] with several operands packs into it and callers destructure with
 //!   tuple `Field` projections.
 //!
+//! * **Fat-pointer values**: `str` and `[]T` slices are `{ ptr, i64 len }` values. String
+//!   literals ([`Const::Str`]) build the fat value from an interned global; [`Rvalue::StrPtr`]/
+//!   [`Rvalue::StrLen`] project it (with a literal fast-path); [`Rvalue::MakeSlice`] packs one
+//!   from a data pointer + length; [`Rvalue::AddrOf`] takes a place's address; and
+//!   [`Proj::Index`] on a slice loads the data pointer before indexing. Array literals build
+//!   inline [`TyKind::Array`] values via [`AggKind::Array`].
+//!
 //! Anything outside this subset returns [`BackendError::Lower`] with a precise message; the
-//! remaining IR (slices' fat pointers, maps, and bump `cop`) lands later.
+//! remaining IR (maps and bump `cop`) lands later.
 
 use inkwell::basic_block::BasicBlock;
 use inkwell::builder::{Builder, BuilderError};
@@ -93,6 +100,13 @@ impl<'c> Cg<'c> {
         self.cx.ptr_type(AddressSpace::default())
     }
 
+    /// The fat-pointer layout `{ ptr, i64 len }` shared by `str` and `[]T` slice values.
+    /// Field 0 is the data pointer; field 1 is the element/byte length.
+    fn fat_ptr_ty(&self) -> StructType<'c> {
+        self.cx
+            .struct_type(&[self.ptr_ty().into(), self.cx.i64_type().into()], false)
+    }
+
     fn basic_ty(&self, ty: TyId) -> Result<BasicTypeEnum<'c>, BackendError> {
         Ok(match self.m.ty(ty) {
             TyKind::Bool => self.cx.bool_type().into(),
@@ -110,7 +124,9 @@ impl<'c> Cg<'c> {
             }
             TyKind::Struct(sid) => self.struct_llvm_ty(*sid)?.into(),
             TyKind::Sum(sid) => self.sum_llvm_ty(*sid).into(),
-            // A fixed-size array is a value; a slice's fat-pointer layout is not modeled yet.
+            // `str` and `[]T` slices are fat `{ ptr, len }` values.
+            TyKind::Str | TyKind::Slice(_) => self.fat_ptr_ty().into(),
+            // A fixed-size array is an inline value.
             TyKind::Array(elem, n) => self.basic_ty(*elem)?.array_type(*n as u32).into(),
             TyKind::Tuple(elems) => {
                 let fields: Vec<BasicTypeEnum> = elems
@@ -377,18 +393,16 @@ impl<'c> Cg<'c> {
             Rvalue::BinOp(op, a, b, _mode) => Ok(Some(self.lower_binop(func, locals, *op, a, b)?)),
             Rvalue::UnOp(op, a) => Ok(Some(self.lower_unop(func, locals, *op, a)?)),
             Rvalue::Cast(op, ty, kind) => Ok(Some(self.lower_cast(func, locals, op, *ty, *kind)?)),
-            Rvalue::StrPtr(op) => {
-                let s = self.str_literal(op)?;
-                let g = self
-                    .builder
-                    .build_global_string_ptr(&s, "str")
-                    .map_err(lower_err)?;
-                Ok(Some(g.as_pointer_value().into()))
+            Rvalue::StrPtr(op) => Ok(Some(self.str_projection(func, locals, op, 0)?)),
+            Rvalue::StrLen(op) => Ok(Some(self.str_projection(func, locals, op, 1)?)),
+            Rvalue::AddrOf(place) => {
+                let (ptr, _ty) = self.place_ptr(func, locals, place)?;
+                Ok(Some(ptr.into()))
             }
-            Rvalue::StrLen(op) => {
-                let s = self.str_literal(op)?;
-                let len = self.cx.i64_type().const_int(s.len() as u64, false);
-                Ok(Some(len.into()))
+            Rvalue::MakeSlice { data, len, .. } => {
+                let d = self.lower_operand(func, locals, data)?;
+                let l = self.lower_operand(func, locals, len)?;
+                Ok(Some(self.build_fat_ptr(d, l)?))
             }
             Rvalue::Call(callee, args) => self.lower_call(func, locals, callee, args),
             Rvalue::Cop(crib, init) => self.lower_cop(func, locals, crib, init),
@@ -426,6 +440,20 @@ impl<'c> Cg<'c> {
                 }
                 let sty = self.tuple_llvm_ty(&elems)?;
                 self.build_struct_value(func, locals, sty, ops)
+            }
+            AggKind::Array(elem) => {
+                let elem_ty = self.basic_ty(*elem)?;
+                let arr_ty = elem_ty.array_type(ops.len() as u32);
+                let mut agg = arr_ty.get_undef();
+                for (i, op) in ops.iter().enumerate() {
+                    let v = self.lower_operand(func, locals, op)?;
+                    agg = self
+                        .builder
+                        .build_insert_value(agg, v, i as u32, "arr")
+                        .map_err(lower_err)?
+                        .into_array_value();
+                }
+                Ok(agg.into())
             }
             AggKind::Sum { sum, variant } => {
                 self.build_sum_value(func, locals, *sum, *variant, ops)
@@ -993,17 +1021,37 @@ impl<'c> Cg<'c> {
                     pending = Some((sid, *v));
                 }
                 Proj::Index(idx) => {
-                    let (elem_ty, elem_llvm): (TyId, BasicTypeEnum) = match self.m.ty(ty) {
-                        TyKind::Array(e, _) | TyKind::Slice(e) => (*e, self.basic_ty(*e)?),
+                    let idx_v = self.lower_operand(func, locals, idx)?.into_int_value();
+                    match self.m.ty(ty) {
+                        // An array is stored inline: GEP straight off its address.
+                        TyKind::Array(e, _) => {
+                            let elem_llvm = self.basic_ty(*e)?;
+                            ptr = self.gep_index_elem(elem_llvm, ptr, idx_v)?;
+                            ty = *e;
+                        }
+                        // A slice is a fat `{ ptr, len }`: `ptr` is the address of that value, so
+                        // load its data pointer (field 0) before indexing the backing storage.
+                        TyKind::Slice(e) => {
+                            let elem_llvm = self.basic_ty(*e)?;
+                            let fat = self.fat_ptr_ty();
+                            let data_ptr_addr = self
+                                .builder
+                                .build_struct_gep(fat, ptr, 0, "slice.ptr")
+                                .map_err(|_| BackendError::Lower("slice ptr gep".into()))?;
+                            let data = self
+                                .builder
+                                .build_load(self.ptr_ty(), data_ptr_addr, "slice.data")
+                                .map_err(lower_err)?
+                                .into_pointer_value();
+                            ptr = self.gep_index_elem(elem_llvm, data, idx_v)?;
+                            ty = *e;
+                        }
                         other => {
                             return Err(BackendError::Lower(format!(
                                 "index into non-array {other:?}"
                             )));
                         }
-                    };
-                    let idx_v = self.lower_operand(func, locals, idx)?.into_int_value();
-                    ptr = self.gep_index_elem(elem_llvm, ptr, idx_v)?;
-                    ty = elem_ty;
+                    }
                 }
             }
         }
@@ -1099,10 +1147,61 @@ impl<'c> Cg<'c> {
                 .as_global_value()
                 .as_pointer_value()
                 .into()),
-            Const::Str(_) => Err(BackendError::Lower(
-                "a bare string constant has no scalar value; use str_ptr/str_len".into(),
-            )),
+            // A `str` literal is a fat `{ ptr, len }` value: an interned global byte array plus
+            // its byte length. This makes `str` a first-class value (locals, params, returns).
+            Const::Str(s) => {
+                let g = self
+                    .builder
+                    .build_global_string_ptr(s, "str")
+                    .map_err(lower_err)?;
+                let len = self.cx.i64_type().const_int(s.len() as u64, false);
+                Ok(self.build_fat_ptr(g.as_pointer_value().into(), len.into())?)
+            }
         }
+    }
+
+    /// Pack a `{ ptr, len }` fat value (a `str` or `[]T` slice) from a data pointer and a length.
+    fn build_fat_ptr(
+        &self,
+        data: BasicValueEnum<'c>,
+        len: BasicValueEnum<'c>,
+    ) -> Result<BasicValueEnum<'c>, BackendError> {
+        let fat = self.fat_ptr_ty();
+        let agg = self
+            .builder
+            .build_insert_value(fat.get_undef(), data, 0, "fat.ptr")
+            .map_err(lower_err)?;
+        let agg = self
+            .builder
+            .build_insert_value(agg, len, 1, "fat.len")
+            .map_err(lower_err)?;
+        Ok(agg.into_struct_value().into())
+    }
+
+    /// Extract field `idx` (0 = data ptr, 1 = len) from a fat `str`/slice operand, or take the
+    /// literal fast-path for a `str` constant (intern its global / use its static length).
+    fn str_projection(
+        &self,
+        func: &Func,
+        locals: &[Option<PointerValue<'c>>],
+        op: &Operand,
+        idx: u32,
+    ) -> Result<BasicValueEnum<'c>, BackendError> {
+        if let Operand::Const(Const::Str(s)) = op {
+            return Ok(if idx == 0 {
+                self.builder
+                    .build_global_string_ptr(s, "str")
+                    .map_err(lower_err)?
+                    .as_pointer_value()
+                    .into()
+            } else {
+                self.cx.i64_type().const_int(s.len() as u64, false).into()
+            });
+        }
+        let fat = self.lower_operand(func, locals, op)?.into_struct_value();
+        self.builder
+            .build_extract_value(fat, idx, "str.proj")
+            .map_err(lower_err)
     }
 
     fn str_literal(&self, op: &Operand) -> Result<String, BackendError> {

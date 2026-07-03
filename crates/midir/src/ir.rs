@@ -326,6 +326,16 @@ pub enum Rvalue {
     StrPtr(Operand),
     /// The byte length of a `str` value, as `u64` — the other `str` projection.
     StrLen(Operand),
+    /// The address of a place's storage, as a `rawptr` (the data pointer for a fat slice,
+    /// or an FFI-boundary raw address). The place must be memory-backed (every local is).
+    AddrOf(Place),
+    /// Build a fat `[]elem` slice value from a data pointer and an element count. The two
+    /// projections of the fat `{ ptr, len }` are `AddrOf`-style reads / `Index`.
+    MakeSlice {
+        data: Operand,
+        len: Operand,
+        elem: TyId,
+    },
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -341,6 +351,8 @@ pub enum Callee {
 pub enum AggKind {
     Struct(StructId),
     Tuple,
+    /// A fixed `[elem; N]` array value built from `N` operands (`N` is the operand count).
+    Array(TyId),
     /// A by-value `moods` (sum) value: the given variant with its payload operands. Sets
     /// the discriminant and stores the payload without allocating into a crib (the `cop`
     /// path is [`CopInit::SumVariant`]).

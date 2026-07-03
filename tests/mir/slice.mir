@@ -1,0 +1,25 @@
+// slice.mir — the fat-pointer value model. `slice_get` takes the address of an array place
+// (`addr_of`), builds a `[]i64` fat pointer from it (`make_slice[i64]`), and indexes the slice
+// — which loads the fat pointer's data field before the element GEP. `str_bytes` projects a
+// computed (non-literal) `str` fat value via `str_ptr`/`str_len`. No frontend surface produces
+// slices yet, so this is a hand-written backend fixture. (Fnd-Slice, backend.)
+
+fn slice_get(%0: [i64; 4], %1: i64) -> i64 {
+  let %2: rawptr
+  let %3: []i64
+  let %4: i64
+  bb0:
+    %2 = addr_of(%0)
+    %3 = make_slice[i64](%2, 4u64)
+    %4 = %3.index(%1)
+    return %4
+}
+
+fn str_bytes(%0: str) -> u64 {
+  let %1: rawptr
+  let %2: u64
+  bb0:
+    %1 = str_ptr(%0)
+    %2 = str_len(%0)
+    return %2
+}

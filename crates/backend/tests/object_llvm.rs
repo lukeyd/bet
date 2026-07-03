@@ -129,6 +129,11 @@ fn array_mir_compiles() {
     compile_fixture("array.mir");
 }
 
+#[test]
+fn slice_mir_compiles() {
+    compile_fixture("slice.mir");
+}
+
 // --- Track C: the scalar `spill` print primitives (bet_print_i64/u64/f64 + the bool branch),
 // including the sign/zero-extend and fpext coercions the frontend emits. ---
 

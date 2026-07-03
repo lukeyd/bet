@@ -266,6 +266,7 @@ impl<'a> Checker<'a> {
                         Some(TyKind::Struct(*sid))
                     }
                     AggKind::Tuple => None,
+                    AggKind::Array(elem) => Some(TyKind::Array(*elem, ops.len() as u64)),
                     AggKind::Sum { sum, variant } => {
                         if let Some(def) = self.sum_def(func, *sum) {
                             match def.variants.get(*variant as usize) {
@@ -329,6 +330,15 @@ impl<'a> Checker<'a> {
                     width: IntWidth::W64,
                     signed: false,
                 })
+            }
+            Rvalue::AddrOf(place) => {
+                let _ = self.place_kind(func, place);
+                Some(TyKind::RawPtr)
+            }
+            Rvalue::MakeSlice { data, len, elem } => {
+                self.operand_kind(func, data);
+                self.operand_kind(func, len);
+                Some(TyKind::Slice(*elem))
             }
         }
     }

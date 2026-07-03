@@ -588,9 +588,7 @@ impl LowerCtx {
                 values,
             } => self.lower_assign(targets, *op, values),
             StmtKind::Expr(e) => self.lower_expr_stmt(e),
-            StmtKind::Squad { .. } => {
-                Err("`squad` (for-each) is not yet lowered (needs slice/array iteration)".into())
-            }
+            StmtKind::Squad { var, iter, body } => self.lower_squad(var, iter, body),
             StmtKind::Sheesh { .. } => Err("`sheesh` (panic recovery) is not yet lowered".into()),
             StmtKind::Slide(_) => Err("`slide` (task spawn) is not yet lowered".into()),
             StmtKind::Bounce(_) => {
@@ -872,18 +870,9 @@ impl LowerCtx {
                 Ok(())
             }
             TyKind::Bool => self.lower_print_bool(op),
-            TyKind::Str => {
-                // Only a string *literal* has a data pointer the backend can intern today.
-                if matches!(op, Operand::Const(Const::Str(_))) {
-                    self.emit_print_operand(op)
-                } else {
-                    Err(
-                        "`spill` of a computed (non-literal) string is not yet lowered \
-                         (the backend has no dynamic string representation yet)"
-                            .into(),
-                    )
-                }
-            }
+            // `str` is a fat `{ ptr, len }` value; `spill` projects it (a literal takes the
+            // interned-global fast-path in the backend, a computed value an extractvalue).
+            TyKind::Str => self.emit_print_operand(op),
             other => Err(format!(
                 "`spill` of a value of type {other:?} is not yet lowered"
             )),
@@ -1204,10 +1193,8 @@ impl LowerCtx {
             ExprKind::Struct(lit) => self.lower_struct_lit(lit),
             ExprKind::Cop { init, crib } => self.lower_cop(init, crib),
             ExprKind::Trust { tag, crib } => self.lower_trust(tag, crib),
-            ExprKind::Index { .. } => {
-                Err("indexing (`base[i]`) is not yet lowered (needs slice/array support)".into())
-            }
-            ExprKind::Array(_) => Err("array/slice literals are not yet lowered".into()),
+            ExprKind::Index { base, index } => self.lower_index(base, index),
+            ExprKind::Array(elems) => self.lower_array_lit(elems, hint),
         }
     }
 
@@ -1409,6 +1396,132 @@ impl LowerCtx {
         let fty = def.fields[idx].ty;
         let fplace = extend(&place, Proj::Field(idx as u32));
         Ok((Operand::Copy(fplace), fty))
+    }
+
+    /// `base[index]` — index into an array or slice, yielding the element place.
+    fn lower_index(&mut self, base: &Expr, index: &Expr) -> Result<(Operand, TyId), String> {
+        let (bop, bty) = self.lower_expr(base, None)?;
+        let base_place = self
+            .operand_place(bop)
+            .ok_or_else(|| "indexing requires an addressable base".to_string())?;
+        let elem = match self.m.ty(bty) {
+            TyKind::Array(e, _) | TyKind::Slice(e) => *e,
+            other => return Err(format!("indexing a non-array/slice value ({other:?})")),
+        };
+        let i64t = self.m.t_i64();
+        let (iop, _ity) = self.lower_expr(index, Some(i64t))?;
+        let iplace = extend(&base_place, Proj::Index(iop));
+        Ok((Operand::Copy(iplace), elem))
+    }
+
+    /// `[a, b, c]` — a fixed array literal. The element type comes from an `[]T`/`[T; N]` hint
+    /// or is inferred from the first element; the value is an [`TyKind::Array`] of that arity.
+    fn lower_array_lit(
+        &mut self,
+        elems: &[Expr],
+        hint: Option<TyId>,
+    ) -> Result<(Operand, TyId), String> {
+        let elem_hint = match hint.map(|h| self.m.ty(h).clone()) {
+            Some(TyKind::Array(e, _)) | Some(TyKind::Slice(e)) => Some(e),
+            _ => None,
+        };
+        let mut ops = Vec::with_capacity(elems.len());
+        let mut elem_ty = elem_hint;
+        for e in elems {
+            let (op, ty) = self.lower_expr(e, elem_ty)?;
+            elem_ty.get_or_insert(ty);
+            ops.push(op);
+        }
+        let elem =
+            elem_ty.ok_or_else(|| "empty array literal needs a type annotation".to_string())?;
+        let aty = self.m.intern_ty(TyKind::Array(elem, elems.len() as u64));
+        let tmp = self.new_local(aty);
+        self.fb().assign(
+            Place::local(tmp),
+            Rvalue::Aggregate(AggKind::Array(elem), ops),
+        );
+        Ok((Operand::Copy(Place::local(tmp)), aty))
+    }
+
+    /// `squad x in xs { .. }` — for-each over a fixed array. Lowered to a counter loop
+    /// `for i in 0..N { x = xs[i]; body }`; the increment block is the `skip`/continue target.
+    fn lower_squad(&mut self, var: &str, iter: &Expr, body: &ast::Block) -> Result<(), String> {
+        let (iop, ity) = self.lower_expr(iter, None)?;
+        let (elem, n) = match self.m.ty(ity) {
+            TyKind::Array(e, n) => (*e, *n),
+            other => {
+                return Err(format!(
+                    "`squad` over a non-array value ({other:?}) is not yet lowered"
+                ));
+            }
+        };
+        let iter_place = self
+            .operand_place(iop)
+            .ok_or_else(|| "`squad` iterable must be addressable".to_string())?;
+        let i64t = self.m.t_i64();
+        let bool_ty = self.m.t_bool();
+
+        // counter = 0
+        let ctr = self.new_local(i64t);
+        self.fb().assign(
+            Place::local(ctr),
+            Rvalue::Use(Operand::Const(Const::Int(0, i64t))),
+        );
+
+        let pre = self.cur;
+        let header = self.reserve_block();
+        self.set_goto(pre, header);
+
+        // header: counter < N ?
+        self.select(header);
+        let cond = self.new_local(bool_ty);
+        self.fb().assign(
+            Place::local(cond),
+            Rvalue::BinOp(
+                BinOp::Lt,
+                Operand::Copy(Place::local(ctr)),
+                Operand::Const(Const::Int(n as i128, i64t)),
+                ArithMode::Na,
+            ),
+        );
+        let header_end = self.cur;
+        let body_bb = self.new_block();
+        let exit = self.reserve_block();
+        self.set_branch(header_end, Operand::Copy(Place::local(cond)), body_bb, exit);
+
+        // body: bind `x = xs[counter]`, then the user block.
+        self.select(body_bb);
+        self.scopes.push(HashMap::new());
+        let elem_place = extend(&iter_place, Proj::Index(Operand::Copy(Place::local(ctr))));
+        let elem_local = self.new_local(elem);
+        self.fb().assign(
+            Place::local(elem_local),
+            Rvalue::Use(Operand::Copy(elem_place)),
+        );
+        self.bind(var, elem_local);
+        // `skip` continues to the increment block so the counter still advances; `dip` breaks.
+        let incr = self.reserve_block();
+        self.loops.push((incr, exit));
+        self.lower_block(body)?;
+        self.loops.pop();
+        self.scopes.pop();
+        self.term_goto(incr);
+
+        // increment: counter += 1; back to header.
+        self.select(incr);
+        self.fb().assign(
+            Place::local(ctr),
+            Rvalue::BinOp(
+                BinOp::Add,
+                Operand::Copy(Place::local(ctr)),
+                Operand::Const(Const::Int(1, i64t)),
+                ArithMode::Wrap,
+            ),
+        );
+        self.term_goto(header);
+
+        self.select(exit);
+        Ok(())
     }
 
     fn lower_method(

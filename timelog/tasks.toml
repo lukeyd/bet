@@ -94,7 +94,7 @@ status = "done"
 slug = "fnd-slice"
 name = "Foundation: slice fat-pointer value model through lower + backend (unblocks arrays/[]u8/[]T/stash/gg buffers)"
 size = 8
-status = "todo"
+status = "done"
 
 [[task]]
 slug = "fnd-sum"
