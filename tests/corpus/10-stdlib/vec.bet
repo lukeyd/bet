@@ -1,0 +1,26 @@
+// vec — growable array: new, stack (push), gang (length), indexing, squad iteration, pop.
+// The runtime-backed `vec[T]` (bet_vec_*) is the compiled-path growable collection; fixed
+// `[a, b, c]` literals stay cheap value arrays. Backs the self-hosted compiler's token/stmt
+// buffers.
+pull "spill"
+pull "vec"
+
+finna main() {
+    lowkey xs = vec.new[int]()
+    xs.stack(10)
+    xs.stack(20)
+    xs.stack(30)
+    spill.it(xs.gang())    // 3
+
+    spill.it(xs[0])        // 10
+    spill.it(xs[2])        // 30
+
+    lowkey sum = 0
+    squad x in xs {
+        sum = sum + x
+    }
+    spill.it(sum)          // 60
+
+    spill.it(xs.pop())     // 30
+    spill.it(xs.gang())    // 2
+}

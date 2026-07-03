@@ -59,6 +59,14 @@ pub struct TaskHandle(pub u64);
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct MapHandle(pub *mut c_void);
 
+/// An opaque handle to a `vec` (growable array). Created by [`bet_vec_new`]. Elements are
+/// fixed-size blobs whose width is fixed at creation — the vec is intentionally type-erased at
+/// the ABI so one runtime implementation backs every `vec[T]` monomorphization (exactly like
+/// [`MapHandle`]). The frontend copies each element to/from a stack slot at the call site.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct VecHandle(pub *mut c_void);
+
 /// An opaque allocator-context handle (the Odin-style "current allocator"). The stub's
 /// current allocator is always the system heap; the handle exists so the contract is stable.
 #[repr(transparent)]
@@ -199,6 +207,25 @@ unsafe extern "C" {
     pub fn bet_map_len(map: MapHandle) -> usize;
     /// Destroy a map and release its backing memory.
     pub fn bet_map_free(map: MapHandle);
+
+    // --- vec (growable array) ---
+    /// Create an empty growable array whose elements are `elem_size`-byte blobs.
+    pub fn bet_vec_new(elem_size: usize) -> VecHandle;
+    /// Append a copy of the `elem_size` bytes at `elem_ptr` to the end of the vec.
+    pub fn bet_vec_push(vec: VecHandle, elem_ptr: *const u8);
+    /// Remove the last element. On success copy its bytes into `out_elem` and return `true`; on
+    /// an empty vec leave `out_elem` untouched and return `false`.
+    pub fn bet_vec_pop(vec: VecHandle, out_elem: *mut u8) -> bool;
+    /// Copy element `idx` into `out_elem`, returning `true`; out-of-range returns `false` and
+    /// leaves `out_elem` untouched.
+    pub fn bet_vec_get(vec: VecHandle, idx: usize, out_elem: *mut u8) -> bool;
+    /// Overwrite element `idx` with the bytes at `elem_ptr`, returning `true`; out-of-range
+    /// returns `false` and writes nothing.
+    pub fn bet_vec_set(vec: VecHandle, idx: usize, elem_ptr: *const u8) -> bool;
+    /// The number of elements in the vec.
+    pub fn bet_vec_len(vec: VecHandle) -> usize;
+    /// Destroy a vec and release its backing memory.
+    pub fn bet_vec_free(vec: VecHandle);
 
     // --- concurrency (slide) ---
 

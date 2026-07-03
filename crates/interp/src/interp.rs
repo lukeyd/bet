@@ -1017,6 +1017,11 @@ impl<'p> Interp<'p> {
                     "stash" if method == "new" => {
                         return Ok(vec![Value::Stash(Rc::new(RefCell::new(Vec::new())))]);
                     }
+                    // `vec.new[T]()` constructs an empty growable array. The `stack`/`pop`/`gang`
+                    // and iteration/index machinery below already operates on `Value::Array`.
+                    "vec" if method == "new" => {
+                        return Ok(vec![Value::Array(Vec::new())]);
+                    }
                     // `mem.scratch()` is a fresh, untyped per-frame arena.
                     "mem" if method == "scratch" => {
                         let id = self.new_arena(false);

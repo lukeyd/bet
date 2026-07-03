@@ -53,7 +53,7 @@ all = [
   # 09 bit math
   "bits.operators", "bits.bam-angles", "bits.wrapping", "bits.fixed-point",
   # 10 stdlib
-  "stdlib.stash", "stdlib.bytes", "stdlib.squadops",
+  "stdlib.stash", "stdlib.bytes", "stdlib.squadops", "stdlib.vec",
   # 11 reference oracles
   "reference.compiler", "reference.doom",
   # 12 ffi
@@ -355,6 +355,12 @@ path = "10-stdlib/squadops"
 covers = ["stdlib.squadops"]
 interp = "pass"
 compiled = "skip"
+
+[[program]]
+path = "10-stdlib/vec"
+covers = ["stdlib.vec"]
+interp = "pass"
+compiled = "pass"
 
 # --- 11 reference oracles ---------------------------------------------------
 [[program]]

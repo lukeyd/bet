@@ -429,6 +429,13 @@ impl LowerCtx {
                     let k = self.map_type(&generics[0])?;
                     let v = self.map_type(&generics[1])?;
                     Ok(self.m.intern_ty(TyKind::Map(k, v)))
+                } else if name == "vec" {
+                    // `vec[T]` — a growable-array handle.
+                    if generics.len() != 1 {
+                        return Err("`vec` takes one type argument `[T]`".into());
+                    }
+                    let e = self.map_type(&generics[0])?;
+                    Ok(self.m.intern_ty(TyKind::Vec(e)))
                 } else {
                     // Generic aggregate instantiation, e.g. `Pair[int]` → the mono struct.
                     let sid = self.mono_struct(name, generics)?;
@@ -1865,6 +1872,10 @@ impl LowerCtx {
     /// `base[index]` — index into an array or slice, yielding the element place.
     fn lower_index(&mut self, base: &Expr, index: &Expr) -> Result<(Operand, TyId), String> {
         let (bop, bty) = self.lower_expr(base, None)?;
+        // A `vec[T]` is a runtime handle, not addressable storage: read via `bet_vec_get`.
+        if let TyKind::Vec(e) = *self.m.ty(bty) {
+            return self.lower_vec_index(bop, e, index);
+        }
         let base_place = self
             .operand_place(bop)
             .ok_or_else(|| "indexing requires an addressable base".to_string())?;
@@ -1931,6 +1942,10 @@ impl LowerCtx {
     /// `for i in 0..N { x = xs[i]; body }`; the increment block is the `skip`/continue target.
     fn lower_squad(&mut self, var: &str, iter: &Expr, body: &ast::Block) -> Result<(), String> {
         let (iop, ity) = self.lower_expr(iter, None)?;
+        // A `vec[T]` iterates via a runtime length + `bet_vec_get` counter loop.
+        if let TyKind::Vec(e) = *self.m.ty(ity) {
+            return self.lower_vec_squad(var, iop, e, body);
+        }
         let (elem, n) = match self.m.ty(ity) {
             TyKind::Array(e, n) => (*e, *n),
             other => {
@@ -2021,9 +2036,12 @@ impl LowerCtx {
             && !self.funcs.contains_key(name)
             && self.is_module(name)
         {
-            // `stash.new[K, V]()` is the one intrinsic that needs its type arguments.
+            // `stash.new[K, V]()` / `vec.new[T]()` are the intrinsics that need their type args.
             if name == "stash" && method == "new" {
                 return self.lower_stash_new(generics);
+            }
+            if name == "vec" && method == "new" {
+                return self.lower_vec_new(generics);
             }
             return self.lower_intrinsic(name, method, args);
         }
@@ -2050,6 +2068,9 @@ impl LowerCtx {
         let (bop, bty) = self.lower_expr(receiver, None)?;
         if let TyKind::Map(k, v) = *self.m.ty(bty) {
             return self.lower_stash_method(bop, k, v, method, args);
+        }
+        if let TyKind::Vec(e) = *self.m.ty(bty) {
+            return self.lower_vec_method(bop, e, method, args);
         }
         if self.is_yikes(bty) {
             return self.lower_yikes_method(bop, method, args);
@@ -2308,6 +2329,220 @@ impl LowerCtx {
         }
     }
 
+    // === vec (growable arrays) ================================================
+
+    /// `vec.new[T]()` — create an empty growable array. Lowered to `bet_vec_new(size_of[T])`.
+    fn lower_vec_new(&mut self, generics: &[ast::Type]) -> Result<(Operand, TyId), String> {
+        if generics.len() != 1 {
+            return Err("`vec.new` takes one type argument `[T]`".into());
+        }
+        let e = self.map_type(&generics[0])?;
+        let vec_ty = self.m.intern_ty(TyKind::Vec(e));
+        let usize_t = self.m.t_int(IntWidth::W64, false);
+        let esize = self.new_local(usize_t);
+        self.fb().assign(Place::local(esize), Rvalue::SizeOf(e));
+        let ext = self.get_extern("bet_vec_new", vec![usize_t], vec![vec_ty]);
+        let tmp = self.new_local(vec_ty);
+        self.fb().assign(
+            Place::local(tmp),
+            Rvalue::Call(
+                Callee::Extern(ext),
+                vec![Operand::Copy(Place::local(esize))],
+            ),
+        );
+        Ok((Operand::Copy(Place::local(tmp)), vec_ty))
+    }
+
+    /// Dispatch a method on a `vec[T]` value: `stack` (push), `pop`, or `gang` (length).
+    fn lower_vec_method(
+        &mut self,
+        vec_op: Operand,
+        e: TyId,
+        method: &str,
+        args: &[ast::Arg],
+    ) -> Result<(Operand, TyId), String> {
+        let vec_ty = self.m.intern_ty(TyKind::Vec(e));
+        let rawptr = self.m.intern_ty(TyKind::RawPtr);
+        let usize_t = self.m.t_int(IntWidth::W64, false);
+        let boolt = self.m.t_bool();
+        match method {
+            // `v.stack(x)` → bet_vec_push(vec, elem_ptr): copy `x` to a slot, push its bytes.
+            "stack" => {
+                if args.len() != 1 {
+                    return Err("`vec.stack` takes a single element".into());
+                }
+                let (val_op, _) = self.lower_expr(&args[0].value, Some(e))?;
+                let el = self.new_local(e);
+                self.fb().assign(Place::local(el), Rvalue::Use(val_op));
+                let elem_ptr = self.new_local(rawptr);
+                self.fb()
+                    .assign(Place::local(elem_ptr), Rvalue::AddrOf(Place::local(el)));
+                let ext = self.get_extern("bet_vec_push", vec![vec_ty, rawptr], vec![]);
+                self.emit_extern_call(
+                    ext,
+                    &[],
+                    vec![vec_op, Operand::Copy(Place::local(elem_ptr))],
+                )
+            }
+            // `v.pop()` → bet_vec_pop writes the removed element into an out slot; yield it. The
+            // "was-nonempty" bool is dropped (an empty pop yields the untouched slot).
+            "pop" => {
+                if !args.is_empty() {
+                    return Err("`vec.pop` takes no arguments".into());
+                }
+                let out = self.new_local(e);
+                let out_ptr = self.new_local(rawptr);
+                self.fb()
+                    .assign(Place::local(out_ptr), Rvalue::AddrOf(Place::local(out)));
+                let ext = self.get_extern("bet_vec_pop", vec![vec_ty, rawptr], vec![boolt]);
+                let ok = self.new_local(boolt);
+                self.fb().assign(
+                    Place::local(ok),
+                    Rvalue::Call(
+                        Callee::Extern(ext),
+                        vec![vec_op, Operand::Copy(Place::local(out_ptr))],
+                    ),
+                );
+                Ok((Operand::Copy(Place::local(out)), e))
+            }
+            // `v.gang()` → bet_vec_len(vec) -> usize.
+            "gang" => {
+                if !args.is_empty() {
+                    return Err("`vec.gang` takes no arguments".into());
+                }
+                let ext = self.get_extern("bet_vec_len", vec![vec_ty], vec![usize_t]);
+                self.emit_extern_call(ext, &[usize_t], vec![vec_op])
+            }
+            other => Err(format!(
+                "unknown `vec` method `{other}` (have: stack, pop, gang)"
+            )),
+        }
+    }
+
+    /// `v[i]` for a `vec[T]` — read element `i` into a fresh slot via `bet_vec_get` and yield it
+    /// as a value (a vec index is a runtime read, not an assignable place like an array slot).
+    fn lower_vec_index(
+        &mut self,
+        vec_op: Operand,
+        e: TyId,
+        index: &Expr,
+    ) -> Result<(Operand, TyId), String> {
+        let vec_ty = self.m.intern_ty(TyKind::Vec(e));
+        let rawptr = self.m.intern_ty(TyKind::RawPtr);
+        let usize_t = self.m.t_int(IntWidth::W64, false);
+        let boolt = self.m.t_bool();
+        let (iop, ity) = self.lower_expr(index, Some(usize_t))?;
+        let iop = self.coerce_int(iop, ity, usize_t);
+        let out = self.new_local(e);
+        let out_ptr = self.new_local(rawptr);
+        self.fb()
+            .assign(Place::local(out_ptr), Rvalue::AddrOf(Place::local(out)));
+        let ext = self.get_extern("bet_vec_get", vec![vec_ty, usize_t, rawptr], vec![boolt]);
+        let ok = self.new_local(boolt);
+        self.fb().assign(
+            Place::local(ok),
+            Rvalue::Call(
+                Callee::Extern(ext),
+                vec![vec_op, iop, Operand::Copy(Place::local(out_ptr))],
+            ),
+        );
+        Ok((Operand::Copy(Place::local(out)), e))
+    }
+
+    /// `squad x in v { .. }` for a `vec[T]` — a counter loop bounded by `bet_vec_len`, binding
+    /// `x = bet_vec_get(v, i)` each iteration. Mirrors the fixed-array loop in [`Self::lower_squad`].
+    fn lower_vec_squad(
+        &mut self,
+        var: &str,
+        vec_op: Operand,
+        e: TyId,
+        body: &ast::Block,
+    ) -> Result<(), String> {
+        let vec_ty = self.m.intern_ty(TyKind::Vec(e));
+        let rawptr = self.m.intern_ty(TyKind::RawPtr);
+        let usize_t = self.m.t_int(IntWidth::W64, false);
+        let boolt = self.m.t_bool();
+
+        // len = bet_vec_len(v); counter = 0
+        let len_ext = self.get_extern("bet_vec_len", vec![vec_ty], vec![usize_t]);
+        let len = self.new_local(usize_t);
+        self.fb().assign(
+            Place::local(len),
+            Rvalue::Call(Callee::Extern(len_ext), vec![vec_op.clone()]),
+        );
+        let ctr = self.new_local(usize_t);
+        self.fb().assign(
+            Place::local(ctr),
+            Rvalue::Use(Operand::Const(Const::Int(0, usize_t))),
+        );
+
+        let pre = self.cur;
+        let header = self.reserve_block();
+        self.set_goto(pre, header);
+
+        // header: counter < len ?
+        self.select(header);
+        let cond = self.new_local(boolt);
+        self.fb().assign(
+            Place::local(cond),
+            Rvalue::BinOp(
+                BinOp::Lt,
+                Operand::Copy(Place::local(ctr)),
+                Operand::Copy(Place::local(len)),
+                ArithMode::Na,
+            ),
+        );
+        let header_end = self.cur;
+        let body_bb = self.new_block();
+        let exit = self.reserve_block();
+        self.set_branch(header_end, Operand::Copy(Place::local(cond)), body_bb, exit);
+
+        // body: x = bet_vec_get(v, counter); then the user block.
+        self.select(body_bb);
+        self.scopes.push(HashMap::new());
+        let elem_local = self.new_local(e);
+        let out_ptr = self.new_local(rawptr);
+        self.fb().assign(
+            Place::local(out_ptr),
+            Rvalue::AddrOf(Place::local(elem_local)),
+        );
+        let get_ext = self.get_extern("bet_vec_get", vec![vec_ty, usize_t, rawptr], vec![boolt]);
+        let got = self.new_local(boolt);
+        self.fb().assign(
+            Place::local(got),
+            Rvalue::Call(
+                Callee::Extern(get_ext),
+                vec![
+                    vec_op.clone(),
+                    Operand::Copy(Place::local(ctr)),
+                    Operand::Copy(Place::local(out_ptr)),
+                ],
+            ),
+        );
+        self.bind(var, elem_local);
+        let incr = self.reserve_block();
+        self.loops.push((incr, exit));
+        self.lower_block(body)?;
+        self.loops.pop();
+        self.scopes.pop();
+        self.term_goto(incr);
+
+        // increment: counter += 1; back to header.
+        self.select(incr);
+        self.fb().assign(
+            Place::local(ctr),
+            Rvalue::BinOp(
+                BinOp::Add,
+                Operand::Copy(Place::local(ctr)),
+                Operand::Const(Const::Int(1, usize_t)),
+                ArithMode::Wrap,
+            ),
+        );
+        self.term_goto(header);
+        self.select(exit);
+        Ok(())
+    }
+
     /// Serialize a key to a `(ptr, len)` pair for the map primitives: a `str` key uses its data
     /// pointer + byte length; any other key is stored into a fresh local and its address + size
     /// taken (so an `int` key hashes over its raw bytes).
@@ -2343,7 +2578,7 @@ impl LowerCtx {
     fn is_module(&self, name: &str) -> bool {
         matches!(
             name,
-            "spill" | "str" | "math" | "mem" | "bytes" | "fmt" | "stash" | "yikes" | "fs"
+            "spill" | "str" | "math" | "mem" | "bytes" | "fmt" | "stash" | "vec" | "yikes" | "fs"
         )
     }
 

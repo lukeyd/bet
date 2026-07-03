@@ -56,7 +56,7 @@ pub fn staticlib_link_name() -> &'static str {
 // Only the *types* are re-exported; the entry-point declarations in `rt-abi` are not (they
 // would collide with the definitions below).
 pub use rt_abi::{
-    AllocCtx, CribHandle, Event, FrameBuffer, MapHandle, Tag, TaskHandle, event_kind,
+    AllocCtx, CribHandle, Event, FrameBuffer, MapHandle, Tag, TaskHandle, VecHandle, event_kind,
 };
 
 // ---------------------------------------------------------------------------
@@ -568,6 +568,91 @@ pub unsafe extern "C" fn bet_map_len(map: MapHandle) -> usize {
 pub unsafe extern "C" fn bet_map_free(map: MapHandle) {
     if !map.0.is_null() {
         drop(unsafe { Box::from_raw(map.0 as *mut StashMap) });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vec (growable array). Type-erased flat byte buffer of fixed-width elements; one
+// implementation backs every `vec[T]` (matches rt-stub, same semantics).
+// ---------------------------------------------------------------------------
+
+struct DynVec {
+    elem_size: usize,
+    data: Vec<u8>,
+}
+
+impl DynVec {
+    fn len(&self) -> usize {
+        // `checked_div` yields `None` for a zero-size element type, which we treat as length 0.
+        self.data.len().checked_div(self.elem_size).unwrap_or(0)
+    }
+}
+
+unsafe fn vec_ref<'a>(vec: VecHandle) -> &'a mut DynVec {
+    unsafe { &mut *(vec.0 as *mut DynVec) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_vec_new(elem_size: usize) -> VecHandle {
+    let v = Box::new(DynVec {
+        elem_size,
+        data: Vec::new(),
+    });
+    VecHandle(Box::into_raw(v) as *mut c_void)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_vec_push(vec: VecHandle, elem_ptr: *const u8) {
+    let v = unsafe { vec_ref(vec) };
+    let bytes = unsafe { core::slice::from_raw_parts(elem_ptr, v.elem_size) };
+    v.data.extend_from_slice(bytes);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_vec_pop(vec: VecHandle, out_elem: *mut u8) -> bool {
+    let v = unsafe { vec_ref(vec) };
+    let n = v.len();
+    if n == 0 {
+        return false;
+    }
+    let start = (n - 1) * v.elem_size;
+    unsafe { core::ptr::copy_nonoverlapping(v.data[start..].as_ptr(), out_elem, v.elem_size) };
+    v.data.truncate(start);
+    true
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_vec_get(vec: VecHandle, idx: usize, out_elem: *mut u8) -> bool {
+    let v = unsafe { vec_ref(vec) };
+    if idx >= v.len() {
+        return false;
+    }
+    let start = idx * v.elem_size;
+    unsafe { core::ptr::copy_nonoverlapping(v.data[start..].as_ptr(), out_elem, v.elem_size) };
+    true
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_vec_set(vec: VecHandle, idx: usize, elem_ptr: *const u8) -> bool {
+    let v = unsafe { vec_ref(vec) };
+    if idx >= v.len() {
+        return false;
+    }
+    let start = idx * v.elem_size;
+    let bytes = unsafe { core::slice::from_raw_parts(elem_ptr, v.elem_size) };
+    v.data[start..start + v.elem_size].copy_from_slice(bytes);
+    true
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_vec_len(vec: VecHandle) -> usize {
+    unsafe { vec_ref(vec) }.len()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_vec_free(vec: VecHandle) {
+    if !vec.0.is_null() {
+        drop(unsafe { Box::from_raw(vec.0 as *mut DynVec) });
     }
 }
 

@@ -37,7 +37,7 @@ pub fn staticlib_link_name() -> &'static str {
 // Only the *types* are re-exported; the entry-point declarations in `rt-abi` are not (they
 // would collide with the definitions below).
 pub use rt_abi::{
-    AllocCtx, CribHandle, Event, FrameBuffer, MapHandle, Tag, TaskHandle, event_kind,
+    AllocCtx, CribHandle, Event, FrameBuffer, MapHandle, Tag, TaskHandle, VecHandle, event_kind,
 };
 
 // ---------------------------------------------------------------------------
@@ -453,6 +453,91 @@ pub unsafe extern "C" fn bet_map_free(map: MapHandle) {
 }
 
 // ---------------------------------------------------------------------------
+// Vec (growable array). A type-erased flat byte buffer of fixed-width elements; one
+// implementation backs every `vec[T]` (the frontend copies elements to/from stack slots).
+// ---------------------------------------------------------------------------
+
+struct DynVec {
+    elem_size: usize,
+    data: Vec<u8>,
+}
+
+impl DynVec {
+    fn len(&self) -> usize {
+        // `checked_div` yields `None` for a zero-size element type, which we treat as length 0.
+        self.data.len().checked_div(self.elem_size).unwrap_or(0)
+    }
+}
+
+unsafe fn vec_ref<'a>(vec: VecHandle) -> &'a mut DynVec {
+    unsafe { &mut *(vec.0 as *mut DynVec) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_vec_new(elem_size: usize) -> VecHandle {
+    let v = Box::new(DynVec {
+        elem_size,
+        data: Vec::new(),
+    });
+    VecHandle(Box::into_raw(v) as *mut c_void)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_vec_push(vec: VecHandle, elem_ptr: *const u8) {
+    let v = unsafe { vec_ref(vec) };
+    let bytes = unsafe { std::slice::from_raw_parts(elem_ptr, v.elem_size) };
+    v.data.extend_from_slice(bytes);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_vec_pop(vec: VecHandle, out_elem: *mut u8) -> bool {
+    let v = unsafe { vec_ref(vec) };
+    let n = v.len();
+    if n == 0 {
+        return false;
+    }
+    let start = (n - 1) * v.elem_size;
+    unsafe { std::ptr::copy_nonoverlapping(v.data[start..].as_ptr(), out_elem, v.elem_size) };
+    v.data.truncate(start);
+    true
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_vec_get(vec: VecHandle, idx: usize, out_elem: *mut u8) -> bool {
+    let v = unsafe { vec_ref(vec) };
+    if idx >= v.len() {
+        return false;
+    }
+    let start = idx * v.elem_size;
+    unsafe { std::ptr::copy_nonoverlapping(v.data[start..].as_ptr(), out_elem, v.elem_size) };
+    true
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_vec_set(vec: VecHandle, idx: usize, elem_ptr: *const u8) -> bool {
+    let v = unsafe { vec_ref(vec) };
+    if idx >= v.len() {
+        return false;
+    }
+    let start = idx * v.elem_size;
+    let bytes = unsafe { std::slice::from_raw_parts(elem_ptr, v.elem_size) };
+    v.data[start..start + v.elem_size].copy_from_slice(bytes);
+    true
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_vec_len(vec: VecHandle) -> usize {
+    unsafe { vec_ref(vec) }.len()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_vec_free(vec: VecHandle) {
+    if !vec.0.is_null() {
+        drop(unsafe { Box::from_raw(vec.0 as *mut DynVec) });
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Concurrency (slide).
 // ---------------------------------------------------------------------------
 
@@ -678,5 +763,36 @@ mod tests {
 
         assert!(unsafe { bet_str_eq(a.as_ptr(), a.len(), a.as_ptr(), a.len()) });
         assert!(!unsafe { bet_str_eq(a.as_ptr(), a.len(), b.as_ptr(), b.len()) });
+    }
+
+    #[test]
+    fn vec_push_get_set_pop_len() {
+        // A `vec[i64]`: elements are 8-byte blobs (the frontend copies each to a stack slot).
+        let v = unsafe { bet_vec_new(8) };
+        for n in [10i64, 20, 30] {
+            unsafe { bet_vec_push(v, n.to_ne_bytes().as_ptr()) };
+        }
+        assert_eq!(unsafe { bet_vec_len(v) }, 3);
+
+        let mut out = [0u8; 8];
+        assert!(unsafe { bet_vec_get(v, 1, out.as_mut_ptr()) });
+        assert_eq!(i64::from_ne_bytes(out), 20);
+        assert!(!unsafe { bet_vec_get(v, 3, out.as_mut_ptr()) }); // out of range
+
+        // Overwrite element 0, then read it back.
+        unsafe { bet_vec_set(v, 0, 99i64.to_ne_bytes().as_ptr()) };
+        assert!(unsafe { bet_vec_get(v, 0, out.as_mut_ptr()) });
+        assert_eq!(i64::from_ne_bytes(out), 99);
+
+        // Pop returns the last element and shrinks; a pop past empty returns false.
+        assert!(unsafe { bet_vec_pop(v, out.as_mut_ptr()) });
+        assert_eq!(i64::from_ne_bytes(out), 30);
+        assert_eq!(unsafe { bet_vec_len(v) }, 2);
+        assert!(unsafe { bet_vec_pop(v, out.as_mut_ptr()) });
+        assert!(unsafe { bet_vec_pop(v, out.as_mut_ptr()) });
+        assert!(!unsafe { bet_vec_pop(v, out.as_mut_ptr()) });
+        assert_eq!(unsafe { bet_vec_len(v) }, 0);
+
+        unsafe { bet_vec_free(v) };
     }
 }

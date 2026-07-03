@@ -159,9 +159,11 @@ impl<'c> Cg<'c> {
             // single 64-bit integer register on our targets — so we carry it as `i64`.
             TyKind::Tag(_) => self.cx.i64_type().into(),
             // Crib handles, live refs, and function values are all raw pointers.
-            TyKind::Crib(_) | TyKind::Ref(_) | TyKind::FnPtr(_) | TyKind::Map(_, _) => {
-                self.ptr_ty().into()
-            }
+            TyKind::Crib(_)
+            | TyKind::Ref(_)
+            | TyKind::FnPtr(_)
+            | TyKind::Map(_, _)
+            | TyKind::Vec(_) => self.ptr_ty().into(),
             TyKind::Struct(sid) => self.struct_llvm_ty(*sid)?.into(),
             TyKind::Sum(sid) => self.sum_llvm_ty(*sid).into(),
             // `str` and `[]T` slices are fat `{ ptr, len }` values.
@@ -210,7 +212,8 @@ impl<'c> Cg<'c> {
             | TyKind::Crib(_)
             | TyKind::Ref(_)
             | TyKind::FnPtr(_)
-            | TyKind::Map(_, _) => 1,
+            | TyKind::Map(_, _)
+            | TyKind::Vec(_) => 1,
             // `str` and slices are fat `(ptr, len)` values (two words).
             TyKind::Str | TyKind::Slice(_) => 2,
             TyKind::Array(elem, n) => self.ty_words(*elem).saturating_mul(*n as u32),

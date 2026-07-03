@@ -107,6 +107,8 @@ pub enum TyKind {
     Ref(TyId),
     /// `map[K]V` — an opaque, runtime-backed hash map handle.
     Map(TyId, TyId),
+    /// `vec[T]` — an opaque, runtime-backed growable-array handle.
+    Vec(TyId),
     /// A function-pointer value; the pointee signature is interned.
     FnPtr(SigId),
     /// An anonymous tuple, used to carry multi-value returns as one value.
