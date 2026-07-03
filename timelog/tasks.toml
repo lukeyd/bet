@@ -114,7 +114,7 @@ status = "todo"
 slug = "compiled-path"
 name = "Compiled-path completion: dyn strings, indexing/array/slice literals, bounce, squad, multi-assign, backend overflow-trap + interp math/bits"
 size = 21
-status = "doing"
+status = "done"
 
 [[task]]
 slug = "bytes-io"
@@ -188,7 +188,7 @@ status = "todo"
 slug = "milestone-5-fmt"
 name = "Milestone 5: self-hosted formatter (crates/fmt on frontend library); full corpus round-trips idempotently"
 size = 8
-status = "todo"
+status = "done"
 
 [[task]]
 slug = "corpus-parity"
