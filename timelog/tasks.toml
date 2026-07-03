@@ -134,7 +134,7 @@ status = "todo"
 slug = "generics"
 name = "§2.2 generics: ahead-of-time monomorphization pass in frontend (mangling, instantiation, cycles); interp parity"
 size = 21
-status = "todo"
+status = "done"
 
 [[task]]
 slug = "stash"
@@ -148,13 +148,13 @@ status = "todo"
 slug = "milestone-3-arenas"
 name = "Milestone 3: crib/cop/evict through codegen (bump-crib + sum-variant cop), 08-memory differential-green, bench harness on"
 size = 8
-status = "todo"
+status = "done"
 
 [[task]]
 slug = "milestone-4-tag-holla"
 name = "Milestone 4: tag/holla end-to-end + debug-mode trust() generation-check (traps on stale tag)"
 size = 8
-status = "todo"
+status = "done"
 
 # ─────────────────────── Track 4 — platform / runtime ───────────────────────
 

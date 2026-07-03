@@ -46,6 +46,17 @@ struct ConstVal {
     ty: TyId,
 }
 
+/// A reserved-but-not-yet-lowered monomorphized function instance.
+#[derive(Clone)]
+struct MonoFnJob {
+    /// The generic function's base name.
+    name: String,
+    /// The concrete type arguments (already resolved to interned ids).
+    args: Vec<TyId>,
+    /// The `FuncId` reserved for this instance (must match its eventual `add_func`).
+    id: FuncId,
+}
+
 /// A collected user-function signature, keyed by name for call/`@f` resolution.
 #[derive(Clone)]
 struct FuncSig {
@@ -75,6 +86,22 @@ struct LowerCtx {
     globals: HashMap<String, ConstVal>,
     /// Module-level `crib` name → its `(CribGlobalId, crib T)` handle type.
     crib_globals: HashMap<String, (CribGlobalId, TyId)>,
+
+    // --- generics / monomorphization ---
+    /// Generic function/struct definitions, kept by name for on-demand instantiation.
+    generic_funcs: HashMap<String, ast::FnDecl>,
+    generic_structs: HashMap<String, ast::DripDecl>,
+    /// Instantiation caches: `(name, concrete type args)` → the monomorphized id.
+    mono_structs: HashMap<(String, Vec<TyId>), StructId>,
+    mono_funcs: HashMap<(String, Vec<TyId>), FuncId>,
+    /// The monomorphic `(params, rets)` of each reserved function instance, by id.
+    mono_sigs: HashMap<FuncId, (Vec<TyId>, Vec<TyId>)>,
+    /// Reserved-but-not-yet-lowered function instances (drained after the concrete funcs).
+    mono_worklist: Vec<MonoFnJob>,
+    /// The next `FuncId` to hand a monomorphized instance (starts past the concrete funcs).
+    next_mono_fid: u32,
+    /// The active type-parameter substitution while lowering a generic instance.
+    subst: HashMap<String, TyId>,
     /// `bet_print(rawptr, u64) -> void` — the stdout entry point (always present).
     print_extern: ExternId,
     /// Deduped externs synthesized on demand, keyed by `(name, ret-type)`.
@@ -115,6 +142,14 @@ impl LowerCtx {
             externs: HashMap::new(),
             globals: HashMap::new(),
             crib_globals: HashMap::new(),
+            generic_funcs: HashMap::new(),
+            generic_structs: HashMap::new(),
+            mono_structs: HashMap::new(),
+            mono_funcs: HashMap::new(),
+            mono_sigs: HashMap::new(),
+            mono_worklist: Vec::new(),
+            next_mono_fid: 0,
+            subst: HashMap::new(),
             print_extern,
             extern_cache: HashMap::new(),
             fb: None,
@@ -134,10 +169,14 @@ impl LowerCtx {
     /// declarations that appear later (and to each other). Ids follow appearance order per
     /// kind, matching the order the lowering pass adds them in.
     fn collect(&mut self, prog: &ast::Program) -> Result<(), String> {
-        // 1a. Assign struct/sum ids by appearance order.
+        // 1a. Assign struct/sum ids by appearance order. Generic aggregates get no id here;
+        // they are stored for on-demand monomorphization and their instances appended later.
         let (mut sn, mut un) = (0u32, 0u32);
         for item in &prog.items {
             match item {
+                Item::Drip(d) if !d.generics.is_empty() => {
+                    self.generic_structs.insert(d.name.clone(), d.clone());
+                }
                 Item::Drip(d) => {
                     self.structs.insert(d.name.clone(), StructId(sn));
                     sn += 1;
@@ -154,13 +193,7 @@ impl LowerCtx {
             match item {
                 Item::Drip(d) => {
                     if !d.generics.is_empty() {
-                        // A generic `drip` has no monomorphic layout; register a placeholder so
-                        // the id count stays aligned, but building a value of it will error.
-                        self.m.add_struct(StructDef {
-                            name: d.name.clone(),
-                            fields: Vec::new(),
-                        });
-                        continue;
+                        continue; // generic — monomorphized on demand
                     }
                     let mut fields = Vec::with_capacity(d.fields.len());
                     for f in &d.fields {
@@ -231,15 +264,22 @@ impl LowerCtx {
             }
         }
 
-        // 3. Function signatures (id by function-item order — the same order lowering adds).
+        // 3. Function signatures (id by concrete-function order — the same order lowering adds).
+        // Generic functions get no id; they are stored for on-demand monomorphization, and their
+        // instances are appended after all concrete functions (starting at `next_mono_fid`).
         let mut fid = 0u32;
         for item in &prog.items {
             if let Item::Func(f) = item {
-                let sig = self.collect_fn_sig(f, FuncId(fid));
-                self.funcs.insert(f.name.clone(), sig);
-                fid += 1;
+                if f.generics.is_empty() {
+                    let sig = self.collect_fn_sig(f, FuncId(fid));
+                    self.funcs.insert(f.name.clone(), sig);
+                    fid += 1;
+                } else {
+                    self.generic_funcs.insert(f.name.clone(), f.clone());
+                }
             }
         }
+        self.next_mono_fid = fid;
 
         // 4. Module-level `facts` constants.
         for item in &prog.items {
@@ -375,17 +415,22 @@ impl LowerCtx {
                 Ok(self.m.intern_ty(TyKind::FnPtr(sig)))
             }
             ast::TypeKind::Named(name, generics) => {
-                if !generics.is_empty() {
-                    return Err(format!(
-                        "generic type instantiation `{name}[..]` is not yet lowered (needs monomorphization)"
-                    ));
+                if generics.is_empty() {
+                    self.named_type(name)
+                } else {
+                    // Generic aggregate instantiation, e.g. `Pair[int]` → the mono struct.
+                    let sid = self.mono_struct(name, generics)?;
+                    Ok(self.m.intern_ty(TyKind::Struct(sid)))
                 }
-                self.named_type(name)
             }
         }
     }
 
     fn named_type(&mut self, name: &str) -> Result<TyId, String> {
+        // A type-parameter name in the active substitution resolves to its concrete argument.
+        if let Some(&t) = self.subst.get(name) {
+            return Ok(t);
+        }
         let int = |w, s| TyKind::Int {
             width: w,
             signed: s,
@@ -420,6 +465,175 @@ impl LowerCtx {
         Ok(self.m.intern_ty(kind))
     }
 
+    // === monomorphization ====================================================
+
+    /// Build a `type-param → concrete arg` substitution from a generic def's params and args.
+    fn build_subst(&self, params: &[String], args: &[TyId]) -> HashMap<String, TyId> {
+        params.iter().cloned().zip(args.iter().copied()).collect()
+    }
+
+    /// Instantiate a generic `drip` at concrete type args, returning the monomorphized
+    /// `StructId` (creating and caching it on first use). Field types are resolved under a
+    /// fresh substitution; the caller's substitution is saved and restored.
+    fn mono_struct(&mut self, name: &str, args: &[ast::Type]) -> Result<StructId, String> {
+        let arg_tys: Vec<TyId> = args
+            .iter()
+            .map(|t| self.map_type(t))
+            .collect::<Result<_, _>>()?;
+        let key = (name.to_string(), arg_tys.clone());
+        if let Some(&sid) = self.mono_structs.get(&key) {
+            return Ok(sid);
+        }
+        let decl = self
+            .generic_structs
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("unknown generic struct `{name}`"))?;
+        if decl.generics.len() != arg_tys.len() {
+            return Err(format!(
+                "generic struct `{name}` expects {} type arg(s), got {}",
+                decl.generics.len(),
+                arg_tys.len()
+            ));
+        }
+        let mangled = self.mangle(name, &arg_tys);
+        let new_subst = self.build_subst(&decl.generics, &arg_tys);
+        let saved = std::mem::replace(&mut self.subst, new_subst);
+        let mut fields = Vec::with_capacity(decl.fields.len());
+        let mut err = None;
+        for f in &decl.fields {
+            match self.map_type(&f.ty) {
+                Ok(ty) => fields.push(Field {
+                    name: f.name.clone(),
+                    ty,
+                    vis: match f.vis {
+                        Some(ast::Vis::Flex) => Vis::Flex,
+                        _ => Vis::Hush,
+                    },
+                }),
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        self.subst = saved;
+        if let Some(e) = err {
+            return Err(e);
+        }
+        let sid = self.m.add_struct(StructDef {
+            name: mangled,
+            fields,
+        });
+        self.mono_structs.insert(key, sid);
+        Ok(sid)
+    }
+
+    /// Reserve (and, on first use, sign) a generic function instance at concrete type args,
+    /// returning its `(FuncId, params, rets)`. The body is lowered later from the work-list.
+    fn mono_fn(
+        &mut self,
+        name: &str,
+        args: &[ast::Type],
+    ) -> Result<(FuncId, Vec<TyId>, Vec<TyId>), String> {
+        let decl = self
+            .generic_funcs
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("unknown generic function `{name}`"))?;
+        let arg_tys: Vec<TyId> = args
+            .iter()
+            .map(|t| self.map_type(t))
+            .collect::<Result<_, _>>()?;
+        if decl.generics.len() != arg_tys.len() {
+            return Err(format!(
+                "generic function `{name}` expects {} type arg(s), got {}",
+                decl.generics.len(),
+                arg_tys.len()
+            ));
+        }
+        let key = (name.to_string(), arg_tys.clone());
+        if let Some(&id) = self.mono_funcs.get(&key) {
+            let (p, r) = self.mono_sigs[&id].clone();
+            return Ok((id, p, r));
+        }
+        // Resolve the instance signature under the substitution.
+        let new_subst = self.build_subst(&decl.generics, &arg_tys);
+        let saved = std::mem::replace(&mut self.subst, new_subst);
+        let mut params = Vec::new();
+        let sig_res = (|this: &mut Self| -> Result<Vec<TyId>, String> {
+            if let Some(r) = &decl.receiver {
+                params.push(this.map_type(&r.ty)?);
+            }
+            for p in &decl.params {
+                params.push(this.map_type(&p.ty)?);
+            }
+            this.ret_types(&decl.ret)
+        })(self);
+        self.subst = saved;
+        let rets = sig_res?;
+        let id = FuncId(self.next_mono_fid);
+        self.next_mono_fid += 1;
+        self.mono_funcs.insert(key, id);
+        self.mono_sigs.insert(id, (params.clone(), rets.clone()));
+        self.mono_worklist.push(MonoFnJob {
+            name: name.to_string(),
+            args: arg_tys,
+            id,
+        });
+        Ok((id, params, rets))
+    }
+
+    /// Lower one queued monomorphized function instance. Its `FuncId` must equal the id
+    /// reserved when it was signed (it is appended after all concrete + prior-instance funcs).
+    fn lower_mono_fn(&mut self, job: &MonoFnJob) -> Result<(), String> {
+        let decl = self.generic_funcs[&job.name].clone();
+        let (params, rets) = self.mono_sigs[&job.id].clone();
+        let mangled = self.mangle(&job.name, &job.args);
+        let new_subst = self.build_subst(&decl.generics, &job.args);
+        let saved = std::mem::replace(&mut self.subst, new_subst);
+        let res = self.lower_fn_core(
+            mangled,
+            params,
+            rets,
+            decl.receiver.as_ref(),
+            &decl.params,
+            &decl.body,
+        );
+        self.subst = saved;
+        res?;
+        debug_assert_eq!(FuncId(self.m.funcs().len() as u32 - 1), job.id);
+        Ok(())
+    }
+
+    /// A unique, readable symbol suffix for an instantiation: `pickFirst$i64`, `Pair$str`.
+    fn mangle(&self, base: &str, args: &[TyId]) -> String {
+        let parts: Vec<String> = args.iter().map(|&t| self.mangle_ty(t)).collect();
+        format!("{base}${}", parts.join("$"))
+    }
+
+    fn mangle_ty(&self, t: TyId) -> String {
+        match self.m.ty(t) {
+            TyKind::Bool => "bool".into(),
+            TyKind::Int { width, signed } => {
+                format!("{}{}", if *signed { "i" } else { "u" }, width.bits())
+            }
+            TyKind::F32 => "f32".into(),
+            TyKind::F64 => "f64".into(),
+            TyKind::Str => "str".into(),
+            TyKind::Void => "void".into(),
+            TyKind::RawPtr => "rawptr".into(),
+            TyKind::Struct(s) => self.m.struct_def(*s).name.clone(),
+            TyKind::Sum(s) => self.m.sum_def(*s).name.clone(),
+            TyKind::Slice(e) => format!("slice_{}", self.mangle_ty(*e)),
+            TyKind::Array(e, n) => format!("arr{n}_{}", self.mangle_ty(*e)),
+            TyKind::Tag(e) => format!("tag_{}", self.mangle_ty(*e)),
+            TyKind::Crib(e) => format!("crib_{}", self.mangle_ty(*e)),
+            TyKind::Ref(e) => format!("ref_{}", self.mangle_ty(*e)),
+            _ => format!("t{}", t.0),
+        }
+    }
+
     fn int_hint_or_default(&mut self, hint: Option<TyId>) -> TyId {
         match hint {
             Some(t) if matches!(self.m.ty(t), TyKind::Int { .. }) => t,
@@ -450,29 +664,32 @@ impl LowerCtx {
                 self.crib_globals.insert(c.name.clone(), (id, crib_ty));
             }
         }
-        // Pass 2: lower function bodies.
+        // Pass 2: lower concrete function bodies (generic ones are instantiated on demand).
         for item in &prog.items {
             match item {
                 Item::Pull(_) | Item::Extern(_) | Item::Drip(_) | Item::Moods(_) => {}
                 // Module-level facts already collected; nothing to emit (inlined at use).
                 Item::Const(_) => {}
                 Item::Crib(_) => {} // registered in pass 1
-                Item::Func(f) => self.lower_func(f)?,
+                Item::Func(f) if f.generics.is_empty() => self.lower_func(f)?,
+                Item::Func(_) => {} // generic — lowered from the work-list below
                 Item::Var(_) => {
                     return Err("module-level `lowkey` is not yet lowered".into());
                 }
             }
         }
+        // Pass 3: drain the monomorphization work-list. Instances may enqueue more (generic
+        // functions calling other generic instances); the index walk picks those up too.
+        let mut i = 0;
+        while i < self.mono_worklist.len() {
+            let job = self.mono_worklist[i].clone();
+            i += 1;
+            self.lower_mono_fn(&job)?;
+        }
         Ok(())
     }
 
     fn lower_func(&mut self, f: &ast::FnDecl) -> Result<(), String> {
-        if !f.generics.is_empty() {
-            return Err(format!(
-                "generic function `{}` is not yet lowered (needs monomorphization)",
-                f.name
-            ));
-        }
         let sig = self
             .funcs
             .get(&f.name)
@@ -484,30 +701,50 @@ impl LowerCtx {
                 f.name
             ));
         }
+        self.lower_fn_core(
+            f.name.clone(),
+            sig.params,
+            sig.rets,
+            f.receiver.as_ref(),
+            &f.params,
+            &f.body,
+        )
+    }
 
-        // Fresh per-function state.
-        let fb = FuncBuilder::new(f.name.clone(), sig.params.clone(), sig.rets.clone());
+    /// The shared body-lowering machinery for a concrete or monomorphized function: sets up
+    /// fresh per-function state, binds the (receiver +) parameters, walks the body, adds the
+    /// finished [`Func`] to the module. The active `self.subst` (if any) is left untouched.
+    fn lower_fn_core(
+        &mut self,
+        name: String,
+        params: Vec<TyId>,
+        rets: Vec<TyId>,
+        receiver: Option<&ast::Receiver>,
+        fn_params: &[ast::Param],
+        body: &ast::Block,
+    ) -> Result<(), String> {
+        let fb = FuncBuilder::new(name, params.clone(), rets.clone());
         self.fb = Some(fb);
-        self.local_tys = sig.params.clone();
+        self.local_tys = params;
         self.scopes = vec![HashMap::new()];
         self.local_consts = HashMap::new();
         self.loops = Vec::new();
-        self.cur_rets = sig.rets.clone();
+        self.cur_rets = rets;
 
         // The entry block, then param bindings (receiver first, if any).
         let entry = self.new_block();
         debug_assert_eq!(entry, BlockId(0));
         let mut pi = 0usize;
-        if let Some(r) = &f.receiver {
+        if let Some(r) = receiver {
             self.bind(&r.name, LocalId(pi as u32));
             pi += 1;
         }
-        for p in &f.params {
+        for p in fn_params {
             self.bind(&p.name, LocalId(pi as u32));
             pi += 1;
         }
 
-        self.lower_block(&f.body)?;
+        self.lower_block(body)?;
 
         // Fall-through epilogue: void functions return; value functions that reach here
         // without a `bet` are structurally unreachable.
@@ -1626,7 +1863,13 @@ impl LowerCtx {
             && self.lookup_local(name).is_none()
         {
             if !generics.is_empty() {
-                return Err(format!("generic call `{name}[..]` is not yet lowered"));
+                // A generic function call: monomorphize the instance and call it directly.
+                if self.generic_funcs.contains_key(name) {
+                    let (id, params, rets) = self.mono_fn(name, generics)?;
+                    let call_args = self.lower_args(args, &params)?;
+                    return self.emit_call(id, &rets, call_args);
+                }
+                return Err(format!("`{name}[..]` is not a known generic function"));
             }
             // A call whose callee names a `moods` variant is a value constructor with payload.
             if self.variants.contains_key(name) && !self.funcs.contains_key(name) {
@@ -1724,16 +1967,14 @@ impl LowerCtx {
     }
 
     fn lower_struct_lit(&mut self, lit: &ast::StructLit) -> Result<(Operand, TyId), String> {
-        if !lit.generics.is_empty() {
-            return Err(format!(
-                "generic struct literal `{}[..]` is not yet lowered",
-                lit.name
-            ));
-        }
-        let sid = *self
-            .structs
-            .get(&lit.name)
-            .ok_or_else(|| format!("unknown struct `{}`", lit.name))?;
+        let sid = if lit.generics.is_empty() {
+            *self
+                .structs
+                .get(&lit.name)
+                .ok_or_else(|| format!("unknown struct `{}`", lit.name))?
+        } else {
+            self.mono_struct(&lit.name, &lit.generics)?
+        };
         let field_tys: Vec<(String, TyId)> = self
             .m
             .struct_def(sid)
