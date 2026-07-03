@@ -2293,6 +2293,83 @@ impl LowerCtx {
                 );
                 Ok((Operand::Copy(Place::local(tmp)), aty))
             }
+            // `str.glow(s)` — an ASCII-uppercased copy of `s`.
+            ("str", "glow") => {
+                if args.len() != 1 {
+                    return Err("`str.glow` takes a single string".into());
+                }
+                let rawptr = self.m.intern_ty(TyKind::RawPtr);
+                let usize_t = self.m.t_int(IntWidth::W64, false);
+                let strt = self.m.t_str();
+                let (s, _) = self.lower_expr(&args[0].value, Some(strt))?;
+                let sp = self.new_local(rawptr);
+                self.fb()
+                    .assign(Place::local(sp), Rvalue::StrPtr(s.clone()));
+                let sl = self.new_local(usize_t);
+                self.fb().assign(Place::local(sl), Rvalue::StrLen(s));
+                let ext = self.get_extern("bet_str_upper", vec![rawptr, usize_t], vec![rawptr]);
+                let out = self.new_local(rawptr);
+                self.fb().assign(
+                    Place::local(out),
+                    Rvalue::Call(
+                        Callee::Extern(ext),
+                        vec![
+                            Operand::Copy(Place::local(sp)),
+                            Operand::Copy(Place::local(sl)),
+                        ],
+                    ),
+                );
+                let result = self.new_local(strt);
+                self.fb().assign(
+                    Place::local(result),
+                    Rvalue::MakeStr {
+                        data: Operand::Copy(Place::local(out)),
+                        len: Operand::Copy(Place::local(sl)),
+                    },
+                );
+                Ok((Operand::Copy(Place::local(result)), strt))
+            }
+            // `str.slaps(a, b)` — byte equality of two strings.
+            ("str", "slaps") => {
+                if args.len() != 2 {
+                    return Err("`str.slaps` takes two strings".into());
+                }
+                let rawptr = self.m.intern_ty(TyKind::RawPtr);
+                let usize_t = self.m.t_int(IntWidth::W64, false);
+                let strt = self.m.t_str();
+                let boolt = self.m.t_bool();
+                let (a, _) = self.lower_expr(&args[0].value, Some(strt))?;
+                let (b, _) = self.lower_expr(&args[1].value, Some(strt))?;
+                let ap = self.new_local(rawptr);
+                self.fb()
+                    .assign(Place::local(ap), Rvalue::StrPtr(a.clone()));
+                let al = self.new_local(usize_t);
+                self.fb().assign(Place::local(al), Rvalue::StrLen(a));
+                let bp = self.new_local(rawptr);
+                self.fb()
+                    .assign(Place::local(bp), Rvalue::StrPtr(b.clone()));
+                let bl = self.new_local(usize_t);
+                self.fb().assign(Place::local(bl), Rvalue::StrLen(b));
+                let ext = self.get_extern(
+                    "bet_str_eq",
+                    vec![rawptr, usize_t, rawptr, usize_t],
+                    vec![boolt],
+                );
+                let out = self.new_local(boolt);
+                self.fb().assign(
+                    Place::local(out),
+                    Rvalue::Call(
+                        Callee::Extern(ext),
+                        vec![
+                            Operand::Copy(Place::local(ap)),
+                            Operand::Copy(Place::local(al)),
+                            Operand::Copy(Place::local(bp)),
+                            Operand::Copy(Place::local(bl)),
+                        ],
+                    ),
+                );
+                Ok((Operand::Copy(Place::local(out)), boolt))
+            }
             // `yikes.new(msg)` — construct a live error carrying `msg`.
             ("yikes", "new") => {
                 if args.len() != 1 {
