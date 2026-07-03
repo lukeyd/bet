@@ -102,6 +102,9 @@ struct LowerCtx {
     next_mono_fid: u32,
     /// The active type-parameter substitution while lowering a generic instance.
     subst: HashMap<String, TyId>,
+    /// The synthesized `__yikes { present: bool, msg: str }` struct backing the `yikes` type in
+    /// the compiled path (created lazily on first use of `yikes`).
+    yikes_sid: Option<StructId>,
     /// `bet_print(rawptr, u64) -> void` — the stdout entry point (always present).
     print_extern: ExternId,
     /// Deduped externs synthesized on demand, keyed by `(name, ret-type)`.
@@ -150,6 +153,7 @@ impl LowerCtx {
             mono_worklist: Vec::new(),
             next_mono_fid: 0,
             subst: HashMap::new(),
+            yikes_sid: None,
             print_extern,
             extern_cache: HashMap::new(),
             fb: None,
@@ -434,10 +438,77 @@ impl LowerCtx {
         }
     }
 
+    /// The (lazily-created) `__yikes { present: bool, msg: str }` struct id. A `yikes` value is
+    /// this struct: `present` distinguishes a live error from `ghosted`, `msg` carries the text.
+    fn yikes_struct(&mut self) -> StructId {
+        if let Some(sid) = self.yikes_sid {
+            return sid;
+        }
+        let boolt = self.m.t_bool();
+        let strt = self.m.t_str();
+        let sid = self.m.add_struct(StructDef {
+            name: "__yikes".into(),
+            fields: vec![
+                Field {
+                    name: "present".into(),
+                    ty: boolt,
+                    vis: Vis::Hush,
+                },
+                Field {
+                    name: "msg".into(),
+                    ty: strt,
+                    vis: Vis::Hush,
+                },
+            ],
+        });
+        self.yikes_sid = Some(sid);
+        sid
+    }
+
+    /// True if `ty` is the synthesized `yikes` struct.
+    fn is_yikes(&self, ty: TyId) -> bool {
+        matches!(self.m.ty(ty), TyKind::Struct(s) if Some(*s) == self.yikes_sid)
+    }
+
+    /// Build a `yikes` value: `present` set for a live error, plus its message operand.
+    fn build_yikes(&mut self, present: bool, msg: Operand) -> (Operand, TyId) {
+        let sid = self.yikes_struct();
+        let sty = self.m.intern_ty(TyKind::Struct(sid));
+        let tmp = self.new_local(sty);
+        self.fb().assign(
+            Place::local(tmp),
+            Rvalue::Aggregate(
+                AggKind::Struct(sid),
+                vec![Operand::Const(Const::Bool(present)), msg],
+            ),
+        );
+        (Operand::Copy(Place::local(tmp)), sty)
+    }
+
+    /// The zero value of a scalar/`str` type, for the leading slots of a `bounce` early return.
+    fn zero_operand(&mut self, ty: TyId) -> Result<Operand, String> {
+        Ok(match self.m.ty(ty) {
+            TyKind::Int { .. } => Operand::Const(Const::Int(0, ty)),
+            TyKind::F32 | TyKind::F64 => Operand::Const(Const::Float(0.0, ty)),
+            TyKind::Bool => Operand::Const(Const::Bool(false)),
+            TyKind::Str => Operand::Const(Const::Str(String::new())),
+            other => {
+                return Err(format!(
+                    "`bounce` cannot synthesize a zero value for {other:?}"
+                ));
+            }
+        })
+    }
+
     fn named_type(&mut self, name: &str) -> Result<TyId, String> {
         // A type-parameter name in the active substitution resolves to its concrete argument.
         if let Some(&t) = self.subst.get(name) {
             return Ok(t);
+        }
+        // `yikes` is the compiled path's error type — a `{ present, msg }` struct.
+        if name == "yikes" {
+            let sid = self.yikes_struct();
+            return Ok(self.m.intern_ty(TyKind::Struct(sid)));
         }
         let int = |w, s| TyKind::Int {
             width: w,
@@ -846,9 +917,7 @@ impl LowerCtx {
             StmtKind::Squad { var, iter, body } => self.lower_squad(var, iter, body),
             StmtKind::Sheesh { .. } => Err("`sheesh` (panic recovery) is not yet lowered".into()),
             StmtKind::Slide(_) => Err("`slide` (task spawn) is not yet lowered".into()),
-            StmtKind::Bounce(_) => {
-                Err("`bounce` (error early-return sugar) is not yet lowered".into())
-            }
+            StmtKind::Bounce(e) => self.lower_bounce(e),
         }
     }
 
@@ -949,6 +1018,40 @@ impl LowerCtx {
             ops.push(op);
         }
         self.term_ret(ops);
+        Ok(())
+    }
+
+    /// `bounce y` — early-return-on-error sugar. When the `yikes` `y` is present, return it in
+    /// the trailing slot with zero values in the leading slots; otherwise fall through.
+    fn lower_bounce(&mut self, e: &Expr) -> Result<(), String> {
+        let (op, ty) = self.lower_expr(e, None)?;
+        if !self.is_yikes(ty) {
+            return Err("`bounce` expects a `yikes` value".into());
+        }
+        let rets = self.cur_rets.clone();
+        if rets.last().map(|&t| self.is_yikes(t)) != Some(true) {
+            return Err(
+                "`bounce` requires the enclosing function to return a trailing `yikes`".into(),
+            );
+        }
+        let place = self
+            .operand_place(op.clone())
+            .ok_or_else(|| "`bounce` needs an addressable operand".to_string())?;
+        let present = Operand::Copy(extend(&place, Proj::Field(0)));
+
+        // The early-return operands: a zero for each leading slot, then the error itself.
+        let mut ret_ops = Vec::with_capacity(rets.len());
+        for &rt in &rets[..rets.len() - 1] {
+            ret_ops.push(self.zero_operand(rt)?);
+        }
+        ret_ops.push(op);
+
+        let cond_end = self.cur;
+        let merge = self.reserve_block();
+        let then_bb = self.new_block();
+        self.term_ret(ret_ops);
+        self.set_branch(cond_end, present, then_bb, merge);
+        self.select(merge);
         Ok(())
     }
 
@@ -1118,6 +1221,14 @@ impl LowerCtx {
             // `str` is a fat `{ ptr, len }` value; `spill` projects it (a literal takes the
             // interned-global fast-path in the backend, a computed value an extractvalue).
             TyKind::Str => self.emit_print_operand(op),
+            // A `yikes` prints as its message (corpus `07-errors`: `spill.it(y)`).
+            TyKind::Struct(s) if Some(s) == self.yikes_sid => {
+                let place = self
+                    .operand_place(op)
+                    .ok_or_else(|| "`spill` of a yikes needs an addressable operand".to_string())?;
+                let msg = Operand::Copy(extend(&place, Proj::Field(1)));
+                self.emit_print_operand(msg)
+            }
             other => Err(format!(
                 "`spill` of a value of type {other:?} is not yet lowered"
             )),
@@ -1404,6 +1515,10 @@ impl LowerCtx {
                 Ok((Operand::Const(Const::Int(*b as i128, ty)), ty))
             }
             ExprKind::Ghosted => match hint {
+                // A `ghosted` in a `yikes` context is the no-error value: `{ present: false }`.
+                Some(t) if self.is_yikes(t) => {
+                    Ok(self.build_yikes(false, Operand::Const(Const::Str(String::new()))))
+                }
                 Some(t) => Ok((Operand::Const(Const::Ghosted), t)),
                 None => Err("`ghosted` needs a known type context to lower".into()),
             },
@@ -1520,6 +1635,42 @@ impl LowerCtx {
         // Short-circuit boolean operators lower to control flow, not a `BinOp`.
         if matches!(op, ast::BinOp::And | ast::BinOp::Or) {
             return self.lower_short_circuit(op, l, r);
+        }
+
+        // A `== ghosted` / `!= ghosted` comparison. For a `yikes` operand this reads its
+        // `present` flag; for anything else it compares against a type-appropriate `ghosted`.
+        if matches!(op, ast::BinOp::Eq | ast::BinOp::Ne)
+            && (matches!(l.kind, ExprKind::Ghosted) || matches!(r.kind, ExprKind::Ghosted))
+        {
+            let (ghost, other) = if matches!(l.kind, ExprKind::Ghosted) {
+                (l, r)
+            } else {
+                (r, l)
+            };
+            let (oop, oty) = self.lower_expr(other, None)?;
+            let boolt = self.m.t_bool();
+            if self.is_yikes(oty) {
+                let place = self
+                    .operand_place(oop)
+                    .ok_or_else(|| "`yikes` comparison needs an addressable operand".to_string())?;
+                let present = Operand::Copy(extend(&place, Proj::Field(0)));
+                // `!= ghosted` is "an error is present"; `== ghosted` is its negation.
+                if matches!(op, ast::BinOp::Ne) {
+                    return Ok((present, boolt));
+                }
+                let tmp = self.new_local(boolt);
+                self.fb()
+                    .assign(Place::local(tmp), Rvalue::UnOp(UnOp::Not, present));
+                return Ok((Operand::Copy(Place::local(tmp)), boolt));
+            }
+            // Non-yikes: compare against a `ghosted` typed like the other operand.
+            let (gop, _) = self.lower_expr(ghost, Some(oty))?;
+            let tmp = self.new_local(boolt);
+            self.fb().assign(
+                Place::local(tmp),
+                Rvalue::BinOp(map_binop(op), oop, gop, ArithMode::Na),
+            );
+            return Ok((Operand::Copy(Place::local(tmp)), boolt));
         }
 
         let irop = map_binop(op);
@@ -2023,7 +2174,7 @@ impl LowerCtx {
     fn is_module(&self, name: &str) -> bool {
         matches!(
             name,
-            "spill" | "str" | "math" | "mem" | "bytes" | "fmt" | "stash"
+            "spill" | "str" | "math" | "mem" | "bytes" | "fmt" | "stash" | "yikes"
         )
     }
 
@@ -2047,6 +2198,15 @@ impl LowerCtx {
                     Rvalue::BinOp(BinOp::Add, a, b, ArithMode::Wrap),
                 );
                 Ok((Operand::Copy(Place::local(tmp)), aty))
+            }
+            // `yikes.new(msg)` — construct a live error carrying `msg`.
+            ("yikes", "new") => {
+                if args.len() != 1 {
+                    return Err("`yikes.new` takes a single message".into());
+                }
+                let strt = self.m.t_str();
+                let (msg, _) = self.lower_expr(&args[0].value, Some(strt))?;
+                Ok(self.build_yikes(true, msg))
             }
             // `mem.scratch()` — the thread's built-in per-frame bump arena (a `crib void`).
             ("mem", "scratch") => {
