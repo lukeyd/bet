@@ -1,0 +1,18 @@
+// fr-naw — if / else-if / else chains via fr ... naw fr ... naw.
+pull "spill"
+
+finna classify(n: int) -> str {
+    fr n < 0 {
+        bet "neg"
+    } naw fr n == 0 {
+        bet "zero"
+    } naw {
+        bet "pos"
+    }
+}
+
+finna main() {
+    spill.it(classify(-3))
+    spill.it(classify(0))
+    spill.it(classify(7))
+}

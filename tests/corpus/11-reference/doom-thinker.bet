@@ -1,0 +1,51 @@
+// doom-thinker — the Doom oracle in miniature (plan-amendment-01 §10.6). Mobjs live
+// in a crib and hold a `think` function-pointer; each tic dispatches it through the
+// mobj's tag. Bit-flag fields track state; note `flags & MASK == 0` needs no parens
+// because & binds tighter than == (syntax-decisions §7).
+pull "spill"
+
+facts MF_SHOOTABLE: u32 = 0x00000004
+facts MF_DEAD:      u32 = 0x00001000
+
+drip Mobj {
+    flex id: int
+    flex hp: int
+    flex flags: u32
+    flex think: finna(tag Mobj) -> void
+}
+
+crib mobjs: Mobj[16]
+
+// A think action: a shootable mobj loses 10 hp per tic; at <= 0 it clears SHOOTABLE
+// and sets DEAD.
+finna hurt(self: tag Mobj) {
+    holla m = self in mobjs {
+        fr m.flags & MF_SHOOTABLE == 0 { bet }
+        m.hp = m.hp - 10
+        fr m.hp <= 0 {
+            m.flags = (m.flags & ~MF_SHOOTABLE) | MF_DEAD
+        }
+    } ghosted {
+    }
+}
+
+finna main() {
+    lowkey e = cop Mobj{ id: 1, hp: 25, flags: MF_SHOOTABLE, think: hurt } in mobjs
+
+    lowkey tic = 0
+    vibin tic < 3 {
+        holla m = e in mobjs {
+            m.think(e)
+        } ghosted {
+        }
+        tic = tic + 1
+    }
+
+    holla m = e in mobjs {
+        spill.it(m.hp)                    // 25 - 30 = -5
+        spill.it(m.flags & MF_DEAD != 0)  // nocap — it died
+        spill.it(m.flags & MF_SHOOTABLE)  // 0 — flag cleared
+    } ghosted {
+        spill.it("gone")
+    }
+}

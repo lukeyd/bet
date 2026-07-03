@@ -1,0 +1,30 @@
+// generation-reuse — the memory-model showcase. After evict, a slot is reused at a
+// newer generation; a stale tag naming that slot is safely detected as ghosted
+// instead of silently reading the new occupant. (spec §7.3-§7.4)
+pull "spill"
+
+drip Enemy { flex id: int }
+
+crib slots: Enemy[4]
+
+finna idOf(e: tag Enemy) -> int {
+    holla ref = e in slots {
+        bet ref.id
+    } ghosted {
+        bet -1
+    }
+}
+
+finna main() {
+    lowkey first = cop Enemy{ id: 7 } in slots
+    spill.it(idOf(first))     // 7
+
+    evict slots               // frees the slab; bumps every slot's generation
+
+    // A new enemy reuses the same physical slot, but at a newer generation.
+    lowkey second = cop Enemy{ id: 42 } in slots
+    spill.it(idOf(second))    // 42 — the fresh tag answers
+
+    // The OLD tag still names that slot, but its generation is stale:
+    spill.it(idOf(first))     // -1 — safely ghosted; no innocent bystander attacked
+}

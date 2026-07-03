@@ -5,6 +5,12 @@
 > This document formalizes them (evaluation order, the `holla`/`ghosted` desugaring,
 > generation-check semantics, overflow/wrapping rules) during Phase 0. See
 > `language-spec.md §11.2` (Phase 0 contracts) and `§12` (open questions).
+>
+> **Settled in Step 1c:** surface syntax is now frozen in `grammar.ebnf`, and the
+> *syntactic/lexical* open questions (ASI rules, numeric/string/byte literals,
+> operator precedence, entry/output model) are resolved with rationale in
+> `syntax-decisions.md`. This document remains responsible for the *semantic*
+> resolutions (memory/generation, overflow/wrapping, desugarings) still to come.
 
 Load-bearing semantics to formalize here:
 

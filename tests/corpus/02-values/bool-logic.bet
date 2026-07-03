@@ -1,0 +1,9 @@
+// bool-logic — nocap/cap, &&, ||, !, and comparison chains.
+pull "spill"
+
+finna main() {
+    spill.it(nocap && cap)
+    spill.it(nocap || cap)
+    spill.it(!cap)
+    spill.it(3 < 5 && 5 <= 5)
+}

@@ -1,0 +1,15 @@
+// receivers — a method defined with a receiver on drip Counter.
+pull "spill"
+
+drip Counter {
+    flex n: int
+}
+
+finna (c: Counter) bump(by: int) -> int {
+    bet c.n + by
+}
+
+finna main() {
+    lowkey c = Counter{ n: 10 }
+    spill.it(c.bump(5))   // 15
+}

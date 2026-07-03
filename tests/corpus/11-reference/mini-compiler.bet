@@ -1,0 +1,66 @@
+// mini-compiler — the compiler oracle in miniature (plan-amendment-01 §10.5).
+// A recursive, tag-linked AST (moods + tag + crib), a stash symbol table, and
+// bounce error propagation. Builds (x + 2) * 3 with x = 5 and evaluates it.
+pull "spill"
+pull "stash"
+
+moods Expr {
+    Lit(int),
+    Var(str),
+    Add(tag Expr, tag Expr),
+    Mul(tag Expr, tag Expr)
+}
+
+crib ast: Expr[64]
+
+finna eval(e: tag Expr, env: stash[str, int]) -> (int, yikes) {
+    holla node = e in ast {
+        vibe node {
+            Lit(n) {
+                bet n, ghosted
+            }
+            Var(name) {
+                lowkey v, found = env.peep(name)
+                fr !found {
+                    bet 0, yikes.new("undefined variable").tea(name)
+                }
+                bet v, ghosted
+            }
+            Add(l, r) {
+                lowkey a, y = eval(l, env)
+                bounce y
+                lowkey b, y2 = eval(r, env)
+                bounce y2
+                bet a + b, ghosted
+            }
+            Mul(l, r) {
+                lowkey a, y = eval(l, env)
+                bounce y
+                lowkey b, y2 = eval(r, env)
+                bounce y2
+                bet a * b, ghosted
+            }
+        }
+    } ghosted {
+        bet 0, yikes.new("dangling AST node")
+    }
+}
+
+finna main() {
+    lowkey env = stash.new[str, int]()
+    env.put("x", 5)
+
+    // Build (x + 2) * 3 as tag-linked nodes in the `ast` crib.
+    lowkey x     = cop Var("x") in ast
+    lowkey two   = cop Lit(2) in ast
+    lowkey three = cop Lit(3) in ast
+    lowkey sum   = cop Add(x, two) in ast
+    lowkey root  = cop Mul(sum, three) in ast
+
+    lowkey result, y = eval(root, env)
+    fr y != ghosted {
+        spill.it(y)
+    } naw {
+        spill.it(result)     // (5 + 2) * 3 = 21
+    }
+}

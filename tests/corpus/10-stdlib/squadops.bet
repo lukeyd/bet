@@ -1,0 +1,22 @@
+// squadops — collection ops: vibeCheck (filter), glowUp (map), stack/pop, gang (length).
+pull "spill"
+pull "squadops"
+
+finna isEven(n: int) -> bool { bet n % 2 == 0 }
+finna dbl(n: int) -> int { bet n * 2 }
+
+finna main() {
+    lowkey xs = [1, 2, 3, 4, 5]
+    spill.it(xs.vibeCheck(isEven).gang())   // [2,4] -> 2
+
+    lowkey sum = 0
+    squad d in xs.glowUp(dbl) {              // [2,4,6,8,10]
+        sum = sum + d
+    }
+    spill.it(sum)   // 30
+
+    lowkey s = [1, 2, 3]
+    s.stack(4)
+    spill.it(s.pop())    // 4
+    spill.it(s.gang())   // 3
+}

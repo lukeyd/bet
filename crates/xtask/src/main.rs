@@ -5,7 +5,8 @@
 //!   timelog report      per-activity / per-task active-time totals from timelog/events
 //!   timelog eta         velocity + estimated time to completion (timelog/tasks.toml)
 //!   setup-llvm          print per-OS guidance for the pinned LLVM (backend --features llvm)
-//!   corpus | dist       stubs (land in Step 2 / release work)
+//!   corpus --check      structural lint of tests/corpus (pairing + feature coverage)
+//!   dist                stub (lands with release work)
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -19,7 +20,8 @@ usage: cargo xtask <command>
   timelog report [--json] [--idle-cap SECS]
   timelog eta    [--hours-per-day N] [--idle-cap SECS]
   setup-llvm                  per-OS LLVM install guidance
-  corpus | dist               (stubs — Step 2 / release)";
+  corpus [--check]            structural lint of tests/corpus (--check); else a Step-2 note
+  dist                        (stub — release packaging)";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -30,10 +32,7 @@ fn main() -> ExitCode {
         "graph-check" => graph_check(),
         "timelog" => timelog(rest),
         "setup-llvm" => setup_llvm(),
-        "corpus" => stub_cmd(
-            "corpus",
-            "differential corpus testing (Step 2 tracer bullet)",
-        ),
+        "corpus" => corpus(rest),
         "dist" => stub_cmd("dist", "release-artifact packaging for the 6 targets"),
         "" => {
             eprintln!("{USAGE}");
@@ -555,6 +554,170 @@ fn fmt_hms(secs: i64) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// corpus — structural lint of tests/corpus (Step 1c). No program execution;
+// the differential runner (interp vs compiled) lands in Step 2.
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+struct CorpusManifest {
+    features: CorpusFeatures,
+    #[serde(default)]
+    program: Vec<CorpusProgram>,
+}
+
+#[derive(serde::Deserialize)]
+struct CorpusFeatures {
+    all: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct CorpusProgram {
+    path: String,
+    #[serde(default)]
+    covers: Vec<String>,
+}
+
+fn corpus(args: &[String]) -> Result<()> {
+    if args.iter().any(|a| a.as_str() == "--check") {
+        corpus_check(&workspace_root())
+    } else {
+        println!(
+            "xtask corpus: nothing to run yet — the differential runner (interp vs \
+             compiled) lands in Step 2. Use `cargo xtask corpus --check` for the \
+             structural lint."
+        );
+        Ok(())
+    }
+}
+
+/// Structural lint of `tests/corpus`: manifest <-> disk pairing and feature-coverage
+/// completeness. Does not execute any program.
+fn corpus_check(root: &Path) -> Result<()> {
+    let dir = root.join("tests").join("corpus");
+    let manifest_path = dir.join("MANIFEST.toml");
+    let src = std::fs::read_to_string(&manifest_path)
+        .with_context(|| format!("reading {}", manifest_path.display()))?;
+    let manifest: CorpusManifest =
+        toml::from_str(&src).context("parsing tests/corpus/MANIFEST.toml")?;
+
+    let mut files = Vec::new();
+    walk_files(&dir, &mut files)?;
+    let bet = stems_with_ext(&files, &dir, "bet");
+    let expected = stems_with_ext(&files, &dir, "expected");
+
+    let problems = check_corpus(&manifest, &bet, &expected);
+    if problems.is_empty() {
+        println!(
+            "corpus --check OK: {} programs, {} features all covered",
+            manifest.program.len(),
+            manifest.features.all.len()
+        );
+        Ok(())
+    } else {
+        bail!(
+            "corpus --check found {} problem(s):\n{}",
+            problems.len(),
+            problems.join("\n")
+        );
+    }
+}
+
+/// Pure checker (no IO), so it is unit-testable. `bet`/`expected` are the program
+/// stems (e.g. `01-basics/hello`) found on disk for each extension. Returns a sorted
+/// list of problems; empty means the corpus is well-formed.
+fn check_corpus(
+    manifest: &CorpusManifest,
+    bet: &std::collections::BTreeSet<String>,
+    expected: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    use std::collections::BTreeSet;
+
+    let mut problems: Vec<String> = Vec::new();
+
+    // 1. Pairing: every .bet needs a .expected and vice-versa.
+    for stem in bet.union(expected) {
+        if !bet.contains(stem) {
+            problems.push(format!("  {stem}.expected has no matching .bet"));
+        }
+        if !expected.contains(stem) {
+            problems.push(format!("  {stem}.bet has no matching .expected"));
+        }
+    }
+    let on_disk: BTreeSet<String> = bet.intersection(expected).cloned().collect();
+
+    // 2. Feature universe + the listed programs.
+    let all: BTreeSet<String> = manifest.features.all.iter().cloned().collect();
+    let mut listed: BTreeSet<String> = BTreeSet::new();
+    let mut covered: BTreeSet<String> = BTreeSet::new();
+
+    for p in &manifest.program {
+        if !listed.insert(p.path.clone()) {
+            problems.push(format!("  program `{}` is listed twice in MANIFEST", p.path));
+        }
+        if !on_disk.contains(&p.path) {
+            problems.push(format!(
+                "  program `{}` is in MANIFEST but has no .bet/.expected pair on disk",
+                p.path
+            ));
+        }
+        for key in &p.covers {
+            if !all.contains(key) {
+                problems.push(format!(
+                    "  program `{}` covers unknown feature `{key}` (not in [features].all)",
+                    p.path
+                ));
+            }
+            covered.insert(key.clone());
+        }
+    }
+
+    // 3. Every on-disk pair must be registered in the manifest.
+    for stem in &on_disk {
+        if !listed.contains(stem) {
+            problems.push(format!("  {stem} exists on disk but is not listed in MANIFEST"));
+        }
+    }
+
+    // 4. Every declared feature must be covered by at least one program.
+    for feat in &all {
+        if !covered.contains(feat) {
+            problems.push(format!("  feature `{feat}` is not covered by any program"));
+        }
+    }
+
+    problems.sort();
+    problems
+}
+
+/// Recursively collect every file under `dir`.
+fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let path = entry?.path();
+        if path.is_dir() {
+            walk_files(&path, out)?;
+        } else {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// The set of program stems (path minus extension, `/`-separated, relative to `base`)
+/// among `files` whose extension is `ext`.
+fn stems_with_ext(
+    files: &[PathBuf],
+    base: &Path,
+    ext: &str,
+) -> std::collections::BTreeSet<String> {
+    files
+        .iter()
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some(ext))
+        .filter_map(|p| p.strip_prefix(base).ok().map(|r| r.with_extension("")))
+        .map(|r| r.to_string_lossy().replace('\\', "/"))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,6 +725,61 @@ mod tests {
     #[test]
     fn smoke() {
         assert_eq!(2 + 2, 4);
+    }
+
+    #[test]
+    fn corpus_manifest_is_consistent() {
+        // The real tests/corpus tree + MANIFEST.toml must pass the structural lint.
+        // This is the same check `cargo xtask corpus --check` runs, so the corpus can
+        // never drift out of sync with its manifest without a red test.
+        let dir = workspace_root().join("tests").join("corpus");
+        let src = std::fs::read_to_string(dir.join("MANIFEST.toml")).unwrap();
+        let manifest: CorpusManifest = toml::from_str(&src).unwrap();
+        let mut files = Vec::new();
+        walk_files(&dir, &mut files).unwrap();
+        let bet = stems_with_ext(&files, &dir, "bet");
+        let expected = stems_with_ext(&files, &dir, "expected");
+        let problems = check_corpus(&manifest, &bet, &expected);
+        assert!(
+            problems.is_empty(),
+            "corpus lint problems:\n{}",
+            problems.join("\n")
+        );
+    }
+
+    #[test]
+    fn corpus_detects_orphans_and_gaps() {
+        use std::collections::BTreeSet;
+        let manifest = CorpusManifest {
+            features: CorpusFeatures {
+                all: vec!["a".into(), "b".into()],
+            },
+            program: vec![
+                CorpusProgram {
+                    path: "cat/one".into(),
+                    covers: vec!["a".into()],
+                },
+                CorpusProgram {
+                    path: "cat/two".into(),
+                    covers: vec!["zzz".into()], // unknown feature
+                },
+            ],
+        };
+        // one: paired. two: .bet only (no .expected). three: paired but unlisted.
+        let bet: BTreeSet<String> = ["cat/one", "cat/two", "cat/three"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let expected: BTreeSet<String> = ["cat/one", "cat/three"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let problems = check_corpus(&manifest, &bet, &expected);
+        assert!(problems.iter().any(|p| p.contains("cat/two.bet has no matching")));
+        assert!(problems.iter().any(|p| p.contains("cat/three exists on disk")));
+        assert!(problems.iter().any(|p| p.contains("feature `b` is not covered")));
+        assert!(problems.iter().any(|p| p.contains("unknown feature `zzz`")));
     }
 
     #[test]

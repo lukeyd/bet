@@ -1,0 +1,13 @@
+// trust — the unchecked escape hatch for hot paths. Debug builds still check and
+// yeet on a stale tag; release compiles to a raw indexed load. Ugly + greppable.
+pull "spill"
+
+drip Enemy { flex hp: int }
+
+crib enemies: Enemy[8]
+
+finna main() {
+    lowkey e = cop Enemy{ hp: 77 } in enemies
+    lowkey ref = e.trust() in enemies    // no generation check
+    spill.it(ref.hp)                     // 77
+}

@@ -1,0 +1,17 @@
+// visibility — flex (exported) vs hush (module-private) fields, plus a receiver method.
+pull "spill"
+
+drip Account {
+    flex owner: str
+    hush balance: int
+}
+
+finna (a: Account) show() -> int {
+    bet a.balance
+}
+
+finna main() {
+    lowkey acc = Account{ owner: "Sam", balance: 42 }
+    spill.it(acc.owner)
+    spill.it(acc.show())
+}

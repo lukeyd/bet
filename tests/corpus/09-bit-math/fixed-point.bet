@@ -1,0 +1,18 @@
+// fixed-point — 16.16 fixed-point multiply, Doom's core number format. A fixed value
+// stores `real * 65536`; a multiply forms the 64-bit product and shifts it back down.
+pull "spill"
+
+facts FRACBITS: int = 16
+facts FRACUNIT: int = 65536        // 1.0 in 16.16
+
+finna fixedMul(a: int, b: int) -> int {
+    bet (a * b) >> FRACBITS
+}
+
+finna main() {
+    lowkey twoAndHalf = 2 * FRACUNIT + FRACUNIT / 2   // 2.5
+    lowkey four       = 4 * FRACUNIT                  // 4.0
+    lowkey prod       = fixedMul(twoAndHalf, four)    // 2.5 * 4.0 = 10.0
+    spill.it(prod / FRACUNIT)                         // 10 (integer part)
+    spill.it(prod == 10 * FRACUNIT)                   // nocap
+}

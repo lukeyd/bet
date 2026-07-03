@@ -13,7 +13,7 @@
 slug = "step0-skeleton"
 name = "Step 0: workspace skeleton, CI, conventions, time-tracking"
 size = 5
-status = "doing"
+status = "done"
 
 [[task]]
 slug = "midir"
@@ -31,7 +31,7 @@ status = "todo"
 slug = "grammar-corpus"
 name = "Step 1c: frozen EBNF grammar + 30-50 golden corpus programs"
 size = 8
-status = "todo"
+status = "done"
 
 [[task]]
 slug = "tracer-bullet"

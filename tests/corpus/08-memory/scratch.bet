@@ -1,0 +1,14 @@
+// scratch — the built-in per-frame arena, reached as mem.scratch(); auto-evicted
+// at frame end, so per-frame allocations are free to clean up.
+pull "spill"
+pull "mem"
+
+drip Vec2 {
+    flex x: int
+    flex y: int
+}
+
+finna main() {
+    lowkey p = cop Vec2{ x: 5, y: 9 } in mem.scratch()
+    spill.it(p.x + p.y)    // 14
+}

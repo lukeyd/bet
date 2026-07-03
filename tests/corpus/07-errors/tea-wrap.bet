@@ -1,0 +1,19 @@
+// tea-wrap — .tea(context) wraps an error, prefixing context (Go's %w).
+pull "spill"
+
+finna readRaw(name: str) -> (str, yikes) {
+    bet "", yikes.new("no such file")
+}
+
+finna load(name: str) -> (str, yikes) {
+    lowkey data, y = readRaw(name)
+    fr y != ghosted {
+        bet "", y.tea("loading config")
+    }
+    bet data, ghosted
+}
+
+finna main() {
+    lowkey d, y = load("cfg")
+    spill.it(y)   // loading config: no such file
+}

@@ -1,0 +1,11 @@
+// generics-fn — a generic function instantiated at two types (monomorphized).
+pull "spill"
+
+finna pickFirst[T](a: T, b: T) -> T {
+    bet a
+}
+
+finna main() {
+    spill.it(pickFirst[int](7, 9))       // 7
+    spill.it(pickFirst[str]("a", "b"))   // a
+}

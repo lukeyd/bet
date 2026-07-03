@@ -1,0 +1,26 @@
+// yikes-basics — Go-style (value, error) returns and the `!= ghosted` idiom.
+pull "spill"
+
+finna half(n: int) -> (int, yikes) {
+    fr n % 2 != 0 {
+        bet 0, yikes.new("not even")
+    } naw {
+        bet n / 2, ghosted
+    }
+}
+
+finna main() {
+    lowkey v, y = half(10)
+    fr y != ghosted {
+        spill.it(y)
+    } naw {
+        spill.it(v)      // 5
+    }
+
+    lowkey v2, y2 = half(7)
+    fr y2 != ghosted {
+        spill.it(y2)     // not even
+    } naw {
+        spill.it(v2)
+    }
+}

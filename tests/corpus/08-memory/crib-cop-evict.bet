@@ -1,0 +1,17 @@
+// crib-cop-evict — an untyped (bump) arena: cop allocates into it, and cop gives
+// back a direct reference; evict frees the whole arena in O(1).
+pull "spill"
+
+drip Particle {
+    flex x: int
+    flex y: int
+}
+
+finna main() {
+    crib frame                          // untyped bump arena (function-local)
+    lowkey a = cop Particle{ x: 1, y: 2 } in frame
+    lowkey b = cop Particle{ x: 3, y: 4 } in frame
+    spill.it(a.x + b.y)                 // 1 + 4 = 5
+    evict frame                         // O(1) mass free
+    spill.it("evicted")
+}

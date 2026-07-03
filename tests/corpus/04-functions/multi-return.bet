@@ -1,0 +1,11 @@
+// multi-return — returning two values and binding both.
+pull "spill"
+
+finna divmod(a: int, b: int) -> (int, int) {
+    bet a / b, a % b
+}
+
+finna main() {
+    lowkey q, r = divmod(17, 5)
+    spill.f("{} r {}\n", q, r)   // 3 r 2
+}

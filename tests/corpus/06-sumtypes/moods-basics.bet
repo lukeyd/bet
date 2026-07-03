@@ -1,0 +1,22 @@
+// moods-basics — a sum type and a vibe (pattern match) over its variants.
+pull "spill"
+
+moods Shape {
+    Circle(int),          // radius
+    Rect(int, int),       // width, height
+    Dot
+}
+
+finna area(s: Shape) -> int {
+    vibe s {
+        Circle(r) { bet 3 * r * r }     // pi ~= 3, keeps it integer
+        Rect(w, h) { bet w * h }
+        Dot { bet 0 }
+    }
+}
+
+finna main() {
+    spill.it(area(Circle(2)))     // 3 * 4 = 12
+    spill.it(area(Rect(3, 4)))    // 12
+    spill.it(area(Dot))           // 0
+}

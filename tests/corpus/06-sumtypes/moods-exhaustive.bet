@@ -1,0 +1,25 @@
+// moods-exhaustive — exhaustiveness is on by default; `naw` is the wildcard arm
+// that covers the variants not named explicitly.
+pull "spill"
+
+moods Token {
+    Num(int),
+    Plus,
+    Minus,
+    Times
+}
+
+finna describe(t: Token) -> str {
+    vibe t {
+        Num(n) { bet "number" }
+        Plus { bet "op" }
+        naw { bet "other op" }    // covers Minus and Times
+    }
+}
+
+finna main() {
+    spill.it(describe(Num(5)))
+    spill.it(describe(Plus))
+    spill.it(describe(Minus))
+    spill.it(describe(Times))
+}

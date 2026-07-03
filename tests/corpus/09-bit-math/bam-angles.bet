@@ -1,0 +1,16 @@
+// bam-angles — BAM (binary angular measurement): the full circle is 2^32, so angle
+// arithmetic relies on defined u32 wraparound. Doom's angle system, in miniature.
+pull "spill"
+
+facts ANG90:  u32 = 0x40000000     // quarter turn
+facts ANG180: u32 = 0x80000000     // half turn
+facts ANG270: u32 = 0xC0000000     // three-quarter turn
+
+finna main() {
+    // 270 deg + 180 deg = 450 deg == 90 deg, by u32 wraparound.
+    lowkey sum: u32 = ANG270 + ANG180
+    spill.it(sum == ANG90)             // nocap
+
+    // Two quarter-turns make a half-turn.
+    spill.it(ANG90 + ANG90 == ANG180)  // nocap
+}

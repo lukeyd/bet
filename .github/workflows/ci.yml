@@ -32,6 +32,10 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: dependency-graph
         run: cargo xtask graph-check
+      - name: corpus-lint
+        # Structural lint of tests/corpus: .bet <-> .expected pairing + feature
+        # coverage vs MANIFEST.toml. No program execution (that is Step 2's runner).
+        run: cargo xtask corpus --check
       - name: cargo-deny
         run: cargo deny check
 
