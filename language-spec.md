@@ -411,22 +411,38 @@ finna loadSave(path: str) -> (SaveData, yikes) {
 
 ## 12. Open Questions
 
+Most of these were resolved by implementation through Milestones 3–6; the five on the
+critical path were ratified early in `plan-amendment-02.md` (SP0). **RESOLVED** items are
+frozen for v1; the short remaining list is what the Milestone-7 freeze still tracks.
+
 **Syntax/semantics**
-- Statement termination rules (Go-style ASI details).
-- Default visibility when neither `flex` nor `hush` is written.
-- Exact numeric type tower and spellings.
-- Generics: yes/no for v1; syntax if yes.
-- Method syntax on `drip` (Go receivers vs. dot-defined) and the interface/trait story.
-- `bounce y` error-return sugar: adopt or not.
+- **RESOLVED — Statement termination:** Go-style ASI; a statement ends at a newline unless an
+  open bracket/binary-operator continuation is pending.
+- **RESOLVED — Default visibility:** no modifier means `hush` (module-private); `flex` exports.
+- **RESOLVED — Numeric tower:** `int`/`uint` (64-bit), `i8/i16/i32/i64`, `u8/u16/u32/u64`,
+  `float`/`f32`/`f64`; unsigned wraps, signed traps in debug (§2.4), explicit
+  `math.lap`/wrapping ops otherwise.
+- **RESOLVED — Generics:** yes for v1; `finna f[T](..)` / `drip S[T]` / `stash[K,V]`, erased in
+  the IR via ahead-of-time monomorphization.
+- **RESOLVED — Method syntax:** dot-defined receivers (`finna (self: T) name(..)`); interfaces/
+  traits are explicitly *out* for v1 (function-pointer struct fields cover the dispatch needs,
+  as the doom-thinker oracle shows).
+- **RESOLVED — `bounce y`:** adopted (early-returns zero values plus the error).
 
 **Memory model**
-- Formal semantics of untyped cribs vs. typed cribs; can a crib be heterogeneous (`tag any`)?
-- Allocator-context mechanism (implicit param vs. context struct).
-- Long-lived shared objects: refcounting vs. opt-in budgeted GC; v1 or later.
-- Threading model for cribs and cross-thread `holla`.
+- **RESOLVED — Typed vs. untyped cribs:** typed cribs hand back generational `tag`s reached
+  through `holla`; untyped bump cribs hand back a live `ref` directly. Heterogeneous `tag any`
+  is *out* for v1.
+- **RESOLVED — Allocator context:** an ambient thread-local allocator context with an
+  `in: <crib>` override (SP0.1; ratifies the existing `bet_ctx_*` ABI).
+- *Open:* long-lived shared objects — refcounting vs. opt-in budgeted GC. Deferred past v1; the
+  arena/`tag` model covers the game-loop workloads without it.
+- *Open:* threading model for cribs and cross-thread `holla` (single-thread-per-crib is the
+  working assumption; revisited when the M:N scheduler lands).
 
 **Ecosystem/bit**
-- **Language name** (blocking repo creation).
-- `squad t in enemies` iterating live slots directly → free ECS-flavored query primitive; how far toward a native ECS to go (candidate feature #2).
-- Package manager model (registry vs. git-based).
-- LLVM version to pin (decide at project start).
+- **RESOLVED — Language name:** `bet`.
+- **RESOLVED — LLVM pin:** LLVM 18 (`llvm-sys` 18, `inkwell` `llvm18-0`).
+- *Open:* how far toward a native ECS the `squad`-over-live-slots query primitive should go
+  (candidate feature #2, post-freeze).
+- *Open:* package-manager model (registry vs. git-based). Out of scope for the language freeze.
