@@ -374,8 +374,7 @@ compiled = "pass"
 [[program]]
 path = "12-ffi/extern-abs"
 covers = ["ffi.extern"]
-# Skip: FFI (`extern` C symbols) has no interpreter execution path.
-interp = "skip"
+interp = "pass"
 compiled = "pass"
 
 # --- 13 concurrency ----------------------------------------------------------
