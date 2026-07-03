@@ -631,7 +631,11 @@ fn corpus(args: &[String]) -> Result<()> {
     if args.iter().any(|a| a.as_str() == "--check") {
         corpus_check(&workspace_root())
     } else if args.iter().any(|a| a.as_str() == "--compiled") {
-        corpus_compiled(&workspace_root())
+        // `--real-runtime` links each compiled program against the real `runtime` archive
+        // instead of the headless `rt-stub` — the same differential, run against production
+        // runtime code.
+        let real = args.iter().any(|a| a.as_str() == "--real-runtime");
+        corpus_compiled(&workspace_root(), real)
     } else {
         corpus_run(&workspace_root())
     }
@@ -764,7 +768,7 @@ fn corpus_run(root: &Path) -> Result<()> {
 /// broader compiled `pass` set (computed-value / formatted printing, e.g. `spill.f`) is curated
 /// by the orchestrator once Tracks R (rt-abi/runtime) and C (frontend/backend `spill` lowering)
 /// merge — flip the relevant `compiled = "skip"` entries to `pass` at that integration point.
-fn corpus_compiled(root: &Path) -> Result<()> {
+fn corpus_compiled(root: &Path, real_runtime: bool) -> Result<()> {
     let dir = root.join("tests").join("corpus");
     let manifest_path = dir.join("MANIFEST.toml");
     let src = std::fs::read_to_string(&manifest_path)
@@ -803,6 +807,18 @@ fn corpus_compiled(root: &Path) -> Result<()> {
         bail!("`cargo build -p rt-stub` failed; cannot link compiled corpus programs");
     }
 
+    // For the real-runtime column, also stage `libruntime.a` next to `bet` (same rationale).
+    if real_runtime {
+        let staged_rt = std::process::Command::new(&cargo)
+            .args(["build", "-p", "runtime"])
+            .current_dir(root)
+            .status()
+            .context("running `cargo build -p runtime` (stages libruntime.a next to `bet`)")?;
+        if !staged_rt.success() {
+            bail!("`cargo build -p runtime` failed; cannot link against the real runtime");
+        }
+    }
+
     let bin = root
         .join("target")
         .join("debug")
@@ -824,7 +840,8 @@ fn corpus_compiled(root: &Path) -> Result<()> {
             CompiledMode::Skip => skipped += 1,
             CompiledMode::Pass => {
                 want_pass += 1;
-                match run_compiled_program(&bin, &dir, &tmp, &prog.path, prog.interp) {
+                match run_compiled_program(&bin, &dir, &tmp, &prog.path, prog.interp, real_runtime)
+                {
                     Ok(()) => got_pass += 1,
                     Err(msg) => failures.push(msg),
                 }
@@ -866,6 +883,7 @@ fn run_compiled_program(
     tmp: &Path,
     stem: &str,
     interp_mode: InterpMode,
+    real_runtime: bool,
 ) -> Result<(), String> {
     let bet = dir.join(format!("{stem}.bet"));
     let expected_path = dir.join(format!("{stem}.expected"));
@@ -879,12 +897,13 @@ fn run_compiled_program(
         std::env::consts::EXE_SUFFIX
     ));
 
-    // 1. Compile: `bet build <stem>.bet -o <exe>`.
-    let build = std::process::Command::new(bin)
-        .arg("build")
-        .arg(&bet)
-        .arg("-o")
-        .arg(&exe)
+    // 1. Compile: `bet build <stem>.bet -o <exe> [--runtime real]`.
+    let mut build_cmd = std::process::Command::new(bin);
+    build_cmd.arg("build").arg(&bet).arg("-o").arg(&exe);
+    if real_runtime {
+        build_cmd.args(["--runtime", "real"]);
+    }
+    let build = build_cmd
         .output()
         .map_err(|e| format!("  FAIL {stem} — spawning `bet build`: {e}"))?;
     if !build.status.success() {
