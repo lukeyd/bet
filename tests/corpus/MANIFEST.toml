@@ -247,7 +247,7 @@ compiled = "pass"
 path = "07-errors/yikes-basics"
 covers = ["errors.yikes"]
 interp = "pass"
-compiled = "skip"
+compiled = "pass"
 
 [[program]]
 path = "07-errors/tea-wrap"
@@ -259,7 +259,7 @@ compiled = "skip"
 path = "07-errors/bounce"
 covers = ["errors.bounce"]
 interp = "pass"
-compiled = "skip"
+compiled = "pass"
 
 [[program]]
 path = "07-errors/yeet-sheesh"
