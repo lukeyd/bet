@@ -73,7 +73,7 @@ compiled = "pass"
 path = "01-basics/spill-format"
 covers = ["basics.format"]
 interp = "pass"
-compiled = "skip"
+compiled = "pass"
 
 [[program]]
 path = "01-basics/comments"
@@ -86,31 +86,31 @@ compiled = "pass"
 path = "02-values/lowkey-facts"
 covers = ["values.mutability", "values.constants", "values.inference"]
 interp = "pass"
-compiled = "skip"
+compiled = "pass"
 
 [[program]]
 path = "02-values/numeric-tower"
 covers = ["values.numeric-tower"]
 interp = "pass"
-compiled = "skip"
+compiled = "pass"
 
 [[program]]
 path = "02-values/casts"
 covers = ["values.casts"]
 interp = "pass"
-compiled = "skip"
+compiled = "pass"
 
 [[program]]
 path = "02-values/arithmetic"
 covers = ["values.arithmetic"]
 interp = "pass"
-compiled = "skip"
+compiled = "pass"
 
 [[program]]
 path = "02-values/bool-logic"
 covers = ["values.bool-logic"]
 interp = "pass"
-compiled = "skip"
+compiled = "pass"
 
 [[program]]
 path = "02-values/strings"
@@ -122,7 +122,7 @@ compiled = "skip"
 path = "02-values/compound-assign"
 covers = ["values.compound-assign"]
 interp = "pass"
-compiled = "skip"
+compiled = "pass"
 
 # --- 03 control -------------------------------------------------------------
 [[program]]
@@ -135,7 +135,7 @@ compiled = "skip"
 path = "03-control/vibin"
 covers = ["control.while"]
 interp = "pass"
-compiled = "skip"
+compiled = "pass"
 
 [[program]]
 path = "03-control/squad"
@@ -147,32 +147,32 @@ compiled = "skip"
 path = "03-control/nested-loops"
 covers = ["control.break-continue"]
 interp = "pass"
-compiled = "skip"
+compiled = "pass"
 
 # --- 04 functions -----------------------------------------------------------
 [[program]]
 path = "04-functions/finna-basics"
 covers = ["functions.basic"]
 interp = "pass"
-compiled = "skip"
+compiled = "pass"
 
 [[program]]
 path = "04-functions/multi-return"
 covers = ["functions.multi-return"]
 interp = "pass"
-compiled = "skip"
+compiled = "pass"
 
 [[program]]
 path = "04-functions/receivers"
 covers = ["functions.receivers"]
 interp = "pass"
-compiled = "skip"
+compiled = "pass"
 
 [[program]]
 path = "04-functions/first-class-fn"
 covers = ["functions.first-class"]
 interp = "pass"
-compiled = "skip"
+compiled = "pass"
 
 [[program]]
 path = "04-functions/generics-fn"
@@ -204,7 +204,7 @@ compiled = "skip"
 path = "06-sumtypes/moods-basics"
 covers = ["sumtypes.moods", "sumtypes.vibe-match"]
 interp = "pass"
-compiled = "skip"
+compiled = "pass"
 
 [[program]]
 path = "06-sumtypes/moods-exhaustive"
@@ -216,7 +216,7 @@ compiled = "skip"
 path = "06-sumtypes/expr-eval"
 covers = ["sumtypes.moods", "sumtypes.vibe-match"]
 interp = "pass"
-compiled = "skip"
+compiled = "pass"
 
 # --- 07 errors --------------------------------------------------------------
 [[program]]
@@ -285,13 +285,13 @@ compiled = "skip"
 path = "09-bit-math/bit-ops"
 covers = ["bits.operators"]
 interp = "pass"
-compiled = "skip"
+compiled = "pass"
 
 [[program]]
 path = "09-bit-math/bam-angles"
 covers = ["bits.bam-angles"]
 interp = "pass"
-compiled = "skip"
+compiled = "pass"
 
 [[program]]
 path = "09-bit-math/wrapping"
@@ -299,13 +299,13 @@ covers = ["bits.wrapping"]
 # Unsupported: sized-integer wrapping arithmetic (`a + b` at u8 width) and `math.lap` need a
 # width-carrying value model the interpreter's uniform i64 domain does not track yet.
 interp = "unsupported"
-compiled = "skip"
+compiled = "pass"
 
 [[program]]
 path = "09-bit-math/fixed-point"
 covers = ["bits.fixed-point"]
 interp = "pass"
-compiled = "skip"
+compiled = "pass"
 
 # --- 10 stdlib --------------------------------------------------------------
 [[program]]
@@ -351,7 +351,7 @@ path = "12-ffi/extern-abs"
 covers = ["ffi.extern"]
 # Skip: FFI (`extern` C symbols) has no interpreter execution path.
 interp = "skip"
-compiled = "skip"
+compiled = "pass"
 
 # --- 13 concurrency ----------------------------------------------------------
 [[program]]

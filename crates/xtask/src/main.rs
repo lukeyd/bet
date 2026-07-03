@@ -824,7 +824,7 @@ fn corpus_compiled(root: &Path) -> Result<()> {
             CompiledMode::Skip => skipped += 1,
             CompiledMode::Pass => {
                 want_pass += 1;
-                match run_compiled_program(&bin, &dir, &tmp, &prog.path) {
+                match run_compiled_program(&bin, &dir, &tmp, &prog.path, prog.interp) {
                     Ok(()) => got_pass += 1,
                     Err(msg) => failures.push(msg),
                 }
@@ -854,9 +854,19 @@ fn corpus_compiled(root: &Path) -> Result<()> {
 }
 
 /// Build, run, and differentially check one `compiled = "pass"` program. Returns `Ok(())` when
-/// the compiled executable's stdout equals both `.expected` and the interpreter's stdout;
-/// otherwise a preformatted `FAIL ...` line describing the first failing stage.
-fn run_compiled_program(bin: &Path, dir: &Path, tmp: &Path, stem: &str) -> Result<(), String> {
+/// the compiled executable's stdout equals `.expected` byte-for-byte AND — when the program's
+/// `interp` field is `pass` — also equals the interpreter's stdout (the interp == compiled
+/// invariant). For programs the interpreter can't run (`interp = unsupported`/`skip`, e.g. FFI or
+/// width-carrying wrapping arithmetic) there is no interpreter output to diff against, so the
+/// compiled gate is `.expected`-only. Otherwise a preformatted `FAIL ...` line for the first
+/// failing stage.
+fn run_compiled_program(
+    bin: &Path,
+    dir: &Path,
+    tmp: &Path,
+    stem: &str,
+    interp_mode: InterpMode,
+) -> Result<(), String> {
     let bet = dir.join(format!("{stem}.bet"));
     let expected_path = dir.join(format!("{stem}.expected"));
     let expected = std::fs::read(&expected_path)
@@ -907,26 +917,30 @@ fn run_compiled_program(bin: &Path, dir: &Path, tmp: &Path, stem: &str) -> Resul
         ));
     }
 
-    // 3b. The differential invariant: compiled stdout must equal the interpreter's stdout.
-    let interp = std::process::Command::new(bin)
-        .arg("run")
-        .arg(&bet)
-        .output()
-        .map_err(|e| format!("  FAIL {stem} — spawning `bet run` (interp): {e}"))?;
-    if !interp.status.success() {
-        return Err(format!(
-            "  FAIL {stem} — interp `bet run` errored (exit {}): {}",
-            interp.status.code().unwrap_or(-1),
-            short(&interp.stderr),
-        ));
-    }
-    if run.stdout != interp.stdout {
-        return Err(format!(
-            "  FAIL {stem} — interp != compiled (differential mismatch)\n\
-             \x20        interp:   {}\n         compiled: {}",
-            short(&interp.stdout),
-            short(&run.stdout),
-        ));
+    // 3b. The differential invariant — only meaningful when the interpreter actually runs this
+    // program (`interp = pass`). For `unsupported`/`skip` programs there is no interpreter output
+    // to compare, so the compiled gate above (`.expected`) stands on its own.
+    if matches!(interp_mode, InterpMode::Pass) {
+        let interp = std::process::Command::new(bin)
+            .arg("run")
+            .arg(&bet)
+            .output()
+            .map_err(|e| format!("  FAIL {stem} — spawning `bet run` (interp): {e}"))?;
+        if !interp.status.success() {
+            return Err(format!(
+                "  FAIL {stem} — interp `bet run` errored (exit {}): {}",
+                interp.status.code().unwrap_or(-1),
+                short(&interp.stderr),
+            ));
+        }
+        if run.stdout != interp.stdout {
+            return Err(format!(
+                "  FAIL {stem} — interp != compiled (differential mismatch)\n\
+                 \x20        interp:   {}\n         compiled: {}",
+                short(&interp.stdout),
+                short(&run.stdout),
+            ));
+        }
     }
     Ok(())
 }
