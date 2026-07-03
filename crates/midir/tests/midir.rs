@@ -430,5 +430,143 @@ fn mir_fixtures_validate_and_round_trip() {
         assert_eq!(t1, t2, "round-trip fixpoint for {}", path.display());
         count += 1;
     }
-    assert!(count >= 3, "expected >= 3 .mir fixtures, found {count}");
+    assert!(count >= 4, "expected >= 4 .mir fixtures, found {count}");
+}
+
+// --- extern calls + string lowering (Step-1 gap fix; the tracer-bullet path) ---
+
+#[test]
+fn extern_call_and_str_projections_round_trip() {
+    // The `spill.it("hi")` → `bet_print(ptr, len)` shape: a `str` literal decomposed into
+    // its data pointer and byte length, passed to an FFI import.
+    let src = r#"
+extern "C" fn bet_print(rawptr, u64) -> void
+fn main() -> void {
+  let %0: rawptr
+  let %1: u64
+  let %2: void
+  bb0:
+    %0 = str_ptr("hi\n")
+    %1 = str_len("hi\n")
+    %2 = call_extern @bet_print(%0, %1)
+    return
+}
+"#;
+    let m = parse(src).expect("extern-call program should parse");
+    validate(&m).expect("extern-call program should validate");
+    let t1 = print(&m);
+    let m2 = parse(&t1).expect("printed extern-call program should re-parse");
+    validate(&m2).expect("re-parsed program should still validate");
+    let t2 = print(&m2);
+    assert_eq!(t1, t2, "extern-call print/parse must reach a fixpoint");
+}
+
+#[test]
+fn detects_str_projection_on_non_str() {
+    // `str_len` on an `i64` operand is a type error.
+    let e = errs("fn f(%0: i64) -> u64 { let %1: u64\n bb0: %1 = str_len(%0)\n return %1 }");
+    assert!(
+        e.iter()
+            .any(|x| matches!(x, ValidationError::TypeMismatch { .. })),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn detects_extern_arity_mismatch() {
+    // `bet_print` takes two args; calling it with none is a shape error.
+    let src = "extern \"C\" fn bet_print(rawptr, u64) -> void \
+               fn f() -> void { let %0: void\n bb0: %0 = call_extern @bet_print()\n return }";
+    let e = errs(src);
+    assert!(
+        e.iter()
+            .any(|x| matches!(x, ValidationError::BadShape { .. })),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn detects_bad_extern_id() {
+    // A call to a nonexistent extern is a dangling id.
+    let mut m = Module::new();
+    let vt = m.t_void();
+    let mut fb = FuncBuilder::new("f", vec![], vec![]);
+    let t = fb.local(vt);
+    fb.block();
+    fb.assign(
+        fb.place(t),
+        Rvalue::Call(Callee::Extern(ExternId(99)), vec![]),
+    );
+    fb.ret(vec![]);
+    m.add_func(fb.finish());
+    assert!(
+        validate(&m)
+            .unwrap_err()
+            .iter()
+            .any(|x| matches!(x, ValidationError::BadId { .. }))
+    );
+}
+
+// --- by-value sum construction + validator hardening (Step-1 gap fix) ---
+
+#[test]
+fn by_value_sum_round_trips() {
+    let src = "sum Opt { None, Some(i64) } \
+               fn f() -> Opt { let %0: Opt\n bb0: %0 = make Opt::Some(7i64)\n return %0 }";
+    let m = parse(src).expect("by-value sum program should parse");
+    validate(&m).expect("by-value sum program should validate");
+    let t1 = print(&m);
+    let m2 = parse(&t1).expect("printed by-value sum should re-parse");
+    validate(&m2).expect("re-parsed by-value sum should still validate");
+    assert_eq!(t1, print(&m2), "by-value sum print/parse fixpoint");
+}
+
+#[test]
+fn detects_by_value_sum_arity() {
+    // `Some` carries one payload; building it with none is a shape error.
+    let src = "sum Opt { None, Some(i64) } \
+               fn f() -> Opt { let %0: Opt\n bb0: %0 = make Opt::Some()\n return %0 }";
+    let e = errs(src);
+    assert!(
+        e.iter()
+            .any(|x| matches!(x, ValidationError::BadShape { .. })),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn detects_bad_arith_mode() {
+    // Integer `add` must carry Wrap or Trap, never Na.
+    let e = errs("fn f(%0: i64) -> i64 { let %1: i64\n bb0: %1 = add.na(%0, %0)\n return %1 }");
+    assert!(
+        e.iter()
+            .any(|x| matches!(x, ValidationError::TypeMismatch { .. })),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn detects_bad_cast() {
+    // `itof` (int→float) from a float source is ill-typed.
+    let e =
+        errs("fn f(%0: f64) -> f64 { let %1: f64\n bb0: %1 = cast.itof(%0 as f64)\n return %1 }");
+    assert!(
+        e.iter()
+            .any(|x| matches!(x, ValidationError::TypeMismatch { .. })),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn detects_global_type_mismatch() {
+    // A `str`-valued global declared `i64` is a type mismatch.
+    let e = errs(
+        "const BAD: i64 = \"nope\" \
+                  fn f() -> void { bb0: return }",
+    );
+    assert!(
+        e.iter()
+            .any(|x| matches!(x, ValidationError::TypeMismatch { .. })),
+        "{e:?}"
+    );
 }

@@ -1,5 +1,5 @@
 (* ============================================================================
-   bet — surface grammar (EBNF)  ★ FROZEN ARTIFACT (v0.1)
+   bet — surface grammar (EBNF)  ★ FROZEN ARTIFACT (v0.1.1)
 
    Frozen in Step 1c (bootstrap-plan.md §1c) alongside the golden corpus. The
    corpus (tests/corpus/) is the executable companion: every construct below is
@@ -10,6 +10,13 @@
 
    This grammar is normative for surface syntax. Where it and prose disagree,
    this file wins; report the conflict.
+
+   Changelog:
+     v0.1.1 — remove the vestigial `mapType` (`map[K]V`) production: maps are
+              spelled `stash[K, V]` (a generic `nameType`), settled in
+              plan-amendment-01 §8. The `map` token was never in the L2 keyword
+              list, so this only deletes dead surface syntax (the mid-level IR
+              keeps its `TyKind::Map`, which `stash[K, V]` lowers to).
 
    ----------------------------------------------------------------------------
    Meta-notation (W3C/ISO-EBNF flavored):
@@ -163,15 +170,15 @@ bindTargets = ident { "," ident } ;               (* multi-value bind: a, y = f(
 
 (* --- S3. Types ----------------------------------------------------------- *)
 
-type      = sliceType | arrayType | tagType | cribType | mapType | fnType
+type      = sliceType | arrayType | tagType | cribType | fnType
           | "rawptr" | nameType ;
 sliceType = "[]" type ;                           (* []Bullet, []u8             *)
 arrayType = nameType "[" intLit "]" ;             (* Enemy[1000] (fixed)        *)
 tagType   = "tag" type ;                          (* tag Enemy (8-byte handle)  *)
 cribType  = "crib" type ;                         (* crib Enemy (param/field)   *)
-mapType   = "map" "[" type "]" type ;             (* map[str]int                *)
 fnType    = "finna" "(" [ typeList ] ")" "->" type ;  (* finna(tag Mobj)->void  *)
 nameType  = ident [ "[" typeList "]" ] ;          (* int, str, vec3, stash[str,i64] *)
+                                                  (* a map is stash[K, V] (§amend 8) *)
 typeList  = type { "," type } ;
 
 
@@ -276,6 +283,11 @@ argList  = arg { "," arg } ;
 arg      = [ ident ":" ] expr ;                       (* optional label: in: crib *)
 
 (* ============================================================================
-   END. Coverage note: every production above is exercised by tests/corpus/;
-   `cargo xtask corpus --check` enforces feature coverage against the manifest.
+   END. Coverage note: every syntactic production above is exercised by at least
+   one program in tests/corpus/ (incl. concurrency `slide`, FFI `extern`, and the
+   compound-assignment operators), and `cargo xtask corpus --check` enforces the
+   feature taxonomy in MANIFEST.toml. The `gg` platform-I/O surface (framebuffer /
+   audio / input / timing) is validated by the rt-stub ABI unit tests rather than
+   golden programs, since its output is environment-dependent, not deterministic
+   stdout.
    ============================================================================ *)

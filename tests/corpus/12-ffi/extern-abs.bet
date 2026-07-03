@@ -1,0 +1,9 @@
+// extern-abs — call a C library function across the FFI boundary. `extern` imports a
+// foreign symbol with a bet signature; here libc's `abs`, resolved at link time.
+pull "spill"
+
+extern "C" finna abs(x: i32) -> i32
+
+finna main() {
+    spill.it(abs(-7 as i32))   // 7
+}

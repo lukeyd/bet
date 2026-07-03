@@ -6,6 +6,12 @@ version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+# Built both as a Rust `rlib` (so the driver can depend on it normally and read its link
+# name) and as a `staticlib` (so `cargo build` emits `librt_stub.a` next to the `bet` binary,
+# which the driver links compiled programs against). Bootstrap-only; never shipped.
+[lib]
+crate-type = ["staticlib", "rlib"]
+
 [dependencies]
 rt-abi = { path = "../rt-abi" }
 

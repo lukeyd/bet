@@ -26,6 +26,13 @@ use std::sync::{Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
+/// The base name of this crate's static library (`librt_stub.a` → `-lrt_stub`). The driver
+/// uses it to construct the link line for compiled `bet` programs. Keeping it here ties the
+/// name to the crate that produces the archive.
+pub fn staticlib_link_name() -> &'static str {
+    "rt_stub"
+}
+
 // Re-export the shared ABI types so downstream (and tests) can name them via `rt_stub`.
 // Only the *types* are re-exported; the entry-point declarations in `rt-abi` are not (they
 // would collide with the definitions below).

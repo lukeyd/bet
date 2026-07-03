@@ -16,7 +16,7 @@ all = [
   # 02 values
   "values.mutability", "values.constants", "values.inference", "values.numeric-tower",
   "values.casts", "values.arithmetic", "values.bool-logic", "values.strings",
-  "values.array-literal",
+  "values.array-literal", "values.compound-assign",
   # 03 control flow
   "control.if", "control.while", "control.foreach", "control.break-continue",
   # 04 functions
@@ -37,6 +37,10 @@ all = [
   "stdlib.stash", "stdlib.bytes", "stdlib.squadops",
   # 11 reference oracles
   "reference.compiler", "reference.doom",
+  # 12 ffi
+  "ffi.extern",
+  # 13 concurrency
+  "concurrency.slide",
 ]
 
 # --- 01 basics --------------------------------------------------------------
@@ -76,6 +80,10 @@ covers = ["values.bool-logic"]
 [[program]]
 path = "02-values/strings"
 covers = ["values.strings"]
+
+[[program]]
+path = "02-values/compound-assign"
+covers = ["values.compound-assign"]
 
 # --- 03 control -------------------------------------------------------------
 [[program]]
@@ -221,3 +229,13 @@ covers = ["reference.compiler"]
 [[program]]
 path = "11-reference/doom-thinker"
 covers = ["reference.doom"]
+
+# --- 12 ffi ------------------------------------------------------------------
+[[program]]
+path = "12-ffi/extern-abs"
+covers = ["ffi.extern"]
+
+# --- 13 concurrency ----------------------------------------------------------
+[[program]]
+path = "13-concurrency/slide-spawn"
+covers = ["concurrency.slide"]

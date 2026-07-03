@@ -16,6 +16,15 @@ frontend = { path = "../frontend" }
 backend  = { path = "../backend" }
 interp   = { path = "../interp" }
 fmt      = { path = "../fmt" }
+# A normal (rlib) dep so cargo builds `librt_stub.a` alongside `bet` and the driver can read
+# its link name; the driver links compiled programs against that archive (see src/link.rs).
+rt-stub  = { path = "../rt-stub" }
+
+[features]
+default = []
+# Forward codegen to the backend. The default build stays LLVM-free; `bet build` without this
+# feature reports a clean runtime error instead of failing to compile.
+llvm = ["backend/llvm"]
 
 [lints]
 workspace = true

@@ -42,6 +42,8 @@ define_id!(/// Index into the module's function table.
     FuncId);
 define_id!(/// Index into the module's global-constant (`facts`) table.
     GlobalId);
+define_id!(/// Index into the module's `extern` (FFI import) table.
+    ExternId);
 define_id!(/// Index of a local within a [`Func`].
     LocalId);
 define_id!(/// Index of a block within a [`Func`].
@@ -317,18 +319,35 @@ pub enum Rvalue {
     /// `tag.trust() in crib` — unchecked resolve to a `ref` (backend picks
     /// checked-in-debug vs. raw-load-in-release).
     Trust(Operand, Operand),
+    /// The data pointer of a `str` value, as a `rawptr`. For a literal, the backend
+    /// interns a private byte-array global and yields its address. This is one of the
+    /// two projections of the (eventual) fat `str` `{ ptr, len }`, so it applies to any
+    /// `str` operand, not just literals.
+    StrPtr(Operand),
+    /// The byte length of a `str` value, as `u64` — the other `str` projection.
+    StrLen(Operand),
 }
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum Callee {
     Direct(FuncId),
     Indirect(Operand),
+    /// A direct call to an `extern "C"` FFI import (e.g. an `rt-abi` entry point such as
+    /// `bet_print`). Resolved through the module's `extern` table, not the `func` table.
+    Extern(ExternId),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AggKind {
     Struct(StructId),
     Tuple,
+    /// A by-value `moods` (sum) value: the given variant with its payload operands. Sets
+    /// the discriminant and stores the payload without allocating into a crib (the `cop`
+    /// path is [`CopInit::SumVariant`]).
+    Sum {
+        sum: SumId,
+        variant: u32,
+    },
 }
 
 /// How a `cop` initializes the freshly allocated slot.
@@ -541,8 +560,14 @@ impl Module {
         &self.sums
     }
 
-    pub fn add_extern(&mut self, ext: Extern) {
+    pub fn add_extern(&mut self, ext: Extern) -> ExternId {
+        let id = ExternId(self.externs.len() as u32);
         self.externs.push(ext);
+        id
+    }
+
+    pub fn extern_def(&self, id: ExternId) -> &Extern {
+        &self.externs[id.index()]
     }
 
     pub fn externs(&self) -> &[Extern] {

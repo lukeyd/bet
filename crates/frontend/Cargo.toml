@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 midir = { path = "../midir" }
+logos = { workspace = true }
 
 [lints]
 workspace = true

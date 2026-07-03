@@ -49,6 +49,12 @@ pub fn validate(module: &Module) -> Result<(), Vec<ValidationError>> {
     for func in module.funcs() {
         c.check_func(func);
     }
+    for g in module.globals() {
+        c.check_global(g);
+    }
+    for e in module.externs() {
+        c.check_extern(e);
+    }
     if c.errors.is_empty() {
         Ok(())
     } else {
@@ -205,7 +211,7 @@ impl<'a> Checker<'a> {
     fn rvalue_kind(&mut self, func: &Func, block: BlockId, rv: &Rvalue) -> Option<TyKind> {
         match rv {
             Rvalue::Use(op) => self.operand_kind(func, op),
-            Rvalue::BinOp(op, a, b, _) => {
+            Rvalue::BinOp(op, a, b, mode) => {
                 let ka = self.operand_kind(func, a);
                 let kb = self.operand_kind(func, b);
                 if let (Some(ka), Some(kb)) = (&ka, &kb)
@@ -217,6 +223,7 @@ impl<'a> Checker<'a> {
                         detail: format!("binary op on mismatched operands {ka:?} and {kb:?}"),
                     });
                 }
+                self.check_arith_mode(func, *op, *mode, ka.as_ref());
                 if op.is_comparison() {
                     Some(TyKind::Bool)
                 } else {
@@ -230,9 +237,11 @@ impl<'a> Checker<'a> {
                     UnOp::Neg | UnOp::BitNot => ka,
                 }
             }
-            Rvalue::Cast(op, ty, _) => {
-                self.operand_kind(func, op);
-                Some(self.module.ty(*ty).clone())
+            Rvalue::Cast(op, ty, kind) => {
+                let src = self.operand_kind(func, op);
+                let target = self.module.ty(*ty).clone();
+                self.check_cast(func, src.as_ref(), &target, *kind);
+                Some(target)
             }
             Rvalue::Call(callee, args) => self.call_kind(func, callee, args),
             Rvalue::Aggregate(kind, ops) => {
@@ -257,6 +266,30 @@ impl<'a> Checker<'a> {
                         Some(TyKind::Struct(*sid))
                     }
                     AggKind::Tuple => None,
+                    AggKind::Sum { sum, variant } => {
+                        if let Some(def) = self.sum_def(func, *sum) {
+                            match def.variants.get(*variant as usize) {
+                                None => self.errors.push(ValidationError::BadId {
+                                    func: func.name.clone(),
+                                    detail: format!("sum `{}` has no variant #{variant}", def.name),
+                                }),
+                                Some(v) if v.payload.len() != ops.len() => {
+                                    self.errors.push(ValidationError::BadShape {
+                                        func: func.name.clone(),
+                                        detail: format!(
+                                            "variant `{}::{}` takes {} payload(s), got {}",
+                                            def.name,
+                                            v.name,
+                                            v.payload.len(),
+                                            ops.len()
+                                        ),
+                                    });
+                                }
+                                Some(_) => {}
+                            }
+                        }
+                        Some(TyKind::Sum(*sum))
+                    }
                 }
             }
             Rvalue::Discriminant(op) => {
@@ -286,42 +319,124 @@ impl<'a> Checker<'a> {
                     _ => None,
                 }
             }
+            Rvalue::StrPtr(op) => {
+                self.expect_str(func, op);
+                Some(TyKind::RawPtr)
+            }
+            Rvalue::StrLen(op) => {
+                self.expect_str(func, op);
+                Some(TyKind::Int {
+                    width: IntWidth::W64,
+                    signed: false,
+                })
+            }
+        }
+    }
+
+    /// Best-effort: a `str` projection (`str_ptr`/`str_len`) requires a `str` operand. Skips
+    /// the check when the operand's kind can't be determined locally (matching file policy).
+    fn expect_str(&mut self, func: &Func, op: &Operand) {
+        if let Some(k) = self.operand_kind(func, op)
+            && k != TyKind::Str
+        {
+            self.errors.push(ValidationError::TypeMismatch {
+                func: func.name.clone(),
+                detail: format!("str projection on non-str operand {k:?}"),
+            });
         }
     }
 
     fn call_kind(&mut self, func: &Func, callee: &Callee, args: &[Operand]) -> Option<TyKind> {
-        for op in args {
-            self.operand_kind(func, op);
-        }
-        let rets: Vec<TyId> = match callee {
+        // Resolve the callee to its (name, params, rets), cloning out of the shared module so
+        // `check_call_args` can borrow `self` mutably. Bad-id callees still visit their args
+        // (so a bad local passed to a dangling call is still reported).
+        let (name, params, rets): (String, Vec<TyId>, Vec<TyId>) = match callee {
             Callee::Direct(fid) => {
-                let funcs = self.module.funcs();
-                let Some(target) = funcs.get(fid.index()) else {
+                let Some(target) = self.module.funcs().get(fid.index()) else {
+                    self.visit_args(func, args);
                     self.errors.push(ValidationError::BadId {
                         func: func.name.clone(),
                         detail: format!("call to function #{}", fid.0),
                     });
                     return None;
                 };
-                if target.params.len() != args.len() {
-                    self.errors.push(ValidationError::BadShape {
+                (
+                    target.name.clone(),
+                    target.params.clone(),
+                    target.rets.clone(),
+                )
+            }
+            Callee::Extern(eid) => {
+                let Some(target) = self.module.externs().get(eid.index()) else {
+                    self.visit_args(func, args);
+                    self.errors.push(ValidationError::BadId {
+                        func: func.name.clone(),
+                        detail: format!("call to extern #{}", eid.0),
+                    });
+                    return None;
+                };
+                (
+                    target.name.clone(),
+                    target.sig.params.clone(),
+                    target.sig.rets.clone(),
+                )
+            }
+            Callee::Indirect(op) => match self.operand_kind(func, op) {
+                Some(TyKind::FnPtr(sig)) => {
+                    let s = self.module.sig(sig).clone();
+                    ("<indirect>".to_string(), s.params, s.rets)
+                }
+                _ => {
+                    self.visit_args(func, args);
+                    return None;
+                }
+            },
+        };
+        self.check_call_args(func, &name, &params, args);
+        Some(self.rets_to_kind(&rets))
+    }
+
+    /// Visit each argument operand for its own well-formedness (used when the callee is
+    /// unresolvable, so bad locals in the argument list are still reported).
+    fn visit_args(&mut self, func: &Func, args: &[Operand]) {
+        for op in args {
+            self.operand_kind(func, op);
+        }
+    }
+
+    /// Arity + best-effort per-argument type checking, uniform across direct/extern/indirect
+    /// calls. Visits every argument exactly once (so it subsumes [`Self::visit_args`]).
+    fn check_call_args(
+        &mut self,
+        func: &Func,
+        callee_name: &str,
+        params: &[TyId],
+        args: &[Operand],
+    ) {
+        if params.len() != args.len() {
+            self.errors.push(ValidationError::BadShape {
+                func: func.name.clone(),
+                detail: format!(
+                    "call to `{callee_name}` passes {} arg(s), expected {}",
+                    args.len(),
+                    params.len()
+                ),
+            });
+        }
+        for (i, arg) in args.iter().enumerate() {
+            let k = self.operand_kind(func, arg);
+            if let (Some(k), Some(&pty)) = (k, params.get(i)) {
+                let want = self.module.ty(pty).clone();
+                if k != want {
+                    self.errors.push(ValidationError::TypeMismatch {
                         func: func.name.clone(),
                         detail: format!(
-                            "call to `{}` passes {} arg(s), expected {}",
-                            target.name,
-                            args.len(),
-                            target.params.len()
+                            "call to `{callee_name}` arg #{i}: passed {k:?}, expected {want:?}"
                         ),
                     });
                 }
-                target.rets.clone()
             }
-            Callee::Indirect(op) => match self.operand_kind(func, op) {
-                Some(TyKind::FnPtr(sig)) => self.module.sig(sig).rets.clone(),
-                _ => return None,
-            },
-        };
-        Some(self.rets_to_kind(&rets))
+        }
     }
 
     fn rets_to_kind(&self, rets: &[TyId]) -> TyKind {
@@ -515,5 +630,99 @@ impl<'a> Checker<'a> {
             return None;
         }
         Some(module.sum_def(sid))
+    }
+
+    // --- best-effort numeric policy (amendment §2.4; ir.rs ArithMode/CastKind docs) ---
+
+    /// The overflow mode must match the operator and operand type: integer arithmetic carries
+    /// `Wrap`/`Trap`, while bitwise/shift/comparison ops and float arithmetic carry `Na`.
+    /// Skipped when the operand type isn't known locally.
+    fn check_arith_mode(
+        &mut self,
+        func: &Func,
+        op: BinOp,
+        mode: ArithMode,
+        operand: Option<&TyKind>,
+    ) {
+        let is_arith = matches!(
+            op,
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem
+        );
+        if !is_arith {
+            // comparisons, bitwise, and shifts always carry Na.
+            if mode != ArithMode::Na {
+                self.errors.push(ValidationError::TypeMismatch {
+                    func: func.name.clone(),
+                    detail: format!("{op:?} must use arith mode Na, found {mode:?}"),
+                });
+            }
+            return;
+        }
+        match operand {
+            Some(TyKind::Int { .. }) if mode == ArithMode::Na => {
+                self.errors.push(ValidationError::TypeMismatch {
+                    func: func.name.clone(),
+                    detail: format!("integer {op:?} needs Wrap or Trap, found Na"),
+                });
+            }
+            Some(TyKind::F32 | TyKind::F64) if mode != ArithMode::Na => {
+                self.errors.push(ValidationError::TypeMismatch {
+                    func: func.name.clone(),
+                    detail: format!("float {op:?} must use Na, found {mode:?}"),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// A cast's kind must be consistent with its source and target types (semantics §2).
+    /// Skipped when the source type isn't known locally; `Bitcast` is unconstrained here.
+    fn check_cast(&mut self, func: &Func, src: Option<&TyKind>, target: &TyKind, kind: CastKind) {
+        let Some(src) = src else { return };
+        let is_int = |t: &TyKind| matches!(t, TyKind::Int { .. });
+        let is_float = |t: &TyKind| matches!(t, TyKind::F32 | TyKind::F64);
+        let ok = match kind {
+            CastKind::IntZext | CastKind::IntSext | CastKind::IntTrunc => {
+                is_int(src) && is_int(target)
+            }
+            CastKind::IntToFloat => is_int(src) && is_float(target),
+            CastKind::FloatToInt => is_float(src) && is_int(target),
+            CastKind::FloatResize => is_float(src) && is_float(target),
+            CastKind::Bitcast => true,
+        };
+        if !ok {
+            self.errors.push(ValidationError::TypeMismatch {
+                func: func.name.clone(),
+                detail: format!("cast {kind:?} from {src:?} to {target:?} is ill-typed"),
+            });
+        }
+    }
+
+    // --- module-level declarations (globals & externs) ---
+
+    /// A `facts` global's constant value must have its declared type.
+    fn check_global(&mut self, g: &Global) {
+        if let Some(k) = self.const_kind(&g.value) {
+            let want = self.module.ty(g.ty).clone();
+            if k != want {
+                self.errors.push(ValidationError::TypeMismatch {
+                    func: format!("<global {}>", g.name),
+                    detail: format!("value of type {k:?} but declared {want:?}"),
+                });
+            }
+        }
+    }
+
+    /// An `extern` signature must reference only in-range interned types.
+    fn check_extern(&mut self, e: &Extern) {
+        let n = self.module.types().len();
+        for &t in e.sig.params.iter().chain(&e.sig.rets) {
+            if t.index() >= n {
+                self.errors.push(ValidationError::BadId {
+                    func: format!("<extern {}>", e.name),
+                    detail: format!("signature references out-of-range type #{}", t.0),
+                });
+            }
+        }
     }
 }

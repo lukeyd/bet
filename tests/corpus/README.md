@@ -23,7 +23,7 @@ MANIFEST.toml               program -> features-covered map + the coverage unive
 ```
 
 Categories: `01-basics 02-values 03-control 04-functions 05-structs 06-sumtypes
-07-errors 08-memory 09-bit-math 10-stdlib 11-reference`.
+07-errors 08-memory 09-bit-math 10-stdlib 11-reference 12-ffi 13-concurrency`.
 
 ## Authoring rules
 

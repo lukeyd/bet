@@ -1,0 +1,18 @@
+// hello.mir — the tracer-bullet program in the mid-level IR: print a string via the
+// runtime ABI. `spill.it("hi")` lowers to a single `bet_print(ptr, len)` extern call over
+// the string literal's data pointer and byte length. `spill.it` is println-like, so the
+// lowered literal carries its trailing newline (`str_len("hi\n") == 3`). This fixture is
+// both a midir round-trip case and the backend's golden input. (Step 1a / Step 2.)
+
+extern "C" fn bet_print(rawptr, u64) -> void
+
+fn main() -> void {
+  let %0: rawptr
+  let %1: u64
+  let %2: void
+  bb0:
+    %0 = str_ptr("hi\n")
+    %1 = str_len("hi\n")
+    %2 = call_extern @bet_print(%0, %1)
+    return
+}
