@@ -15,12 +15,17 @@ bet — the bet compiler driver
 
 USAGE:
     bet build <input.bet|input.mir> [-o <output>]
+    bet build --emit <tokens|ast|mir> <input.bet>
     bet run   <input.bet>
     bet fmt   [--check] <input.bet>
 
 `build` compiles a program to a native executable, linking it against the bootstrap runtime.
 Requires a codegen-enabled build (`--features llvm`); without it, `build` reports that no code
 generator is present.
+
+`build --emit <kind>` instead prints a canonical textual dump of a frontend intermediate
+(`tokens`, `ast`, or `mir`) and stops — no backend, so it works in the default build. These
+dumps are the differential-testing surface for the self-hosted frontend.
 
 `run` parses a `.bet` program and executes it on the tree-walking interpreter, writing its
 output to stdout. No codegen or LLVM is required.
@@ -114,6 +119,7 @@ fn build(args: &[String]) -> Result<(), String> {
     let mut input: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
     let mut runtime = link::Runtime::Stub;
+    let mut emit: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -121,6 +127,10 @@ fn build(args: &[String]) -> Result<(), String> {
                 i += 1;
                 let path = args.get(i).ok_or("`-o` needs a path")?;
                 output = Some(PathBuf::from(path));
+            }
+            "--emit" => {
+                i += 1;
+                emit = Some(args.get(i).ok_or("`--emit` needs a kind")?.clone());
             }
             "--runtime" => {
                 i += 1;
@@ -141,6 +151,14 @@ fn build(args: &[String]) -> Result<(), String> {
         i += 1;
     }
     let input = input.ok_or("`bet build` needs an input file")?;
+
+    // `--emit=<kind>` short-circuits the native pipeline: print a canonical textual dump of a
+    // frontend intermediate (for differential-testing the self-hosted frontend) and stop. These
+    // never touch the backend, so they work in the default LLVM-free build.
+    if let Some(kind) = emit {
+        return emit_dump(&input, &kind);
+    }
+
     let output = output.unwrap_or_else(|| default_output(&input));
 
     let opts = backend::EmitOptions {
@@ -167,6 +185,31 @@ fn compile_object(input: &Path, opts: &backend::EmitOptions) -> Result<Vec<u8>, 
             "unknown input extension `.{ext}` (expected `.bet` or `.mir`)"
         )),
     }
+}
+
+/// `bet build --emit=<tokens|ast|mir> <input.bet>` — print a canonical textual dump of a
+/// frontend intermediate to stdout. The dumps are byte-for-byte reproducible by the future
+/// self-hosted `bet` frontend, so `diff`ing the two localizes a port bug to a single layer.
+fn emit_dump(input: &Path, kind: &str) -> Result<(), String> {
+    match input.extension().and_then(|e| e.to_str()) {
+        Some("bet") | None => {}
+        Some(ext) => return Err(format!("`--emit` expects a `.bet` input, got `.{ext}`")),
+    }
+    let src =
+        std::fs::read_to_string(input).map_err(|e| format!("reading {}: {e}", input.display()))?;
+    let dump = match kind {
+        "tokens" => frontend::dump::tokens(&src),
+        "ast" => frontend::dump::ast(&src),
+        "mir" => frontend::dump::mir(&src),
+        other => {
+            return Err(format!(
+                "unknown --emit kind `{other}` (expected `tokens`, `ast`, or `mir`)"
+            ));
+        }
+    }
+    .map_err(|e| e.to_string())?;
+    print!("{dump}");
+    Ok(())
 }
 
 fn default_output(input: &Path) -> PathBuf {

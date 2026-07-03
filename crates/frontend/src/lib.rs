@@ -10,6 +10,7 @@
 //!   wider grammar to `midir` is still to come; `parse` already accepts it.
 
 pub mod ast;
+pub mod dump;
 mod lexer;
 mod lower;
 mod parser;

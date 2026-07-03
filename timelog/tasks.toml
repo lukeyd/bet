@@ -202,12 +202,80 @@ name = "Milestone 7: language freeze — SP0 5 decisions pulled forward into fea
 size = 5
 status = "todo"
 
-# ─────────────────────── Capstone ───────────────────────
+# ─────────────────── Self-host roadmap (plan: its-time-to-plan-synchronous-cosmos.md) ───────────────────
+# Milestone 7.1 → 8. Decisions locked: full roadmap, runtime-backed vec+stash, faithful 1:1
+# port aiming for byte-identical .mir. Existing prerequisites map to the plan's phases:
+#   A1 bytes-io · A3 fnd-alloc · B2 corpus-parity · B3 milestone-7-freeze (above).
+# selfhost/*.bet (Phase C) stays empty until B3 (freeze) is green. New tasks below.
+
+# Phase A — features the compiler needs (NEW, beyond existing A1/A3)
+[[task]]
+slug = "selfhost-stdlib"
+name = "A2: write std/{str,bytes,fs} in bet + growable string builder for .mir emission (currently README-only)"
+size = 8
+status = "todo"
 
 [[task]]
+slug = "compiled-collections"
+name = "A4: runtime-backed growable vec[T] + stash on the COMPILED path (rt-abi/midir/backend/runtime/interp parity); promote 10-stdlib to compiled=pass"
+size = 13
+status = "todo"
+
+# Phase B — verification infra (NEW; B2 corpus-parity + B3 freeze already exist above)
+[[task]]
+slug = "emit-dumps"
+name = "B1: bet build --emit=tokens|ast|mir on the Rust driver for per-layer differential vs the ported frontend"
+size = 3
+status = "todo"
+
+# Phase C — the self-hosted frontend (Milestone 7.1), broken out so the ETA doesn't lump the
+# capstone. Umbrella `selfhost` kept at size 0 as the clock-in target for coordination time.
+[[task]]
 slug = "selfhost"
-name = "Milestone 7.1: self-host stage 1 (frontend rewritten in bet, compiled by Rust stage-0); interp==Rust-compiled==self-compiled on full corpus"
-size = 34
+name = "Milestone 7.1 umbrella: self-host stage 1 — see selfhost-{scaffold,lexer,ast,parser,lower,emit,fixpoint}"
+size = 0
+status = "todo"
+
+[[task]]
+slug = "selfhost-scaffold"
+name = "C0: selfhost/ module layout + betfe main (read->lex->parse->lower->emit->write) + driver/xtask `--frontend=self` hook"
+size = 3
+status = "todo"
+
+[[task]]
+slug = "selfhost-lexer"
+name = "C1: port lexer.rs -> bet (keywords, operators, numeric tower, string/byte literals, ASI); verify --emit=tokens diff on corpus"
+size = 5
+status = "todo"
+
+[[task]]
+slug = "selfhost-ast"
+name = "C2: AST as moods+drip, tag-linked in cribs (mirror ast.rs; scale up mini-compiler.bet's shape)"
+size = 3
+status = "todo"
+
+[[task]]
+slug = "selfhost-parser"
+name = "C3: port parser.rs -> bet (recursive descent, generics disambiguation); verify --emit=ast diff"
+size = 8
+status = "todo"
+
+[[task]]
+slug = "selfhost-lower"
+name = "C4: port lower.rs -> bet (folded typecheck + monomorphization + midir construction); verify --emit=mir diff — the ~3200-LOC monster"
+size = 13
+status = "todo"
+
+[[task]]
+slug = "selfhost-emit"
+name = "C5: .mir textual printer in bet matching crates/midir/src/text.rs exactly (enables byte-identical .mir)"
+size = 3
+status = "todo"
+
+[[task]]
+slug = "selfhost-fixpoint"
+name = "C6/M8: stage-2/stage-3 build + byte-identical binary assertion + 3-way harness wired into CI"
+size = 3
 status = "todo"
 
 # ─────────────────────── The gate this plan STOPS at (out of scope) ───────────────────────
