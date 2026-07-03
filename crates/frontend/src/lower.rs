@@ -916,7 +916,7 @@ impl LowerCtx {
             StmtKind::Expr(e) => self.lower_expr_stmt(e),
             StmtKind::Squad { var, iter, body } => self.lower_squad(var, iter, body),
             StmtKind::Sheesh { .. } => Err("`sheesh` (panic recovery) is not yet lowered".into()),
-            StmtKind::Slide(_) => Err("`slide` (task spawn) is not yet lowered".into()),
+            StmtKind::Slide(call) => self.lower_slide(call),
             StmtKind::Bounce(e) => self.lower_bounce(e),
         }
     }
@@ -1018,6 +1018,61 @@ impl LowerCtx {
             ops.push(op);
         }
         self.term_ret(ops);
+        Ok(())
+    }
+
+    /// `slide worker()` — spawn a concurrent task via `bet_slide`. The worker (a no-arg
+    /// function today) is passed as a code pointer; the task argument is unused, so the entry
+    /// pointer doubles as it. The returned `TaskHandle` is discarded.
+    fn lower_slide(&mut self, call: &Expr) -> Result<(), String> {
+        let ExprKind::Call { callee, args } = &call.kind else {
+            return Err("`slide` expects a function call".into());
+        };
+        if !args.is_empty() {
+            return Err("`slide` of a function taking arguments is not yet lowered".into());
+        }
+        let ExprKind::Name { name, .. } = &callee.kind else {
+            return Err("`slide` expects a named function".into());
+        };
+        let sig = self
+            .funcs
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("`slide` of unknown function `{name}`"))?;
+        if !sig.ok {
+            return Err(format!("`slide` of a not-yet-lowerable function `{name}`"));
+        }
+        // The worker's code pointer, cast to a raw pointer for the ABI.
+        let fn_sig = self.m.intern_sig(Sig {
+            params: sig.params.clone(),
+            rets: sig.rets.clone(),
+        });
+        let fnptr_ty = self.m.intern_ty(TyKind::FnPtr(fn_sig));
+        let fnref = self.new_local(fnptr_ty);
+        self.fb().assign(
+            Place::local(fnref),
+            Rvalue::Use(Operand::Const(Const::FnRef(sig.id))),
+        );
+        let rawptr = self.m.intern_ty(TyKind::RawPtr);
+        let entry = self.new_local(rawptr);
+        self.fb().assign(
+            Place::local(entry),
+            Rvalue::Cast(
+                Operand::Copy(Place::local(fnref)),
+                rawptr,
+                CastKind::Bitcast,
+            ),
+        );
+        // bet_slide(entry, arg) -> TaskHandle (u64). The worker ignores its arg, so reuse the
+        // entry pointer as the (discarded) argument.
+        let u64t = self.m.t_int(IntWidth::W64, false);
+        let ext = self.get_extern("bet_slide", vec![rawptr, rawptr], vec![u64t]);
+        let handle = self.new_local(u64t);
+        let entry_op = Operand::Copy(Place::local(entry));
+        self.fb().assign(
+            Place::local(handle),
+            Rvalue::Call(Callee::Extern(ext), vec![entry_op.clone(), entry_op]),
+        );
         Ok(())
     }
 
