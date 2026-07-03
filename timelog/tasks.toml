@@ -219,14 +219,19 @@ status = "todo"
 slug = "compiled-collections"
 name = "A4: runtime-backed growable vec[T] + stash on the COMPILED path (rt-abi/midir/backend/runtime/interp parity); promote 10-stdlib to compiled=pass"
 size = 13
-status = "todo"
+# vec[T] core DONE (bet_vec_* ABI; new/stack/pop/gang/index/squad; 10-stdlib/vec compiled=pass;
+# stash was already compiled=pass). Remaining sliver: higher-order .vibeCheck/.glowUp on vec +
+# squadops.bet -> vec.new rewrite (not on the compiler's critical path — it uses squad loops).
+status = "doing"
 
 # Phase B — verification infra (NEW; B2 corpus-parity + B3 freeze already exist above)
 [[task]]
 slug = "emit-dumps"
 name = "B1: bet build --emit=tokens|ast|mir on the Rust driver for per-layer differential vs the ported frontend"
 size = 3
-status = "todo"
+# tokens + mir dumps DONE (frontend::dump); --emit=ast intentionally deferred to the C3 parser
+# port so its format is co-designed with the bet reproducer.
+status = "doing"
 
 # Phase C — the self-hosted frontend (Milestone 7.1), broken out so the ETA doesn't lump the
 # capstone. Umbrella `selfhost` kept at size 0 as the clock-in target for coordination time.
