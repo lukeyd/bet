@@ -426,7 +426,13 @@ impl<'p> Interp<'p> {
             }
             StmtKind::Bounce(e) => self.exec_bounce(env, e),
             // Concurrency is out of this slice (corpus `13-concurrency` is `skip`).
-            StmtKind::Slide(_) => Err(RunError::Unsupported("slide task spawn".into())),
+            // `slide call()` — the interpreter is single-threaded, so it runs the task
+            // synchronously. Corpus tasks are required to be observably order-independent, so a
+            // deterministic inline run matches any real scheduling of the compiled path.
+            StmtKind::Slide(call) => {
+                self.eval_call_or_expr(env, call)?;
+                Ok(Flow::Normal)
+            }
         }
     }
 

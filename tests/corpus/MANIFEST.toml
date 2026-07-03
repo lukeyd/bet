@@ -382,6 +382,5 @@ compiled = "pass"
 [[program]]
 path = "13-concurrency/slide-spawn"
 covers = ["concurrency.slide"]
-# Skip: `slide` task spawning has no interpreter execution path.
-interp = "skip"
-compiled = "skip"
+interp = "pass"
+compiled = "pass"
