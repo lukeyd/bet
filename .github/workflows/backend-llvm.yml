@@ -49,8 +49,10 @@ jobs:
       - name: install LLVM 18 (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
+        # The runner ships a newer LLVM preinstalled; llvm-sys 180 needs exactly 18.x, so
+        # force a downgrade to the pinned version.
         run: |
-          choco install llvm --version=18.1.8 -y --no-progress
+          choco install llvm --version=18.1.8 -y --no-progress --force --allow-downgrade
           echo "LLVM_SYS_180_PREFIX=C:\Program Files\LLVM" >> $env:GITHUB_ENV
           echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH
 
