@@ -36,7 +36,9 @@ pub fn staticlib_link_name() -> &'static str {
 // Re-export the shared ABI types so downstream (and tests) can name them via `rt_stub`.
 // Only the *types* are re-exported; the entry-point declarations in `rt-abi` are not (they
 // would collide with the definitions below).
-pub use rt_abi::{AllocCtx, CribHandle, Event, FrameBuffer, Tag, TaskHandle, event_kind};
+pub use rt_abi::{
+    AllocCtx, CribHandle, Event, FrameBuffer, MapHandle, Tag, TaskHandle, event_kind,
+};
 
 // ---------------------------------------------------------------------------
 // Allocator.
@@ -306,6 +308,80 @@ pub unsafe extern "C" fn bet_slot_ptr(handle: CribHandle, slot: u32) -> *mut u8 
         unsafe { t.base.add(slot * t.elem_size) }
     } else {
         std::ptr::null_mut()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stash (hash maps).
+// ---------------------------------------------------------------------------
+
+/// A type-erased map: byte-sequence keys to fixed-width value blobs. One implementation backs
+/// every `stash[K, V]` — the frontend serializes keys/values to bytes at each call site.
+struct StashMap {
+    val_size: usize,
+    entries: HashMap<Vec<u8>, Vec<u8>>,
+}
+
+unsafe fn stash_ref<'a>(map: MapHandle) -> &'a mut StashMap {
+    unsafe { &mut *(map.0 as *mut StashMap) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_map_new(val_size: usize) -> MapHandle {
+    let m = Box::new(StashMap {
+        val_size,
+        entries: HashMap::new(),
+    });
+    MapHandle(Box::into_raw(m) as *mut c_void)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_map_put(
+    map: MapHandle,
+    key_ptr: *const u8,
+    key_len: usize,
+    val_ptr: *const u8,
+) {
+    let m = unsafe { stash_ref(map) };
+    let key = unsafe { std::slice::from_raw_parts(key_ptr, key_len) }.to_vec();
+    let val = unsafe { std::slice::from_raw_parts(val_ptr, m.val_size) }.to_vec();
+    m.entries.insert(key, val);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_map_get(
+    map: MapHandle,
+    key_ptr: *const u8,
+    key_len: usize,
+    out_val: *mut u8,
+) -> bool {
+    let m = unsafe { stash_ref(map) };
+    let key = unsafe { std::slice::from_raw_parts(key_ptr, key_len) };
+    match m.entries.get(key) {
+        Some(v) => {
+            unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), out_val, m.val_size) };
+            true
+        }
+        None => false,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_map_del(map: MapHandle, key_ptr: *const u8, key_len: usize) -> bool {
+    let m = unsafe { stash_ref(map) };
+    let key = unsafe { std::slice::from_raw_parts(key_ptr, key_len) };
+    m.entries.remove(key).is_some()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_map_len(map: MapHandle) -> usize {
+    unsafe { stash_ref(map) }.entries.len()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_map_free(map: MapHandle) {
+    if !map.0.is_null() {
+        drop(unsafe { Box::from_raw(map.0 as *mut StashMap) });
     }
 }
 

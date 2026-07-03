@@ -140,7 +140,7 @@ status = "done"
 slug = "stash"
 name = "§2.3 stash hash maps: new/put/peep/yeet/gang, generic + allocator-aware; midir Map lowering; interp support"
 size = 13
-status = "todo"
+status = "done"
 
 # ─────────────────────── Track 3 — memory milestones ───────────────────────
 

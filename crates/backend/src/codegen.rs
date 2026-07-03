@@ -297,10 +297,17 @@ impl<'c> Cg<'c> {
 
     fn declare_externs(&mut self) -> Result<(), BackendError> {
         for ext in self.m.externs() {
-            let fty = self.fn_type(&ext.sig.params, &ext.sig.rets)?;
-            let f = self
-                .llm
-                .add_function(&ext.name, fty, Some(Linkage::External));
+            // Reuse an existing declaration when the same C symbol appears under more than one
+            // midir signature (e.g. `bet_map_new` per `stash[K, V]` monomorphization — all
+            // coerce to the same `ptr fn(i64)` at the ABI). One LLVM function per name.
+            let f = match self.llm.get_function(&ext.name) {
+                Some(existing) => existing,
+                None => {
+                    let fty = self.fn_type(&ext.sig.params, &ext.sig.rets)?;
+                    self.llm
+                        .add_function(&ext.name, fty, Some(Linkage::External))
+                }
+            };
             self.externs.push(f);
         }
         Ok(())
@@ -465,6 +472,11 @@ impl<'c> Cg<'c> {
                     .build_load(self.ptr_ty(), g.as_pointer_value(), "crib.g")
                     .map_err(lower_err)?;
                 Ok(Some(v))
+            }
+            Rvalue::SizeOf(ty) => {
+                let bt = self.basic_ty(*ty)?;
+                let size = self.td.get_store_size(&bt);
+                Ok(Some(self.cx.i64_type().const_int(size, false).into()))
             }
             Rvalue::Call(callee, args) => self.lower_call(func, locals, callee, args),
             Rvalue::Cop(crib, init) => self.lower_cop(func, locals, crib, init),

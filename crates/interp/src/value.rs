@@ -10,7 +10,9 @@
 //! `rt-abi`-backed slab is a later refinement, which is why the crate already depends on `rt-abi`.
 //! `yikes` errors are [`Value::Yikes`], the value half of `(value, yikes)` returns.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 /// A runtime value.
 #[derive(Clone, Debug, PartialEq)]
@@ -57,6 +59,10 @@ pub enum Value {
     },
     /// A handle to an in-process arena (`crib`): the target of `cop`/`holla`/`trust`/`evict`.
     Crib(usize),
+    /// A `stash` hash map. Reference-counted so a map mutated through a method receiver (`.put`)
+    /// or passed to a function is shared, not value-copied — matching the compiled path's opaque
+    /// handle. Entries are `(key, value)` pairs (linear probing; the corpus keeps them small).
+    Stash(Rc<RefCell<Vec<(Value, Value)>>>),
 }
 
 /// The default display of a value (corpus "Display rules"): the text `spill.it` prints before
@@ -98,6 +104,7 @@ pub fn display(v: &Value) -> String {
             slot, generation, ..
         } => format!("<tag #{slot}@{generation}>"),
         Value::Crib(id) => format!("<crib #{id}>"),
+        Value::Stash(m) => format!("<stash x{}>", m.borrow().len()),
     }
 }
 
@@ -129,6 +136,7 @@ impl Value {
             Value::Yikes(_) => "yikes",
             Value::Tag { .. } => "tag",
             Value::Crib(_) => "crib",
+            Value::Stash(_) => "stash",
         }
     }
 }

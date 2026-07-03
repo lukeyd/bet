@@ -330,6 +330,7 @@ impl Printer<'_> {
             Rvalue::CribGlobal(id) => {
                 format!("crib_global(@{})", self.m.crib_global(*id).name)
             }
+            Rvalue::SizeOf(ty) => format!("size_of[{}]", self.ty(*ty)),
         }
     }
 
@@ -1328,6 +1329,13 @@ impl Parser {
                     .get(&name)
                     .ok_or_else(|| self.err(&format!("unknown module-level crib `{name}`")))?;
                 Ok(Rvalue::CribGlobal(id))
+            }
+            "size_of" => {
+                self.pos += 1;
+                self.expect(&Tok::LBracket)?;
+                let ty = self.ty()?;
+                self.expect(&Tok::RBracket)?;
+                Ok(Rvalue::SizeOf(ty))
             }
             "discriminant" => {
                 self.pos += 1;

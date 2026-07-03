@@ -417,6 +417,14 @@ impl LowerCtx {
             ast::TypeKind::Named(name, generics) => {
                 if generics.is_empty() {
                     self.named_type(name)
+                } else if name == "stash" {
+                    // `stash[K, V]` — a hash map handle.
+                    if generics.len() != 2 {
+                        return Err("`stash` takes two type arguments `[K, V]`".into());
+                    }
+                    let k = self.map_type(&generics[0])?;
+                    let v = self.map_type(&generics[1])?;
+                    Ok(self.m.intern_ty(TyKind::Map(k, v)))
                 } else {
                     // Generic aggregate instantiation, e.g. `Pair[int]` → the mono struct.
                     let sid = self.mono_struct(name, generics)?;
@@ -1780,6 +1788,10 @@ impl LowerCtx {
             && !self.funcs.contains_key(name)
             && self.is_module(name)
         {
+            // `stash.new[K, V]()` is the one intrinsic that needs its type arguments.
+            if name == "stash" && method == "new" {
+                return self.lower_stash_new(generics);
+            }
             return self.lower_intrinsic(name, method, args);
         }
         if !generics.is_empty() {
@@ -1800,21 +1812,24 @@ impl LowerCtx {
             }
             return self.emit_call(sig.id, &sig.rets, call_args);
         }
-        // Otherwise: a struct field holding a `finna(..)` pointer, called through the receiver
-        // (`m.think(e)` where `think` is a function-pointer field). The receiver is NOT passed —
-        // the field's own signature governs the arguments.
-        self.lower_fn_field_call(receiver, method, args)
+        // Otherwise evaluate the receiver: a `stash` (Map) value gets the hash-map methods; a
+        // struct with a `finna(..)` field gets an indirect call through the field.
+        let (bop, bty) = self.lower_expr(receiver, None)?;
+        if let TyKind::Map(k, v) = *self.m.ty(bty) {
+            return self.lower_stash_method(bop, k, v, method, args);
+        }
+        self.lower_fn_field_call(bop, bty, method, args)
     }
 
-    /// `recv.field(args)` where `field` is a function-pointer field of the receiver's struct
-    /// (auto-dereferencing a `ref Struct`). Lowered to an indirect call through the field.
+    /// `recv.field(args)` where `field` is a function-pointer field of the receiver's (already
+    /// lowered) struct value (auto-dereferencing a `ref Struct`). An indirect call through it.
     fn lower_fn_field_call(
         &mut self,
-        receiver: &Expr,
+        bop: Operand,
+        bty: TyId,
         method: &str,
         args: &[ast::Arg],
     ) -> Result<(Operand, TyId), String> {
-        let (bop, bty) = self.lower_expr(receiver, None)?;
         let base_place = self
             .operand_place(bop)
             .ok_or_else(|| format!("unknown method `{method}`"))?;
@@ -1847,8 +1862,169 @@ impl LowerCtx {
         self.emit_call_result(Callee::Indirect(fptr_op), &sig.rets, call_args, ret_ty)
     }
 
+    // === stash (hash maps) ===================================================
+
+    /// `stash.new[K, V]()` — create an empty map. Lowered to `bet_map_new(size_of[V])`.
+    fn lower_stash_new(&mut self, generics: &[ast::Type]) -> Result<(Operand, TyId), String> {
+        if generics.len() != 2 {
+            return Err("`stash.new` takes two type arguments `[K, V]`".into());
+        }
+        let k = self.map_type(&generics[0])?;
+        let v = self.map_type(&generics[1])?;
+        let map_ty = self.m.intern_ty(TyKind::Map(k, v));
+        let usize_t = self.m.t_int(IntWidth::W64, false);
+        let vsize = self.new_local(usize_t);
+        self.fb().assign(Place::local(vsize), Rvalue::SizeOf(v));
+        let ext = self.get_extern("bet_map_new", vec![usize_t], vec![map_ty]);
+        let tmp = self.new_local(map_ty);
+        self.fb().assign(
+            Place::local(tmp),
+            Rvalue::Call(
+                Callee::Extern(ext),
+                vec![Operand::Copy(Place::local(vsize))],
+            ),
+        );
+        Ok((Operand::Copy(Place::local(tmp)), map_ty))
+    }
+
+    /// Dispatch a method on a `stash[K, V]` value: `put`, `peep`, `yeet`, or `gang`.
+    fn lower_stash_method(
+        &mut self,
+        map_op: Operand,
+        k: TyId,
+        v: TyId,
+        method: &str,
+        args: &[ast::Arg],
+    ) -> Result<(Operand, TyId), String> {
+        let map_ty = self.m.intern_ty(TyKind::Map(k, v));
+        let rawptr = self.m.intern_ty(TyKind::RawPtr);
+        let usize_t = self.m.t_int(IntWidth::W64, false);
+        let boolt = self.m.t_bool();
+        match method {
+            // `m.put(key, value)` → bet_map_put(map, key_ptr, key_len, val_ptr).
+            "put" => {
+                if args.len() != 2 {
+                    return Err("`stash.put` takes a key and a value".into());
+                }
+                let (key_ptr, key_len) = self.serialize_key(&args[0].value, k)?;
+                let (val_op, _) = self.lower_expr(&args[1].value, Some(v))?;
+                let vl = self.new_local(v);
+                self.fb().assign(Place::local(vl), Rvalue::Use(val_op));
+                let val_ptr = self.new_local(rawptr);
+                self.fb()
+                    .assign(Place::local(val_ptr), Rvalue::AddrOf(Place::local(vl)));
+                let ext =
+                    self.get_extern("bet_map_put", vec![map_ty, rawptr, usize_t, rawptr], vec![]);
+                let call_args = vec![
+                    map_op,
+                    key_ptr,
+                    key_len,
+                    Operand::Copy(Place::local(val_ptr)),
+                ];
+                self.emit_extern_call(ext, &[], call_args)
+            }
+            // `m.peep(key)` → (value, found): bet_map_get writes into an out slot; the result
+            // is a `(V, bool)` tuple destructured by the caller's `lowkey v, ok = ...`.
+            "peep" => {
+                if args.len() != 1 {
+                    return Err("`stash.peep` takes a single key".into());
+                }
+                let (key_ptr, key_len) = self.serialize_key(&args[0].value, k)?;
+                let out = self.new_local(v);
+                let val_ptr = self.new_local(rawptr);
+                self.fb()
+                    .assign(Place::local(val_ptr), Rvalue::AddrOf(Place::local(out)));
+                let ext = self.get_extern(
+                    "bet_map_get",
+                    vec![map_ty, rawptr, usize_t, rawptr],
+                    vec![boolt],
+                );
+                let ok = self.new_local(boolt);
+                self.fb().assign(
+                    Place::local(ok),
+                    Rvalue::Call(
+                        Callee::Extern(ext),
+                        vec![
+                            map_op,
+                            key_ptr,
+                            key_len,
+                            Operand::Copy(Place::local(val_ptr)),
+                        ],
+                    ),
+                );
+                let tuple_ty = self.m.intern_ty(TyKind::Tuple(vec![v, boolt]));
+                let tup = self.new_local(tuple_ty);
+                self.fb().assign(
+                    Place::local(tup),
+                    Rvalue::Aggregate(
+                        AggKind::Tuple,
+                        vec![
+                            Operand::Copy(Place::local(out)),
+                            Operand::Copy(Place::local(ok)),
+                        ],
+                    ),
+                );
+                Ok((Operand::Copy(Place::local(tup)), tuple_ty))
+            }
+            // `m.yeet(key)` → bet_map_del(map, key_ptr, key_len) -> bool (was-present).
+            "yeet" => {
+                if args.len() != 1 {
+                    return Err("`stash.yeet` takes a single key".into());
+                }
+                let (key_ptr, key_len) = self.serialize_key(&args[0].value, k)?;
+                let ext =
+                    self.get_extern("bet_map_del", vec![map_ty, rawptr, usize_t], vec![boolt]);
+                self.emit_extern_call(ext, &[boolt], vec![map_op, key_ptr, key_len])
+            }
+            // `m.gang()` → bet_map_len(map) -> usize.
+            "gang" => {
+                if !args.is_empty() {
+                    return Err("`stash.gang` takes no arguments".into());
+                }
+                let ext = self.get_extern("bet_map_len", vec![map_ty], vec![usize_t]);
+                self.emit_extern_call(ext, &[usize_t], vec![map_op])
+            }
+            other => Err(format!("unknown `stash` method `{other}`")),
+        }
+    }
+
+    /// Serialize a key to a `(ptr, len)` pair for the map primitives: a `str` key uses its data
+    /// pointer + byte length; any other key is stored into a fresh local and its address + size
+    /// taken (so an `int` key hashes over its raw bytes).
+    fn serialize_key(&mut self, key_expr: &Expr, kty: TyId) -> Result<(Operand, Operand), String> {
+        let rawptr = self.m.intern_ty(TyKind::RawPtr);
+        let usize_t = self.m.t_int(IntWidth::W64, false);
+        let (key_op, _) = self.lower_expr(key_expr, Some(kty))?;
+        if matches!(self.m.ty(kty), TyKind::Str) {
+            let kp = self.new_local(rawptr);
+            self.fb()
+                .assign(Place::local(kp), Rvalue::StrPtr(key_op.clone()));
+            let kl = self.new_local(usize_t);
+            self.fb().assign(Place::local(kl), Rvalue::StrLen(key_op));
+            Ok((
+                Operand::Copy(Place::local(kp)),
+                Operand::Copy(Place::local(kl)),
+            ))
+        } else {
+            let slot = self.new_local(kty);
+            self.fb().assign(Place::local(slot), Rvalue::Use(key_op));
+            let kp = self.new_local(rawptr);
+            self.fb()
+                .assign(Place::local(kp), Rvalue::AddrOf(Place::local(slot)));
+            let kl = self.new_local(usize_t);
+            self.fb().assign(Place::local(kl), Rvalue::SizeOf(kty));
+            Ok((
+                Operand::Copy(Place::local(kp)),
+                Operand::Copy(Place::local(kl)),
+            ))
+        }
+    }
+
     fn is_module(&self, name: &str) -> bool {
-        matches!(name, "spill" | "str" | "math" | "mem" | "bytes" | "fmt")
+        matches!(
+            name,
+            "spill" | "str" | "math" | "mem" | "bytes" | "fmt" | "stash"
+        )
     }
 
     fn lower_intrinsic(

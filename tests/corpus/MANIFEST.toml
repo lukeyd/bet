@@ -335,10 +335,8 @@ compiled = "pass"
 [[program]]
 path = "10-stdlib/stash"
 covers = ["stdlib.stash"]
-# Unsupported: `stash` (hash map) needs a mutable-through-method receiver; the interpreter's
-# value-copy method receivers can't yet observe `m.put(...)` mutations.
-interp = "unsupported"
-compiled = "skip"
+interp = "pass"
+compiled = "pass"
 
 [[program]]
 path = "10-stdlib/bytes-parse"
@@ -357,8 +355,7 @@ compiled = "skip"
 [[program]]
 path = "11-reference/mini-compiler"
 covers = ["reference.compiler"]
-# Unsupported: depends on the `stash` symbol table (see 10-stdlib/stash).
-interp = "unsupported"
+interp = "pass"
 compiled = "skip"
 
 [[program]]
