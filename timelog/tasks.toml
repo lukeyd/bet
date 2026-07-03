@@ -25,7 +25,7 @@ status = "done"
 slug = "rt-abi"
 name = "Step 1b: runtime ABI + rt-stub (incl. platform layer, amendment §6.1)"
 size = 8
-status = "doing"
+status = "done"
 
 [[task]]
 slug = "grammar-corpus"
