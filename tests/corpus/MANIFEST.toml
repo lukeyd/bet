@@ -116,7 +116,7 @@ compiled = "pass"
 path = "02-values/strings"
 covers = ["values.strings"]
 interp = "pass"
-compiled = "skip"
+compiled = "pass"
 
 [[program]]
 path = "02-values/array-index"

@@ -164,6 +164,11 @@ unsafe extern "C" {
         b_ptr: *const u8,
         b_len: usize,
     ) -> *mut u8;
+    /// Allocate `len` bytes and copy an ASCII-uppercased copy of `[ptr, len)` into it, returning
+    /// the buffer (the length is unchanged). Backs `str.glow`.
+    pub fn bet_str_upper(ptr: *const u8, len: usize) -> *mut u8;
+    /// Byte-equality of two strings. Backs `str.slaps`.
+    pub fn bet_str_eq(a_ptr: *const u8, a_len: usize, b_ptr: *const u8, b_len: usize) -> bool;
 
     // --- stash (hash maps) ---
 

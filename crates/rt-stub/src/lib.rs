@@ -332,6 +332,25 @@ pub unsafe extern "C" fn bet_str_concat(
     Box::into_raw(buf.into_boxed_slice()) as *mut u8
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_str_upper(ptr: *const u8, len: usize) -> *mut u8 {
+    let src = unsafe { std::slice::from_raw_parts(ptr, len) };
+    let buf: Vec<u8> = src.iter().map(|b| b.to_ascii_uppercase()).collect();
+    Box::into_raw(buf.into_boxed_slice()) as *mut u8
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_str_eq(
+    a_ptr: *const u8,
+    a_len: usize,
+    b_ptr: *const u8,
+    b_len: usize,
+) -> bool {
+    let a = unsafe { std::slice::from_raw_parts(a_ptr, a_len) };
+    let b = unsafe { std::slice::from_raw_parts(b_ptr, b_len) };
+    a == b
+}
+
 // ---------------------------------------------------------------------------
 // Stash (hash maps).
 // ---------------------------------------------------------------------------
