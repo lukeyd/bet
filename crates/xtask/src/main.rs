@@ -653,7 +653,10 @@ fn check_corpus(
 
     for p in &manifest.program {
         if !listed.insert(p.path.clone()) {
-            problems.push(format!("  program `{}` is listed twice in MANIFEST", p.path));
+            problems.push(format!(
+                "  program `{}` is listed twice in MANIFEST",
+                p.path
+            ));
         }
         if !on_disk.contains(&p.path) {
             problems.push(format!(
@@ -675,7 +678,9 @@ fn check_corpus(
     // 3. Every on-disk pair must be registered in the manifest.
     for stem in &on_disk {
         if !listed.contains(stem) {
-            problems.push(format!("  {stem} exists on disk but is not listed in MANIFEST"));
+            problems.push(format!(
+                "  {stem} exists on disk but is not listed in MANIFEST"
+            ));
         }
     }
 
@@ -705,11 +710,7 @@ fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 
 /// The set of program stems (path minus extension, `/`-separated, relative to `base`)
 /// among `files` whose extension is `ext`.
-fn stems_with_ext(
-    files: &[PathBuf],
-    base: &Path,
-    ext: &str,
-) -> std::collections::BTreeSet<String> {
+fn stems_with_ext(files: &[PathBuf], base: &Path, ext: &str) -> std::collections::BTreeSet<String> {
     files
         .iter()
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some(ext))
@@ -776,9 +777,21 @@ mod tests {
             .collect();
 
         let problems = check_corpus(&manifest, &bet, &expected);
-        assert!(problems.iter().any(|p| p.contains("cat/two.bet has no matching")));
-        assert!(problems.iter().any(|p| p.contains("cat/three exists on disk")));
-        assert!(problems.iter().any(|p| p.contains("feature `b` is not covered")));
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("cat/two.bet has no matching"))
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("cat/three exists on disk"))
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("feature `b` is not covered"))
+        );
         assert!(problems.iter().any(|p| p.contains("unknown feature `zzz`")));
     }
 

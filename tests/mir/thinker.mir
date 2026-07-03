@@ -1,0 +1,24 @@
+// thinker.mir — the Doom "thinker" shape in the IR: a mobj carries a function-pointer
+// `think` field, lives in a crib, and its flags are manipulated with bitwise ops. `hurt`
+// resolves the mobj, tests a flag (`& MASK == 0`), and mutates a field through the live
+// ref. Exercises fn-pointer types, holla_check, bit math, field mutation, and a void
+// return. (Step 1a, midir.)
+
+struct Mobj { flex id: i64, flex hp: i64, flex flags: u32, flex think: fn(tag Mobj, crib Mobj) -> void }
+
+fn hurt(%0: tag Mobj, %1: crib Mobj) -> void {
+  let %2: ref Mobj
+  let %3: u32
+  let %4: bool
+  bb0:
+    holla_check(%0, %1, %2) -> bb1 else bb3
+  bb1:
+    %3 = bitand.na(%2.deref.field(2), 4u32)
+    %4 = eq.na(%3, 0u32)
+    branch %4 -> bb3 else bb2
+  bb2:
+    %2.deref.field(1) = sub.trap(%2.deref.field(1), 10i64)
+    return
+  bb3:
+    return
+}

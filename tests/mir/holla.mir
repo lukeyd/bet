@@ -1,0 +1,16 @@
+// holla.mir — the generational-access primitive in the IR. `idOf` resolves a
+// `tag Enemy` against a crib via a holla_check terminator: the live edge binds a
+// `ref Enemy` and reads its field; the ghosted edge returns a sentinel. This is the
+// exact shape the memory model lowers to (spec §7.4). (Step 1a, midir.)
+
+struct Enemy { flex id: i64 }
+
+fn idOf(%0: tag Enemy, %1: crib Enemy) -> i64 {
+  let %2: ref Enemy
+  bb0:
+    holla_check(%0, %1, %2) -> bb1 else bb2
+  bb1:
+    return %2.deref.field(0)
+  bb2:
+    return -1i64
+}

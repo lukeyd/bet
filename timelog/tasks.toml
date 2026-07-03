@@ -19,13 +19,13 @@ status = "done"
 slug = "midir"
 name = "Step 1a: midir crate — IR types, builder, .mir text format, validator"
 size = 13
-status = "todo"
+status = "done"
 
 [[task]]
 slug = "rt-abi"
 name = "Step 1b: runtime ABI + rt-stub (incl. platform layer, amendment §6.1)"
 size = 8
-status = "todo"
+status = "doing"
 
 [[task]]
 slug = "grammar-corpus"
