@@ -15,6 +15,16 @@
 #   * "skip"        — not executed (parses, but out of the interpreter's scope for now).
 # `interp` defaults to "pass" when omitted.
 #
+# `cargo xtask corpus --compiled` runs the OTHER half of the differential runner (needs an
+# LLVM codegen driver; without one it skips cleanly and passes). For each program it consults
+# the per-program `compiled` field:
+#   * "pass" — `bet build` it to a native executable, run it, and assert its stdout equals
+#              `.expected` byte-for-byte AND equals the interpreter's stdout for the same
+#              program (the interp == compiled invariant). A failure is a hard error (ratchet).
+#   * "skip" — not compiled/run (codegen out of scope for it for now).
+# `compiled` defaults to "skip" when omitted. Today only the `spill.it("literal")` tracer-bullet
+# programs are "pass"; the computed-value set is promoted as backend/runtime codegen grows.
+#
 # The taxonomy tracks the spec + plan-amendment-01 §2 feature set. When a new feature
 # lands, add its key here AND a program that covers it — the lint fails otherwise.
 
@@ -57,194 +67,231 @@ all = [
 path = "01-basics/hello"
 covers = ["basics.print"]
 interp = "pass"
+compiled = "pass"
 
 [[program]]
 path = "01-basics/spill-format"
 covers = ["basics.format"]
 interp = "pass"
+compiled = "pass"
 
 [[program]]
 path = "01-basics/comments"
 covers = ["basics.comments"]
 interp = "pass"
+compiled = "pass"
 
 # --- 02 values --------------------------------------------------------------
 [[program]]
 path = "02-values/lowkey-facts"
 covers = ["values.mutability", "values.constants", "values.inference"]
 interp = "pass"
+compiled = "pass"
 
 [[program]]
 path = "02-values/numeric-tower"
 covers = ["values.numeric-tower"]
 interp = "pass"
+compiled = "pass"
 
 [[program]]
 path = "02-values/casts"
 covers = ["values.casts"]
 interp = "pass"
+compiled = "pass"
 
 [[program]]
 path = "02-values/arithmetic"
 covers = ["values.arithmetic"]
 interp = "pass"
+compiled = "pass"
 
 [[program]]
 path = "02-values/bool-logic"
 covers = ["values.bool-logic"]
 interp = "pass"
+compiled = "pass"
 
 [[program]]
 path = "02-values/strings"
 covers = ["values.strings"]
 interp = "pass"
+compiled = "skip"
 
 [[program]]
 path = "02-values/compound-assign"
 covers = ["values.compound-assign"]
 interp = "pass"
+compiled = "pass"
 
 # --- 03 control -------------------------------------------------------------
 [[program]]
 path = "03-control/fr-naw"
 covers = ["control.if"]
 interp = "pass"
+compiled = "skip"
 
 [[program]]
 path = "03-control/vibin"
 covers = ["control.while"]
 interp = "pass"
+compiled = "pass"
 
 [[program]]
 path = "03-control/squad"
 covers = ["control.foreach", "values.array-literal"]
 interp = "pass"
+compiled = "skip"
 
 [[program]]
 path = "03-control/nested-loops"
 covers = ["control.break-continue"]
 interp = "pass"
+compiled = "pass"
 
 # --- 04 functions -----------------------------------------------------------
 [[program]]
 path = "04-functions/finna-basics"
 covers = ["functions.basic"]
 interp = "pass"
+compiled = "pass"
 
 [[program]]
 path = "04-functions/multi-return"
 covers = ["functions.multi-return"]
 interp = "pass"
+compiled = "pass"
 
 [[program]]
 path = "04-functions/receivers"
 covers = ["functions.receivers"]
 interp = "pass"
+compiled = "pass"
 
 [[program]]
 path = "04-functions/first-class-fn"
 covers = ["functions.first-class"]
 interp = "pass"
+compiled = "pass"
 
 [[program]]
 path = "04-functions/generics-fn"
 covers = ["functions.generics"]
 interp = "pass"
+compiled = "skip"
 
 # --- 05 structs -------------------------------------------------------------
 [[program]]
 path = "05-structs/drip-basics"
 covers = ["structs.drip", "structs.value-copy"]
 interp = "pass"
+compiled = "skip"
 
 [[program]]
 path = "05-structs/visibility"
 covers = ["structs.visibility", "functions.receivers"]
 interp = "pass"
+compiled = "skip"
 
 [[program]]
 path = "05-structs/drip-generic"
 covers = ["structs.generic"]
 interp = "pass"
+compiled = "skip"
 
 # --- 06 sum types -----------------------------------------------------------
 [[program]]
 path = "06-sumtypes/moods-basics"
 covers = ["sumtypes.moods", "sumtypes.vibe-match"]
 interp = "pass"
+compiled = "pass"
 
 [[program]]
 path = "06-sumtypes/moods-exhaustive"
 covers = ["sumtypes.exhaustiveness"]
 interp = "pass"
+compiled = "skip"
 
 [[program]]
 path = "06-sumtypes/expr-eval"
 covers = ["sumtypes.moods", "sumtypes.vibe-match"]
 interp = "pass"
+compiled = "pass"
 
 # --- 07 errors --------------------------------------------------------------
 [[program]]
 path = "07-errors/yikes-basics"
 covers = ["errors.yikes"]
 interp = "pass"
+compiled = "skip"
 
 [[program]]
 path = "07-errors/tea-wrap"
 covers = ["errors.tea"]
 interp = "pass"
+compiled = "skip"
 
 [[program]]
 path = "07-errors/bounce"
 covers = ["errors.bounce"]
 interp = "pass"
+compiled = "skip"
 
 [[program]]
 path = "07-errors/yeet-sheesh"
 covers = ["errors.yeet-sheesh"]
 interp = "pass"
+compiled = "skip"
 
 # --- 08 memory --------------------------------------------------------------
 [[program]]
 path = "08-memory/crib-cop-evict"
 covers = ["memory.crib", "memory.cop-evict"]
 interp = "pass"
+compiled = "skip"
 
 [[program]]
 path = "08-memory/typed-crib-tag"
 covers = ["memory.tag"]
 interp = "pass"
+compiled = "skip"
 
 [[program]]
 path = "08-memory/holla-ghosted"
 covers = ["memory.holla-ghosted"]
 interp = "pass"
+compiled = "skip"
 
 [[program]]
 path = "08-memory/trust"
 covers = ["memory.trust"]
 interp = "pass"
+compiled = "skip"
 
 [[program]]
 path = "08-memory/scratch"
 covers = ["memory.scratch"]
 interp = "pass"
+compiled = "skip"
 
 [[program]]
 path = "08-memory/generation-reuse"
 covers = ["memory.generation-reuse"]
 interp = "pass"
+compiled = "skip"
 
 # --- 09 bit math ------------------------------------------------------------
 [[program]]
 path = "09-bit-math/bit-ops"
 covers = ["bits.operators"]
 interp = "pass"
+compiled = "pass"
 
 [[program]]
 path = "09-bit-math/bam-angles"
 covers = ["bits.bam-angles"]
 interp = "pass"
+compiled = "pass"
 
 [[program]]
 path = "09-bit-math/wrapping"
@@ -252,11 +299,13 @@ covers = ["bits.wrapping"]
 # Unsupported: sized-integer wrapping arithmetic (`a + b` at u8 width) and `math.lap` need a
 # width-carrying value model the interpreter's uniform i64 domain does not track yet.
 interp = "unsupported"
+compiled = "pass"
 
 [[program]]
 path = "09-bit-math/fixed-point"
 covers = ["bits.fixed-point"]
 interp = "pass"
+compiled = "pass"
 
 # --- 10 stdlib --------------------------------------------------------------
 [[program]]
@@ -265,17 +314,20 @@ covers = ["stdlib.stash"]
 # Unsupported: `stash` (hash map) needs a mutable-through-method receiver; the interpreter's
 # value-copy method receivers can't yet observe `m.put(...)` mutations.
 interp = "unsupported"
+compiled = "skip"
 
 [[program]]
 path = "10-stdlib/bytes-parse"
 covers = ["stdlib.bytes", "values.array-literal"]
 interp = "pass"
+compiled = "skip"
 
 [[program]]
 path = "10-stdlib/squadops"
 covers = ["stdlib.squadops"]
 # Unsupported: `stack`/`pop` mutate the receiver in place, which value-copy receivers can't do.
 interp = "unsupported"
+compiled = "skip"
 
 # --- 11 reference oracles ---------------------------------------------------
 [[program]]
@@ -283,6 +335,7 @@ path = "11-reference/mini-compiler"
 covers = ["reference.compiler"]
 # Unsupported: depends on the `stash` symbol table (see 10-stdlib/stash).
 interp = "unsupported"
+compiled = "skip"
 
 [[program]]
 path = "11-reference/doom-thinker"
@@ -290,6 +343,7 @@ covers = ["reference.doom"]
 # Unsupported: needs mutation-through-`holla` (writing back into the crib slot) and calling a
 # function-pointer struct field as a method — both beyond the current value-copy model.
 interp = "unsupported"
+compiled = "skip"
 
 # --- 12 ffi ------------------------------------------------------------------
 [[program]]
@@ -297,6 +351,7 @@ path = "12-ffi/extern-abs"
 covers = ["ffi.extern"]
 # Skip: FFI (`extern` C symbols) has no interpreter execution path.
 interp = "skip"
+compiled = "pass"
 
 # --- 13 concurrency ----------------------------------------------------------
 [[program]]
@@ -304,3 +359,4 @@ path = "13-concurrency/slide-spawn"
 covers = ["concurrency.slide"]
 # Skip: `slide` task spawning has no interpreter execution path.
 interp = "skip"
+compiled = "skip"

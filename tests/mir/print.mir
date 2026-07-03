@@ -1,0 +1,74 @@
+// print.mir — the scalar print primitives the frontend's `spill` value-print pass lowers to.
+// Exercises the three numeric runtime entry points (bet_print_i64 / bet_print_u64 /
+// bet_print_f64) alongside the string bet_print, over both computed and constant operands and
+// with the sign/zero-extend + fpext coercions the frontend emits. Object-compilation only:
+// linking needs rt-stub's real symbols (Track R), so this is a codegen fixture, not an e2e run.
+
+extern "C" fn bet_print(rawptr, u64) -> void
+extern "C" fn bet_print_i64(i64) -> void
+extern "C" fn bet_print_u64(u64) -> void
+extern "C" fn bet_print_f64(f64) -> void
+
+// A signed int narrower than i64 sign-extends, then prints; a constant i64 prints directly.
+fn print_signed(%0: i32) -> void {
+  let %1: i64
+  let %2: void
+  let %3: void
+  bb0:
+    %1 = cast.sext(%0 as i64)
+    %2 = call_extern @bet_print_i64(%1)
+    %3 = call_extern @bet_print_i64(-42i64)
+    return
+}
+
+// An unsigned int (here a byte-width u8) zero-extends to u64, then prints.
+fn print_unsigned(%0: u8) -> void {
+  let %1: u64
+  let %2: void
+  bb0:
+    %1 = cast.zext(%0 as u64)
+    %2 = call_extern @bet_print_u64(%1)
+    return
+}
+
+// An f32 widens to f64 via fpext before printing; a constant f64 prints directly.
+fn print_float(%0: f32) -> void {
+  let %1: f64
+  let %2: void
+  let %3: void
+  bb0:
+    %1 = cast.fresize(%0 as f64)
+    %2 = call_extern @bet_print_f64(%1)
+    %3 = call_extern @bet_print_f64(2.5f64)
+    return
+}
+
+// The `bool` print shape: branch, printing `nocap` / `cap`, joined at a merge, then a newline.
+fn print_bool(%0: bool) -> void {
+  let %1: rawptr
+  let %2: u64
+  let %3: void
+  let %4: rawptr
+  let %5: u64
+  let %6: void
+  let %7: rawptr
+  let %8: u64
+  let %9: void
+  bb0:
+    branch %0 -> bb2 else bb3
+  bb1:
+    %7 = str_ptr("\n")
+    %8 = str_len("\n")
+    %9 = call_extern @bet_print(%7, %8)
+    return
+  bb2:
+    %1 = str_ptr("nocap")
+    %2 = str_len("nocap")
+    %3 = call_extern @bet_print(%1, %2)
+    goto bb1
+  bb3:
+    %4 = str_ptr("cap")
+    %5 = str_len("cap")
+    %6 = call_extern @bet_print(%4, %5)
+    goto bb1
+}

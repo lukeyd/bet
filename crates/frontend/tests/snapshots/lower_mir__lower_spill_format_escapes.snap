@@ -1,0 +1,25 @@
+---
+source: crates/frontend/tests/lower_mir.rs
+expression: "lower_to_mir(\"finna show(n: int) { spill.f(\\\"{{{}}}\\\", n) }\")"
+---
+extern "C" fn bet_print(rawptr, u64) -> void
+extern "C" fn bet_print_i64(i64) -> void
+
+fn show(%0: i64) -> void {
+  let %1: rawptr
+  let %2: u64
+  let %3: void
+  let %4: void
+  let %5: rawptr
+  let %6: u64
+  let %7: void
+  bb0:
+    %1 = str_ptr("{")
+    %2 = str_len("{")
+    %3 = call_extern @bet_print(%1, %2)
+    %4 = call_extern @bet_print_i64(%0)
+    %5 = str_ptr("}")
+    %6 = str_len("}")
+    %7 = call_extern @bet_print(%5, %6)
+    return
+}

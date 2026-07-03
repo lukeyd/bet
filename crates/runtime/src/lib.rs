@@ -559,9 +559,53 @@ pub unsafe extern "C" fn bet_print(ptr: *const u8, len: usize) {
         return;
     }
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    write_stdout(bytes);
+}
+
+/// Write `bytes` to stdout and flush — the shared tail of every `bet_print_*` entry point.
+fn write_stdout(bytes: &[u8]) {
     let mut out = std::io::stdout();
     let _ = out.write_all(bytes);
     let _ = out.flush();
+}
+
+/// Format a signed integer the way the interpreter prints it: plain decimal, no newline.
+/// Factored out so the test asserts the exact bytes without capturing process stdout.
+/// Byte-for-byte identical to `rt-stub`'s `fmt_i64` (drop-in parity).
+pub fn fmt_i64(v: i64) -> String {
+    format!("{v}")
+}
+
+/// Format an unsigned integer the way the interpreter prints it: plain decimal, no newline.
+/// Byte-for-byte identical to `rt-stub`'s `fmt_u64`.
+pub fn fmt_u64(v: u64) -> String {
+    format!("{v}")
+}
+
+/// Format a float to match the interpreter's `display_float`: a finite integral value gets a
+/// single trailing `.0` (e.g. `3.0`); everything else uses the default `f64` formatting.
+/// Byte-for-byte identical to `rt-stub`'s `fmt_f64`.
+pub fn fmt_f64(v: f64) -> String {
+    if v.is_finite() && v.fract() == 0.0 {
+        format!("{v:.1}")
+    } else {
+        format!("{v}")
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_print_i64(v: i64) {
+    write_stdout(fmt_i64(v).as_bytes());
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_print_u64(v: u64) {
+    write_stdout(fmt_u64(v).as_bytes());
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_print_f64(v: f64) {
+    write_stdout(fmt_f64(v).as_bytes());
 }
 
 // ---------------------------------------------------------------------------

@@ -21,9 +21,11 @@
 //!   `vibe` matches (`Discriminant`+`Switch`+`Downcast`), `crib` decls, `holla`, and `evict`.
 //!
 //! Verification is IR-level: every function this pass emits passes `midir::validate`, and the
-//! `.mir` text is snapshotted in the frontend tests. The compiled path cannot yet *print*
-//! computed values (there is no runtime int-format primitive — a deliberate follow-up), so
-//! `spill.it` only prints string operands; `spill.it(<number>)` is a clean `Err`.
+//! `.mir` text is snapshotted in the frontend tests. `spill.it` / `spill.f` now lower for every
+//! scalar type — ints (via `bet_print_i64`/`bet_print_u64`), floats (`bet_print_f64`), `bool`
+//! (a `nocap`/`cap` branch), `ghosted`, and string literals (`bet_print`) — matching the
+//! interpreter's `display`. Computed (non-literal) strings remain a backend gap and return a
+//! clean `Err`.
 
 use crate::ast::{self, Expr, ExprKind, Item, Stmt, StmtKind};
 use midir::*;
@@ -754,47 +756,183 @@ impl LowerCtx {
         Ok(())
     }
 
-    /// Lower a `spill.it` / `spill.f` print. Only string operands are printed — the compiled
-    /// path has no runtime int-format primitive yet, so `spill.it(<number>)` is a clean error.
+    /// Lower a `spill.it` / `spill.f` print to real runtime output.
+    ///
+    /// `spill.it(x)` prints `x`'s interpreter `display` form followed by a newline;
+    /// `spill.f(fmt, args..)` splits the literal `fmt` on `{}` placeholders (honoring `{{`/`}}`)
+    /// and interleaves the literal segments with each argument's display, adding no trailing
+    /// newline. Both route non-string values through [`Self::lower_print_value`], which emits the
+    /// type-directed `bet_print_i64` / `bet_print_u64` / `bet_print_f64` calls; string literals
+    /// still go through `bet_print`. Computed (non-literal) strings remain a backend gap.
     fn lower_spill(&mut self, method: &str, args: &[ast::Arg]) -> Result<(), String> {
         match method {
             "it" => {
                 if args.len() != 1 {
                     return Err("`spill.it` takes exactly one argument".into());
                 }
-                // A string *literal* prints newline-terminated (println-like).
+                // A string *literal* prints newline-terminated in a single `bet_print` — the
+                // original tracer-bullet shape, kept byte-for-byte.
                 if let ExprKind::Str(s) = &args[0].value.kind {
                     return self.emit_print(format!("{s}\n"));
                 }
-                // A string *value* prints its bytes (no synthesized newline available).
-                let (op, ty) = self.lower_expr(&args[0].value, None)?;
-                if matches!(self.m.ty(ty), TyKind::Str) {
-                    return self.emit_print_operand(op);
-                }
-                Err(
-                    "`spill.it` of a computed non-string value needs the runtime int-format \
-                     primitive, which is not implemented yet"
-                        .into(),
-                )
+                self.lower_print_expr(&args[0].value)?;
+                // `spill.it` always appends a newline.
+                self.emit_print("\n".to_string())
             }
             "f" => {
-                if args.is_empty() {
+                let Some((fmt_arg, rest)) = args.split_first() else {
                     return Err("`spill.f` takes a format string".into());
-                }
-                let ExprKind::Str(fmt) = &args[0].value.kind else {
+                };
+                let ExprKind::Str(fmt) = &fmt_arg.value.kind else {
                     return Err("`spill.f` format must be a string literal".into());
                 };
-                let fmt = fmt.clone();
-                // The `{}` substitution runtime does not exist yet; print the literal format
-                // and evaluate the arguments for their side effects so arithmetic still lowers.
-                self.emit_print(fmt)?;
-                for a in &args[1..] {
-                    let _ = self.lower_expr(&a.value, None)?;
+                let segments = split_format(fmt)?;
+                let holes = segments
+                    .iter()
+                    .filter(|s| matches!(s, FmtSeg::Hole))
+                    .count();
+                if holes != rest.len() {
+                    return Err(format!(
+                        "`spill.f` format has {holes} `{{}}` placeholder(s) but {} argument(s) \
+                         were supplied",
+                        rest.len()
+                    ));
+                }
+                // No auto trailing newline: any newline is part of the format string itself.
+                let mut next = 0usize;
+                for seg in &segments {
+                    match seg {
+                        FmtSeg::Text(t) => {
+                            if !t.is_empty() {
+                                self.emit_print(t.clone())?;
+                            }
+                        }
+                        FmtSeg::Hole => {
+                            self.lower_print_expr(&rest[next].value)?;
+                            next += 1;
+                        }
+                    }
                 }
                 Ok(())
             }
             other => Err(format!("`spill.{other}` is not a known print method")),
         }
+    }
+
+    /// Lower a single printed argument: evaluate it, then print its value. `ghosted` has no
+    /// interned type to lower through `lower_expr`, so its `display` form is printed directly.
+    fn lower_print_expr(&mut self, e: &Expr) -> Result<(), String> {
+        if matches!(e.kind, ExprKind::Ghosted) {
+            return self.emit_print("ghosted".to_string());
+        }
+        let (op, ty) = self.lower_expr(e, None)?;
+        self.lower_print_value(op, ty)
+    }
+
+    /// Type-directed value print, matching the interpreter's `display`: emit the runtime print
+    /// primitive appropriate to `ty`.
+    ///
+    /// * signed int (any width) → sign-extend to `i64`, `bet_print_i64`
+    /// * unsigned int (incl. `u8` bytes) → zero-extend to `u64`, `bet_print_u64`
+    /// * `f32` → `fpext` to `f64`; `f64` → `bet_print_f64`
+    /// * `bool` → branch, printing `nocap` / `cap`
+    /// * `ghosted` operand → `bet_print("ghosted")`
+    /// * string *literal* → `bet_print` of its bytes (computed strings are a backend gap)
+    /// * anything else (struct/sum/array/fn/void) → a clean "not yet lowered" error
+    fn lower_print_value(&mut self, op: Operand, ty: TyId) -> Result<(), String> {
+        if matches!(op, Operand::Const(Const::Ghosted)) {
+            return self.emit_print("ghosted".to_string());
+        }
+        match self.m.ty(ty).clone() {
+            TyKind::Int { signed: true, .. } => {
+                let i64t = self.m.t_int(IntWidth::W64, true);
+                let v = self.coerce_int(op, ty, i64t);
+                self.emit_print_num("bet_print_i64", i64t, v);
+                Ok(())
+            }
+            TyKind::Int { signed: false, .. } => {
+                let u64t = self.m.t_int(IntWidth::W64, false);
+                let v = self.coerce_int(op, ty, u64t);
+                self.emit_print_num("bet_print_u64", u64t, v);
+                Ok(())
+            }
+            TyKind::F64 => {
+                self.emit_print_num("bet_print_f64", ty, op);
+                Ok(())
+            }
+            TyKind::F32 => {
+                // `spill.it(<f32>)` prints at f64 precision (the runtime has one float primitive).
+                let f64t = self.m.intern_ty(TyKind::F64);
+                let tmp = self.new_local(f64t);
+                self.fb().assign(
+                    Place::local(tmp),
+                    Rvalue::Cast(op, f64t, CastKind::FloatResize),
+                );
+                self.emit_print_num("bet_print_f64", f64t, Operand::Copy(Place::local(tmp)));
+                Ok(())
+            }
+            TyKind::Bool => self.lower_print_bool(op),
+            TyKind::Str => {
+                // Only a string *literal* has a data pointer the backend can intern today.
+                if matches!(op, Operand::Const(Const::Str(_))) {
+                    self.emit_print_operand(op)
+                } else {
+                    Err(
+                        "`spill` of a computed (non-literal) string is not yet lowered \
+                         (the backend has no dynamic string representation yet)"
+                            .into(),
+                    )
+                }
+            }
+            other => Err(format!(
+                "`spill` of a value of type {other:?} is not yet lowered"
+            )),
+        }
+    }
+
+    /// Print a `bool` by branching: the true edge prints `nocap`, the false edge `cap`, and both
+    /// rejoin at a merge block (mirrors `display`'s `nocap`/`cap`).
+    fn lower_print_bool(&mut self, cond: Operand) -> Result<(), String> {
+        let cond_end = self.cur;
+        let merge = self.reserve_block();
+
+        let then_bb = self.new_block();
+        self.emit_print("nocap".to_string())?;
+        self.term_goto(merge);
+
+        let else_bb = self.new_block();
+        self.emit_print("cap".to_string())?;
+        self.term_goto(merge);
+
+        self.set_branch(cond_end, cond, then_bb, else_bb);
+        self.select(merge);
+        Ok(())
+    }
+
+    /// Emit `call_extern @name(v)` for one of the numeric print primitives (`v` already the
+    /// declared parameter type). The extern is synthesized/deduped on demand.
+    fn emit_print_num(&mut self, name: &str, arg_ty: TyId, v: Operand) {
+        let voidt = self.m.t_void();
+        let ext = self.get_extern(name, vec![arg_ty], vec![]);
+        let result = self.new_local(voidt);
+        self.fb().assign(
+            Place::local(result),
+            Rvalue::Call(Callee::Extern(ext), vec![v]),
+        );
+    }
+
+    /// Widen an integer operand to the print primitive's word type. A no-op when `from` already
+    /// is `to`; otherwise a sign/zero-extending cast (never a truncation — `to` is the widest
+    /// int, so every source is narrower-or-equal).
+    fn coerce_int(&mut self, op: Operand, from: TyId, to: TyId) -> Operand {
+        if from == to {
+            return op;
+        }
+        let kind = self.cast_kind(from, to).unwrap_or(CastKind::Bitcast);
+        let tmp = self.new_local(to);
+        self.fb()
+            .assign(Place::local(tmp), Rvalue::Cast(op, to, kind));
+        Operand::Copy(Place::local(tmp))
     }
 
     fn emit_print(&mut self, text: String) -> Result<(), String> {
@@ -1850,6 +1988,49 @@ impl LowerCtx {
         self.extern_cache.insert((name.to_string(), ret_key), id);
         id
     }
+}
+
+/// One piece of a split `spill.f` format string.
+enum FmtSeg {
+    /// A literal run of text between placeholders (`{{`/`}}` already unescaped).
+    Text(String),
+    /// A `{}` placeholder consuming the next argument.
+    Hole,
+}
+
+/// Split a `spill.f` format string into literal-text and placeholder segments, mirroring the
+/// interpreter's `format_str`: `{}` is a hole, `{{`/`}}` are literal braces, and a lone `{` or
+/// `}` is an error. The result always alternates `Text` (possibly empty) around each `Hole`.
+fn split_format(fmt: &str) -> Result<Vec<FmtSeg>, String> {
+    let mut segs = Vec::new();
+    let mut text = String::new();
+    let mut chars = fmt.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' => match chars.peek() {
+                Some('{') => {
+                    chars.next();
+                    text.push('{');
+                }
+                Some('}') => {
+                    chars.next();
+                    segs.push(FmtSeg::Text(std::mem::take(&mut text)));
+                    segs.push(FmtSeg::Hole);
+                }
+                _ => return Err("`spill.f`: lone `{` in format string".into()),
+            },
+            '}' => match chars.peek() {
+                Some('}') => {
+                    chars.next();
+                    text.push('}');
+                }
+                _ => return Err("`spill.f`: lone `}` in format string".into()),
+            },
+            other => text.push(other),
+        }
+    }
+    segs.push(FmtSeg::Text(text));
+    Ok(segs)
 }
 
 /// Extend a place with one more projection step (a pure value operation).

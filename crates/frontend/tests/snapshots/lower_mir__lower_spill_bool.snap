@@ -1,0 +1,34 @@
+---
+source: crates/frontend/tests/lower_mir.rs
+expression: "lower_to_mir(\"finna show(b: bool) { spill.it(b) }\")"
+---
+extern "C" fn bet_print(rawptr, u64) -> void
+
+fn show(%0: bool) -> void {
+  let %1: rawptr
+  let %2: u64
+  let %3: void
+  let %4: rawptr
+  let %5: u64
+  let %6: void
+  let %7: rawptr
+  let %8: u64
+  let %9: void
+  bb0:
+    branch %0 -> bb2 else bb3
+  bb1:
+    %7 = str_ptr("\n")
+    %8 = str_len("\n")
+    %9 = call_extern @bet_print(%7, %8)
+    return
+  bb2:
+    %1 = str_ptr("nocap")
+    %2 = str_len("nocap")
+    %3 = call_extern @bet_print(%1, %2)
+    goto bb1
+  bb3:
+    %4 = str_ptr("cap")
+    %5 = str_len("cap")
+    %6 = call_extern @bet_print(%4, %5)
+    goto bb1
+}

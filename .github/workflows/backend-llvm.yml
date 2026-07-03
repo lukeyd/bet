@@ -97,3 +97,12 @@ jobs:
 
       - name: tracer-bullet tests (codegen + bet build -> run)
         run: cargo nextest run -p backend -p driver --features llvm --locked
+
+      # Compiled differential column: with codegen available (LLVM 18 is installed above),
+      # `bet build` every `compiled = "pass"` corpus program, run it, and assert its stdout ==
+      # .expected == the interpreter's stdout (the interp == compiled invariant). This gates the
+      # compiled `pass` set. `--compiled` builds the driver `--features llvm` itself (inheriting
+      # LLVM_SYS_180_PREFIX from the env above); if LLVM were absent it would skip cleanly and
+      # pass, so this step only ever fails on a real codegen regression.
+      - name: corpus compiled differential column
+        run: cargo xtask corpus --compiled
