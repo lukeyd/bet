@@ -1,0 +1,26 @@
+---
+source: crates/frontend/tests/lower_mir.rs
+expression: "lower_to_mir(\"finna narrow(x: int) -> u8 { bet x as u8 }\\n\\\n                    finna widen(x: u8) -> int { bet x as int }\\n\\\n                    finna to_int(f: f64) -> int { bet f as int }\")"
+---
+extern "C" fn bet_print(rawptr, u64) -> void
+
+fn narrow(%0: i64) -> u8 {
+  let %1: u8
+  bb0:
+    %1 = cast.trunc(%0 as u8)
+    return %1
+}
+
+fn widen(%0: u8) -> i64 {
+  let %1: i64
+  bb0:
+    %1 = cast.zext(%0 as i64)
+    return %1
+}
+
+fn to_int(%0: f64) -> i64 {
+  let %1: i64
+  bb0:
+    %1 = cast.ftoi(%0 as i64)
+    return %1
+}

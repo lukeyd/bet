@@ -1,0 +1,23 @@
+// vibe.mir — a `vibe` match with a wildcard `naw` arm (`06-sumtypes/moods-exhaustive`).
+// Only `Num` and `Plus` are named; the `switch`'s `else` edge is the real `naw` arm (bb4),
+// not an unreachable landing pad. Exercises `Discriminant` + `Switch` with a live default and
+// a single-payload `downcast(0).field(0)`. (Step 3, backend.)
+
+sum Token { Num(i64), Plus, Minus, Times }
+
+fn arity(%0: Token) -> i64 {
+  let %1: u32
+  let %2: i64
+  bb0:
+    %1 = discriminant(%0)
+    switch %1 [0 -> bb2, 1 -> bb3] else bb4
+  bb1:
+    unreachable
+  bb2:
+    %2 = %0.downcast(0).field(0)
+    return %2
+  bb3:
+    return 2i64
+  bb4:
+    return 0i64
+}

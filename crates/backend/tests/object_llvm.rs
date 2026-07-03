@@ -106,3 +106,25 @@ fn thinker_mir_compiles() {
 fn crib_mir_compiles() {
     compile_fixture("crib.mir");
 }
+
+// --- Step-3 gap-fill: sums, tuples/multi-return, arrays. ---
+
+#[test]
+fn sum_mir_compiles() {
+    compile_fixture("sum.mir");
+}
+
+#[test]
+fn vibe_mir_compiles() {
+    compile_fixture("vibe.mir");
+}
+
+#[test]
+fn tuple_mir_compiles() {
+    compile_fixture("tuple.mir");
+}
+
+#[test]
+fn array_mir_compiles() {
+    compile_fixture("array.mir");
+}

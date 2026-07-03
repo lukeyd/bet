@@ -1,0 +1,25 @@
+---
+source: crates/frontend/tests/lower_mir.rs
+expression: "lower_to_mir(\"finna bits(a: u8, b: u8) -> u8 { bet (a & b) | (a ^ b) }\\n\\\n                      finna shifts(a: u8) -> u8 { bet (a << 1) >> 2 }\")"
+---
+extern "C" fn bet_print(rawptr, u64) -> void
+
+fn bits(%0: u8, %1: u8) -> u8 {
+  let %2: u8
+  let %3: u8
+  let %4: u8
+  bb0:
+    %2 = bitand.na(%0, %1)
+    %3 = bitxor.na(%0, %1)
+    %4 = bitor.na(%2, %3)
+    return %4
+}
+
+fn shifts(%0: u8) -> u8 {
+  let %1: u8
+  let %2: u8
+  bb0:
+    %1 = shl.na(%0, 1u8)
+    %2 = shr.na(%1, 2u8)
+    return %2
+}

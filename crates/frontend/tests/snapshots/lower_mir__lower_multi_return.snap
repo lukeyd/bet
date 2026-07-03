@@ -1,0 +1,27 @@
+---
+source: crates/frontend/tests/lower_mir.rs
+expression: "lower_to_mir(\"finna divmod(a: int, b: int) -> (int, int) { bet a / b, a % b }\\n\\\n                           finna go() -> int { lowkey q, r = divmod(17, 5)\\n bet q + r }\")"
+---
+extern "C" fn bet_print(rawptr, u64) -> void
+
+fn divmod(%0: i64, %1: i64) -> (i64, i64) {
+  let %2: i64
+  let %3: i64
+  bb0:
+    %2 = div.trap(%0, %1)
+    %3 = rem.trap(%0, %1)
+    return %2, %3
+}
+
+fn go() -> i64 {
+  let %0: (i64, i64)
+  let %1: i64
+  let %2: i64
+  let %3: i64
+  bb0:
+    %0 = call @divmod(17i64, 5i64)
+    %1 = %0.field(0)
+    %2 = %0.field(1)
+    %3 = add.trap(%1, %2)
+    return %3
+}

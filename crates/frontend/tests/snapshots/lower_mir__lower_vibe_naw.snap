@@ -1,0 +1,23 @@
+---
+source: crates/frontend/tests/lower_mir.rs
+expression: "lower_to_mir(\"moods Token { Num(int), Plus, Minus, Times }\\n\\\n                       finna arity(t: Token) -> int {\\n\\\n                         vibe t { Num(n) { bet n } Plus { bet 2 } naw { bet 0 } }\\n}\")"
+---
+sum Token { Num(i64), Plus, Minus, Times }
+extern "C" fn bet_print(rawptr, u64) -> void
+
+fn arity(%0: Token) -> i64 {
+  let %1: u32
+  let %2: i64
+  bb0:
+    %1 = discriminant(%0)
+    switch %1 [0 -> bb2, 1 -> bb3] else bb4
+  bb1:
+    unreachable
+  bb2:
+    %2 = %0.downcast(0).field(0)
+    return %2
+  bb3:
+    return 2i64
+  bb4:
+    return 0i64
+}

@@ -1,0 +1,28 @@
+---
+source: crates/frontend/tests/lower_mir.rs
+expression: "lower_to_mir(\"finna sumto(n: int) -> int {\\n\\\n                      lowkey i = 1\\n lowkey total = 0\\n\\\n                      vibin i <= n { total = total + i\\n i = i + 1 }\\n bet total\\n}\")"
+---
+extern "C" fn bet_print(rawptr, u64) -> void
+
+fn sumto(%0: i64) -> i64 {
+  let %1: i64
+  let %2: i64
+  let %3: bool
+  let %4: i64
+  let %5: i64
+  bb0:
+    %1 = 1i64
+    %2 = 0i64
+    goto bb1
+  bb1:
+    %3 = le.na(%1, %0)
+    branch %3 -> bb2 else bb3
+  bb2:
+    %4 = add.trap(%2, %1)
+    %2 = %4
+    %5 = add.trap(%1, 1i64)
+    %1 = %5
+    goto bb1
+  bb3:
+    return %2
+}

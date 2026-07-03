@@ -1,0 +1,19 @@
+---
+source: crates/frontend/tests/lower_mir.rs
+expression: "lower_to_mir(\"finna add(a: int, b: int) -> int { bet a + b }\\n\\\n                    finna umath(x: u32, y: u32) -> u32 { bet x + y }\")"
+---
+extern "C" fn bet_print(rawptr, u64) -> void
+
+fn add(%0: i64, %1: i64) -> i64 {
+  let %2: i64
+  bb0:
+    %2 = add.trap(%0, %1)
+    return %2
+}
+
+fn umath(%0: u32, %1: u32) -> u32 {
+  let %2: u32
+  bb0:
+    %2 = add.wrap(%0, %1)
+    return %2
+}

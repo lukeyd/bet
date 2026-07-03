@@ -18,9 +18,16 @@
 //!   the C-ABI coercion of `rt_abi::Tag`); a `crib T`/`ref T`/`fn(..)` is a raw pointer.
 //! * **Control flow**: `switch`, `panic` (→ `bet_panic` + `unreachable`), and `unreachable`.
 //! * **Function values**: `@f` [`Const::FnRef`] and [`Callee::Indirect`] indirect calls.
+//! * **Aggregates & sums**: [`Rvalue::Aggregate`] (`drip` structs, tuples, and by-value
+//!   `moods` sums), [`Rvalue::Discriminant`], a tagged-union [`TyKind::Sum`] layout
+//!   (`{ i32 tag, [N x i64] payload }`), fixed [`TyKind::Array`] values, and the
+//!   [`Proj::Index`]/[`Proj::Downcast`] place projections.
+//! * **Multi-value returns**: a [`TyKind::Tuple`] is an anonymous return struct;
+//!   [`Terminator::Return`] with several operands packs into it and callers destructure with
+//!   tuple `Field` projections.
 //!
 //! Anything outside this subset returns [`BackendError::Lower`] with a precise message; the
-//! remaining IR (sums, slices/arrays, tuples/multi-value returns, maps, bump `cop`) lands
+//! remaining IR (slices' fat pointers, maps, bump `cop`, and non-word sum payloads) lands
 //! later.
 
 use inkwell::basic_block::BasicBlock;
@@ -101,6 +108,16 @@ impl<'c> Cg<'c> {
                 self.ptr_ty().into()
             }
             TyKind::Struct(sid) => self.struct_llvm_ty(*sid)?.into(),
+            TyKind::Sum(sid) => self.sum_llvm_ty(*sid).into(),
+            // A fixed-size array is a value; a slice's fat-pointer layout is not modeled yet.
+            TyKind::Array(elem, n) => self.basic_ty(*elem)?.array_type(*n as u32).into(),
+            TyKind::Tuple(elems) => {
+                let fields: Vec<BasicTypeEnum> = elems
+                    .iter()
+                    .map(|&t| self.basic_ty(t))
+                    .collect::<Result<_, _>>()?;
+                self.cx.struct_type(&fields, false).into()
+            }
             other => {
                 return Err(BackendError::Lower(format!(
                     "value type {other:?} is not supported yet"
@@ -120,6 +137,32 @@ impl<'c> Cg<'c> {
         Ok(self.cx.struct_type(&fields, false))
     }
 
+    /// The number of `i64` payload slots a `moods` needs (the widest variant's arity). Each
+    /// payload field gets its own word-sized slot; this is a simple tagged-union layout that
+    /// is correct for word-or-narrower scalar payloads (the whole corpus).
+    fn sum_max_payload(&self, sid: SumId) -> u32 {
+        self.m
+            .sum_def(sid)
+            .variants
+            .iter()
+            .map(|v| v.payload.len() as u32)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The LLVM layout for a `moods`: `{ i32 tag, [maxfields x i64] payload }`. A nullary-only
+    /// sum (no payload anywhere) is just `{ i32 tag }`.
+    fn sum_llvm_ty(&self, sid: SumId) -> StructType<'c> {
+        let tag = self.cx.i32_type();
+        let max = self.sum_max_payload(sid);
+        if max == 0 {
+            self.cx.struct_type(&[tag.into()], false)
+        } else {
+            let payload = self.cx.i64_type().array_type(max);
+            self.cx.struct_type(&[tag.into(), payload.into()], false)
+        }
+    }
+
     fn fn_type(&self, params: &[TyId], rets: &[TyId]) -> Result<FunctionType<'c>, BackendError> {
         let ps: Vec<BasicMetadataTypeEnum> = params
             .iter()
@@ -128,12 +171,18 @@ impl<'c> Cg<'c> {
         Ok(match rets {
             [] => self.cx.void_type().fn_type(&ps, false),
             [one] => self.basic_ty(*one)?.fn_type(&ps, false),
-            _ => {
-                return Err(BackendError::Lower(
-                    "multi-value returns are not supported yet".into(),
-                ));
-            }
+            // Multi-value returns are carried as one anonymous struct (a `Tuple`).
+            many => self.tuple_llvm_ty(many)?.fn_type(&ps, false),
         })
+    }
+
+    /// The anonymous LLVM struct that carries a multi-value return / `Tuple`.
+    fn tuple_llvm_ty(&self, elems: &[TyId]) -> Result<StructType<'c>, BackendError> {
+        let fields: Vec<BasicTypeEnum> = elems
+            .iter()
+            .map(|&t| self.basic_ty(t))
+            .collect::<Result<_, _>>()?;
+        Ok(self.cx.struct_type(&fields, false))
     }
 
     // --- declarations ---
@@ -292,9 +341,149 @@ impl<'c> Cg<'c> {
             Rvalue::Call(callee, args) => self.lower_call(func, locals, callee, args),
             Rvalue::Cop(crib, init) => self.lower_cop(func, locals, crib, init),
             Rvalue::Trust(crib, tag) => Ok(Some(self.lower_trust(func, locals, crib, tag)?)),
-            other => Err(BackendError::Lower(format!(
-                "rvalue {other:?} is not supported yet"
-            ))),
+            Rvalue::Aggregate(kind, ops) => {
+                Ok(Some(self.lower_aggregate(func, locals, kind, ops)?))
+            }
+            Rvalue::Discriminant(op) => Ok(Some(self.lower_discriminant(func, locals, op)?)),
+        }
+    }
+
+    // --- aggregates & sums ---
+
+    /// Build a by-value aggregate: a `drip` struct, a tuple, or a `moods` sum value.
+    fn lower_aggregate(
+        &self,
+        func: &Func,
+        locals: &[Option<PointerValue<'c>>],
+        kind: &AggKind,
+        ops: &[Operand],
+    ) -> Result<BasicValueEnum<'c>, BackendError> {
+        match kind {
+            AggKind::Struct(sid) => {
+                let sty = self.struct_llvm_ty(*sid)?;
+                self.build_struct_value(func, locals, sty, ops)
+            }
+            AggKind::Tuple => {
+                // Recover the element types from each operand to form the tuple's struct type.
+                let mut elems = Vec::with_capacity(ops.len());
+                for op in ops {
+                    let ty = self.operand_ty(func, op)?.ok_or_else(|| {
+                        BackendError::Lower("tuple element has no statically-known type".into())
+                    })?;
+                    elems.push(ty);
+                }
+                let sty = self.tuple_llvm_ty(&elems)?;
+                self.build_struct_value(func, locals, sty, ops)
+            }
+            AggKind::Sum { sum, variant } => {
+                self.build_sum_value(func, locals, *sum, *variant, ops)
+            }
+        }
+    }
+
+    /// Materialize a struct/tuple value by inserting each field into an undef aggregate.
+    fn build_struct_value(
+        &self,
+        func: &Func,
+        locals: &[Option<PointerValue<'c>>],
+        sty: StructType<'c>,
+        ops: &[Operand],
+    ) -> Result<BasicValueEnum<'c>, BackendError> {
+        let mut agg = sty.get_undef();
+        for (i, op) in ops.iter().enumerate() {
+            let v = self.lower_operand(func, locals, op)?;
+            agg = self
+                .builder
+                .build_insert_value(agg, v, i as u32, "agg")
+                .map_err(lower_err)?
+                .into_struct_value();
+        }
+        Ok(agg.into())
+    }
+
+    /// Materialize a `moods` value: set the discriminant, then store each payload field into
+    /// its word-sized slot. Uses a scratch alloca so narrower-than-`i64` payloads store
+    /// through their own field type.
+    fn build_sum_value(
+        &self,
+        func: &Func,
+        locals: &[Option<PointerValue<'c>>],
+        sum: SumId,
+        variant: u32,
+        ops: &[Operand],
+    ) -> Result<BasicValueEnum<'c>, BackendError> {
+        let sty = self.sum_llvm_ty(sum);
+        let slot = self.builder.build_alloca(sty, "sum").map_err(lower_err)?;
+        // Tag = variant index.
+        let tag_ptr = self
+            .builder
+            .build_struct_gep(sty, slot, 0, "sum.tag")
+            .map_err(|_| BackendError::Lower("sum tag gep".into()))?;
+        let tag = self.cx.i32_type().const_int(variant as u64, false);
+        self.builder.build_store(tag_ptr, tag).map_err(lower_err)?;
+        // Payload fields, each in its own i64-sized slot.
+        if !ops.is_empty() {
+            let arr_ty = self.cx.i64_type().array_type(self.sum_max_payload(sum));
+            let arr_ptr = self
+                .builder
+                .build_struct_gep(sty, slot, 1, "sum.payload")
+                .map_err(|_| BackendError::Lower("sum payload gep".into()))?;
+            for (j, op) in ops.iter().enumerate() {
+                let v = self.lower_operand(func, locals, op)?;
+                let elem = self.gep_array_elem(arr_ty, arr_ptr, j as u64)?;
+                self.builder.build_store(elem, v).map_err(lower_err)?;
+            }
+        }
+        let val = self
+            .builder
+            .build_load(sty, slot, "sum.val")
+            .map_err(lower_err)?;
+        Ok(val)
+    }
+
+    /// Read a sum value's discriminant (its `i32` tag) via `extractvalue`.
+    fn lower_discriminant(
+        &self,
+        func: &Func,
+        locals: &[Option<PointerValue<'c>>],
+        op: &Operand,
+    ) -> Result<BasicValueEnum<'c>, BackendError> {
+        let v = self.lower_operand(func, locals, op)?;
+        let sv = v.into_struct_value();
+        self.builder
+            .build_extract_value(sv, 0, "disc")
+            .map_err(lower_err)
+    }
+
+    /// GEP to constant element `idx` of an `[N x i64]` array through its base pointer.
+    #[allow(unsafe_code)] // inkwell's GEP builders are `unsafe`; indices are in range by construction.
+    fn gep_array_elem(
+        &self,
+        arr_ty: inkwell::types::ArrayType<'c>,
+        arr_ptr: PointerValue<'c>,
+        idx: u64,
+    ) -> Result<PointerValue<'c>, BackendError> {
+        let zero = self.cx.i32_type().const_zero();
+        let i = self.cx.i32_type().const_int(idx, false);
+        unsafe {
+            self.builder
+                .build_in_bounds_gep(arr_ty, arr_ptr, &[zero, i], "elem")
+                .map_err(lower_err)
+        }
+    }
+
+    /// GEP to a dynamically-indexed element of a slice/array (`base[i]`).
+    #[allow(unsafe_code)] // inkwell's GEP builders are `unsafe`; bounds are the frontend's job.
+    fn gep_index_elem(
+        &self,
+        elem_ty: BasicTypeEnum<'c>,
+        base: PointerValue<'c>,
+        idx: IntValue<'c>,
+    ) -> Result<PointerValue<'c>, BackendError> {
+        unsafe {
+            self.builder
+                .build_in_bounds_gep(elem_ty, base, &[idx], "index")
+                .map_err(lower_err)
         }
     }
 
@@ -676,6 +865,9 @@ impl<'c> Cg<'c> {
         let mut ptr = locals[place.local.index()]
             .ok_or_else(|| BackendError::Lower("addressing a void/zero-sized local".into()))?;
         let mut ty = func.local_ty(place.local);
+        // A `Downcast(v)` positions us at the sum's payload array; the following `Field(j)`
+        // then indexes that array. This carries the pending `(sum, variant)` between them.
+        let mut pending: Option<(SumId, u32)> = None;
         for proj in &place.proj {
             match proj {
                 Proj::Deref => {
@@ -693,6 +885,20 @@ impl<'c> Cg<'c> {
                     ty = elem;
                 }
                 Proj::Field(i) => {
+                    if let Some((sid, v)) = pending.take() {
+                        // Payload field of a downcast sum: `ptr` is the payload array pointer.
+                        let arr_ty = self.cx.i64_type().array_type(self.sum_max_payload(sid));
+                        ptr = self.gep_array_elem(arr_ty, ptr, *i as u64)?;
+                        let variant = &self.m.sum_def(sid).variants[v as usize];
+                        ty = *variant.payload.get(*i as usize).ok_or_else(|| {
+                            BackendError::Lower(format!(
+                                "variant `{}::{}` has no payload #{i}",
+                                self.m.sum_def(sid).name,
+                                variant.name
+                            ))
+                        })?;
+                        continue;
+                    }
                     let (sty, field_ty) = match self.m.ty(ty) {
                         TyKind::Struct(sid) => {
                             let def = self.m.struct_def(*sid);
@@ -704,9 +910,15 @@ impl<'c> Cg<'c> {
                             })?;
                             (self.struct_llvm_ty(*sid)?, field.ty)
                         }
+                        TyKind::Tuple(elems) => {
+                            let field_ty = *elems.get(*i as usize).ok_or_else(|| {
+                                BackendError::Lower(format!("tuple has no element #{i}"))
+                            })?;
+                            (self.tuple_llvm_ty(elems)?, field_ty)
+                        }
                         other => {
                             return Err(BackendError::Lower(format!(
-                                "field projection on non-struct {other:?}"
+                                "field projection on non-aggregate {other:?}"
                             )));
                         }
                     };
@@ -716,10 +928,37 @@ impl<'c> Cg<'c> {
                         .map_err(|_| BackendError::Lower(format!("bad field index {i}")))?;
                     ty = field_ty;
                 }
-                Proj::Index(_) | Proj::Downcast(_) => {
-                    return Err(BackendError::Lower(
-                        "index/downcast projections are not supported yet".into(),
-                    ));
+                Proj::Downcast(v) => {
+                    let sid = match self.m.ty(ty) {
+                        TyKind::Sum(s) => *s,
+                        other => {
+                            return Err(BackendError::Lower(format!(
+                                "downcast of non-sum {other:?}"
+                            )));
+                        }
+                    };
+                    // Position at the payload array (struct field 1); the next Field indexes it.
+                    let sty = self.sum_llvm_ty(sid);
+                    ptr = self
+                        .builder
+                        .build_struct_gep(sty, ptr, 1, "downcast")
+                        .map_err(|_| {
+                            BackendError::Lower("sum has no payload to downcast".into())
+                        })?;
+                    pending = Some((sid, *v));
+                }
+                Proj::Index(idx) => {
+                    let (elem_ty, elem_llvm): (TyId, BasicTypeEnum) = match self.m.ty(ty) {
+                        TyKind::Array(e, _) | TyKind::Slice(e) => (*e, self.basic_ty(*e)?),
+                        other => {
+                            return Err(BackendError::Lower(format!(
+                                "index into non-array {other:?}"
+                            )));
+                        }
+                    };
+                    let idx_v = self.lower_operand(func, locals, idx)?.into_int_value();
+                    ptr = self.gep_index_elem(elem_llvm, ptr, idx_v)?;
+                    ty = elem_ty;
                 }
             }
         }
@@ -739,7 +978,17 @@ impl<'c> Cg<'c> {
     /// Resolve a place's element `TyId` by walking its projections (types only, no codegen).
     fn place_ty(&self, func: &Func, place: &Place) -> Result<TyId, BackendError> {
         let mut ty = func.local_ty(place.local);
+        let mut pending: Option<(SumId, u32)> = None;
         for proj in &place.proj {
+            if let Proj::Field(i) = proj
+                && let Some((sid, v)) = pending.take()
+            {
+                ty = *self.m.sum_def(sid).variants[v as usize]
+                    .payload
+                    .get(*i as usize)
+                    .ok_or_else(|| BackendError::Lower(format!("bad payload #{i}")))?;
+                continue;
+            }
             ty = match (proj, self.m.ty(ty)) {
                 (Proj::Deref, TyKind::Ref(e)) => *e,
                 (Proj::Field(i), TyKind::Struct(sid)) => {
@@ -754,6 +1003,11 @@ impl<'c> Cg<'c> {
                 (Proj::Field(i), TyKind::Tuple(elems)) => *elems
                     .get(*i as usize)
                     .ok_or_else(|| BackendError::Lower(format!("tuple has no element #{i}")))?,
+                (Proj::Index(_), TyKind::Array(e, _) | TyKind::Slice(e)) => *e,
+                (Proj::Downcast(v), TyKind::Sum(sid)) => {
+                    pending = Some((*sid, *v));
+                    ty
+                }
                 (p, other) => {
                     return Err(BackendError::Lower(format!(
                         "cannot resolve projection {p:?} on {other:?}"
@@ -832,10 +1086,19 @@ impl<'c> Cg<'c> {
                         let v = self.lower_operand(func, locals, op)?;
                         self.builder.build_return(Some(&v)).map_err(lower_err)?;
                     }
-                    _ => {
-                        return Err(BackendError::Lower(
-                            "multi-value return is not supported yet".into(),
-                        ));
+                    many => {
+                        // Pack the values into the function's anonymous return struct.
+                        let sty = self.tuple_llvm_ty(&func.rets)?;
+                        let mut agg = sty.get_undef();
+                        for (i, op) in many.iter().enumerate() {
+                            let v = self.lower_operand(func, locals, op)?;
+                            agg = self
+                                .builder
+                                .build_insert_value(agg, v, i as u32, "ret")
+                                .map_err(lower_err)?
+                                .into_struct_value();
+                        }
+                        self.builder.build_return(Some(&agg)).map_err(lower_err)?;
                     }
                 }
                 Ok(())

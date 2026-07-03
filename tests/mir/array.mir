@@ -1,0 +1,18 @@
+// array.mir — fixed-array values and the `[i]` place projection. A `T[N]` is a by-value
+// aggregate; `get` reads two constant-indexed elements and `set` writes one through an
+// `.index(i)` projection. Exercises `Array` type layout and `Proj::Index` in `place_ptr`
+// (both the load and the store path). Arrays aren't emitted by the frontend yet, so this is a
+// hand-written backend fixture. (Step 3, backend.)
+
+fn get(%0: [i64; 4]) -> i64 {
+  let %1: i64
+  bb0:
+    %1 = add.trap(%0.index(0i64), %0.index(2i64))
+    return %1
+}
+
+fn set(%0: [i64; 4], %1: i64, %2: i64) -> [i64; 4] {
+  bb0:
+    %0.index(%1) = %2
+    return %0
+}

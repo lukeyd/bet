@@ -1,0 +1,26 @@
+---
+source: crates/frontend/tests/lower_mir.rs
+expression: "lower_to_mir(\"finna dub(x: int) -> int { bet x * 2 }\\n\\\n                          finna apply(f: finna(int) -> int, x: int) -> int { bet f(x) }\\n\\\n                          finna go() -> int { bet apply(dub, 21) }\")"
+---
+extern "C" fn bet_print(rawptr, u64) -> void
+
+fn dub(%0: i64) -> i64 {
+  let %1: i64
+  bb0:
+    %1 = mul.trap(%0, 2i64)
+    return %1
+}
+
+fn apply(%0: fn(i64) -> i64, %1: i64) -> i64 {
+  let %2: i64
+  bb0:
+    %2 = call_indirect %0(%1)
+    return %2
+}
+
+fn go() -> i64 {
+  let %0: i64
+  bb0:
+    %0 = call @apply(@dub, 21i64)
+    return %0
+}

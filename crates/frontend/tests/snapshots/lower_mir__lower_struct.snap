@@ -1,0 +1,24 @@
+---
+source: crates/frontend/tests/lower_mir.rs
+expression: "lower_to_mir(\"drip Counter { flex n: int }\\n\\\n                     finna (c: Counter) bump(by: int) -> int { bet c.n + by }\\n\\\n                     finna go() -> int { lowkey c = Counter{ n: 10 }\\n bet c.bump(5) }\")"
+---
+struct Counter { flex n: i64 }
+extern "C" fn bet_print(rawptr, u64) -> void
+
+fn bump(%0: Counter, %1: i64) -> i64 {
+  let %2: i64
+  bb0:
+    %2 = add.trap(%0.field(0), %1)
+    return %2
+}
+
+fn go() -> i64 {
+  let %0: Counter
+  let %1: Counter
+  let %2: i64
+  bb0:
+    %0 = make Counter(10i64)
+    %1 = %0
+    %2 = call @bump(%1, 5i64)
+    return %2
+}

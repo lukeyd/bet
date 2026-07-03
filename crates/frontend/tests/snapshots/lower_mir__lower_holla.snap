@@ -1,0 +1,20 @@
+---
+source: crates/frontend/tests/lower_mir.rs
+expression: "lower_to_mir(\"drip Enemy { flex hp: int }\\n\\\n                    finna idOf(e: tag Enemy, arena: crib Enemy) -> int {\\n\\\n                      holla r = e in arena { bet r.hp } ghosted { bet -1 }\\n}\")"
+---
+struct Enemy { flex hp: i64 }
+extern "C" fn bet_print(rawptr, u64) -> void
+
+fn idOf(%0: tag Enemy, %1: crib Enemy) -> i64 {
+  let %2: ref Enemy
+  let %3: i64
+  bb0:
+    holla_check(%0, %1, %2) -> bb2 else bb3
+  bb1:
+    unreachable
+  bb2:
+    return %2.deref.field(0)
+  bb3:
+    %3 = neg(1i64)
+    return %3
+}

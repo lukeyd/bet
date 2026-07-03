@@ -1,0 +1,27 @@
+// tuple.mir — multi-value returns carried as an anonymous `Tuple` (`04-functions/multi-return`).
+// `divmod` returns `(i64, i64)` via `Return(vec)`; the backend packs it into one anonymous
+// return struct. `sum_of` receives it in a `(i64, i64)` local and destructures with
+// `.field(0)` / `.field(1)` tuple projections. Exercises the `Tuple` type, multi-value
+// `Return`, and tuple `Field` in `place_ptr`. (Step 3, backend.)
+
+fn divmod(%0: i64, %1: i64) -> (i64, i64) {
+  let %2: i64
+  let %3: i64
+  bb0:
+    %2 = div.trap(%0, %1)
+    %3 = rem.trap(%0, %1)
+    return %2, %3
+}
+
+fn sum_of(%0: i64, %1: i64) -> i64 {
+  let %2: (i64, i64)
+  let %3: i64
+  let %4: i64
+  let %5: i64
+  bb0:
+    %2 = call @divmod(%0, %1)
+    %3 = %2.field(0)
+    %4 = %2.field(1)
+    %5 = add.trap(%3, %4)
+    return %5
+}

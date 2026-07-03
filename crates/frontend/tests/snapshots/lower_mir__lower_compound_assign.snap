@@ -1,0 +1,16 @@
+---
+source: crates/frontend/tests/lower_mir.rs
+expression: "lower_to_mir(\"finna acc() -> int {\\n\\\n                                lowkey n = 10\\n n += 5\\n n *= 2\\n n <<= 1\\n n &= 60\\n bet n\\n}\")"
+---
+extern "C" fn bet_print(rawptr, u64) -> void
+
+fn acc() -> i64 {
+  let %0: i64
+  bb0:
+    %0 = 10i64
+    %0 = add.trap(%0, 5i64)
+    %0 = mul.trap(%0, 2i64)
+    %0 = shl.na(%0, 1i64)
+    %0 = bitand.na(%0, 60i64)
+    return %0
+}

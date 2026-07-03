@@ -1,0 +1,55 @@
+// sum.mir — `moods` (sum / tagged-union) values end to end, as the frontend now lowers a
+// `vibe` match. `make Shape::Rect(..)` / `make Shape::Dot` build a by-value sum with
+// `Rvalue::Aggregate(Sum{..})` (tag + payload slots); `area` dispatches by reading
+// `discriminant(%0)` into a `switch`, and each arm reads its payload through a
+// `downcast(variant).field(j)` place projection. Exercises the backend's `Sum` layout,
+// `Aggregate`/`Discriminant`, and `Downcast`+`Field` in `place_ptr`. (Step 3, backend.)
+
+sum Shape { Circle(i64), Rect(i64, i64), Dot }
+
+fn area(%0: Shape) -> i64 {
+  let %1: u32
+  let %2: i64
+  let %3: i64
+  let %4: i64
+  let %5: i64
+  let %6: i64
+  let %7: i64
+  bb0:
+    %1 = discriminant(%0)
+    switch %1 [0 -> bb2, 1 -> bb3, 2 -> bb4] else bb5
+  bb1:
+    unreachable
+  bb2:
+    %2 = %0.downcast(0).field(0)
+    %3 = mul.trap(3i64, %2)
+    %4 = mul.trap(%3, %2)
+    return %4
+  bb3:
+    %5 = %0.downcast(1).field(0)
+    %6 = %0.downcast(1).field(1)
+    %7 = mul.trap(%5, %6)
+    return %7
+  bb4:
+    return 0i64
+  bb5:
+    unreachable
+}
+
+fn make_rect(%0: i64, %1: i64) -> i64 {
+  let %2: Shape
+  let %3: i64
+  bb0:
+    %2 = make Shape::Rect(%0, %1)
+    %3 = call @area(%2)
+    return %3
+}
+
+fn make_dot() -> i64 {
+  let %0: Shape
+  let %1: i64
+  bb0:
+    %0 = make Shape::Dot()
+    %1 = call @area(%0)
+    return %1
+}
