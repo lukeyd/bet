@@ -1,0 +1,51 @@
+---
+source: crates/frontend/tests/lower_mir.rs
+expression: "lower_to_mir(\"finna both(a: bool, b: bool) -> bool { bet a && b }\\n\\\n                            finna either(a: bool, b: bool) -> bool { bet a || b }\\n\\\n                            finna chain(x: int) -> bool { bet 3 < x && x <= 5 }\")"
+---
+extern "C" fn bet_print(rawptr, u64) -> void
+
+fn both(%0: bool, %1: bool) -> bool {
+  let %2: bool
+  bb0:
+    branch %0 -> bb1 else bb2
+  bb1:
+    %2 = %1
+    goto bb3
+  bb2:
+    %2 = false
+    goto bb3
+  bb3:
+    return %2
+}
+
+fn either(%0: bool, %1: bool) -> bool {
+  let %2: bool
+  bb0:
+    branch %0 -> bb2 else bb1
+  bb1:
+    %2 = %1
+    goto bb3
+  bb2:
+    %2 = true
+    goto bb3
+  bb3:
+    return %2
+}
+
+fn chain(%0: i64) -> bool {
+  let %1: bool
+  let %2: bool
+  let %3: bool
+  bb0:
+    %2 = lt.na(3i64, %0)
+    branch %2 -> bb1 else bb2
+  bb1:
+    %3 = le.na(%0, 5i64)
+    %1 = %3
+    goto bb3
+  bb2:
+    %1 = false
+    goto bb3
+  bb3:
+    return %1
+}

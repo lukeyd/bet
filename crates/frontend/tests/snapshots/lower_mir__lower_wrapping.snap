@@ -1,0 +1,12 @@
+---
+source: crates/frontend/tests/lower_mir.rs
+expression: "lower_to_mir(\"finna wrap_add(a: i8, b: i8) -> i8 { bet math.lap(a, b) }\")"
+---
+extern "C" fn bet_print(rawptr, u64) -> void
+
+fn wrap_add(%0: i8, %1: i8) -> i8 {
+  let %2: i8
+  bb0:
+    %2 = add.wrap(%0, %1)
+    return %2
+}

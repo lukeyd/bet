@@ -262,6 +262,79 @@ fn run_main(body: Vec<Stmt>) -> String {
     run_to_string(&program(vec![main_fn(body)])).expect("program should run")
 }
 
+// -- memory model & error handling builders ----------------------------------
+
+/// A top-level `crib name [: Type]` arena declaration (typed hands `cop` a tag).
+fn crib_item(name: &str, typed: bool) -> Item {
+    Item::Crib(CribDecl {
+        vis: Vis::Hush,
+        name: name.into(),
+        ty: typed.then(|| tn("Enemy")),
+        span: sp(),
+    })
+}
+/// A function-local `crib name` statement (untyped unless `typed`).
+fn crib_stmt(name: &str, typed: bool) -> Stmt {
+    st(StmtKind::Crib(CribDecl {
+        vis: Vis::Hush,
+        name: name.into(),
+        ty: typed.then(|| tn("Enemy")),
+        span: sp(),
+    }))
+}
+/// `cop Ty{ fields } in crib`.
+fn cop_struct(ty: &str, fields: Vec<(&str, Expr)>, crib: Expr) -> Expr {
+    ex(ExprKind::Cop {
+        init: Box::new(CopInit::Struct(StructLit {
+            name: ty.into(),
+            generics: vec![],
+            fields: fields
+                .into_iter()
+                .map(|(name, value)| FieldInit {
+                    name: name.into(),
+                    value,
+                    span: sp(),
+                })
+                .collect(),
+            span: sp(),
+        })),
+        crib: Box::new(crib),
+    })
+}
+/// `holla binding = tag in crib { live } ghosted { ghosted }`.
+fn holla(binding: &str, tag: Expr, crib: Expr, live: Vec<Stmt>, ghosted: Vec<Stmt>) -> Stmt {
+    st(StmtKind::Holla {
+        binding: binding.into(),
+        tag,
+        crib,
+        live: block(live),
+        ghosted: block(ghosted),
+    })
+}
+/// `tag.trust() in crib`.
+fn trust(tag: Expr, crib: Expr) -> Expr {
+    ex(ExprKind::Trust {
+        tag: Box::new(tag),
+        crib: Box::new(crib),
+    })
+}
+fn evict(crib: Expr) -> Stmt {
+    st(StmtKind::Evict(crib))
+}
+/// `yikes.new(msg)` — construct an error value.
+fn yikes_new(msg: &str) -> Expr {
+    method_call(name("yikes"), "new", vec![string(msg)])
+}
+fn bounce(e: Expr) -> Stmt {
+    st(StmtKind::Bounce(e))
+}
+fn sheesh(body: Vec<Stmt>, recover: Option<(&str, Vec<Stmt>)>) -> Stmt {
+    st(StmtKind::Sheesh {
+        body: block(body),
+        recover: recover.map(|(n, b)| (n.to_string(), block(b))),
+    })
+}
+
 // ============================================================================
 // 01-basics
 // ============================================================================
@@ -981,17 +1054,300 @@ fn undefined_name_is_an_error() {
 }
 
 #[test]
-fn unsupported_memory_construct_reports_cleanly() {
-    // A `cop` allocation is grammatical but out of this slice — clean Unsupported, no panic.
-    let cop = ex(ExprKind::Cop {
-        init: Box::new(CopInit::Variant {
-            name: "Dot".into(),
-            args: vec![],
-        }),
-        crib: Box::new(name("arena")),
-    });
+fn cop_into_undefined_crib_errors_cleanly() {
+    // `cop Foo{} in arena` where `arena` names no crib is a clean error, not a panic.
+    let cop = cop_struct("Foo", vec![], name("arena"));
     let err = run_to_string(&program(vec![main_fn(vec![expr_stmt(cop)])]));
-    assert!(matches!(err, Err(RunError::Unsupported(_))), "got {err:?}");
+    assert_eq!(err, Err(RunError::Undefined("arena".into())));
+}
+
+// ============================================================================
+// 07-errors — yikes / tea / bounce / yeet-sheesh
+// ============================================================================
+
+#[test]
+fn yikes_value_and_ghosted_idiom() {
+    // y = yikes.new("boom"); fr y != ghosted { spill.it(y) } naw { spill.it("clean") } -> boom
+    let out = run_main(vec![
+        let_(&["y"], None, vec![yikes_new("boom")]),
+        fr(
+            bin(BinOp::Ne, name("y"), ghosted()),
+            vec![spill_it(name("y"))],
+            vec![],
+            Some(vec![spill_it(string("clean"))]),
+        ),
+    ]);
+    assert_eq!(out, "boom\n");
+}
+
+#[test]
+fn tea_prefixes_context() {
+    // yikes.new("no such file").tea("loading config") -> "loading config: no such file"
+    let wrapped = method_call(
+        yikes_new("no such file"),
+        "tea",
+        vec![string("loading config")],
+    );
+    assert_eq!(
+        run_main(vec![spill_it(wrapped)]),
+        "loading config: no such file\n"
+    );
+}
+
+#[test]
+fn bounce_early_returns_the_error() {
+    // step(n) -> (int, yikes): negative n is an error; pipe bounces it, else returns the value.
+    let step = func(
+        "step",
+        vec![param("n", "int")],
+        vec![tn("int"), tn("yikes")],
+        vec![fr(
+            bin(BinOp::Lt, name("n"), int(0)),
+            vec![bet(vec![int(0), yikes_new("negative")])],
+            vec![],
+            Some(vec![bet(vec![
+                bin(BinOp::Mul, name("n"), int(2)),
+                ghosted(),
+            ])]),
+        )],
+    );
+    let pipe = func(
+        "pipe",
+        vec![param("n", "int")],
+        vec![tn("int"), tn("yikes")],
+        vec![
+            let_(&["a", "y"], None, vec![call(name("step"), vec![name("n")])]),
+            bounce(name("y")),
+            bet(vec![name("a"), ghosted()]),
+        ],
+    );
+    let main = main_fn(vec![
+        let_(
+            &["r", "y"],
+            None,
+            vec![call(name("pipe"), vec![un(UnOp::Neg, int(1))])],
+        ),
+        fr(
+            bin(BinOp::Ne, name("y"), ghosted()),
+            vec![spill_it(name("y"))],
+            vec![],
+            Some(vec![spill_it(name("r"))]),
+        ),
+        let_(&["r2", "y2"], None, vec![call(name("pipe"), vec![int(3)])]),
+        fr(
+            bin(BinOp::Ne, name("y2"), ghosted()),
+            vec![spill_it(name("y2"))],
+            vec![],
+            Some(vec![spill_it(name("r2"))]),
+        ),
+    ]);
+    assert_eq!(
+        run_to_string(&program(vec![step, pipe, main])).unwrap(),
+        "negative\n6\n"
+    );
+}
+
+#[test]
+fn sheesh_recovers_a_yeet() {
+    // risky(0) yeets; sheesh catches it and binds the yeeted value to `p`.
+    let risky = func(
+        "risky",
+        vec![param("n", "int")],
+        vec![],
+        vec![fr(
+            bin(BinOp::Eq, name("n"), int(0)),
+            vec![st(StmtKind::Yeet(string("div by zero")))],
+            vec![],
+            Some(vec![spill_it(bin(BinOp::Div, int(100), name("n")))]),
+        )],
+    );
+    let main = main_fn(vec![sheesh(
+        vec![
+            expr_stmt(call(name("risky"), vec![int(5)])),
+            expr_stmt(call(name("risky"), vec![int(0)])),
+            spill_it(string("after")),
+        ],
+        Some(("p", vec![spill_f("recovered: {}\n", vec![name("p")])])),
+    )]);
+    assert_eq!(
+        run_to_string(&program(vec![risky, main])).unwrap(),
+        "20\nrecovered: div by zero\n"
+    );
+}
+
+// ============================================================================
+// 08-memory — crib / cop / tag / holla / trust / evict
+// ============================================================================
+
+#[test]
+fn untyped_crib_cop_returns_direct_reference() {
+    // crib frame; a = cop Particle{x:1,y:2} in frame; b = cop {x:3,y:4}; a.x + b.y -> 5
+    let out = run_main(vec![
+        crib_stmt("frame", false),
+        let_(
+            &["a"],
+            None,
+            vec![cop_struct(
+                "Particle",
+                vec![("x", int(1)), ("y", int(2))],
+                name("frame"),
+            )],
+        ),
+        let_(
+            &["b"],
+            None,
+            vec![cop_struct(
+                "Particle",
+                vec![("x", int(3)), ("y", int(4))],
+                name("frame"),
+            )],
+        ),
+        spill_it(bin(
+            BinOp::Add,
+            field(name("a"), "x"),
+            field(name("b"), "y"),
+        )),
+        evict(name("frame")),
+        spill_it(string("evicted")),
+    ]);
+    assert_eq!(out, "5\nevicted\n");
+}
+
+#[test]
+fn typed_crib_holla_and_generation_reuse() {
+    // A top-level typed crib + idOf: a fresh tag resolves; after evict + reuse, the OLD tag
+    // is safely ghosted rather than reading the new occupant (spec §7.3-§7.4).
+    let slots = crib_item("slots", true);
+    let id_of = func(
+        "idOf",
+        vec![param("e", "Enemy")],
+        vec![tn("int")],
+        vec![holla(
+            "r",
+            name("e"),
+            name("slots"),
+            vec![bet(vec![field(name("r"), "id")])],
+            vec![bet(vec![un(UnOp::Neg, int(1))])],
+        )],
+    );
+    let main = main_fn(vec![
+        let_(
+            &["first"],
+            None,
+            vec![cop_struct("Enemy", vec![("id", int(7))], name("slots"))],
+        ),
+        spill_it(call(name("idOf"), vec![name("first")])),
+        evict(name("slots")),
+        let_(
+            &["second"],
+            None,
+            vec![cop_struct("Enemy", vec![("id", int(42))], name("slots"))],
+        ),
+        spill_it(call(name("idOf"), vec![name("second")])),
+        spill_it(call(name("idOf"), vec![name("first")])),
+    ]);
+    assert_eq!(
+        run_to_string(&program(vec![slots, id_of, main])).unwrap(),
+        "7\n42\n-1\n"
+    );
+}
+
+#[test]
+fn holla_ghosted_after_evict() {
+    // A tag dangles once its crib is evicted: the live arm runs first, the ghosted arm after.
+    let enemies = crib_item("enemies", true);
+    let hp_of = func(
+        "hpOf",
+        vec![param("e", "Enemy")],
+        vec![tn("int")],
+        vec![holla(
+            "r",
+            name("e"),
+            name("enemies"),
+            vec![bet(vec![field(name("r"), "hp")])],
+            vec![bet(vec![un(UnOp::Neg, int(1))])],
+        )],
+    );
+    let main = main_fn(vec![
+        let_(
+            &["a"],
+            None,
+            vec![cop_struct("Enemy", vec![("hp", int(30))], name("enemies"))],
+        ),
+        spill_it(call(name("hpOf"), vec![name("a")])),
+        evict(name("enemies")),
+        spill_it(call(name("hpOf"), vec![name("a")])),
+    ]);
+    assert_eq!(
+        run_to_string(&program(vec![enemies, hp_of, main])).unwrap(),
+        "30\n-1\n"
+    );
+}
+
+#[test]
+fn trust_reads_the_slot_unchecked() {
+    // `e.trust() in enemies` skips the generation check and reads the slot directly.
+    let enemies = crib_item("enemies", true);
+    let main = main_fn(vec![
+        let_(
+            &["e"],
+            None,
+            vec![cop_struct("Enemy", vec![("hp", int(77))], name("enemies"))],
+        ),
+        let_(&["r"], None, vec![trust(name("e"), name("enemies"))]),
+        spill_it(field(name("r"), "hp")),
+    ]);
+    assert_eq!(
+        run_to_string(&program(vec![enemies, main])).unwrap(),
+        "77\n"
+    );
+}
+
+// ============================================================================
+// 10-stdlib (bytes) & index assignment
+// ============================================================================
+
+#[test]
+fn bytes_read_u32le() {
+    // Little-endian u32 decode out of a []u8 (corpus 10-stdlib/bytes-parse).
+    let out = run_main(vec![
+        let_(
+            &["buf"],
+            None,
+            vec![array(vec![
+                int(0x2A),
+                int(0),
+                int(0),
+                int(0),
+                int(0x07),
+                int(0),
+                int(0),
+                int(0),
+            ])],
+        ),
+        spill_it(method_call(
+            name("bytes"),
+            "readU32le",
+            vec![name("buf"), int(0)],
+        )),
+        spill_it(method_call(
+            name("bytes"),
+            "readU32le",
+            vec![name("buf"), int(4)],
+        )),
+    ]);
+    assert_eq!(out, "42\n7\n");
+}
+
+#[test]
+fn index_assignment_updates_element() {
+    // xs[1] = 99
+    let out = run_main(vec![
+        let_(&["xs"], None, vec![array(vec![int(1), int(2), int(3)])]),
+        assign(vec![index(name("xs"), int(1))], AssignOp::Eq, vec![int(99)]),
+        spill_it(index(name("xs"), int(1))),
+    ]);
+    assert_eq!(out, "99\n");
 }
 
 #[test]

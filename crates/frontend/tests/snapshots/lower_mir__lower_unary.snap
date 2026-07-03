@@ -1,0 +1,26 @@
+---
+source: crates/frontend/tests/lower_mir.rs
+expression: "lower_to_mir(\"finna negate(x: int) -> int { bet -x }\\n\\\n                    finna complement(x: u32) -> u32 { bet ~x }\\n\\\n                    finna notb(b: bool) -> bool { bet !b }\")"
+---
+extern "C" fn bet_print(rawptr, u64) -> void
+
+fn negate(%0: i64) -> i64 {
+  let %1: i64
+  bb0:
+    %1 = neg(%0)
+    return %1
+}
+
+fn complement(%0: u32) -> u32 {
+  let %1: u32
+  bb0:
+    %1 = bitnot(%0)
+    return %1
+}
+
+fn notb(%0: bool) -> bool {
+  let %1: bool
+  bb0:
+    %1 = not(%0)
+    return %1
+}

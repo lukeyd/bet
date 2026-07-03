@@ -19,11 +19,14 @@
 //! * `moods` sum types with `vibe` pattern matching (including the `naw` wildcard);
 //! * integer casts with two's-complement wrapping (`300 as u8 == 44`) and float→int
 //!   truncation, plus overflow-trapping signed arithmetic (amendment §2.4);
-//! * the `spill.it` / `spill.f` output builtins and a minimal `str` module (`glow`, `slaps`).
+//! * the `spill.it` / `spill.f` output builtins and minimal `str`/`bytes` modules;
+//! * the memory model — `crib` arenas, `cop` allocation, `tag`/`holla` generational checks,
+//!   `trust`, and `evict` — over an in-process generational slab (`interp::Arena`);
+//! * error handling — `yikes.new`/`.tea`, `bounce` propagation, and `yeet`/`sheesh` recovery.
 //!
-//! Memory-model constructs (`crib`/`cop`/`evict`, `tag`/`holla`/`trust`), error handling
-//! (`sheesh`/`bounce`), and `slide` concurrency parse into the AST but evaluate to a clean
-//! [`RunError::Unsupported`] for now — they land once `rt-abi`/`rt-stub` back the value model.
+//! Still out of this slice (a clean [`RunError::Unsupported`], no panic): `slide` concurrency,
+//! `extern`/FFI, and stdlib collections that need interior mutation (`stash`, `squadops`). The
+//! in-process slab is an `rt-abi`/`rt-stub`-backed refinement away from the compiled path.
 //!
 //! # API
 //! ```

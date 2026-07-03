@@ -6,6 +6,7 @@
 //!   timelog eta         velocity + estimated time to completion (timelog/tasks.toml)
 //!   setup-llvm          print per-OS guidance for the pinned LLVM (backend --features llvm)
 //!   corpus --check      structural lint of tests/corpus (pairing + feature coverage)
+//!   corpus              execute each program via `bet run` and diff stdout vs .expected
 //!   dist                stub (lands with release work)
 
 use std::collections::BTreeMap;
@@ -20,7 +21,8 @@ usage: cargo xtask <command>
   timelog report [--json] [--idle-cap SECS]
   timelog eta    [--hours-per-day N] [--idle-cap SECS]
   setup-llvm                  per-OS LLVM install guidance
-  corpus [--check]            structural lint of tests/corpus (--check); else a Step-2 note
+  corpus [--check]            --check: structural lint of tests/corpus; else execute each
+                              program via `bet run` and diff stdout vs its .expected
   dist                        (stub — release packaging)";
 
 fn main() -> ExitCode {
@@ -555,8 +557,10 @@ fn fmt_hms(secs: i64) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// corpus — structural lint of tests/corpus (Step 1c). No program execution;
-// the differential runner (interp vs compiled) lands in Step 2.
+// corpus — `--check` is the structural lint of tests/corpus (Step 1c); the bare
+// command executes each program on the interpreter (`bet run`) and diffs stdout
+// against its `.expected`, gated by the manifest's per-program `interp` field.
+// The compiled-side half of the differential runner lands with backend codegen.
 // ---------------------------------------------------------------------------
 
 #[derive(serde::Deserialize)]
@@ -576,18 +580,154 @@ struct CorpusProgram {
     path: String,
     #[serde(default)]
     covers: Vec<String>,
+    /// How the interpreter (`bet run`) is expected to handle this program under the execute
+    /// runner (`cargo xtask corpus`). Defaults to `pass`.
+    #[serde(default)]
+    interp: InterpMode,
+}
+
+/// The per-program interpreter expectation gated by `cargo xtask corpus`.
+#[derive(serde::Deserialize, Default, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "lowercase")]
+enum InterpMode {
+    /// Must run and match `.expected` byte-for-byte (the gated set).
+    #[default]
+    Pass,
+    /// Must still error (non-zero `bet run`); a newly-passing one is flagged (ratchet).
+    Unsupported,
+    /// Not executed at all (parses, but out of the interpreter's scope for now).
+    Skip,
 }
 
 fn corpus(args: &[String]) -> Result<()> {
     if args.iter().any(|a| a.as_str() == "--check") {
         corpus_check(&workspace_root())
     } else {
-        println!(
-            "xtask corpus: nothing to run yet — the differential runner (interp vs \
-             compiled) lands in Step 2. Use `cargo xtask corpus --check` for the \
-             structural lint."
-        );
+        corpus_run(&workspace_root())
+    }
+}
+
+/// Execute every corpus program through the interpreter (`bet run`) and diff stdout against its
+/// `.expected`, gated by each program's `interp` field:
+///   * `pass`        — must run and match `.expected` byte-for-byte;
+///   * `unsupported` — must still error (non-zero exit), or it is flagged for promotion;
+///   * `skip`        — not run.
+///
+/// Fails (non-zero) if any `pass` program regresses or any `unsupported` program starts passing.
+fn corpus_run(root: &Path) -> Result<()> {
+    let dir = root.join("tests").join("corpus");
+    let manifest_path = dir.join("MANIFEST.toml");
+    let src = std::fs::read_to_string(&manifest_path)
+        .with_context(|| format!("reading {}", manifest_path.display()))?;
+    let manifest: CorpusManifest =
+        toml::from_str(&src).context("parsing tests/corpus/MANIFEST.toml")?;
+
+    // Build the driver once, then invoke the built binary per program (keeps `xtask = []`;
+    // mirrors the `cargo metadata` shell-out that graph-check already relies on).
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let status = std::process::Command::new(&cargo)
+        .args(["build", "-p", "driver"])
+        .current_dir(root)
+        .status()
+        .context("running `cargo build -p driver`")?;
+    if !status.success() {
+        bail!("`cargo build -p driver` failed; cannot run the corpus");
+    }
+    let bin = root
+        .join("target")
+        .join("debug")
+        .join(format!("bet{}", std::env::consts::EXE_SUFFIX));
+
+    let mut want_pass = 0usize;
+    let mut got_pass = 0usize;
+    let mut unsupported = 0usize;
+    let mut skipped = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+
+    for prog in &manifest.program {
+        match prog.interp {
+            InterpMode::Skip => skipped += 1,
+            InterpMode::Pass => {
+                want_pass += 1;
+                let bet = dir.join(format!("{}.bet", prog.path));
+                let expected_path = dir.join(format!("{}.expected", prog.path));
+                let expected = std::fs::read(&expected_path)
+                    .with_context(|| format!("reading {}", expected_path.display()))?;
+                let out = std::process::Command::new(&bin)
+                    .arg("run")
+                    .arg(&bet)
+                    .output()
+                    .with_context(|| format!("running `bet run {}`", bet.display()))?;
+                if out.status.success() && out.stdout == expected {
+                    got_pass += 1;
+                } else if !out.status.success() {
+                    failures.push(format!(
+                        "  FAIL {} — `bet run` errored (exit {}): {}",
+                        prog.path,
+                        out.status.code().unwrap_or(-1),
+                        short(&out.stderr),
+                    ));
+                } else {
+                    failures.push(format!(
+                        "  FAIL {} — stdout mismatch\n         expected: {}\n         actual:   {}",
+                        prog.path,
+                        short(&expected),
+                        short(&out.stdout),
+                    ));
+                }
+            }
+            InterpMode::Unsupported => {
+                unsupported += 1;
+                let bet = dir.join(format!("{}.bet", prog.path));
+                let out = std::process::Command::new(&bin)
+                    .arg("run")
+                    .arg(&bet)
+                    .output()
+                    .with_context(|| format!("running `bet run {}`", bet.display()))?;
+                // The ratchet: an `unsupported` program that now runs cleanly is coverage we
+                // should lock in — flag it so the field gets flipped to `pass`.
+                if out.status.success() {
+                    failures.push(format!(
+                        "  RATCHET {} — now runs without error; promote it to `interp = \"pass\"` \
+                         (and verify its `.expected`)",
+                        prog.path,
+                    ));
+                }
+            }
+        }
+    }
+
+    println!(
+        "corpus: {}/{} pass  ({} unsupported, {} skip, {} total)",
+        got_pass,
+        want_pass,
+        unsupported,
+        skipped,
+        manifest.program.len(),
+    );
+    if failures.is_empty() {
         Ok(())
+    } else {
+        failures.sort();
+        bail!(
+            "corpus run found {} problem(s):\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+}
+
+/// A compact, single-line rendering of captured output for a diff message: UTF-8 lossy with
+/// escapes (so newlines show as `\n`), truncated so a long stream stays readable.
+fn short(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let escaped: String = text.escape_debug().collect();
+    // Truncate by chars (not bytes) so a multi-byte escape rendering never splits mid-char.
+    if escaped.chars().count() > 200 {
+        let head: String = escaped.chars().take(200).collect();
+        format!("\"{head}…\"")
+    } else {
+        format!("\"{escaped}\"")
     }
 }
 
@@ -759,10 +899,12 @@ mod tests {
                 CorpusProgram {
                     path: "cat/one".into(),
                     covers: vec!["a".into()],
+                    interp: InterpMode::Pass,
                 },
                 CorpusProgram {
                     path: "cat/two".into(),
                     covers: vec!["zzz".into()], // unknown feature
+                    interp: InterpMode::Pass,
                 },
             ],
         };

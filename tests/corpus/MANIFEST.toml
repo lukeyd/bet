@@ -6,6 +6,15 @@
 #   3. every key in `[features].all` is covered by >= 1 program (no coverage gaps);
 #   4. every key in a program's `covers` exists in `[features].all` (no typos).
 #
+# `cargo xtask corpus` (no `--check`) additionally EXECUTES each program through the
+# interpreter (`bet run`) and diffs stdout against its `.expected`, gated by the per-program
+# `interp` field:
+#   * "pass"        — must run and match `.expected` byte-for-byte (the gated set).
+#   * "unsupported" — must still error (non-zero `bet run`); a newly-passing one is flagged so
+#                     coverage gains get ratcheted in. Reduce this set over time.
+#   * "skip"        — not executed (parses, but out of the interpreter's scope for now).
+# `interp` defaults to "pass" when omitted.
+#
 # The taxonomy tracks the spec + plan-amendment-01 §2 feature set. When a new feature
 # lands, add its key here AND a program that covers it — the lint fails otherwise.
 
@@ -47,195 +56,251 @@ all = [
 [[program]]
 path = "01-basics/hello"
 covers = ["basics.print"]
+interp = "pass"
 
 [[program]]
 path = "01-basics/spill-format"
 covers = ["basics.format"]
+interp = "pass"
 
 [[program]]
 path = "01-basics/comments"
 covers = ["basics.comments"]
+interp = "pass"
 
 # --- 02 values --------------------------------------------------------------
 [[program]]
 path = "02-values/lowkey-facts"
 covers = ["values.mutability", "values.constants", "values.inference"]
+interp = "pass"
 
 [[program]]
 path = "02-values/numeric-tower"
 covers = ["values.numeric-tower"]
+interp = "pass"
 
 [[program]]
 path = "02-values/casts"
 covers = ["values.casts"]
+interp = "pass"
 
 [[program]]
 path = "02-values/arithmetic"
 covers = ["values.arithmetic"]
+interp = "pass"
 
 [[program]]
 path = "02-values/bool-logic"
 covers = ["values.bool-logic"]
+interp = "pass"
 
 [[program]]
 path = "02-values/strings"
 covers = ["values.strings"]
+interp = "pass"
 
 [[program]]
 path = "02-values/compound-assign"
 covers = ["values.compound-assign"]
+interp = "pass"
 
 # --- 03 control -------------------------------------------------------------
 [[program]]
 path = "03-control/fr-naw"
 covers = ["control.if"]
+interp = "pass"
 
 [[program]]
 path = "03-control/vibin"
 covers = ["control.while"]
+interp = "pass"
 
 [[program]]
 path = "03-control/squad"
 covers = ["control.foreach", "values.array-literal"]
+interp = "pass"
 
 [[program]]
 path = "03-control/nested-loops"
 covers = ["control.break-continue"]
+interp = "pass"
 
 # --- 04 functions -----------------------------------------------------------
 [[program]]
 path = "04-functions/finna-basics"
 covers = ["functions.basic"]
+interp = "pass"
 
 [[program]]
 path = "04-functions/multi-return"
 covers = ["functions.multi-return"]
+interp = "pass"
 
 [[program]]
 path = "04-functions/receivers"
 covers = ["functions.receivers"]
+interp = "pass"
 
 [[program]]
 path = "04-functions/first-class-fn"
 covers = ["functions.first-class"]
+interp = "pass"
 
 [[program]]
 path = "04-functions/generics-fn"
 covers = ["functions.generics"]
+interp = "pass"
 
 # --- 05 structs -------------------------------------------------------------
 [[program]]
 path = "05-structs/drip-basics"
 covers = ["structs.drip", "structs.value-copy"]
+interp = "pass"
 
 [[program]]
 path = "05-structs/visibility"
 covers = ["structs.visibility", "functions.receivers"]
+interp = "pass"
 
 [[program]]
 path = "05-structs/drip-generic"
 covers = ["structs.generic"]
+interp = "pass"
 
 # --- 06 sum types -----------------------------------------------------------
 [[program]]
 path = "06-sumtypes/moods-basics"
 covers = ["sumtypes.moods", "sumtypes.vibe-match"]
+interp = "pass"
 
 [[program]]
 path = "06-sumtypes/moods-exhaustive"
 covers = ["sumtypes.exhaustiveness"]
+interp = "pass"
 
 [[program]]
 path = "06-sumtypes/expr-eval"
 covers = ["sumtypes.moods", "sumtypes.vibe-match"]
+interp = "pass"
 
 # --- 07 errors --------------------------------------------------------------
 [[program]]
 path = "07-errors/yikes-basics"
 covers = ["errors.yikes"]
+interp = "pass"
 
 [[program]]
 path = "07-errors/tea-wrap"
 covers = ["errors.tea"]
+interp = "pass"
 
 [[program]]
 path = "07-errors/bounce"
 covers = ["errors.bounce"]
+interp = "pass"
 
 [[program]]
 path = "07-errors/yeet-sheesh"
 covers = ["errors.yeet-sheesh"]
+interp = "pass"
 
 # --- 08 memory --------------------------------------------------------------
 [[program]]
 path = "08-memory/crib-cop-evict"
 covers = ["memory.crib", "memory.cop-evict"]
+interp = "pass"
 
 [[program]]
 path = "08-memory/typed-crib-tag"
 covers = ["memory.tag"]
+interp = "pass"
 
 [[program]]
 path = "08-memory/holla-ghosted"
 covers = ["memory.holla-ghosted"]
+interp = "pass"
 
 [[program]]
 path = "08-memory/trust"
 covers = ["memory.trust"]
+interp = "pass"
 
 [[program]]
 path = "08-memory/scratch"
 covers = ["memory.scratch"]
+interp = "pass"
 
 [[program]]
 path = "08-memory/generation-reuse"
 covers = ["memory.generation-reuse"]
+interp = "pass"
 
 # --- 09 bit math ------------------------------------------------------------
 [[program]]
 path = "09-bit-math/bit-ops"
 covers = ["bits.operators"]
+interp = "pass"
 
 [[program]]
 path = "09-bit-math/bam-angles"
 covers = ["bits.bam-angles"]
+interp = "pass"
 
 [[program]]
 path = "09-bit-math/wrapping"
 covers = ["bits.wrapping"]
+# Unsupported: sized-integer wrapping arithmetic (`a + b` at u8 width) and `math.lap` need a
+# width-carrying value model the interpreter's uniform i64 domain does not track yet.
+interp = "unsupported"
 
 [[program]]
 path = "09-bit-math/fixed-point"
 covers = ["bits.fixed-point"]
+interp = "pass"
 
 # --- 10 stdlib --------------------------------------------------------------
 [[program]]
 path = "10-stdlib/stash"
 covers = ["stdlib.stash"]
+# Unsupported: `stash` (hash map) needs a mutable-through-method receiver; the interpreter's
+# value-copy method receivers can't yet observe `m.put(...)` mutations.
+interp = "unsupported"
 
 [[program]]
 path = "10-stdlib/bytes-parse"
 covers = ["stdlib.bytes", "values.array-literal"]
+interp = "pass"
 
 [[program]]
 path = "10-stdlib/squadops"
 covers = ["stdlib.squadops"]
+# Unsupported: `stack`/`pop` mutate the receiver in place, which value-copy receivers can't do.
+interp = "unsupported"
 
 # --- 11 reference oracles ---------------------------------------------------
 [[program]]
 path = "11-reference/mini-compiler"
 covers = ["reference.compiler"]
+# Unsupported: depends on the `stash` symbol table (see 10-stdlib/stash).
+interp = "unsupported"
 
 [[program]]
 path = "11-reference/doom-thinker"
 covers = ["reference.doom"]
+# Unsupported: needs mutation-through-`holla` (writing back into the crib slot) and calling a
+# function-pointer struct field as a method — both beyond the current value-copy model.
+interp = "unsupported"
 
 # --- 12 ffi ------------------------------------------------------------------
 [[program]]
 path = "12-ffi/extern-abs"
 covers = ["ffi.extern"]
+# Skip: FFI (`extern` C symbols) has no interpreter execution path.
+interp = "skip"
 
 # --- 13 concurrency ----------------------------------------------------------
 [[program]]
 path = "13-concurrency/slide-spawn"
 covers = ["concurrency.slide"]
+# Skip: `slide` task spawning has no interpreter execution path.
+interp = "skip"

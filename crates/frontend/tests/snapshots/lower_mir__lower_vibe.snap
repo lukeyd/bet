@@ -1,0 +1,44 @@
+---
+source: crates/frontend/tests/lower_mir.rs
+expression: "lower_to_mir(\"moods Shape { Circle(int), Rect(int, int), Dot }\\n\\\n                   finna area(s: Shape) -> int {\\n\\\n                     vibe s { Circle(r) { bet 3 * r * r } Rect(w, h) { bet w * h } Dot { bet 0 } }\\n}\\n\\\n                   finna go() -> int { bet area(Rect(3, 4)) }\")"
+---
+sum Shape { Circle(i64), Rect(i64, i64), Dot }
+extern "C" fn bet_print(rawptr, u64) -> void
+
+fn area(%0: Shape) -> i64 {
+  let %1: u32
+  let %2: i64
+  let %3: i64
+  let %4: i64
+  let %5: i64
+  let %6: i64
+  let %7: i64
+  bb0:
+    %1 = discriminant(%0)
+    switch %1 [0 -> bb2, 1 -> bb3, 2 -> bb4] else bb5
+  bb1:
+    unreachable
+  bb2:
+    %2 = %0.downcast(0).field(0)
+    %3 = mul.trap(3i64, %2)
+    %4 = mul.trap(%3, %2)
+    return %4
+  bb3:
+    %5 = %0.downcast(1).field(0)
+    %6 = %0.downcast(1).field(1)
+    %7 = mul.trap(%5, %6)
+    return %7
+  bb4:
+    return 0i64
+  bb5:
+    unreachable
+}
+
+fn go() -> i64 {
+  let %0: Shape
+  let %1: i64
+  bb0:
+    %0 = make Shape::Rect(3i64, 4i64)
+    %1 = call @area(%0)
+    return %1
+}

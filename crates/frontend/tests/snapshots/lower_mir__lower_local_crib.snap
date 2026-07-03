@@ -1,0 +1,27 @@
+---
+source: crates/frontend/tests/lower_mir.rs
+expression: "lower_to_mir(\"drip Enemy { flex hp: int }\\n\\\n                         finna go() -> int {\\n\\\n                           crib arena: Enemy[8]\\n\\\n                           lowkey e = cop Enemy{ hp: 5 } in arena\\n\\\n                           holla r = e in arena { bet r.hp } ghosted { bet -1 }\\n}\")"
+---
+struct Enemy { flex hp: i64 }
+extern "C" fn bet_print(rawptr, u64) -> void
+extern "C" fn bet_crib_new(u64) -> crib Enemy
+
+fn go() -> i64 {
+  let %0: crib Enemy
+  let %1: tag Enemy
+  let %2: tag Enemy
+  let %3: ref Enemy
+  let %4: i64
+  bb0:
+    %0 = call_extern @bet_crib_new(8u64)
+    %1 = cop(%0, Enemy{0: 5i64})
+    %2 = %1
+    holla_check(%2, %0, %3) -> bb2 else bb3
+  bb1:
+    unreachable
+  bb2:
+    return %3.deref.field(0)
+  bb3:
+    %4 = neg(1i64)
+    return %4
+}

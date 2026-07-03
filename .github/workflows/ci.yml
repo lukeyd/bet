@@ -34,8 +34,13 @@ jobs:
         run: cargo xtask graph-check
       - name: corpus-lint
         # Structural lint of tests/corpus: .bet <-> .expected pairing + feature
-        # coverage vs MANIFEST.toml. No program execution (that is Step 2's runner).
+        # coverage vs MANIFEST.toml. No program execution.
         run: cargo xtask corpus --check
+      - name: corpus-run
+        # Execute every `interp = "pass"` program via `bet run` and diff stdout against its
+        # .expected (byte-exact). Gates the interpreter's pass set: fails if any `pass` program
+        # regresses, or if an `unsupported` program starts passing (ratchet — promote it).
+        run: cargo xtask corpus
       - name: cargo-deny
         run: cargo deny check
 

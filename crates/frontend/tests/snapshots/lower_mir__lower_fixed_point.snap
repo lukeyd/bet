@@ -1,0 +1,14 @@
+---
+source: crates/frontend/tests/lower_mir.rs
+expression: "lower_to_mir(\"facts FRACBITS: int = 16\\n\\\n                          finna fixedMul(a: int, b: int) -> int { bet (a * b) >> FRACBITS }\")"
+---
+extern "C" fn bet_print(rawptr, u64) -> void
+
+fn fixedMul(%0: i64, %1: i64) -> i64 {
+  let %2: i64
+  let %3: i64
+  bb0:
+    %2 = mul.trap(%0, %1)
+    %3 = shr.na(%2, 16i64)
+    return %3
+}

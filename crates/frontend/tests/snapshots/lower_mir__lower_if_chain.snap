@@ -1,0 +1,24 @@
+---
+source: crates/frontend/tests/lower_mir.rs
+expression: "lower_to_mir(\"finna classify(n: int) -> int {\\n\\\n                         fr n < 0 { bet 0 } naw fr n == 0 { bet 1 } naw { bet 2 }\\n\\\n                       }\")"
+---
+extern "C" fn bet_print(rawptr, u64) -> void
+
+fn classify(%0: i64) -> i64 {
+  let %1: bool
+  let %2: bool
+  bb0:
+    %1 = lt.na(%0, 0i64)
+    branch %1 -> bb2 else bb3
+  bb1:
+    unreachable
+  bb2:
+    return 0i64
+  bb3:
+    %2 = eq.na(%0, 0i64)
+    branch %2 -> bb4 else bb5
+  bb4:
+    return 1i64
+  bb5:
+    return 2i64
+}

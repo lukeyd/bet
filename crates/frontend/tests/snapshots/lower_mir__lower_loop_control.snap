@@ -1,0 +1,46 @@
+---
+source: crates/frontend/tests/lower_mir.rs
+expression: "lower_to_mir(\"finna scan(n: int) -> int {\\n\\\n                             lowkey sum = 0\\n lowkey i = 0\\n\\\n                             vibin i < n {\\n i = i + 1\\n\\\n                               fr sum > 20 { dip }\\n fr i % 2 == 0 { skip }\\n\\\n                               sum = sum + i\\n }\\n bet sum\\n}\")"
+---
+extern "C" fn bet_print(rawptr, u64) -> void
+
+fn scan(%0: i64) -> i64 {
+  let %1: i64
+  let %2: i64
+  let %3: bool
+  let %4: i64
+  let %5: bool
+  let %6: i64
+  let %7: bool
+  let %8: i64
+  bb0:
+    %1 = 0i64
+    %2 = 0i64
+    goto bb1
+  bb1:
+    %3 = lt.na(%2, %0)
+    branch %3 -> bb2 else bb3
+  bb2:
+    %4 = add.trap(%2, 1i64)
+    %2 = %4
+    %5 = gt.na(%1, 20i64)
+    branch %5 -> bb5 else bb6
+  bb3:
+    return %1
+  bb4:
+    %6 = rem.trap(%2, 2i64)
+    %7 = eq.na(%6, 0i64)
+    branch %7 -> bb8 else bb9
+  bb5:
+    goto bb3
+  bb6:
+    goto bb4
+  bb7:
+    %8 = add.trap(%1, %2)
+    %1 = %8
+    goto bb1
+  bb8:
+    goto bb1
+  bb9:
+    goto bb7
+}

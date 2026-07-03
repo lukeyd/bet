@@ -12,6 +12,9 @@ logos = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }
+# The frontend->midir edge already exists (see graph-allowlist.toml); tests reach for the
+# `.mir` printer/validator directly to snapshot and check lowered modules.
+midir = { path = "../midir" }
 
 [lints]
 workspace = true

@@ -1,0 +1,26 @@
+---
+source: crates/frontend/tests/lower_mir.rs
+expression: "lower_to_mir(\"moods Op { Add, Sub }\\n\\\n                           drip Calc { flex op: Op\\n flex lhs: int\\n flex rhs: int }\\n\\\n                           finna eval(c: Calc) -> int {\\n\\\n                             vibe c.op { Add { bet c.lhs + c.rhs } Sub { bet c.lhs - c.rhs } }\\n}\")"
+---
+struct Calc { flex op: Op, flex lhs: i64, flex rhs: i64 }
+sum Op { Add, Sub }
+extern "C" fn bet_print(rawptr, u64) -> void
+
+fn eval(%0: Calc) -> i64 {
+  let %1: u32
+  let %2: i64
+  let %3: i64
+  bb0:
+    %1 = discriminant(%0.field(0))
+    switch %1 [0 -> bb2, 1 -> bb3] else bb4
+  bb1:
+    unreachable
+  bb2:
+    %2 = add.trap(%0.field(1), %0.field(2))
+    return %2
+  bb3:
+    %3 = sub.trap(%0.field(1), %0.field(2))
+    return %3
+  bb4:
+    unreachable
+}
