@@ -1,0 +1,6 @@
+tokens: 5
+num 12
+op +
+id foo
+op *
+num 345

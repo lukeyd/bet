@@ -388,6 +388,12 @@ interp = "pass"
 compiled = "pass"
 
 [[program]]
+path = "11-reference/mini-lexer"
+covers = ["reference.compiler"]
+interp = "pass"
+compiled = "pass"
+
+[[program]]
 path = "11-reference/doom-thinker"
 covers = ["reference.doom"]
 interp = "pass"

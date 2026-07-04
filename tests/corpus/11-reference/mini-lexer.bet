@@ -1,0 +1,74 @@
+// mini-lexer — a real tokenizer written in `bet`, the shape the self-hosted compiler's C1
+// lexer takes. It walks the source with the str byte primitives (str.len / str.at / str.sub),
+// classifies bytes by integer comparison, and accumulates tokens in a growable vec[Tok] (a
+// moods sum). Proves the whole lexer data path — byte scanning + a shared token buffer — runs
+// byte-identically on the interpreter and the compiled runtime-backed vec. Oracle for C1.
+pull "spill"
+pull "str"
+pull "vec"
+
+moods Tok {
+    Num(int),
+    Ident(str),
+    Op(str),
+}
+
+finna isDigit(c: int) -> bool {
+    bet c >= 48 && c <= 57
+}
+
+finna isAlpha(c: int) -> bool {
+    bet (c >= 97 && c <= 122) || (c >= 65 && c <= 90)
+}
+
+// Decimal string -> int, digit by digit (the lexer's numeric literal conversion).
+finna parseInt(s: str) -> int {
+    lowkey acc = 0
+    lowkey i = 0
+    lowkey n = str.len(s)
+    vibin i < n {
+        acc = acc * 10 + (str.at(s, i) - 48)
+        i = i + 1
+    }
+    bet acc
+}
+
+finna lex(src: str) -> vec[Tok] {
+    lowkey toks = vec.new[Tok]()
+    lowkey n = str.len(src)
+    lowkey i = 0
+    vibin i < n {
+        lowkey c = str.at(src, i)
+        fr c == 32 {
+            i = i + 1                       // skip spaces
+        } naw fr isDigit(c) {
+            lowkey start = i
+            vibin i < n && isDigit(str.at(src, i)) {
+                i = i + 1
+            }
+            toks.stack(Num(parseInt(str.sub(src, start, i))))
+        } naw fr isAlpha(c) {
+            lowkey start = i
+            vibin i < n && isAlpha(str.at(src, i)) {
+                i = i + 1
+            }
+            toks.stack(Ident(str.sub(src, start, i)))
+        } naw {
+            toks.stack(Op(str.sub(src, i, i + 1)))
+            i = i + 1
+        }
+    }
+    bet toks
+}
+
+finna main() {
+    lowkey toks = lex("12 + foo * 345")
+    spill.f("tokens: {}\n", toks.gang())
+    squad t in toks {
+        vibe t {
+            Num(v) { spill.f("num {}\n", v) }
+            Ident(name) { spill.f("id {}\n", name) }
+            Op(o) { spill.f("op {}\n", o) }
+        }
+    }
+}
