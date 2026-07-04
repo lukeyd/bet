@@ -284,7 +284,16 @@ status = "todo"
 slug = "selfhost-scaffold"
 name = "C0: selfhost/ module layout + betfe main (read->lex->parse->lower->emit->write) + driver/xtask `--frontend=self` hook"
 size = 3
-status = "todo"
+# DONE as a TRACER BULLET (the self-hosted analogue of Step 2's spill.it("hi")). selfhost/betfe.bet
+# is the frontend's `main`, emitting a fixed program's .mir via the A2 string builder; `cargo xtask
+# selfhost` is the hook: build betfe with the Rust compiler -> run it -> .mir -> backend -> binary,
+# asserting the `hello` oracle prints "hi" AND that betfe's .mir is byte-identical to the Rust
+# frontend's canonical dump (the strong-equivalence property Phase C must preserve). Skips clean
+# without LLVM, like corpus --compiled. This proves the whole pipeline end-to-end; C1-C5 replace
+# emitHelloMir with real lex/parse/lower that mirror crates/frontend/src/*.rs. Remaining for a
+# "full" C0 (deferred to C1): read the input .bet (fs.peep + argv) instead of a fixed program, and
+# a `bet build --frontend=self` driver convenience flag over the xtask hook.
+status = "done"
 
 [[task]]
 slug = "selfhost-lexer"

@@ -28,6 +28,9 @@ usage: cargo xtask <command>
                                           codegen driver; skipped cleanly without one);
                               else:       execute each program via `bet run` and diff
                                           stdout vs its .expected
+  selfhost                    self-hosted-frontend tracer: build selfhost/betfe.bet, run it to
+                                          emit .mir, compile+run that, assert the hello oracle
+                                          (needs an LLVM codegen driver; skipped cleanly without one)
   dist                        (stub — release packaging)";
 
 fn main() -> ExitCode {
@@ -40,6 +43,7 @@ fn main() -> ExitCode {
         "timelog" => timelog(rest),
         "setup-llvm" => setup_llvm(),
         "corpus" => corpus(rest),
+        "selfhost" => selfhost(&workspace_root()),
         "dist" => stub_cmd("dist", "release-artifact packaging for the 6 targets"),
         "" => {
             eprintln!("{USAGE}");
@@ -1104,6 +1108,148 @@ fn stems_with_ext(files: &[PathBuf], base: &Path, ext: &str) -> std::collections
         .filter_map(|p| p.strip_prefix(base).ok().map(|r| r.with_extension("")))
         .map(|r| r.to_string_lossy().replace('\\', "/"))
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// selfhost — Phase-C tracer bullet
+// ---------------------------------------------------------------------------
+
+/// `cargo xtask selfhost` — prove the self-hosted-frontend pipeline end-to-end: build the
+/// bet-written frontend `selfhost/betfe.bet` with the Rust compiler, run it to emit `.mir`,
+/// compile that `.mir` with the backend, run the result, and assert it prints the `hello`
+/// oracle's output. Also asserts betfe's `.mir` is byte-identical to the Rust frontend's
+/// canonical dump — the strong-equivalence property Phase C must preserve.
+///
+/// Requires a codegen-capable driver (`--features llvm`); without LLVM the whole check is skipped
+/// with a zero exit, exactly like `corpus --compiled`, so the LLVM-free gates are unaffected.
+fn selfhost(root: &Path) -> Result<()> {
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let built = std::process::Command::new(&cargo)
+        .args(["build", "-p", "driver", "--features", "llvm"])
+        .current_dir(root)
+        .status()
+        .context("running `cargo build -p driver --features llvm`")?;
+    if !built.success() {
+        println!(
+            "selfhost skipped: no LLVM/codegen \
+             (`cargo build -p driver --features llvm` failed — install LLVM 18 and set \
+             LLVM_SYS_180_PREFIX to enable it). The LLVM-free gates are unaffected."
+        );
+        return Ok(());
+    }
+    // `bet build` links against `librt_stub.a`, which cargo only stages next to `bet` when the
+    // `rt-stub` package itself is built (mirrors `corpus --compiled`).
+    let staged = std::process::Command::new(&cargo)
+        .args(["build", "-p", "rt-stub"])
+        .current_dir(root)
+        .status()
+        .context("running `cargo build -p rt-stub` (stages librt_stub.a next to `bet`)")?;
+    if !staged.success() {
+        bail!("`cargo build -p rt-stub` failed; cannot link the self-hosted program");
+    }
+
+    let bin = root
+        .join("target")
+        .join("debug")
+        .join(format!("bet{}", std::env::consts::EXE_SUFFIX));
+    let tmp = std::env::temp_dir().join(format!("bet-selfhost-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp)
+        .with_context(|| format!("creating scratch dir {}", tmp.display()))?;
+
+    let result = selfhost_run(&bin, root, &tmp);
+    let _ = std::fs::remove_dir_all(&tmp); // best-effort cleanup
+    result
+}
+
+/// The staged pipeline behind `cargo xtask selfhost`, factored out so the scratch dir is always
+/// cleaned up. Each stage bails with a focused message on failure.
+fn selfhost_run(bin: &Path, root: &Path, tmp: &Path) -> Result<()> {
+    let corpus = root.join("tests").join("corpus").join("01-basics");
+
+    // 1. Build the bet-written frontend `betfe` with the Rust compiler.
+    let betfe = tmp.join(format!("betfe{}", std::env::consts::EXE_SUFFIX));
+    let build_betfe = std::process::Command::new(bin)
+        .arg("build")
+        .arg(root.join("selfhost").join("betfe.bet"))
+        .arg("-o")
+        .arg(&betfe)
+        .output()
+        .context("running `bet build selfhost/betfe.bet`")?;
+    if !build_betfe.status.success() {
+        bail!(
+            "stage 1 (build betfe) failed:\n{}",
+            String::from_utf8_lossy(&build_betfe.stderr)
+        );
+    }
+
+    // 2. Run betfe to emit the `.mir` text.
+    let emitted = std::process::Command::new(&betfe)
+        .output()
+        .context("running the betfe binary")?;
+    if !emitted.status.success() {
+        bail!(
+            "stage 2 (run betfe) failed:\n{}",
+            String::from_utf8_lossy(&emitted.stderr)
+        );
+    }
+    let mir_path = tmp.join("hello.mir");
+    std::fs::write(&mir_path, &emitted.stdout)
+        .with_context(|| format!("writing {}", mir_path.display()))?;
+
+    // 3. Compile the emitted `.mir` with the backend and 4. run it.
+    let prog = tmp.join(format!("prog{}", std::env::consts::EXE_SUFFIX));
+    let build_mir = std::process::Command::new(bin)
+        .arg("build")
+        .arg(&mir_path)
+        .arg("-o")
+        .arg(&prog)
+        .output()
+        .context("running `bet build hello.mir`")?;
+    if !build_mir.status.success() {
+        bail!(
+            "stage 3 (compile betfe's .mir) failed:\n{}",
+            String::from_utf8_lossy(&build_mir.stderr)
+        );
+    }
+    let ran = std::process::Command::new(&prog)
+        .output()
+        .context("running the self-compiled program")?;
+    let got = String::from_utf8_lossy(&ran.stdout).into_owned();
+
+    // The `hello` oracle: the self-hosted pipeline must reproduce its expected output.
+    let expected =
+        std::fs::read_to_string(corpus.join("hello.expected")).context("reading hello.expected")?;
+    if got != expected {
+        bail!("stage 4 (run) output mismatch: expected {expected:?}, got {got:?}");
+    }
+
+    // Strong equivalence: betfe's `.mir` is byte-identical to the Rust frontend's canonical dump.
+    let dump = std::process::Command::new(bin)
+        .arg("build")
+        .arg("--emit")
+        .arg("mir")
+        .arg(corpus.join("hello.bet"))
+        .output()
+        .context("running `bet build --emit mir hello.bet`")?;
+    if !dump.status.success() {
+        bail!(
+            "emitting the reference .mir failed:\n{}",
+            String::from_utf8_lossy(&dump.stderr)
+        );
+    }
+    if emitted.stdout != dump.stdout {
+        bail!(
+            "betfe's .mir is not byte-identical to the Rust frontend's:\n--- betfe ---\n{}\n--- rustfe ---\n{}",
+            String::from_utf8_lossy(&emitted.stdout),
+            String::from_utf8_lossy(&dump.stdout),
+        );
+    }
+
+    println!(
+        "selfhost: OK — betfe -> .mir -> backend -> binary prints {expected:?}; \
+         .mir byte-identical to the Rust frontend"
+    );
+    Ok(())
 }
 
 #[cfg(test)]

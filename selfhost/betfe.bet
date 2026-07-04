@@ -1,0 +1,61 @@
+// betfe — the self-hosted `bet` frontend's entry point (Milestone 7.1, Phase C).
+//
+// The eventual shape is: read a `.bet` source, lex → parse → lower, and PRINT the `.mir` text to
+// stdout, where the existing Rust backend takes over (`bet build foo.mir`). The only contract is
+// the `.mir` textual format (crates/midir/src/text.rs); no FFI into Rust is needed.
+//
+// C0 status — TRACER BULLET. This does not yet lex or parse anything; it emits a fixed program's
+// `.mir` (the `hello` oracle: print "hi") using the growable string builder (A2). Its job is to
+// prove the self-hosted pipeline end-to-end:
+//
+//     betfe.bet --(Rust compiler)--> betfe binary --(run)--> hello.mir --(backend)--> a.out --> "hi"
+//
+// `cargo xtask selfhost` drives exactly that and checks the binary prints "hi". C1–C5 replace
+// `emitHelloMir` with real lexing / parsing / lowering that mirror crates/frontend/src/*.rs; the
+// StrBuilder and the emit/write structure below are what they grow into.
+pull "spill"
+pull "str"
+pull "vec"
+
+// --- the growable string builder the `.mir` emitter is built on (A2, inline per the no-source-
+// imports model: the stdlib is intrinsics, so shared helpers live in the selfhost program). ---
+drip StrBuilder {
+    buf: vec[u8]
+}
+
+finna sbNew() -> StrBuilder {
+    bet StrBuilder{ buf: vec.new[u8]() }
+}
+
+finna (sb: StrBuilder) add(s: str) {
+    sb.buf.append(s)
+}
+
+finna (sb: StrBuilder) finish() -> str {
+    bet sb.buf.str()
+}
+
+// Emit the `.mir` for the `hello` program (`spill.it("hi")`), matching the Rust frontend's
+// canonical printer (crates/midir/src/text.rs) line for line. This is the fixed stand-in for the
+// real lower→emit pipeline the later phases install.
+finna emitHelloMir() -> str {
+    lowkey sb = sbNew()
+    sb.add("extern \"C\" fn bet_print(rawptr, u64) -> void\n")
+    sb.add("\n")
+    sb.add("fn main() -> void {\n")
+    sb.add("  let %0: rawptr\n")
+    sb.add("  let %1: u64\n")
+    sb.add("  let %2: void\n")
+    sb.add("  bb0:\n")
+    sb.add("    %0 = str_ptr(\"hi\\n\")\n")
+    sb.add("    %1 = str_len(\"hi\\n\")\n")
+    sb.add("    %2 = call_extern @bet_print(%0, %1)\n")
+    sb.add("    return\n")
+    sb.add("}")
+    bet sb.finish()
+}
+
+finna main() {
+    // stdout is the `.mir` text; the driver/xtask hook pipes it into the backend.
+    spill.it(emitHelloMir())
+}
