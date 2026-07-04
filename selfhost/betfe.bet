@@ -2700,6 +2700,55 @@ finna isPlace(s: str) -> bool {
     bet str.at(s, 0) == 37
 }
 
+// --- function-pointer types, spelled `fn(P, ..) -> R` (a callable value) ---
+finna isFnPtrTy(t: str) -> bool {
+    fr str.len(t) < 3 { bet cap }
+    bet str.at(t, 0) == 102 && str.at(t, 1) == 110 && str.at(t, 2) == 40
+}
+
+// Index of the ") -> " that separates a `fn(..) -> R` type's params from its return, or -1.
+finna fnPtrArrowAt(t: str) -> int {
+    lowkey n = str.len(t)
+    lowkey i = 0
+    vibin i + 5 <= n {
+        fr str.at(t, i) == 41 && str.at(t, i + 1) == 32 && str.at(t, i + 2) == 45 && str.at(t, i + 3) == 62 && str.at(t, i + 4) == 32 {
+            bet i
+        }
+        i = i + 1
+    }
+    bet 0 - 1
+}
+
+// Params portion of `fn(P, ..) -> R` — the text between `fn(` and `) -> ` (a ", "-joined list).
+finna fnPtrParams(t: str) -> str {
+    lowkey a = fnPtrArrowAt(t)
+    fr a < 3 { bet "" }
+    bet str.sub(t, 3, a)
+}
+
+// Return portion of `fn(P, ..) -> R` — the text after `) -> `.
+finna fnPtrRet(t: str) -> str {
+    lowkey a = fnPtrArrowAt(t)
+    fr a < 0 { bet "" }
+    bet str.sub(t, a + 5, str.len(t))
+}
+
+// The `fn(P, ..) -> R` type of a registered function (mirror the FnPtr TyKind of a bare fn name).
+finna fnPtrTypeOf(c: LowerCtx, fi: int) -> str {
+    lowkey csv = c.fnParamCsv[fi]
+    lowkey sb = sbNew()
+    sb.add("fn(")
+    lowkey i = 0
+    vibin !isEmpty(csvAt(csv, i)) {
+        fr i > 0 { sb.add(", ") }
+        sb.add(csvAt(csv, i))
+        i = i + 1
+    }
+    sb.add(") -> ")
+    sb.add(c.fnRet[fi])
+    bet sb.finish()
+}
+
 // The .mir type string for a type node (scalar named types only in C4.2).
 finna mapTypeNode(c: LowerCtx, p: P, tyNode: int) -> str {
     fr str.slaps(firstWord(lab(p, tyNode)), "named") {
@@ -2724,6 +2773,23 @@ finna mapTypeNode(c: LowerCtx, p: P, tyNode: int) -> str {
     // A `[]T` slice type node is `slice` with the element type as its child.
     fr str.slaps(firstWord(lab(p, tyNode)), "slice") {
         bet sliceTyStr(mapTypeNode(c, p, kidAt(p, tyNode, 0)))
+    }
+    // A `finna(P, ..) -> R` function-pointer type node: `fn(P, ..) -> R` (mirror TyKind::FnPtr).
+    fr str.slaps(firstWord(lab(p, tyNode)), "fn-ty") {
+        lowkey paramsW = kidAt(p, tyNode, 0)
+        lowkey retW = kidAt(p, tyNode, 1)
+        lowkey sb = sbNew()
+        sb.add("fn(")
+        lowkey np = kidCount(p, paramsW)
+        lowkey i = 0
+        vibin i < np {
+            fr i > 0 { sb.add(", ") }
+            sb.add(mapTypeNode(c, p, kidAt(p, paramsW, i)))
+            i = i + 1
+        }
+        sb.add(") -> ")
+        sb.add(mapTypeNode(c, p, kidAt(p, retW, 0)))
+        bet sb.finish()
     }
     lcFail(c)
     bet "i64"
@@ -3856,9 +3922,35 @@ finna lowerCall(c: LowerCtx, p: P, idx: int) -> (str, str) {
         bet "0i64", "i64"
     }
     lowkey nm = afterFirst(lab(p, calleeE))
-    fr lookupLocal(c, nm) >= 0 {
-        lcFail(c)
-        bet "0i64", "i64"
+    // A callee that names a local of function-pointer type is an indirect call through that value
+    // (mirror lower_call's Callee::Indirect path): `%r = call_indirect %f(args)`.
+    lowkey lid = lookupLocal(c, nm)
+    fr lid >= 0 {
+        lowkey fty = c.localTypes[lid]
+        fr !isFnPtrTy(fty) {
+            lcFail(c)
+            bet "0i64", "i64"
+        }
+        lowkey ipCsv = fnPtrParams(fty)
+        lowkey iret = fnPtrRet(fty)
+        lowkey iargsW = findKid(p, idx, "args")
+        lowkey iargs = vec.new[str]()
+        lowkey inr = kidCount(p, iargsW)
+        lowkey ik = 0
+        vibin ik < inr {
+            lowkey aop, aty = lowerExpr(c, p, argValue(p, iargsW, ik), csvAt(ipCsv, ik))
+            iargs.stack(aop)
+            ik = ik + 1
+        }
+        lowkey ires = newLocal(c, iret)
+        lowkey isb = sbNew()
+        isb.add("call_indirect ")
+        isb.add(reg(lid))
+        isb.add("(")
+        isb.add(joinComma(iargs))
+        isb.add(")")
+        emitAssign(c, ires, isb.finish())
+        bet reg(ires), iret
     }
     // A callee that names a `moods` variant (and not a fn) is a value constructor with payload.
     lowkey vi = lookupVariant(c, nm)
@@ -3953,6 +4045,12 @@ finna lowerName(c: LowerCtx, p: P, idx: int) -> (str, str) {
     fr vi >= 0 && isEmpty(c.variantPayload[vi]) {
         lowkey mo, mt = emitMakeVariant(c, c.variantSum[vi], nm, vec.new[str]())
         bet mo, mt
+    }
+    // A bare function name used as a value is a function pointer: `@NAME` of type `fn(..) -> R`
+    // (mirror lower_name's Const::FnRef case). The operand is inlined; callers materialize it.
+    lowkey fi = lookupFn(c, nm)
+    fr fi >= 0 {
+        bet cat2("@", nm), fnPtrTypeOf(c, fi)
     }
     lcFail(c)
     bet "0i64", "i64"
