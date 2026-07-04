@@ -263,6 +263,12 @@ size = 13
 # path (interp done) + squadops.bet -> vec.new rewrite (not on the compiler's critical path).
 status = "doing"
 
+[[task]]
+slug = "selfhost-argv"
+name = "A5: argv intrinsic (sys.arg/sys.argc) — thread argc/argv from synthesized main into a runtime static; interp parity — so betfe can read its input .bet path"
+size = 3
+status = "doing"
+
 # Phase B — verification infra (NEW; B2 corpus-parity + B3 freeze already exist above)
 [[task]]
 slug = "emit-dumps"

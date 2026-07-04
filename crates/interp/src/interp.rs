@@ -1052,6 +1052,7 @@ impl<'p> Interp<'p> {
                         let id = self.new_arena(false);
                         return Ok(vec![Value::Crib(id)]);
                     }
+                    "sys" => return self.call_sys(env, method, args).map(|v| vec![v]),
                     _ => {}
                 }
             }
@@ -1537,6 +1538,28 @@ impl<'p> Interp<'p> {
 
     /// A minimal `bytes` module: `bytes.readU32le(buf, off)` decodes a little-endian u32 out of
     /// a `[]u8` (corpus `10-stdlib/bytes-parse`).
+    /// `sys.arg(i)` / `sys.argc()` — process arguments. Under the interpreter these are the host
+    /// process's args (`bet run …`), which differ from a compiled binary's; only out-of-range
+    /// emptiness and the "argv[0] always exists" invariant are portable across paths (see the
+    /// `sys-args` corpus test). Uses `args_os` so a non-UTF-8 arg never panics.
+    fn call_sys(&mut self, env: &mut Env, method: &str, args: &[Arg]) -> Result<Value, RunError> {
+        let vals = self.eval_args(env, args)?;
+        match (method, vals.as_slice()) {
+            ("argc", []) => Ok(Value::Int(std::env::args_os().count() as i64)),
+            ("arg", [Value::Int(i)]) if *i >= 0 => {
+                let arg = std::env::args_os()
+                    .nth(*i as usize)
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                Ok(Value::Str(arg))
+            }
+            ("arg", [Value::Int(_)]) => Ok(Value::Str(String::new())),
+            ("argc", _) => Err(RunError::Type("`sys.argc` takes no arguments".into())),
+            ("arg", _) => Err(RunError::Type("`sys.arg` takes a single index".into())),
+            (other, _) => Err(RunError::Unsupported(format!("sys.{other}"))),
+        }
+    }
+
     fn call_bytes(&mut self, env: &mut Env, method: &str, args: &[Arg]) -> Result<Value, RunError> {
         let vals = self.eval_args(env, args)?;
         match (method, vals.as_slice()) {

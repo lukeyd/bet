@@ -385,6 +385,51 @@ pub unsafe extern "C" fn bet_fs_read(
 }
 
 // ---------------------------------------------------------------------------
+// Process arguments. Captured once from the synthesized `main`; `sys.arg`/`sys.argc` read them.
+// ---------------------------------------------------------------------------
+
+static ARGS: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_args_init(argc: i32, argv: *const *const u8) {
+    let mut args = Vec::new();
+    if !argv.is_null() && argc > 0 {
+        for i in 0..argc as isize {
+            let p = unsafe { *argv.offset(i) };
+            if p.is_null() {
+                args.push(Vec::new());
+            } else {
+                args.push(
+                    unsafe { std::ffi::CStr::from_ptr(p.cast()) }
+                        .to_bytes()
+                        .to_vec(),
+                );
+            }
+        }
+    }
+    let _ = ARGS.set(args);
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_arg_count() -> usize {
+    ARGS.get().map_or(0, Vec::len)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_arg_get(i: usize, out_len: *mut usize) -> *const u8 {
+    match ARGS.get().and_then(|a| a.get(i)) {
+        Some(bytes) => {
+            unsafe { *out_len = bytes.len() };
+            bytes.as_ptr()
+        }
+        None => {
+            unsafe { *out_len = 0 };
+            std::ptr::null()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Stash (hash maps).
 // ---------------------------------------------------------------------------
 
@@ -756,6 +801,29 @@ mod tests {
         assert_eq!(read, contents);
         // Reclaim the leaked buffer so the test does not leak.
         drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, out_len)) });
+    }
+
+    #[test]
+    fn args_capture_and_out_of_range() {
+        // Build a C-style argv, capture it, then read back in-range and out-of-range.
+        // (nextest runs each test in its own process, so the set-once `ARGS` is fresh here.)
+        let raw = [
+            std::ffi::CString::new("betfe").unwrap(),
+            std::ffi::CString::new("foo.bet").unwrap(),
+        ];
+        let ptrs: Vec<*const u8> = raw.iter().map(|c| c.as_ptr().cast()).collect();
+        unsafe { bet_args_init(ptrs.len() as i32, ptrs.as_ptr()) };
+
+        assert_eq!(unsafe { bet_arg_count() }, 2);
+        let mut len: usize = 123;
+        let p = unsafe { bet_arg_get(1, &mut len as *mut usize) };
+        assert_eq!(len, "foo.bet".len());
+        assert_eq!(unsafe { std::slice::from_raw_parts(p, len) }, b"foo.bet");
+        // Out of range: null pointer, zero length.
+        let mut oob: usize = 123;
+        let np = unsafe { bet_arg_get(99, &mut oob as *mut usize) };
+        assert!(np.is_null());
+        assert_eq!(oob, 0);
     }
 
     #[test]

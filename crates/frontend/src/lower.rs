@@ -2702,7 +2702,17 @@ impl LowerCtx {
     fn is_module(&self, name: &str) -> bool {
         matches!(
             name,
-            "spill" | "str" | "math" | "mem" | "bytes" | "fmt" | "stash" | "vec" | "yikes" | "fs"
+            "spill"
+                | "str"
+                | "math"
+                | "mem"
+                | "bytes"
+                | "fmt"
+                | "stash"
+                | "vec"
+                | "yikes"
+                | "fs"
+                | "sys"
         )
     }
 
@@ -2837,6 +2847,59 @@ impl LowerCtx {
                             Operand::Copy(Place::local(pl)),
                             Operand::Copy(Place::local(out_ptr)),
                         ],
+                    ),
+                );
+                let result = self.new_local(strt);
+                self.fb().assign(
+                    Place::local(result),
+                    Rvalue::MakeStr {
+                        data: Operand::Copy(Place::local(data)),
+                        len: Operand::Copy(Place::local(out_len)),
+                    },
+                );
+                Ok((Operand::Copy(Place::local(result)), strt))
+            }
+            // `sys.argc()` — the process argument count, as an `int`.
+            ("sys", "argc") => {
+                if !args.is_empty() {
+                    return Err("`sys.argc` takes no arguments".into());
+                }
+                let usize_t = self.m.t_int(IntWidth::W64, false);
+                let i64t = self.m.t_i64();
+                let ext = self.get_extern("bet_arg_count", vec![], vec![usize_t]);
+                let n = self.new_local(usize_t);
+                self.fb()
+                    .assign(Place::local(n), Rvalue::Call(Callee::Extern(ext), vec![]));
+                let out = self.coerce_int(Operand::Copy(Place::local(n)), usize_t, i64t);
+                Ok((out, i64t))
+            }
+            // `sys.arg(i)` — the `i`-th process argument as a `str`, empty if out of range.
+            ("sys", "arg") => {
+                if args.len() != 1 {
+                    return Err("`sys.arg` takes a single index".into());
+                }
+                let rawptr = self.m.intern_ty(TyKind::RawPtr);
+                let usize_t = self.m.t_int(IntWidth::W64, false);
+                let i64t = self.m.t_i64();
+                let strt = self.m.t_str();
+                let (idx, ity) = self.lower_expr(&args[0].value, Some(i64t))?;
+                let idxu = self.coerce_int(idx, ity, usize_t);
+                // An out-parameter local for the read length; pass its address.
+                let out_len = self.new_local(usize_t);
+                self.fb().assign(
+                    Place::local(out_len),
+                    Rvalue::Use(Operand::Const(Const::Int(0, usize_t))),
+                );
+                let out_ptr = self.new_local(rawptr);
+                self.fb()
+                    .assign(Place::local(out_ptr), Rvalue::AddrOf(Place::local(out_len)));
+                let ext = self.get_extern("bet_arg_get", vec![usize_t, rawptr], vec![rawptr]);
+                let data = self.new_local(rawptr);
+                self.fb().assign(
+                    Place::local(data),
+                    Rvalue::Call(
+                        Callee::Extern(ext),
+                        vec![idxu, Operand::Copy(Place::local(out_ptr))],
                     ),
                 );
                 let result = self.new_local(strt);

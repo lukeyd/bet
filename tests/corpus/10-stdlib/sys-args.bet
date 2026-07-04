@@ -1,0 +1,15 @@
+// sys-args — process arguments (sys.arg / sys.argc). Only DETERMINISTIC, cross-path behavior is
+// asserted here: argv[0] always exists (so argc >= 1), and an out-of-range index yields the empty
+// string. The actual content of the arguments legitimately differs between `bet run` (interp, the
+// args are the driver's) and a compiled binary, so it is exercised for real only by the
+// self-hosted `betfe` in `cargo xtask selfhost`.
+pull "spill"
+pull "sys"
+
+finna main() {
+    fr sys.argc() >= 1 {
+        spill.it("has-args")
+    }
+    spill.f("oob=[{}]\n", sys.arg(999))
+    spill.f("ooblen={}\n", str.len(sys.arg(999)))
+}

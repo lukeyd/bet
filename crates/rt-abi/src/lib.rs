@@ -190,6 +190,20 @@ unsafe extern "C" {
     /// leaves `out_len` = 0) on any error. The caller owns the buffer. Backs `fs.peep`.
     pub fn bet_fs_read(path_ptr: *const u8, path_len: usize, out_len: *mut usize) -> *mut u8;
 
+    // --- process arguments ---
+
+    /// Capture the process's command-line arguments. Called once from the synthesized `main`,
+    /// with `argc`/`argv` straight from the C entry point, before `bet`'s `main` runs. The
+    /// runtime takes an owned copy, so the pointers need not outlive the call. Backs the
+    /// `sys.arg` / `sys.argc` intrinsics.
+    pub fn bet_args_init(argc: i32, argv: *const *const u8);
+    /// The number of captured command-line arguments (0 before [`bet_args_init`] runs).
+    pub fn bet_arg_count() -> usize;
+    /// A pointer to the `i`-th captured argument's bytes, writing its length to `out_len`.
+    /// Returns null (and leaves `out_len` = 0) if `i` is out of range. The bytes live for the
+    /// rest of the process; the caller must not free them. Backs `sys.arg`.
+    pub fn bet_arg_get(i: usize, out_len: *mut usize) -> *const u8;
+
     // --- stash (hash maps) ---
 
     /// Create an empty hash map whose values are `val_size`-byte blobs. Keys are arbitrary

@@ -1576,9 +1576,14 @@ impl<'c> Cg<'c> {
         let bet_main = self.funcs[idx];
 
         let i32t = self.cx.i32_type();
-        let main_fn =
-            self.llm
-                .add_function("main", i32t.fn_type(&[], false), Some(Linkage::External));
+        let ptr_t = self.ptr_ty();
+        // `int main(int argc, char** argv)` — the C entry point; we forward argc/argv to the
+        // runtime so `sys.arg` / `sys.argc` can read them.
+        let main_fn = self.llm.add_function(
+            "main",
+            i32t.fn_type(&[i32t.into(), ptr_t.into()], false),
+            Some(Linkage::External),
+        );
         let bb = self.cx.append_basic_block(main_fn, "entry");
         self.builder.position_at_end(bb);
 
@@ -1587,6 +1592,23 @@ impl<'c> Cg<'c> {
         let shutdown = self.get_or_add("bet_rt_shutdown", void_fty);
 
         self.builder.build_call(init, &[], "").map_err(lower_err)?;
+        // Capture the process arguments before user code runs.
+        let args_init_fty = self
+            .cx
+            .void_type()
+            .fn_type(&[i32t.into(), ptr_t.into()], false);
+        let args_init = self.get_or_add("bet_args_init", args_init_fty);
+        let argc = main_fn
+            .get_nth_param(0)
+            .expect("main argc param")
+            .into_int_value();
+        let argv = main_fn
+            .get_nth_param(1)
+            .expect("main argv param")
+            .into_pointer_value();
+        self.builder
+            .build_call(args_init, &[argc.into(), argv.into()], "")
+            .map_err(lower_err)?;
         // Initialize every module-level crib once, after the runtime is up.
         for (i, c) in self.m.crib_globals().iter().enumerate() {
             let handle = self.lower_crib_new(c.elem, c.capacity)?;
