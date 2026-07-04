@@ -1903,12 +1903,24 @@ drip Seg {
 // ordered extern decl lines (bet_print pre-added), the current fn's local types (index = local
 // id — the SSA temp counter is `localTypes.gang()`), its bb0 statement lines, and a 1-elem
 // `ok` cell (0 once an unsupported construct is hit).
+// A basic block: statement lines + a 1-element terminator cell ("" until set).
+drip Block {
+    stmts: vec[str],
+    term: vec[str]
+}
+
+finna blkNew() -> Block {
+    lowkey t = vec.new[str]()
+    t.stack("")
+    bet Block{ stmts: vec.new[str](), term: t }
+}
+
 drip LowerCtx {
     externs: vec[str],
     localTypes: vec[str],
-    stmts: vec[str],
+    blocks: vec[Block],
+    curBlock: vec[int],
     ok: vec[int],
-    done: vec[int],
     bindNames: vec[str],
     bindIds: vec[int],
     constNames: vec[str],
@@ -1921,18 +1933,85 @@ finna lcNew() -> LowerCtx {
     ex.stack("extern \"C\" fn bet_print(rawptr, u64) -> void")
     lowkey okc = vec.new[int]()
     okc.stack(1)
-    lowkey donec = vec.new[int]()
-    donec.stack(0)
-    bet LowerCtx{ externs: ex, localTypes: vec.new[str](), stmts: vec.new[str](), ok: okc, done: donec, bindNames: vec.new[str](), bindIds: vec.new[int](), constNames: vec.new[str](), constVals: vec.new[str](), constTys: vec.new[str]() }
+    lowkey blks = vec.new[Block]()
+    blks.stack(blkNew())
+    lowkey cur = vec.new[int]()
+    cur.stack(0)
+    bet LowerCtx{ externs: ex, localTypes: vec.new[str](), blocks: blks, curBlock: cur, ok: okc, bindNames: vec.new[str](), bindIds: vec.new[int](), constNames: vec.new[str](), constVals: vec.new[str](), constTys: vec.new[str]() }
 }
 
+// --- basic-block / terminator management (mirror lower.rs new_block/reserve_block/select/term_*) ---
+finna curId(c: LowerCtx) -> int {
+    bet c.curBlock[0]
+}
+
+finna setCur(c: LowerCtx, id: int) {
+    c.curBlock.pop()
+    c.curBlock.stack(id)
+}
+
+// Create a block and select it (emission continues there).
+finna newBlock(c: LowerCtx) -> int {
+    lowkey id = c.blocks.gang() as int
+    c.blocks.stack(blkNew())
+    setCur(c, id)
+    bet id
+}
+
+// Create a block WITHOUT selecting it (its id is allocated now; it is filled later).
+finna reserveBlock(c: LowerCtx) -> int {
+    lowkey id = c.blocks.gang() as int
+    c.blocks.stack(blkNew())
+    bet id
+}
+
+finna selectBlock(c: LowerCtx, id: int) {
+    setCur(c, id)
+}
+
+finna blkTerm(c: LowerCtx, id: int) -> str {
+    bet c.blocks[id].term[0]
+}
+
+finna setTerm(c: LowerCtx, id: int, t: str) {
+    lowkey tv = c.blocks[id].term
+    tv.pop()
+    tv.stack(t)
+}
+
+// `done` = the current block already has a terminator (mirror ctx.done).
 finna lcDone(c: LowerCtx) -> bool {
-    bet c.done[0] == 1
+    bet !isEmpty(blkTerm(c, curId(c)))
 }
 
-finna lcSetDone(c: LowerCtx) {
-    c.done.pop()
-    c.done.stack(1)
+// Terminate the current block with `goto to`, unless already terminated (mirror term_goto).
+finna termGoto(c: LowerCtx, to: int) {
+    fr !lcDone(c) {
+        setTerm(c, curId(c), cat2("goto bb", itoa(to)))
+    }
+}
+
+finna termRet(c: LowerCtx) {
+    fr !lcDone(c) {
+        setTerm(c, curId(c), "return")
+    }
+}
+
+// Unconditionally set a block's terminator (mirror set_goto / set_branch — the block is known
+// to need this edge and has no terminator yet).
+finna setGoto(c: LowerCtx, from: int, to: int) {
+    setTerm(c, from, cat2("goto bb", itoa(to)))
+}
+
+finna setBranch(c: LowerCtx, from: int, cond: str, thenBb: int, elseBb: int) {
+    lowkey sb = sbNew()
+    sb.add("branch ")
+    sb.add(cond)
+    sb.add(" -> bb")
+    sb.add(itoa(thenBb))
+    sb.add(" else bb")
+    sb.add(itoa(elseBb))
+    setTerm(c, from, sb.finish())
 }
 
 // --- current-function name/const bindings ---
@@ -2113,7 +2192,7 @@ finna newLocal(c: LowerCtx, ty: str) -> int {
 }
 
 finna emitStmt(c: LowerCtx, line: str) {
-    c.stmts.stack(line)
+    c.blocks[curId(c)].stmts.stack(line)
 }
 
 // `%N` — a register name.
@@ -2379,10 +2458,10 @@ finna lowerUnary(c: LowerCtx, p: P, idx: int, hint: str) -> (str, str) {
 
 finna lowerBinary(c: LowerCtx, p: P, idx: int, hint: str) -> (str, str) {
     lowkey opTag = afterFirst(lab(p, idx))
-    // Short-circuit `and`/`or` lower to control flow — not in this subset.
+    // Short-circuit `and`/`or` lower to control flow.
     fr str.slaps(opTag, "and") || str.slaps(opTag, "or") {
-        lcFail(c)
-        bet "0i64", "i64"
+        lowkey so, st = lowerShortCircuit(c, p, idx, opTag)
+        bet so, st
     }
     lowkey isCmp = isComparisonTag(opTag)
     lowkey lhint = ""
@@ -2484,6 +2563,8 @@ finna lowerPrintValue(c: LowerCtx, opStr: str, ty: str) {
         emitPrintNum(c, "extern \"C\" fn bet_print_f64(f64) -> void", "bet_print_f64", reg(t))
     } naw fr str.slaps(ty, "str") {
         emitPrintOperand(c, opStr)
+    } naw fr str.slaps(ty, "bool") {
+        lowerPrintBool(c, opStr)
     } naw {
         lcFail(c)
     }
@@ -2651,13 +2732,112 @@ finna lowerAssign(c: LowerCtx, p: P, stmtIdx: int) {
     }
 }
 
-// `bet` — main is void, so only the zero-value form lowers here; it ends the block.
+// `bet` — main is void, so only the zero-value form lowers here; it terminates the block.
 finna lowerBet(c: LowerCtx, p: P, stmtIdx: int) {
     fr kidCount(p, stmtIdx) == 0 {
-        lcSetDone(c)
+        termRet(c)
     } naw {
         lcFail(c)
     }
+}
+
+// Print a bool by branching: true edge prints `nocap`, false edge `cap` (mirror lower_print_bool).
+finna lowerPrintBool(c: LowerCtx, cond: str) {
+    lowkey condEnd = curId(c)
+    lowkey merge = reserveBlock(c)
+    lowkey thenBb = newBlock(c)
+    emitPrint(c, "nocap")
+    termGoto(c, merge)
+    lowkey elseBb = newBlock(c)
+    emitPrint(c, "cap")
+    termGoto(c, merge)
+    setBranch(c, condEnd, cond, thenBb, elseBb)
+    selectBlock(c, merge)
+}
+
+// Short-circuit `&&`/`||` lower to control flow (mirror lower_short_circuit).
+finna lowerShortCircuit(c: LowerCtx, p: P, idx: int, opTag: str) -> (str, str) {
+    lowkey res = newLocal(c, "bool")
+    lowkey lo, lty = lowerExpr(c, p, kidAt(p, idx, 0), "bool")
+    lowkey lhsEnd = curId(c)
+    lowkey rhsBb = newBlock(c)
+    lowkey ro, rty = lowerExpr(c, p, kidAt(p, idx, 1), "bool")
+    lowkey rhsEnd = curId(c)
+    emitAssign(c, res, ro)
+    lowkey shortBb = newBlock(c)
+    lowkey shortVal = "false"
+    fr str.slaps(opTag, "or") { shortVal = "true" }
+    emitAssign(c, res, shortVal)
+    lowkey merge = newBlock(c)
+    setGoto(c, rhsEnd, merge)
+    setGoto(c, shortBb, merge)
+    fr str.slaps(opTag, "and") {
+        setBranch(c, lhsEnd, lo, rhsBb, shortBb)
+    } naw {
+        setBranch(c, lhsEnd, lo, shortBb, rhsBb)
+    }
+    selectBlock(c, merge)
+    bet reg(res), "bool"
+}
+
+// `fr cond { .. } naw fr .. naw { .. }` (mirror lower_fr + emit_if_chain).
+finna lowerFr(c: LowerCtx, p: P, frIdx: int) {
+    lowkey conds = vec.new[int]()
+    lowkey bodies = vec.new[int]()
+    conds.stack(kidAt(p, frIdx, 0))
+    bodies.stack(kidAt(p, frIdx, 1))
+    lowkey elseBody = 0 - 1
+    lowkey nk = kidCount(p, frIdx)
+    lowkey i = 2
+    vibin i < nk {
+        lowkey k = kidAt(p, frIdx, i)
+        fr str.slaps(lab(p, k), "elif") {
+            conds.stack(kidAt(p, k, 0))
+            bodies.stack(kidAt(p, k, 1))
+        } naw fr str.slaps(lab(p, k), "else") {
+            elseBody = kidAt(p, k, 0)
+        }
+        i = i + 1
+    }
+    lowkey merge = reserveBlock(c)
+    emitIfChain(c, p, conds, bodies, elseBody, 0, merge)
+    selectBlock(c, merge)
+}
+
+finna emitIfChain(c: LowerCtx, p: P, conds: vec[int], bodies: vec[int], elseBody: int, armIdx: int, merge: int) {
+    lowkey cndOp, cty = lowerExpr(c, p, conds[armIdx], "bool")
+    lowkey condEnd = curId(c)
+    lowkey thenBb = newBlock(c)
+    lowerBlock(c, p, bodies[armIdx])
+    termGoto(c, merge)
+    lowkey elseBb = newBlock(c)
+    lowkey narms = conds.gang() as int
+    fr armIdx + 1 < narms {
+        emitIfChain(c, p, conds, bodies, elseBody, armIdx + 1, merge)
+    } naw fr elseBody >= 0 {
+        lowerBlock(c, p, elseBody)
+        termGoto(c, merge)
+    } naw {
+        termGoto(c, merge)
+    }
+    setBranch(c, condEnd, cndOp, thenBb, elseBb)
+}
+
+// `vibin cond { .. }` (mirror lower_vibin). dip/skip in the body are not yet lowered.
+finna lowerVibin(c: LowerCtx, p: P, vibinIdx: int) {
+    lowkey pre = curId(c)
+    lowkey header = reserveBlock(c)
+    setGoto(c, pre, header)
+    selectBlock(c, header)
+    lowkey cndOp, cty = lowerExpr(c, p, kidAt(p, vibinIdx, 0), "bool")
+    lowkey headerEnd = curId(c)
+    lowkey bodyBb = newBlock(c)
+    lowkey exit = reserveBlock(c)
+    setBranch(c, headerEnd, cndOp, bodyBb, exit)
+    selectBlock(c, bodyBb)
+    lowerBlock(c, p, kidAt(p, vibinIdx, 1))
+    termGoto(c, header)
+    selectBlock(c, exit)
 }
 
 // Lower one statement (mirror lower_stmt) — the scalar subset.
@@ -2673,6 +2853,10 @@ finna lowerStmt(c: LowerCtx, p: P, stmtIdx: int) {
         lowerAssign(c, p, stmtIdx)
     } naw fr str.slaps(h, "bet") {
         lowerBet(c, p, stmtIdx)
+    } naw fr str.slaps(h, "fr") {
+        lowerFr(c, p, stmtIdx)
+    } naw fr str.slaps(h, "vibin") {
+        lowerVibin(c, p, stmtIdx)
     } naw {
         lcFail(c)
     }
@@ -2721,16 +2905,26 @@ finna assembleMir(c: LowerCtx) -> str {
         sb.add("\n")
         j = j + 1
     }
-    sb.add("  bb0:\n")
-    lowkey ns = c.stmts.gang() as int
-    lowkey k = 0
-    vibin k < ns {
+    lowkey nb = c.blocks.gang() as int
+    lowkey bi = 0
+    vibin bi < nb {
+        sb.add("  bb")
+        sb.add(itoa(bi))
+        sb.add(":\n")
+        lowkey blk = c.blocks[bi]
+        lowkey ns = blk.stmts.gang() as int
+        lowkey k = 0
+        vibin k < ns {
+            sb.add("    ")
+            sb.add(blk.stmts[k])
+            sb.add("\n")
+            k = k + 1
+        }
         sb.add("    ")
-        sb.add(c.stmts[k])
+        sb.add(blk.term[0])
         sb.add("\n")
-        k = k + 1
+        bi = bi + 1
     }
-    sb.add("    return\n")
     sb.add("}\n")
     bet sb.finish()
 }
@@ -2756,6 +2950,7 @@ finna emitMir(p: P, root: int) -> str {
     }
     fr mainBlock >= 0 && lcOk(c) {
         lowerBlock(c, p, mainBlock)
+        termRet(c)
     } naw {
         lcFail(c)
     }
