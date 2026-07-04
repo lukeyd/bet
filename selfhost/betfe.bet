@@ -1931,7 +1931,9 @@ drip LowerCtx {
     bindIds: vec[int],
     constNames: vec[str],
     constVals: vec[str],
-    constTys: vec[str]
+    constTys: vec[str],
+    loopIncr: vec[int],
+    loopExit: vec[int]
 }
 
 finna lcNew() -> LowerCtx {
@@ -1947,7 +1949,7 @@ finna lcNew() -> LowerCtx {
     blks.stack(blkNew())
     lowkey cur = vec.new[int]()
     cur.stack(0)
-    bet LowerCtx{ externs: ex, fns: vec.new[str](), fnNames: vec.new[str](), fnParamCsv: vec.new[str](), fnRet: vec.new[str](), localTypes: vec.new[str](), paramCount: pc, curRet: cr, blocks: blks, curBlock: cur, ok: okc, bindNames: vec.new[str](), bindIds: vec.new[int](), constNames: vec.new[str](), constVals: vec.new[str](), constTys: vec.new[str]() }
+    bet LowerCtx{ externs: ex, fns: vec.new[str](), fnNames: vec.new[str](), fnParamCsv: vec.new[str](), fnRet: vec.new[str](), localTypes: vec.new[str](), paramCount: pc, curRet: cr, blocks: blks, curBlock: cur, ok: okc, bindNames: vec.new[str](), bindIds: vec.new[int](), constNames: vec.new[str](), constVals: vec.new[str](), constTys: vec.new[str](), loopIncr: vec.new[int](), loopExit: vec.new[int]() }
 }
 
 // --- per-function reset (structs pass by value, so drain the shared-handle vecs in place) ---
@@ -1986,6 +1988,31 @@ finna resetFn(c: LowerCtx, paramCount: int, ret: str) {
     drainStr(c.constNames)
     drainStr(c.constVals)
     drainStr(c.constTys)
+    drainInt(c.loopIncr)
+    drainInt(c.loopExit)
+}
+
+// --- loop stack (dip=break -> exit, skip=continue -> incr/header) ---
+finna pushLoop(c: LowerCtx, incr: int, exit: int) {
+    c.loopIncr.stack(incr)
+    c.loopExit.stack(exit)
+}
+
+finna popLoop(c: LowerCtx) {
+    c.loopIncr.pop()
+    c.loopExit.pop()
+}
+
+finna inLoop(c: LowerCtx) -> bool {
+    bet (c.loopExit.gang() as int) > 0
+}
+
+finna loopIncrTop(c: LowerCtx) -> int {
+    bet c.loopIncr[(c.loopIncr.gang() as int) - 1]
+}
+
+finna loopExitTop(c: LowerCtx) -> int {
+    bet c.loopExit[(c.loopExit.gang() as int) - 1]
 }
 
 // The index of a registered function named `name`, or -1.
@@ -2255,6 +2282,72 @@ finna mapScalar(nm: str) -> str {
     bet ""
 }
 
+// --- fixed-array value model: types spelled `[ELEM; N]` (slices are `[]ELEM`) ---
+finna arrayTyStr(elem: str, n: int) -> str {
+    lowkey sb = sbNew()
+    sb.add("[")
+    sb.add(elem)
+    sb.add("; ")
+    sb.add(itoa(n))
+    sb.add("]")
+    bet sb.finish()
+}
+
+// True for `[ELEM; N]` (an array), false for `[]ELEM` (a slice) or non-bracket types.
+finna isArrayTy(t: str) -> bool {
+    fr str.len(t) < 2 { bet cap }
+    fr str.at(t, 0) != 91 { bet cap }
+    bet str.at(t, 1) != 93
+}
+
+// Element type of `[ELEM; N]`: the text between `[` and `;`.
+finna arrayElem(t: str) -> str {
+    lowkey n = str.len(t)
+    lowkey i = 1
+    vibin i < n {
+        fr str.at(t, i) == 59 { bet str.sub(t, 1, i) }
+        i = i + 1
+    }
+    bet ""
+}
+
+// Length text of `[ELEM; N]`: the digits after `; ` up to `]`.
+finna arrayLenStr(t: str) -> str {
+    lowkey n = str.len(t)
+    lowkey semi = 0
+    lowkey i = 1
+    vibin i < n {
+        fr str.at(t, i) == 59 { semi = i }
+        i = i + 1
+    }
+    lowkey start = semi + 2
+    lowkey j = start
+    vibin j < n {
+        fr str.at(t, j) == 93 { bet str.sub(t, start, j) }
+        j = j + 1
+    }
+    bet ""
+}
+
+// Element hint from an array/slice type hint, else "".
+finna arrayElemHint(hint: str) -> str {
+    fr isArrayTy(hint) { bet arrayElem(hint) }
+    bet ""
+}
+
+// True for a bare SSA register `%N` with no projection (an addressable place base).
+finna isReg(s: str) -> bool {
+    fr str.len(s) == 0 { bet cap }
+    fr str.at(s, 0) != 37 { bet cap }
+    lowkey n = str.len(s)
+    lowkey i = 1
+    vibin i < n {
+        fr str.at(s, i) == 46 { bet cap }
+        i = i + 1
+    }
+    bet nocap
+}
+
 // The .mir type string for a type node (scalar named types only in C4.2).
 finna mapTypeNode(c: LowerCtx, p: P, tyNode: int) -> str {
     fr str.slaps(firstWord(lab(p, tyNode)), "named") {
@@ -2519,12 +2612,68 @@ finna lowerExpr(c: LowerCtx, p: P, idx: int, hint: str) -> (str, str) {
         lowkey co, ct = lowerCast(c, p, idx)
         bet co, ct
     }
+    fr str.slaps(h, "array-lit") {
+        lowkey ao, at = lowerArrayLit(c, p, idx, hint)
+        bet ao, at
+    }
+    fr str.slaps(h, "index") {
+        lowkey xo, xt = lowerIndex(c, p, idx)
+        bet xo, xt
+    }
     fr str.slaps(h, "call") {
         lowkey lo, lt = lowerCall(c, p, idx)
         bet lo, lt
     }
     lcFail(c)
     bet "0i64", "i64"
+}
+
+// `[a, b, c]` — a fixed array literal materialized into a temp (mirror lower_array_lit).
+// Slice-typed contexts (`[]T` hint) are sentineled upstream, so only the array form is emitted.
+finna lowerArrayLit(c: LowerCtx, p: P, idx: int, hint: str) -> (str, str) {
+    lowkey nk = kidCount(p, idx)
+    fr nk == 0 {
+        lcFail(c)
+        bet "0i64", "i64"
+    }
+    lowkey elemHint = arrayElemHint(hint)
+    lowkey ops = vec.new[str]()
+    lowkey elemTy = elemHint
+    lowkey i = 0
+    vibin i < nk {
+        lowkey eo, et = lowerExpr(c, p, kidAt(p, idx, i), elemTy)
+        fr isEmpty(elemTy) { elemTy = et }
+        ops.stack(eo)
+        i = i + 1
+    }
+    lowkey aty = arrayTyStr(elemTy, nk)
+    lowkey tmp = newLocal(c, aty)
+    lowkey sb = sbNew()
+    sb.add("array[")
+    sb.add(elemTy)
+    sb.add("](")
+    sb.add(joinComma(ops))
+    sb.add(")")
+    emitAssign(c, tmp, sb.finish())
+    bet reg(tmp), aty
+}
+
+// `base[i]` — a place projection used as an operand (mirror lower_index). Arrays/slices only;
+// the base must be an addressable place (a bare register) and vec[T] indexing is deferred.
+finna lowerIndex(c: LowerCtx, p: P, idx: int) -> (str, str) {
+    lowkey bop, bty = lowerExpr(c, p, kidAt(p, idx, 0), "")
+    fr !isArrayTy(bty) || !isReg(bop) {
+        lcFail(c)
+        bet "0i64", "i64"
+    }
+    lowkey elem = arrayElem(bty)
+    lowkey iop, ity = lowerExpr(c, p, kidAt(p, idx, 1), "i64")
+    lowkey sb = sbNew()
+    sb.add(bop)
+    sb.add(".index(")
+    sb.add(iop)
+    sb.add(")")
+    bet sb.finish(), elem
 }
 
 // A direct call to a named user function (mirror lower_call + lower_args + emit_call_result).
@@ -2988,9 +3137,65 @@ finna lowerVibin(c: LowerCtx, p: P, vibinIdx: int) {
     lowkey exit = reserveBlock(c)
     setBranch(c, headerEnd, cndOp, bodyBb, exit)
     selectBlock(c, bodyBb)
+    pushLoop(c, header, exit)
     lowerBlock(c, p, kidAt(p, vibinIdx, 1))
+    popLoop(c)
     termGoto(c, header)
     selectBlock(c, exit)
+}
+
+// `squad x in xs { .. }` over a fixed array — a counter loop (mirror lower_squad). The
+// increment block is the `skip` target and the exit block is the `dip` target. vec[T]
+// iterables are deferred (sentinel).
+finna lowerSquad(c: LowerCtx, p: P, squadIdx: int) {
+    lowkey var = afterFirst(lab(p, squadIdx))
+    lowkey iop, ity = lowerExpr(c, p, kidAt(p, squadIdx, 0), "")
+    fr !isArrayTy(ity) || !isReg(iop) {
+        lcFail(c)
+    } naw {
+        lowkey elem = arrayElem(ity)
+        lowkey nStr = arrayLenStr(ity)
+        lowkey ctr = newLocal(c, "i64")
+        emitAssign(c, ctr, "0i64")
+        lowkey pre = curId(c)
+        lowkey header = reserveBlock(c)
+        setGoto(c, pre, header)
+        selectBlock(c, header)
+        lowkey cond = newLocal(c, "bool")
+        lowkey csb = sbNew()
+        csb.add("lt.na(")
+        csb.add(reg(ctr))
+        csb.add(", ")
+        csb.add(nStr)
+        csb.add("i64)")
+        emitAssign(c, cond, csb.finish())
+        lowkey headerEnd = curId(c)
+        lowkey bodyBb = newBlock(c)
+        lowkey exit = reserveBlock(c)
+        setBranch(c, headerEnd, reg(cond), bodyBb, exit)
+        selectBlock(c, bodyBb)
+        lowkey elemLocal = newLocal(c, elem)
+        lowkey esb = sbNew()
+        esb.add(iop)
+        esb.add(".index(")
+        esb.add(reg(ctr))
+        esb.add(")")
+        emitAssign(c, elemLocal, esb.finish())
+        bindLocal(c, var, elemLocal)
+        lowkey incr = reserveBlock(c)
+        pushLoop(c, incr, exit)
+        lowerBlock(c, p, kidAt(p, squadIdx, 1))
+        popLoop(c)
+        termGoto(c, incr)
+        selectBlock(c, incr)
+        lowkey isb = sbNew()
+        isb.add("add.wrap(")
+        isb.add(reg(ctr))
+        isb.add(", 1i64)")
+        emitAssign(c, ctr, isb.finish())
+        termGoto(c, header)
+        selectBlock(c, exit)
+    }
 }
 
 // Lower one statement (mirror lower_stmt) — the scalar subset.
@@ -3010,6 +3215,12 @@ finna lowerStmt(c: LowerCtx, p: P, stmtIdx: int) {
         lowerFr(c, p, stmtIdx)
     } naw fr str.slaps(h, "vibin") {
         lowerVibin(c, p, stmtIdx)
+    } naw fr str.slaps(h, "squad") {
+        lowerSquad(c, p, stmtIdx)
+    } naw fr str.slaps(h, "dip") {
+        fr inLoop(c) { termGoto(c, loopExitTop(c)) } naw { lcFail(c) }
+    } naw fr str.slaps(h, "skip") {
+        fr inLoop(c) { termGoto(c, loopIncrTop(c)) } naw { lcFail(c) }
     } naw {
         lcFail(c)
     }

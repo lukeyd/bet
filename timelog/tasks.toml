@@ -383,8 +383,12 @@ size = 13
 # state, params bind to %0.. (no `let`), calls lower args with param-type hints -> `call @NAME`,
 # value bet -> `return %op`, non-void fall-through -> `unreachable`. `betfe --emit mir` is byte-
 # identical for 14/59 corpus programs; the rest emit the `%%UNSUPPORTED%%` sentinel (logged by the
-# selfhost C4 gate, not asserted — 0 false-supported). Deferred (each a further increment): arrays/
-# slices/indexing + squad, structs (drip/field/struct-lit) + receiver methods, sums (moods/vibe),
+# selfhost C4 gate, not asserted — 0 false-supported). C4.5 added the fixed-array value model:
+# array literals (`array[ELEM](..)` into a temp), `base[i]` place-projection indexing (arrays only,
+# addressable base), `squad x in xs` as a counter loop (ctr<N header / body binds x=xs[ctr] /
+# incr ctr+=1.wrap / exit), a loop stack (loopIncr/loopExit) threaded through vibin+squad, and
+# dip(break)->exit / skip(continue)->incr. 17/59 byte-identical. Deferred (each a further increment):
+# vec[T] indexing/squad, structs (drip/field/struct-lit) + receiver methods, sums (moods/vibe),
 # errors (yikes/bounce/sheesh), memory (crib/tag/holla/cop), collections (vec/stash), the remaining
 # str/bytes/fs/mem/sys intrinsics + FFI, generics/monomorphization, then the 11-reference programs.
 status = "doing"
