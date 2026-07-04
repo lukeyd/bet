@@ -369,7 +369,17 @@ status = "done"
 slug = "selfhost-lower"
 name = "C4: port lower.rs -> bet (folded typecheck + monomorphization + midir construction); verify --emit=mir diff — the ~3200-LOC monster"
 size = 13
-status = "todo"
+# DOING. Grown incrementally in betfe.bet; since betfe emits .mir TEXT, C4 (lower) + C5 (print)
+# merge: walk the AST label-tree and append text matching lower.rs + midir/text.rs EXACTLY (same
+# eager bet_print extern, same SSA temp numbering, same op sequence). C4.1 landed: a print-only
+# `main` (spill.it/spill.f of str+int literals) — the full architecture (LowerCtx with ordered
+# externs + local-type/temp counter + bb0 stmts, emit_print/emit_print_num, split_format, unquote,
+# label-tree accessors). `betfe --emit mir` is byte-identical to `bet build --emit mir` for 3/59
+# corpus programs (hello, comments, spill-format); the other 56 emit the `%%UNSUPPORTED%%` sentinel
+# and are LOGGED, not asserted, by the new `cargo xtask selfhost` C4 gate (mir_parity) — so the
+# subset grows without silent gaps. Next: locals+arithmetic (lowkey/int exprs), then bool/float
+# printing (needs multi-block for bool), then control flow, the value model, intrinsics, generics.
+status = "doing"
 
 [[task]]
 slug = "selfhost-emit"

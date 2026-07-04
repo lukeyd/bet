@@ -1256,14 +1256,72 @@ fn selfhost_run(bin: &Path, root: &Path, tmp: &Path) -> Result<()> {
 
     emit_parity(bin, &betfe, &bet_files, &corpus_root, "tokens", "C1 lexer")?;
     emit_parity(bin, &betfe, &bet_files, &corpus_root, "ast", "C3 parser")?;
+    let mir_lowered = mir_parity(bin, &betfe, &bet_files, &corpus_root)?;
     let checked = bet_files.len();
 
     println!(
         "selfhost: OK — betfe -> .mir -> backend -> binary prints {expected:?}; \
          .mir byte-identical to the Rust frontend; \
-         C1 `--emit tokens` + C3 `--emit ast` byte-identical across {checked} corpus programs"
+         C1 `--emit tokens` + C3 `--emit ast` byte-identical across {checked} corpus programs; \
+         C4 `--emit mir` byte-identical across {mir_lowered}/{checked} (rest emit the sentinel — not yet lowered)"
     );
     Ok(())
+}
+
+/// C4 lowering parity: `betfe --emit mir P` must be byte-identical to `bin build --emit mir P` for
+/// every program betfe can lower. Programs it can't yet lower emit the `%%UNSUPPORTED%%` sentinel
+/// and are counted (logged), not asserted — so the supported subset grows without silent gaps.
+/// Returns the number of byte-identical (lowered) programs.
+fn mir_parity(bin: &Path, betfe: &Path, files: &[PathBuf], corpus_root: &Path) -> Result<usize> {
+    let mut mismatches = Vec::new();
+    let mut lowered = 0usize;
+    for f in files {
+        let mine = std::process::Command::new(betfe)
+            .args(["--emit", "mir"])
+            .arg(f)
+            .output()
+            .with_context(|| format!("`betfe --emit mir {}`", f.display()))?;
+        if !mine.status.success() {
+            bail!(
+                "betfe `--emit mir` failed for {}:\n{}",
+                f.display(),
+                String::from_utf8_lossy(&mine.stderr)
+            );
+        }
+        if mine.stdout == b"%%UNSUPPORTED%%\n" {
+            continue; // not yet lowered — logged in the summary count, not asserted
+        }
+        let rust = std::process::Command::new(bin)
+            .args(["build", "--emit", "mir"])
+            .arg(f)
+            .output()
+            .with_context(|| format!("`bet build --emit mir {}`", f.display()))?;
+        if !rust.status.success() {
+            bail!(
+                "reference `--emit mir` failed for {}:\n{}",
+                f.display(),
+                String::from_utf8_lossy(&rust.stderr)
+            );
+        }
+        if mine.stdout == rust.stdout {
+            lowered += 1;
+        } else {
+            mismatches.push(
+                f.strip_prefix(corpus_root)
+                    .unwrap_or(f)
+                    .display()
+                    .to_string(),
+            );
+        }
+    }
+    if !mismatches.is_empty() {
+        bail!(
+            "C4 lower: {} corpus program(s) betfe claims to lower have non-identical `mir` (betfe vs Rust):\n  {}",
+            mismatches.len(),
+            mismatches.join("\n  ")
+        );
+    }
+    Ok(lowered)
 }
 
 /// Assert that `betfe --emit <kind> P` is byte-identical to `bin build --emit <kind> P` for every

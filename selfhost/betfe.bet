@@ -9,12 +9,13 @@
 // way the Rust `frontend` crate holds lexer.rs / parser.rs / lower.rs together and `--emit <kind>`
 // stops after the relevant phase. Each phase is a section below.
 //
-// C1+C2+C3 status — the LEXER and PARSER are real. `betfe --emit tokens <file>` prints the post-ASI
-// token stream and `--emit ast <file>` prints the parsed AST, both in the exact format of
-// crates/frontend/src/dump.rs and both verified byte-identical against `bet build --emit <kind>`
-// over the WHOLE corpus by `cargo xtask selfhost`. With NO args betfe still emits the fixed `hello`
-// .mir (the C0 tracer) so the end-to-end `.mir` -> backend -> binary pipeline stays proven; that
-// fixed path retires at C4/C5 when real lowering lands. C4 adds lower + `--emit mir`.
+// C1+C2+C3 done, C4 in progress — the LEXER and PARSER are real. `betfe --emit tokens <file>`
+// prints the post-ASI token stream and `--emit ast <file>` prints the parsed AST, both in the exact
+// format of crates/frontend/src/dump.rs and both verified byte-identical against `bet build --emit
+// <kind>` over the WHOLE corpus by `cargo xtask selfhost`. `--emit mir <file>` lowers the AST to
+// .mir text (C4): byte-identical for the growing supported subset (print-only main so far), the
+// `%%UNSUPPORTED%%` sentinel otherwise. With NO args betfe still emits the fixed `hello` .mir (the
+// C0 tracer) so the `.mir` -> backend -> binary pipeline stays proven; it retires once C4 covers it.
 //
 // A Token here is a `drip { kind, text, hasText }` where `kind` is the canonical DUMP TAG (not a
 // 70-variant `moods` sum). This is deliberate: dump.rs maps every keyword to its own spelling, so
@@ -1866,6 +1867,427 @@ finna emitAst(toks: vec[Token]) -> str {
     bet sb.finish()
 }
 
+// Lex + parse a source string and emit its .mir text (or the unsupported sentinel).
+finna emitMirFromSrc(src: str) -> str {
+    lowkey pos = vec.new[int]()
+    pos.stack(0)
+    lowkey ns = vec.new[int]()
+    ns.stack(0)
+    lowkey p = P{ toks: lex(src), pos: pos, nodes: vec.new[Node](), ns: ns }
+    lowkey root = parseProgram(p)
+    bet emitMir(p, root)
+}
+
+// ===========================================================================
+// C4 — lowering (mirror of crates/frontend/src/lower.rs), emitting .mir text directly.
+//
+// betfe emits `.mir` TEXT (not an in-memory midir Module), so C4 (lower) and C5 (the .mir
+// printer) merge here: walk the AST label-tree and append text matching midir/src/text.rs and
+// lower.rs EXACTLY — same externs (bet_print is eager, ExternId 0), same SSA temp numbering, same
+// op sequence. This is grown incrementally; the SUPPORTED SUBSET so far is a print-only `main`
+// (spill.it / spill.f of str and int literals: hello, comments, spill-format). Any construct not
+// yet handled sets the ctx `unsupported` flag and emitMir returns the `%%UNSUPPORTED%%` sentinel,
+// which the `cargo xtask selfhost` C4 gate logs as not-yet-lowered (no silent gaps) rather than
+// diffing. As coverage grows, programs move from that list to byte-identical automatically.
+// ===========================================================================
+
+facts UNSUPPORTED = "%%UNSUPPORTED%%\n"
+
+// A `spill.f` format segment: literal text, or a `{}` hole consuming the next argument.
+drip Seg {
+    isHole: bool,
+    text: str
+}
+
+// The lowering context. All mutable state is shared-handle vecs (structs pass by value): the
+// ordered extern decl lines (bet_print pre-added), the current fn's local types (index = local
+// id — the SSA temp counter is `localTypes.gang()`), its bb0 statement lines, and a 1-elem
+// `ok` cell (0 once an unsupported construct is hit).
+drip LowerCtx {
+    externs: vec[str],
+    localTypes: vec[str],
+    stmts: vec[str],
+    ok: vec[int]
+}
+
+finna lcNew() -> LowerCtx {
+    lowkey ex = vec.new[str]()
+    ex.stack("extern \"C\" fn bet_print(rawptr, u64) -> void")
+    lowkey okc = vec.new[int]()
+    okc.stack(1)
+    bet LowerCtx{ externs: ex, localTypes: vec.new[str](), stmts: vec.new[str](), ok: okc }
+}
+
+finna lcOk(c: LowerCtx) -> bool {
+    bet c.ok[0] == 1
+}
+
+finna lcFail(c: LowerCtx) {
+    c.ok.pop()
+    c.ok.stack(0)
+}
+
+// Dedup-add an extern decl line, preserving first-use order (matches lower.rs get_extern).
+finna getExtern(c: LowerCtx, line: str) {
+    lowkey found = cap
+    lowkey n = c.externs.gang() as int
+    lowkey i = 0
+    vibin i < n {
+        fr str.slaps(c.externs[i], line) { found = nocap }
+        i = i + 1
+    }
+    fr !found { c.externs.stack(line) }
+}
+
+// Allocate a fresh SSA local of type `ty`; returns its id (mirrors ctx.new_local).
+finna newLocal(c: LowerCtx, ty: str) -> int {
+    lowkey id = c.localTypes.gang() as int
+    c.localTypes.stack(ty)
+    bet id
+}
+
+finna emitStmt(c: LowerCtx, line: str) {
+    c.stmts.stack(line)
+}
+
+// `%N` — a register name.
+finna reg(n: int) -> str {
+    bet cat2("%", itoa(n))
+}
+
+finna cat2(a: str, b: str) -> str {
+    lowkey sb = sbNew()
+    sb.add(a)
+    sb.add(b)
+    bet sb.finish()
+}
+
+// --- AST label-tree accessors (lowering reads the tree the parser built) ---
+finna kidCount(p: P, idx: int) -> int {
+    bet p.nodes[idx].kids.gang() as int
+}
+
+finna kidAt(p: P, idx: int, n: int) -> int {
+    bet p.nodes[idx].kids[n]
+}
+
+finna lab(p: P, idx: int) -> str {
+    bet p.nodes[idx].label
+}
+
+// The first space-delimited word of a label (its node kind).
+finna firstWord(s: str) -> str {
+    lowkey n = str.len(s)
+    lowkey i = 0
+    vibin i < n && str.at(s, i) != 32 {
+        i = i + 1
+    }
+    bet str.sub(s, 0, i)
+}
+
+// Everything after the first word (the payload — may contain spaces, e.g. a quoted string).
+finna afterFirst(s: str) -> str {
+    lowkey n = str.len(s)
+    lowkey i = 0
+    vibin i < n && str.at(s, i) != 32 {
+        i = i + 1
+    }
+    fr i >= n {
+        bet ""
+    }
+    bet str.sub(s, i + 1, n)
+}
+
+// The index of the first child whose label exactly equals `name` (or -1).
+finna findKid(p: P, idx: int, name: str) -> int {
+    lowkey n = kidCount(p, idx)
+    lowkey i = 0
+    vibin i < n {
+        lowkey k = kidAt(p, idx, i)
+        fr str.slaps(lab(p, k), name) {
+            bet k
+        }
+        i = i + 1
+    }
+    bet -1
+}
+
+// Undo the dump `quote`: strip the surrounding quotes and decode \\ \" \n \t \r back to bytes.
+// The AST stores string payloads quoted; lowering needs the raw value to concat/re-escape/split.
+finna unquote(q: str) -> str {
+    lowkey out = vec.new[u8]()
+    lowkey n = str.len(q)
+    lowkey i = 1
+    vibin i < n - 1 {
+        lowkey ch = str.at(q, i)
+        fr ch == 92 {
+            i = i + 1
+            lowkey e = str.at(q, i)
+            fr e == 110 {
+                out.stack(10 as u8)
+            } naw fr e == 116 {
+                out.stack(9 as u8)
+            } naw fr e == 114 {
+                out.stack(13 as u8)
+            } naw fr e == 92 {
+                out.stack(92 as u8)
+            } naw fr e == 34 {
+                out.stack(34 as u8)
+            } naw {
+                out.stack(e as u8)
+            }
+            i = i + 1
+        } naw {
+            out.stack(ch as u8)
+            i = i + 1
+        }
+    }
+    bet out.str()
+}
+
+// Split a `spill.f` format string into text/hole segments (mirror lower.rs split_format). Valid
+// corpus formats never contain a lone `{`/`}`, so those are passed through as literal bytes.
+finna splitFormat(fmt: str) -> vec[Seg] {
+    lowkey segs = vec.new[Seg]()
+    lowkey buf = vec.new[u8]()
+    lowkey n = str.len(fmt)
+    lowkey i = 0
+    vibin i < n {
+        lowkey ch = str.at(fmt, i)
+        lowkey nx = 0
+        fr i + 1 < n {
+            nx = str.at(fmt, i + 1)
+        }
+        fr ch == 123 && nx == 123 {
+            buf.stack(123 as u8)
+            i = i + 2
+        } naw fr ch == 123 && nx == 125 {
+            segs.stack(Seg{ isHole: cap, text: buf.str() })
+            buf = vec.new[u8]()
+            segs.stack(Seg{ isHole: nocap, text: "" })
+            i = i + 2
+        } naw fr ch == 125 && nx == 125 {
+            buf.stack(125 as u8)
+            i = i + 2
+        } naw {
+            buf.stack(ch as u8)
+            i = i + 1
+        }
+    }
+    segs.stack(Seg{ isHole: cap, text: buf.str() })
+    bet segs
+}
+
+// emit_print: str_ptr / str_len / call_extern @bet_print of a literal string (raw bytes).
+finna emitPrint(c: LowerCtx, raw: str) {
+    lowkey q = quote(raw)
+    lowkey ptr = newLocal(c, "rawptr")
+    lowkey len = newLocal(c, "u64")
+    lowkey res = newLocal(c, "void")
+    lowkey s1 = sbNew()
+    s1.add(reg(ptr))
+    s1.add(" = str_ptr(")
+    s1.add(q)
+    s1.add(")")
+    emitStmt(c, s1.finish())
+    lowkey s2 = sbNew()
+    s2.add(reg(len))
+    s2.add(" = str_len(")
+    s2.add(q)
+    s2.add(")")
+    emitStmt(c, s2.finish())
+    lowkey s3 = sbNew()
+    s3.add(reg(res))
+    s3.add(" = call_extern @bet_print(")
+    s3.add(reg(ptr))
+    s3.add(", ")
+    s3.add(reg(len))
+    s3.add(")")
+    emitStmt(c, s3.finish())
+}
+
+// emit_print_num: call_extern @name(valStr) after ensuring its extern decl (mirror emit_print_num).
+finna emitPrintNum(c: LowerCtx, externLine: str, name: str, valStr: str) {
+    getExtern(c, externLine)
+    lowkey res = newLocal(c, "void")
+    lowkey sb = sbNew()
+    sb.add(reg(res))
+    sb.add(" = call_extern @")
+    sb.add(name)
+    sb.add("(")
+    sb.add(valStr)
+    sb.add(")")
+    emitStmt(c, sb.finish())
+}
+
+// Lower a single printed argument expression (the SUPPORTED subset: str / int literals).
+finna lowerPrintExpr(c: LowerCtx, p: P, valIdx: int) {
+    lowkey h = firstWord(lab(p, valIdx))
+    fr str.slaps(h, "str") {
+        emitPrint(c, unquote(afterFirst(lab(p, valIdx))))
+    } naw fr str.slaps(h, "int") {
+        emitPrintNum(c, "extern \"C\" fn bet_print_i64(i64) -> void", "bet_print_i64", cat2(afterFirst(lab(p, valIdx)), "i64"))
+    } naw {
+        lcFail(c)
+    }
+}
+
+// The value expression of the nth argument under an `args` wrapper.
+finna argValue(p: P, argsIdx: int, n: int) -> int {
+    bet kidAt(p, kidAt(p, argsIdx, n), 0)
+}
+
+// Lower a `spill.it` / `spill.f` call (mirror lower_spill).
+finna lowerSpill(c: LowerCtx, p: P, methodIdx: int) {
+    lowkey method = afterFirst(lab(p, methodIdx))
+    lowkey argsIdx = findKid(p, methodIdx, "args")
+    fr argsIdx < 0 {
+        lcFail(c)
+    } naw fr str.slaps(method, "it") {
+        lowkey v = argValue(p, argsIdx, 0)
+        fr str.slaps(firstWord(lab(p, v)), "str") {
+            emitPrint(c, cat2(unquote(afterFirst(lab(p, v))), "\n"))
+        } naw {
+            lowerPrintExpr(c, p, v)
+            emitPrint(c, "\n")
+        }
+    } naw fr str.slaps(method, "f") {
+        lowkey fmtNode = argValue(p, argsIdx, 0)
+        fr !str.slaps(firstWord(lab(p, fmtNode)), "str") {
+            lcFail(c)
+        } naw {
+            lowkey segs = splitFormat(unquote(afterFirst(lab(p, fmtNode))))
+            lowkey hole = 1
+            lowkey nS = segs.gang() as int
+            lowkey i = 0
+            vibin i < nS {
+                lowkey seg = segs[i]
+                fr seg.isHole {
+                    lowerPrintExpr(c, p, argValue(p, argsIdx, hole))
+                    hole = hole + 1
+                } naw fr str.len(seg.text) > 0 {
+                    emitPrint(c, seg.text)
+                }
+                i = i + 1
+            }
+        }
+    } naw {
+        lcFail(c)
+    }
+}
+
+// Lower one statement (SUPPORTED subset: an expr-stmt that is a spill.it/spill.f call).
+finna lowerStmt(c: LowerCtx, p: P, stmtIdx: int) {
+    fr !str.slaps(lab(p, stmtIdx), "expr-stmt") {
+        lcFail(c)
+    } naw {
+        lowkey e = kidAt(p, stmtIdx, 0)
+        fr !str.slaps(firstWord(lab(p, e)), "method") {
+            lcFail(c)
+        } naw {
+            lowkey recv = findKid(p, e, "receiver")
+            lowkey isSpill = cap
+            fr recv >= 0 && kidCount(p, recv) > 0 {
+                fr str.slaps(lab(p, kidAt(p, recv, 0)), "name spill") {
+                    isSpill = nocap
+                }
+            }
+            fr isSpill {
+                lowerSpill(c, p, e)
+            } naw {
+                lcFail(c)
+            }
+        }
+    }
+}
+
+finna lowerBlock(c: LowerCtx, p: P, blockIdx: int) {
+    lowkey n = kidCount(p, blockIdx)
+    lowkey i = 0
+    vibin i < n && lcOk(c) {
+        lowerStmt(c, p, kidAt(p, blockIdx, i))
+        i = i + 1
+    }
+}
+
+// True when `funcIdx` is a `finna main()` with no generics, no params, and no return (the only
+// function shape C4.1 lowers). Its kids are [generics, params, ret, block].
+finna mainIsSimple(p: P, funcIdx: int) -> bool {
+    lowkey g = findKid(p, funcIdx, "generics")
+    lowkey pm = findKid(p, funcIdx, "params")
+    lowkey rt = findKid(p, funcIdx, "ret none")
+    fr g < 0 || pm < 0 || rt < 0 {
+        bet cap
+    }
+    bet kidCount(p, pm) == 0
+}
+
+// Assemble the full .mir text: extern decls, a blank line, then `fn main`.
+finna assembleMir(c: LowerCtx) -> str {
+    lowkey sb = sbNew()
+    lowkey ne = c.externs.gang() as int
+    lowkey i = 0
+    vibin i < ne {
+        sb.add(c.externs[i])
+        sb.add("\n")
+        i = i + 1
+    }
+    sb.add("\n")
+    sb.add("fn main() -> void {\n")
+    lowkey nl = c.localTypes.gang() as int
+    lowkey j = 0
+    vibin j < nl {
+        sb.add("  let ")
+        sb.add(reg(j))
+        sb.add(": ")
+        sb.add(c.localTypes[j])
+        sb.add("\n")
+        j = j + 1
+    }
+    sb.add("  bb0:\n")
+    lowkey ns = c.stmts.gang() as int
+    lowkey k = 0
+    vibin k < ns {
+        sb.add("    ")
+        sb.add(c.stmts[k])
+        sb.add("\n")
+        k = k + 1
+    }
+    sb.add("    return\n")
+    sb.add("}\n")
+    bet sb.finish()
+}
+
+// Walk the program and emit its .mir, or the `%%UNSUPPORTED%%` sentinel if it uses a construct
+// C4 doesn't lower yet.
+finna emitMir(p: P, root: int) -> str {
+    lowkey c = lcNew()
+    lowkey mainBlock = 0 - 1
+    lowkey nItems = kidCount(p, root)
+    lowkey i = 0
+    vibin i < nItems {
+        lowkey it = kidAt(p, root, i)
+        lowkey h = firstWord(lab(p, it))
+        fr str.slaps(h, "pull") {
+            // pull is a no-op import — ignored.
+        } naw fr str.slaps(lab(p, it), "func hush main") && mainIsSimple(p, it) {
+            mainBlock = findKid(p, it, "block")
+        } naw {
+            lcFail(c)
+        }
+        i = i + 1
+    }
+    fr mainBlock >= 0 && lcOk(c) {
+        lowerBlock(c, p, mainBlock)
+    } naw {
+        lcFail(c)
+    }
+    fr !lcOk(c) {
+        bet UNSUPPORTED
+    }
+    bet assembleMir(c)
+}
+
 // ===========================================================================
 // C0 tracer — the fixed `hello` .mir emission (retires at C4/C5 when real lowering lands).
 // ===========================================================================
@@ -1900,6 +2322,9 @@ finna main() {
     } naw fr sys.argc() >= 4 && str.slaps(sys.arg(1), "--emit") && str.slaps(sys.arg(2), "ast") {
         lowkey src = fs.peepText(sys.arg(3))
         spill.f("{}", emitAst(lex(src)))
+    } naw fr sys.argc() >= 4 && str.slaps(sys.arg(1), "--emit") && str.slaps(sys.arg(2), "mir") {
+        lowkey src = fs.peepText(sys.arg(3))
+        spill.f("{}", emitMirFromSrc(src))
     } naw {
         spill.it(emitHelloMir())
     }
