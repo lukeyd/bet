@@ -357,6 +357,8 @@ impl<'p> Interp<'p> {
                 let iter_val = self.eval_expr(env, iter)?;
                 let items = match iter_val {
                     Value::Array(xs) => xs,
+                    // A vec iterates over a snapshot of its current contents.
+                    Value::Vec(rc) => rc.borrow().clone(),
                     other => {
                         return Err(RunError::Type(format!(
                             "`squad` needs an array to iterate, got {}",
@@ -703,6 +705,18 @@ impl<'p> Interp<'p> {
                             )))
                         }
                     }
+                    Value::Vec(rc) => {
+                        let mut xs = rc.borrow_mut();
+                        let len = xs.len();
+                        if let Some(slot) = xs.get_mut(i) {
+                            *slot = val;
+                            Ok(())
+                        } else {
+                            Err(RunError::Type(format!(
+                                "index {i} out of bounds (len {len})"
+                            )))
+                        }
+                    }
                     other => Err(RunError::Type(format!(
                         "cannot index-assign into {}",
                         other.type_name()
@@ -809,6 +823,12 @@ impl<'p> Interp<'p> {
                     Value::Array(xs) => xs.get(i).cloned().ok_or_else(|| {
                         RunError::Type(format!("index {i} out of bounds (len {})", xs.len()))
                     }),
+                    Value::Vec(rc) => {
+                        let xs = rc.borrow();
+                        xs.get(i).cloned().ok_or_else(|| {
+                            RunError::Type(format!("index {i} out of bounds (len {})", xs.len()))
+                        })
+                    }
                     other => Err(RunError::Type(format!(
                         "cannot index {}",
                         other.type_name()
@@ -1017,10 +1037,11 @@ impl<'p> Interp<'p> {
                     "stash" if method == "new" => {
                         return Ok(vec![Value::Stash(Rc::new(RefCell::new(Vec::new())))]);
                     }
-                    // `vec.new[T]()` constructs an empty growable array. The `stack`/`pop`/`gang`
-                    // and iteration/index machinery below already operates on `Value::Array`.
+                    // `vec.new[T]()` constructs an empty growable vec — a shared, reference-counted
+                    // handle (like `stash`), so `stack`/`pop` through any holder are visible to all,
+                    // matching the compiled path's runtime-backed VecHandle.
                     "vec" if method == "new" => {
-                        return Ok(vec![Value::Array(Vec::new())]);
+                        return Ok(vec![Value::Vec(Rc::new(RefCell::new(Vec::new())))]);
                     }
                     // `mem.scratch()` is a fresh, untyped per-frame arena.
                     "mem" if method == "scratch" => {
@@ -1031,28 +1052,37 @@ impl<'p> Interp<'p> {
                 }
             }
         }
-        // `stack`/`pop` mutate an array in place, so they need an addressable receiver rather
-        // than an evaluated copy (squadops).
+        // `stack`/`pop` on a fixed `Array` mutate in place, so they need an addressable receiver
+        // rather than an evaluated copy (squadops value semantics). On a `Vec` they go through the
+        // shared handle instead; a temporary vec (e.g. returned from a call) is handled by the
+        // fall-through to `call_method` -> `call_vec_method`.
         if matches!(method, "stack" | "pop") {
             let arg_vals = self.eval_args(env, args)?;
-            if let Ok(Value::Array(xs)) = self.place_mut(env, receiver) {
-                return match method {
-                    "stack" => {
-                        let v = arg_vals
-                            .into_iter()
-                            .next()
-                            .ok_or_else(|| RunError::Type("`stack` takes a value".into()))?;
-                        xs.push(v);
-                        Ok(Vec::new())
-                    }
-                    // "pop"
-                    _ => {
-                        let v = xs
-                            .pop()
-                            .ok_or_else(|| RunError::Type("`pop` on an empty array".into()))?;
-                        Ok(vec![v])
-                    }
-                };
+            match self.place_mut(env, receiver) {
+                Ok(Value::Array(xs)) => {
+                    return match method {
+                        "stack" => {
+                            let v = arg_vals
+                                .into_iter()
+                                .next()
+                                .ok_or_else(|| RunError::Type("`stack` takes a value".into()))?;
+                            xs.push(v);
+                            Ok(Vec::new())
+                        }
+                        // "pop"
+                        _ => {
+                            let v = xs
+                                .pop()
+                                .ok_or_else(|| RunError::Type("`pop` on an empty array".into()))?;
+                            Ok(vec![v])
+                        }
+                    };
+                }
+                Ok(Value::Vec(rc)) => {
+                    let rc = rc.clone();
+                    return vec_stack_pop(&rc, method, arg_vals);
+                }
+                _ => {}
             }
         }
         // Otherwise it's a user method call: evaluate the receiver, then dispatch.
@@ -1212,6 +1242,21 @@ impl<'p> Interp<'p> {
         if let Value::Stash(map) = &recv {
             let map = map.clone();
             return self.call_stash(env, map, method, args);
+        }
+        // `vec` methods dispatch on the reference-counted handle: `stack`/`pop` mutate it in place
+        // (shared with every holder); `gang`/`vibeCheck`/`glowUp` read a snapshot.
+        if let Value::Vec(rc) = &recv {
+            let rc = rc.clone();
+            return match method {
+                "stack" | "pop" => {
+                    let arg_vals = self.eval_args(env, args)?;
+                    vec_stack_pop(&rc, method, arg_vals)
+                }
+                _ => {
+                    let xs = rc.borrow().clone();
+                    self.call_array_method(env, xs, method, args)
+                }
+            };
         }
         // Pure collection methods on an array (squadops): `gang`, `vibeCheck`, `glowUp`. The
         // mutating `stack`/`pop` are handled earlier in `eval_method_call` (they need a place).
@@ -1489,6 +1534,34 @@ impl<'p> Interp<'p> {
 // ================================================================================
 // Free helpers (no `self`).
 // ================================================================================
+
+/// The mutating `vec` methods on the shared handle: `stack` (push) and `pop`. Mutations go
+/// through the `Rc<RefCell<..>>`, so they are visible to every holder — matching the compiled
+/// path's runtime-backed VecHandle.
+fn vec_stack_pop(
+    rc: &Rc<RefCell<Vec<Value>>>,
+    method: &str,
+    arg_vals: Vec<Value>,
+) -> Result<Vec<Value>, RunError> {
+    match method {
+        "stack" => {
+            let v = arg_vals
+                .into_iter()
+                .next()
+                .ok_or_else(|| RunError::Type("`stack` takes a value".into()))?;
+            rc.borrow_mut().push(v);
+            Ok(Vec::new())
+        }
+        "pop" => {
+            let v = rc
+                .borrow_mut()
+                .pop()
+                .ok_or_else(|| RunError::Type("`pop` on an empty vec".into()))?;
+            Ok(vec![v])
+        }
+        other => Err(RunError::Undefined(format!("vec.{other}"))),
+    }
+}
 
 /// Collect a `[]u8`-shaped array (elements are byte or in-range int values) into raw bytes,
 /// for `str.fromBytes` / `str.fromBytesTrust`.

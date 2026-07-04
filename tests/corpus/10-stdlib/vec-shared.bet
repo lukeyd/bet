@@ -1,0 +1,34 @@
+// vec is a shared handle (reference semantics), NOT a value-copied array: a vec passed to a
+// function, re-bound, or stored in a struct is aliased, so a stack/pop through any holder is
+// visible to every other. This is the invariant the self-hosted compiler relies on — it threads
+// token/AST vecs through helper functions and keeps them in parser/lexer structs. interp ==
+// compiled (both share the underlying runtime-backed buffer).
+pull "spill"
+pull "vec"
+
+drip Lexer {
+    toks: vec[int]
+}
+
+finna emit(v: vec[int], x: int) {
+    v.stack(x)
+}
+
+finna main() {
+    lowkey xs = vec.new[int]()
+    xs.stack(1)
+    emit(xs, 2)                // push through a parameter alias
+    emit(xs, 3)
+    spill.it(xs.gang())        // 3
+
+    lowkey ys = xs             // re-bind: same handle
+    ys.stack(4)
+    spill.it(xs.gang())        // 4
+
+    // a vec inside a struct is shared too
+    lowkey lx = Lexer { toks: vec.new[int]() }
+    lx.toks.stack(10)
+    lx.toks.stack(20)
+    spill.it(lx.toks.gang())   // 2
+    spill.it(lx.toks[1])       // 20
+}

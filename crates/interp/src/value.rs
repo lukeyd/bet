@@ -63,6 +63,11 @@ pub enum Value {
     /// or passed to a function is shared, not value-copied — matching the compiled path's opaque
     /// handle. Entries are `(key, value)` pairs (linear probing; the corpus keeps them small).
     Stash(Rc<RefCell<Vec<(Value, Value)>>>),
+    /// A growable `vec[T]`. Like `Stash`, reference-counted: a vec passed to a function or stored
+    /// in a struct is a shared handle, so a `stack`/`pop` through any holder is visible to all —
+    /// matching the compiled path's runtime-backed `VecHandle`. Distinct from `Array`, which is a
+    /// fixed value-semantics literal (`[a, b, c]`) copied on assignment.
+    Vec(Rc<RefCell<Vec<Value>>>),
 }
 
 /// The default display of a value (corpus "Display rules"): the text `spill.it` prints before
@@ -105,6 +110,15 @@ pub fn display(v: &Value) -> String {
         } => format!("<tag #{slot}@{generation}>"),
         Value::Crib(id) => format!("<crib #{id}>"),
         Value::Stash(m) => format!("<stash x{}>", m.borrow().len()),
+        Value::Vec(xs) => {
+            let inner = xs
+                .borrow()
+                .iter()
+                .map(display)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("[{inner}]")
+        }
     }
 }
 
@@ -137,6 +151,7 @@ impl Value {
             Value::Tag { .. } => "tag",
             Value::Crib(_) => "crib",
             Value::Stash(_) => "stash",
+            Value::Vec(_) => "vec",
         }
     }
 }

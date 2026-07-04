@@ -374,6 +374,12 @@ covers = ["stdlib.vec"]
 interp = "pass"
 compiled = "pass"
 
+[[program]]
+path = "10-stdlib/vec-shared"
+covers = ["stdlib.vec"]
+interp = "pass"
+compiled = "pass"
+
 # --- 11 reference oracles ---------------------------------------------------
 [[program]]
 path = "11-reference/mini-compiler"
