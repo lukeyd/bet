@@ -1952,7 +1952,21 @@ drip LowerCtx {
     externFnRet: vec[str],
     externFnDecl: vec[str],
     loopIncr: vec[int],
-    loopExit: vec[int]
+    loopExit: vec[int],
+    // --- generics / monomorphization ---
+    // Active type-parameter substitution (T -> concrete .mir type) while lowering an instance.
+    substNames: vec[str],
+    substTypes: vec[str],
+    // Generic fn/struct definitions kept by name (-> their AST node index) for on-demand instances.
+    genFnNames: vec[str],
+    genFnIdx: vec[int],
+    genStructNames: vec[str],
+    genStructIdx: vec[int],
+    // Reserved-but-not-yet-lowered fn instances (drained after the concrete funcs): the base
+    // generic name, the mangled instance name, and a "," CSV of concrete arg .mir types.
+    moQName: vec[str],
+    moQMangled: vec[str],
+    moQArgs: vec[str]
 }
 
 finna lcNew() -> LowerCtx {
@@ -1968,7 +1982,7 @@ finna lcNew() -> LowerCtx {
     blks.stack(blkNew())
     lowkey cur = vec.new[int]()
     cur.stack(0)
-    bet LowerCtx{ externs: ex, fns: vec.new[str](), fnNames: vec.new[str](), fnParamCsv: vec.new[str](), fnRet: vec.new[str](), localTypes: vec.new[str](), paramCount: pc, curRet: cr, blocks: blks, curBlock: cur, ok: okc, bindNames: vec.new[str](), bindIds: vec.new[int](), constNames: vec.new[str](), constVals: vec.new[str](), constTys: vec.new[str](), gConstNames: vec.new[str](), gConstVals: vec.new[str](), gConstTys: vec.new[str](), structNames: vec.new[str](), structDecls: vec.new[str](), fieldStruct: vec.new[str](), fieldNames: vec.new[str](), fieldTypes: vec.new[str](), fieldIdx: vec.new[int](), sumNames: vec.new[str](), sumDecls: vec.new[str](), variantSum: vec.new[str](), variantNames: vec.new[str](), variantIdx: vec.new[int](), variantPayload: vec.new[str](), externFnNames: vec.new[str](), externFnParamCsv: vec.new[str](), externFnRet: vec.new[str](), externFnDecl: vec.new[str](), loopIncr: vec.new[int](), loopExit: vec.new[int]() }
+    bet LowerCtx{ externs: ex, fns: vec.new[str](), fnNames: vec.new[str](), fnParamCsv: vec.new[str](), fnRet: vec.new[str](), localTypes: vec.new[str](), paramCount: pc, curRet: cr, blocks: blks, curBlock: cur, ok: okc, bindNames: vec.new[str](), bindIds: vec.new[int](), constNames: vec.new[str](), constVals: vec.new[str](), constTys: vec.new[str](), gConstNames: vec.new[str](), gConstVals: vec.new[str](), gConstTys: vec.new[str](), structNames: vec.new[str](), structDecls: vec.new[str](), fieldStruct: vec.new[str](), fieldNames: vec.new[str](), fieldTypes: vec.new[str](), fieldIdx: vec.new[int](), sumNames: vec.new[str](), sumDecls: vec.new[str](), variantSum: vec.new[str](), variantNames: vec.new[str](), variantIdx: vec.new[int](), variantPayload: vec.new[str](), externFnNames: vec.new[str](), externFnParamCsv: vec.new[str](), externFnRet: vec.new[str](), externFnDecl: vec.new[str](), loopIncr: vec.new[int](), loopExit: vec.new[int](), substNames: vec.new[str](), substTypes: vec.new[str](), genFnNames: vec.new[str](), genFnIdx: vec.new[int](), genStructNames: vec.new[str](), genStructIdx: vec.new[int](), moQName: vec.new[str](), moQMangled: vec.new[str](), moQArgs: vec.new[str]() }
 }
 
 // --- per-function reset (structs pass by value, so drain the shared-handle vecs in place) ---
@@ -2647,9 +2661,308 @@ finna isPlace(s: str) -> bool {
 }
 
 // The .mir type string for a type node (scalar named types only in C4.2).
+// ===========================================================================
+// Generics / monomorphization (mirror lower.rs: mono_struct / mono_fn / lower_mono_fn / mangle).
+// Generic defs are collected by name; each distinct concrete instantiation is emitted once with a
+// name-mangled symbol (`pickFirst$i64`, `Pair$str`). A work-list drains fn instances after the
+// concrete funcs, so an instance that calls further generics spawns more instances.
+// ===========================================================================
+
+// --- active type-parameter substitution (T -> concrete .mir type) ---
+finna clearSubst(c: LowerCtx) {
+    vibin (c.substNames.gang() as int) > 0 {
+        c.substNames.pop()
+        c.substTypes.pop()
+    }
+}
+
+// The concrete .mir type bound to type-parameter `name`, or "" if `name` is not a bound param.
+finna substLookup(c: LowerCtx, name: str) -> str {
+    lowkey n = c.substNames.gang() as int
+    lowkey i = 0
+    vibin i < n {
+        fr str.slaps(c.substNames[i], name) { bet c.substTypes[i] }
+        i = i + 1
+    }
+    bet ""
+}
+
+// Snapshot the active substitution (so a nested instantiation can save/restore the caller's).
+finna substSnapshot(c: LowerCtx) -> (vec[str], vec[str]) {
+    lowkey sn = vec.new[str]()
+    lowkey st = vec.new[str]()
+    lowkey n = c.substNames.gang() as int
+    lowkey i = 0
+    vibin i < n {
+        sn.stack(c.substNames[i])
+        st.stack(c.substTypes[i])
+        i = i + 1
+    }
+    bet sn, st
+}
+
+finna substRestore(c: LowerCtx, sn: vec[str], st: vec[str]) {
+    clearSubst(c)
+    lowkey n = sn.gang() as int
+    lowkey i = 0
+    vibin i < n {
+        c.substNames.stack(sn[i])
+        c.substTypes.stack(st[i])
+        i = i + 1
+    }
+}
+
+// Split a space-separated string into its words (generic param name lists are `T` / `T U`).
+finna splitWs(s: str) -> vec[str] {
+    lowkey out = vec.new[str]()
+    lowkey n = str.len(s)
+    lowkey start = 0
+    lowkey i = 0
+    vibin i < n {
+        fr str.at(s, i) == 32 {
+            fr i > start { out.stack(str.sub(s, start, i)) }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    fr n > start { out.stack(str.sub(s, start, n)) }
+    bet out
+}
+
+// Join a vec of strings with "," (comma only — the CSV format `csvAt` splits on).
+finna joinCsv(v: vec[str]) -> str {
+    lowkey sb = sbNew()
+    lowkey n = v.gang() as int
+    lowkey i = 0
+    vibin i < n {
+        fr i > 0 { sb.add(",") }
+        sb.add(v[i])
+        i = i + 1
+    }
+    bet sb.finish()
+}
+
+// The space-separated generic-param names of a decl node (`generics T U` -> "T U"), or "".
+finna genericParamsStr(p: P, declIdx: int) -> str {
+    lowkey g = findKidWord(p, declIdx, "generics")
+    fr g < 0 { bet "" }
+    bet afterFirst(lab(p, g))
+}
+
+// True if a `func`/`drip`/`moods` decl has a non-empty generic parameter list.
+finna isGenericDeclG(p: P, declIdx: int) -> bool {
+    bet !isEmpty(genericParamsStr(p, declIdx))
+}
+
+// Replace the active substitution with {decl's generic params -> the given concrete arg CSV}.
+finna setSubstCsv(c: LowerCtx, p: P, declIdx: int, argsCsv: str) {
+    clearSubst(c)
+    lowkey names = splitWs(genericParamsStr(p, declIdx))
+    lowkey n = names.gang() as int
+    lowkey i = 0
+    vibin i < n {
+        c.substNames.stack(names[i])
+        c.substTypes.stack(csvAt(argsCsv, i))
+        i = i + 1
+    }
+}
+
+// --- generic-definition registries (populated by the prescan; keyed by base name) ---
+finna isGenericFn(c: LowerCtx, name: str) -> bool {
+    lowkey n = c.genFnNames.gang() as int
+    lowkey i = 0
+    vibin i < n {
+        fr str.slaps(c.genFnNames[i], name) { bet nocap }
+        i = i + 1
+    }
+    bet cap
+}
+
+finna lookupGenericFn(c: LowerCtx, name: str) -> int {
+    lowkey n = c.genFnNames.gang() as int
+    lowkey i = 0
+    vibin i < n {
+        fr str.slaps(c.genFnNames[i], name) { bet i }
+        i = i + 1
+    }
+    bet 0 - 1
+}
+
+finna isGenericStruct(c: LowerCtx, name: str) -> bool {
+    lowkey n = c.genStructNames.gang() as int
+    lowkey i = 0
+    vibin i < n {
+        fr str.slaps(c.genStructNames[i], name) { bet nocap }
+        i = i + 1
+    }
+    bet cap
+}
+
+finna lookupGenericStruct(c: LowerCtx, name: str) -> int {
+    lowkey n = c.genStructNames.gang() as int
+    lowkey i = 0
+    vibin i < n {
+        fr str.slaps(c.genStructNames[i], name) { bet i }
+        i = i + 1
+    }
+    bet 0 - 1
+}
+
+// --- symbol mangling (mirror lower.rs mangle / mangle_ty) ---
+// The mangle suffix component for one concrete .mir type. Scalars and (already-mangled) aggregate
+// names map to themselves; slice/array match lower.rs; anything else is conservatively sentineled.
+finna mangleTy(c: LowerCtx, mir: str) -> str {
+    fr isIntTy(mir) || isFloatTy(mir) { bet mir }
+    fr str.slaps(mir, "bool") || str.slaps(mir, "str") { bet mir }
+    fr str.slaps(mir, "void") || str.slaps(mir, "rawptr") { bet mir }
+    fr isStruct(c, mir) || isSum(c, mir) { bet mir }
+    fr isSliceTy(mir) { bet cat2("slice_", mangleTy(c, sliceElem(mir))) }
+    fr isArrayTy(mir) { bet cat2(cat2("arr", arrayLenStr(mir)), cat2("_", mangleTy(c, arrayElem(mir)))) }
+    lcFail(c)
+    bet mir
+}
+
+// `base$t0$t1..` — the mangled instance symbol for a generic instantiation.
+finna mangle(c: LowerCtx, base: str, argTys: vec[str]) -> str {
+    lowkey sb = sbNew()
+    sb.add(base)
+    lowkey n = argTys.gang() as int
+    lowkey i = 0
+    vibin i < n {
+        sb.add("$")
+        sb.add(mangleTy(c, argTys[i]))
+        i = i + 1
+    }
+    bet sb.finish()
+}
+
+// Map every child of `parent` as a type node -> a vec of concrete .mir type strings. Used for both
+// a `typeargs` wrapper (call / struct-lit sites) and a `named STRUCT <args..>` type position.
+finna mapTypeArgs(c: LowerCtx, p: P, parent: int) -> vec[str] {
+    lowkey out = vec.new[str]()
+    lowkey n = kidCount(p, parent)
+    lowkey i = 0
+    vibin i < n {
+        out.stack(mapTypeNode(c, p, kidAt(p, parent, i)))
+        i = i + 1
+    }
+    bet out
+}
+
+// Instantiate a generic `drip` at concrete `argTys`, returning the mangled struct name (rendering
+// its `struct NAME { .. }` decl and registering its fields on first use). Mirror mono_struct.
+finna monoStruct(c: LowerCtx, p: P, genName: str, argTys: vec[str]) -> str {
+    lowkey mangled = mangle(c, genName, argTys)
+    fr !lcOk(c) { bet mangled }
+    fr isStruct(c, mangled) { bet mangled }
+    lowkey gi = lookupGenericStruct(c, genName)
+    fr gi < 0 {
+        lcFail(c)
+        bet mangled
+    }
+    lowkey dripIdx = c.genStructIdx[gi]
+    lowkey names = splitWs(genericParamsStr(p, dripIdx))
+    fr (names.gang() as int) != (argTys.gang() as int) {
+        lcFail(c)
+        bet mangled
+    }
+    lowkey argsCsv = joinCsv(argTys)
+    lowkey sn, st = substSnapshot(c)
+    setSubstCsv(c, p, dripIdx, argsCsv)
+    lowkey sb = sbNew()
+    sb.add("struct ")
+    sb.add(mangled)
+    sb.add(" {")
+    lowkey nk = kidCount(p, dripIdx)
+    lowkey pos = 0
+    lowkey i = 0
+    vibin i < nk && lcOk(c) {
+        lowkey k = kidAt(p, dripIdx, i)
+        fr str.slaps(firstWord(lab(p, k)), "field") {
+            lowkey visName = afterFirst(lab(p, k))
+            lowkey vis = firstWord(visName)
+            fr str.slaps(vis, "default") { vis = "hush" }
+            lowkey fname = afterFirst(visName)
+            lowkey fty = mapTypeNode(c, p, kidAt(p, k, 0))
+            fr pos == 0 { sb.add(" ") } naw { sb.add(", ") }
+            sb.add(vis)
+            sb.add(" ")
+            sb.add(fname)
+            sb.add(": ")
+            sb.add(fty)
+            addField(c, mangled, fname, fty, pos)
+            pos = pos + 1
+        }
+        i = i + 1
+    }
+    sb.add(" }")
+    substRestore(c, sn, st)
+    c.structNames.stack(mangled)
+    c.structDecls.stack(sb.finish())
+    bet mangled
+}
+
+// Reserve (and register the signature of) a generic function instance at concrete `argTys`,
+// returning its mangled name and enqueuing its body for later lowering. Mirror mono_fn.
+finna monoFn(c: LowerCtx, p: P, genName: str, argTys: vec[str]) -> str {
+    lowkey mangled = mangle(c, genName, argTys)
+    fr !lcOk(c) { bet mangled }
+    fr lookupFn(c, mangled) >= 0 { bet mangled }
+    lowkey gi = lookupGenericFn(c, genName)
+    fr gi < 0 {
+        lcFail(c)
+        bet mangled
+    }
+    lowkey funcIdx = c.genFnIdx[gi]
+    // Generic methods (a receiver) are not yet lowered.
+    fr findKidWord(p, funcIdx, "receiver") >= 0 {
+        lcFail(c)
+        bet mangled
+    }
+    lowkey names = splitWs(genericParamsStr(p, funcIdx))
+    fr (names.gang() as int) != (argTys.gang() as int) {
+        lcFail(c)
+        bet mangled
+    }
+    lowkey argsCsv = joinCsv(argTys)
+    lowkey sn, st = substSnapshot(c)
+    setSubstCsv(c, p, funcIdx, argsCsv)
+    lowkey pw = findKid(p, funcIdx, "params")
+    lowkey csv = collectParamTypes(c, p, pw)
+    lowkey ret = collectRetType(c, p, funcIdx)
+    substRestore(c, sn, st)
+    c.fnNames.stack(mangled)
+    c.fnParamCsv.stack(csv)
+    c.fnRet.stack(ret)
+    c.moQName.stack(genName)
+    c.moQMangled.stack(mangled)
+    c.moQArgs.stack(argsCsv)
+    bet mangled
+}
+
+// Lower one queued monomorphized function instance from the work-list (mirror lower_mono_fn).
+finna lowerMonoFn(c: LowerCtx, p: P, qi: int) {
+    lowkey genName = c.moQName[qi]
+    lowkey mangled = c.moQMangled[qi]
+    lowkey argsCsv = c.moQArgs[qi]
+    lowkey gi = lookupGenericFn(c, genName)
+    fr gi < 0 {
+        lcFail(c)
+    } naw {
+        lowkey funcIdx = c.genFnIdx[gi]
+        lowkey sn, st = substSnapshot(c)
+        setSubstCsv(c, p, funcIdx, argsCsv)
+        lowerFuncNamed(c, p, funcIdx, mangled)
+        substRestore(c, sn, st)
+    }
+}
+
 finna mapTypeNode(c: LowerCtx, p: P, tyNode: int) -> str {
     fr str.slaps(firstWord(lab(p, tyNode)), "named") {
         lowkey nm = afterFirst(lab(p, tyNode))
+        // A type-parameter name in the active substitution resolves to its concrete argument.
+        lowkey sub = substLookup(c, nm)
+        fr !isEmpty(sub) { bet sub }
         lowkey m = mapScalar(nm)
         fr !isEmpty(m) { bet m }
         fr str.slaps(nm, "yikes") {
@@ -2659,6 +2972,10 @@ finna mapTypeNode(c: LowerCtx, p: P, tyNode: int) -> str {
         // A `vec[T]` type node is `named vec` with the element type as its child.
         fr str.slaps(nm, "vec") && kidCount(p, tyNode) > 0 {
             bet vecTyStr(mapTypeNode(c, p, kidAt(p, tyNode, 0)))
+        }
+        // `Pair[int]` in a type position: `named STRUCT` with the type args as direct children.
+        fr kidCount(p, tyNode) > 0 && isGenericStruct(c, nm) {
+            bet monoStruct(c, p, nm, mapTypeArgs(c, p, tyNode))
         }
         fr isStruct(c, nm) { bet nm }
         fr isSum(c, nm) { bet nm }
@@ -3536,6 +3853,19 @@ finna lowerMethodCall(c: LowerCtx, p: P, idx: int) -> (str, str) {
 // operands are built in DECLARATION order (matched by name), each lowered with its field type.
 finna lowerStructLit(c: LowerCtx, p: P, idx: int) -> (str, str) {
     lowkey name = afterFirst(lab(p, idx))
+    // `Pair[int]{ .. }` — a generic struct literal carries a `typeargs` child; monomorphize it to
+    // the mangled struct (and re-point `name` at that instance) before matching fields.
+    lowkey taW = findKid(p, idx, "typeargs")
+    fr taW >= 0 {
+        fr !isGenericStruct(c, name) {
+            lcFail(c)
+            bet "0i64", "i64"
+        }
+        name = monoStruct(c, p, name, mapTypeArgs(c, p, taW))
+        fr !lcOk(c) {
+            bet "0i64", "i64"
+        }
+    }
     fr !isStruct(c, name) {
         lcFail(c)
         bet "0i64", "i64"
@@ -3677,8 +4007,8 @@ finna lowerIndex(c: LowerCtx, p: P, idx: int) -> (str, str) {
 finna lowerCall(c: LowerCtx, p: P, idx: int) -> (str, str) {
     lowkey calleeW = findKid(p, idx, "callee")
     lowkey calleeE = kidAt(p, calleeW, 0)
-    // Only a bare (non-generic, non-local) function name is lowered in this subset.
-    fr !str.slaps(firstWord(lab(p, calleeE)), "name") || kidCount(p, calleeE) > 0 {
+    // Only a bare function name is a direct call (a generic call adds a `typeargs` child, below).
+    fr !str.slaps(firstWord(lab(p, calleeE)), "name") {
         lcFail(c)
         bet "0i64", "i64"
     }
@@ -3686,6 +4016,23 @@ finna lowerCall(c: LowerCtx, p: P, idx: int) -> (str, str) {
     fr lookupLocal(c, nm) >= 0 {
         lcFail(c)
         bet "0i64", "i64"
+    }
+    // A generic call `f[int](..)` — the callee `name f` carries a `typeargs` child. Monomorphize
+    // the instance and re-point `nm` at its mangled symbol, then fall through to the normal path.
+    fr kidCount(p, calleeE) > 0 {
+        lowkey taW = findKid(p, calleeE, "typeargs")
+        fr taW < 0 || !isGenericFn(c, nm) {
+            lcFail(c)
+            bet "0i64", "i64"
+        }
+        lowkey gargs = mapTypeArgs(c, p, taW)
+        fr !lcOk(c) {
+            bet "0i64", "i64"
+        }
+        nm = monoFn(c, p, nm, gargs)
+        fr !lcOk(c) {
+            bet "0i64", "i64"
+        }
     }
     // A callee that names a `moods` variant (and not a fn) is a value constructor with payload.
     lowkey vi = lookupVariant(c, nm)
@@ -4517,9 +4864,10 @@ finna collectRetType(c: LowerCtx, p: P, funcIdx: int) -> str {
 // collect pass). Generic / receiver / non-scalar signatures defer the whole program.
 finna registerFn(c: LowerCtx, p: P, funcIdx: int) {
     lowkey name = afterFirst(afterFirst(lab(p, funcIdx)))
-    lowkey g = findKid(p, funcIdx, "generics")
-    fr g < 0 || !isEmpty(afterFirst(lab(p, g))) {
-        lcFail(c)
+    fr isGenericDecl(p, funcIdx) {
+        // A generic `finna f[T](..)` — store for on-demand monomorphization; no concrete sig here.
+        c.genFnNames.stack(name)
+        c.genFnIdx.stack(funcIdx)
     } naw {
         // A receiver method's receiver is a leading parameter (mirror has_receiver).
         lowkey pw = findKid(p, funcIdx, "params")
@@ -4611,16 +4959,18 @@ finna lowerGlobalConst(c: LowerCtx, p: P, stmtIdx: int) {
     }
 }
 
-// True if a `drip`/`moods` item is generic (deferred).
+// True if a `drip`/`moods` item is generic. (A generic decl's node is labeled `generics T ..`, so
+// it must be found by first-word match — the empty non-generic node is labeled exactly `generics`.)
 finna isGenericDecl(p: P, declIdx: int) -> bool {
-    lowkey g = findKid(p, declIdx, "generics")
-    bet g >= 0 && !isEmpty(afterFirst(lab(p, g)))
+    bet isGenericDeclG(p, declIdx)
 }
 
-// Prescan pass 1: register a struct's name so any field/variant type can resolve it.
+// Prescan pass 1: register a struct's name so any field/variant type can resolve it. A generic
+// `drip S[T] { .. }` is stored for on-demand monomorphization instead (no concrete decl here).
 finna registerStructName(c: LowerCtx, p: P, dripIdx: int) {
     fr isGenericDecl(p, dripIdx) {
-        lcFail(c)
+        c.genStructNames.stack(afterFirst(afterFirst(lab(p, dripIdx))))
+        c.genStructIdx.stack(dripIdx)
     } naw {
         c.structNames.stack(afterFirst(afterFirst(lab(p, dripIdx))))
     }
@@ -4767,8 +5117,14 @@ finna collectConsts(c: LowerCtx, p: P, root: int) {
 
 // Lower one function to .mir text (mirror lower_func + lower_fn_core).
 finna lowerFunc(c: LowerCtx, p: P, funcIdx: int) {
-    lowkey name = afterFirst(afterFirst(lab(p, funcIdx)))
-    lowkey fi = lookupFn(c, name)
+    lowerFuncNamed(c, p, funcIdx, afterFirst(afterFirst(lab(p, funcIdx))))
+}
+
+// As `lowerFunc`, but with the emitted symbol given explicitly (a monomorphized instance uses its
+// mangled name and looks up its reserved signature under that name; the active subst supplies the
+// concrete param/ret types via `mapTypeNode`).
+finna lowerFuncNamed(c: LowerCtx, p: P, funcIdx: int, emitName: str) {
+    lowkey fi = lookupFn(c, emitName)
     lowkey pw = findKid(p, funcIdx, "params")
     lowkey recvW = findKidWord(p, funcIdx, "receiver")
     lowkey explicit = kidCount(p, pw)
@@ -4799,7 +5155,7 @@ finna lowerFunc(c: LowerCtx, p: P, funcIdx: int) {
     }
     lowkey sig = sbNew()
     sig.add("fn ")
-    sig.add(name)
+    sig.add(emitName)
     sig.add("(")
     lowkey ps = vec.new[str]()
     lowkey j = 0
@@ -4914,11 +5270,20 @@ finna emitMir(p: P, root: int) -> str {
         } naw fr str.slaps(h, "moods") {
             // sums were registered in the type prescan.
         } naw fr str.slaps(h, "func") {
-            lowerFunc(c, p, it)
+            // Concrete functions are lowered in place; generic ones are instantiated on demand
+            // (their bodies are drained from the work-list after all concrete funcs, below).
+            fr !isGenericDecl(p, it) { lowerFunc(c, p, it) }
         } naw {
             lcFail(c)
         }
         i = i + 1
+    }
+    // Drain the monomorphization work-list. Instances may enqueue further instances (a generic
+    // function calling another generic instance); the index walk picks those up too.
+    lowkey qi = 0
+    vibin qi < (c.moQName.gang() as int) && lcOk(c) {
+        lowerMonoFn(c, p, qi)
+        qi = qi + 1
     }
     fr !lcOk(c) {
         bet UNSUPPORTED
