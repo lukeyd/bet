@@ -408,6 +408,12 @@ size = 13
 # name), and `vibe` (discriminant + switch [v -> bb] else default; per-arm downcast(v).field(j)
 # payload binds; reserved unreachable merge; `naw` default body; scrutinee may be any place).
 # Unlocks moods-basics/moods-exhaustive/expr-eval/struct-payload (crib-variants needs memory). 29/59.
+# C4.11 added FFI extern imports (extern "C" finna -> call_extern @NAME + decl on first use) and the
+# sys.argc/sys.arg/str.len intrinsics (31/59). C4.12 added the yikes error type: the synthesized
+# __yikes{present,msg} struct (lazily registered on first use, printed first), yikes.new/ghosted
+# construction, the `!= ghosted`/`== ghosted` present-flag idiom, spill of a yikes (prints .msg),
+# `bounce` (early return of zeros + err), and `.tea` (bet_str_concat wrap). yeet/sheesh stay sentinel
+# (unlowered in the Rust frontend too). Unlocks yikes-basics/bounce/tea-wrap. 34/59 byte-identical.
 status = "doing"
 
 [[task]]

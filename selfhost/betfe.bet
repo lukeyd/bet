@@ -2343,6 +2343,35 @@ finna emitMakeVariant(c: LowerCtx, sumName: str, variantName: str, ops: vec[str]
     bet reg(tmp), sumName
 }
 
+// --- yikes: the built-in error type, a synthesized struct `__yikes { present: bool, msg: str }` ---
+finna isYikesTy(ty: str) -> bool {
+    bet str.slaps(ty, "__yikes")
+}
+
+// Lazily register the `__yikes` struct on first use (mirror the frontend's lazy yikes_struct).
+finna ensureYikes(c: LowerCtx) {
+    fr !isStruct(c, "__yikes") {
+        c.structNames.stack("__yikes")
+        c.structDecls.stack("struct __yikes { hush present: bool, hush msg: str }")
+        addField(c, "__yikes", "present", "bool", 0)
+        addField(c, "__yikes", "msg", "str", 1)
+    }
+}
+
+// Emit `%t = make __yikes(present, msg)` and return (reg, "__yikes").
+finna emitMakeYikes(c: LowerCtx, present: str, msg: str) -> (str, str) {
+    ensureYikes(c)
+    lowkey tmp = newLocal(c, "__yikes")
+    lowkey sb = sbNew()
+    sb.add("make __yikes(")
+    sb.add(present)
+    sb.add(", ")
+    sb.add(msg)
+    sb.add(")")
+    emitAssign(c, tmp, sb.finish())
+    bet reg(tmp), "__yikes"
+}
+
 // --- scalar type helpers ---
 finna isSignedIntTy(t: str) -> bool {
     bet str.slaps(t, "i8") || str.slaps(t, "i16") || str.slaps(t, "i32") || str.slaps(t, "i64")
@@ -2536,6 +2565,22 @@ finna tupleComponentAt(t: str, idx: int) -> str {
     bet ""
 }
 
+// Number of components in a tuple type `(A, B, ..)`.
+finna tupleArity(t: str) -> int {
+    lowkey i = 0
+    vibin !isEmpty(tupleComponentAt(t, i)) { i = i + 1 }
+    bet i
+}
+
+// The zero value operand for a scalar/str return slot (mirror zero_operand).
+finna zeroOperand(c: LowerCtx, ty: str) -> str {
+    fr isIntTy(ty) { bet cat2("0", ty) }
+    fr str.slaps(ty, "bool") { bet "false" }
+    fr str.slaps(ty, "str") { bet "\"\"" }
+    lcFail(c)
+    bet "0i64"
+}
+
 // Split a space-separated target list ("q r") into names.
 finna splitSpaces(s: str) -> vec[str] {
     lowkey out = vec.new[str]()
@@ -2578,6 +2623,10 @@ finna mapTypeNode(c: LowerCtx, p: P, tyNode: int) -> str {
         lowkey nm = afterFirst(lab(p, tyNode))
         lowkey m = mapScalar(nm)
         fr !isEmpty(m) { bet m }
+        fr str.slaps(nm, "yikes") {
+            ensureYikes(c)
+            bet "__yikes"
+        }
         fr isStruct(c, nm) { bet nm }
         fr isSum(c, nm) { bet nm }
     }
@@ -2886,6 +2935,15 @@ finna lowerExpr(c: LowerCtx, p: P, idx: int, hint: str) -> (str, str) {
         lowkey mo, mt = lowerMethodCall(c, p, idx)
         bet mo, mt
     }
+    fr str.slaps(h, "ghosted") {
+        // `ghosted` in a yikes context is the no-error value `{ present: false }`.
+        fr isYikesTy(hint) {
+            lowkey go, gt = emitMakeYikes(c, "false", "\"\"")
+            bet go, gt
+        }
+        lcFail(c)
+        bet "0i64", "i64"
+    }
     lcFail(c)
     bet "0i64", "i64"
 }
@@ -2916,10 +2974,54 @@ finna emitStrLen(c: LowerCtx, sop: str) -> int {
     bet t
 }
 
+// Concatenate two str operands into a fresh str via bet_str_concat (mirror concat_str); returns
+// the result str operand.
+finna concatStr(c: LowerCtx, a: str, b: str) -> str {
+    lowkey ap = emitStrPtr(c, a)
+    lowkey al = emitStrLen(c, a)
+    lowkey bp = emitStrPtr(c, b)
+    lowkey bl = emitStrLen(c, b)
+    getExtern(c, "extern \"C\" fn bet_str_concat(rawptr, u64, rawptr, u64) -> rawptr")
+    lowkey outPtr = newLocal(c, "rawptr")
+    lowkey cb = sbNew()
+    cb.add("call_extern @bet_str_concat(")
+    cb.add(reg(ap))
+    cb.add(", ")
+    cb.add(reg(al))
+    cb.add(", ")
+    cb.add(reg(bp))
+    cb.add(", ")
+    cb.add(reg(bl))
+    cb.add(")")
+    emitAssign(c, outPtr, cb.finish())
+    lowkey outLen = newLocal(c, "u64")
+    lowkey lb = sbNew()
+    lb.add("add.wrap(")
+    lb.add(reg(al))
+    lb.add(", ")
+    lb.add(reg(bl))
+    lb.add(")")
+    emitAssign(c, outLen, lb.finish())
+    lowkey result = newLocal(c, "str")
+    lowkey mb = sbNew()
+    mb.add("make_str(")
+    mb.add(reg(outPtr))
+    mb.add(", ")
+    mb.add(reg(outLen))
+    mb.add(")")
+    emitAssign(c, result, mb.finish())
+    bet reg(result)
+}
+
 // A stdlib module intrinsic call (mirror lower_intrinsic) — the scalar/str subset. Unhandled
 // (module, method) pairs sentinel the program.
 finna lowerIntrinsic(c: LowerCtx, p: P, module: str, method: str, methodIdx: int) -> (str, str) {
     lowkey argsW = findKid(p, methodIdx, "args")
+    fr str.slaps(module, "yikes") && str.slaps(method, "new") {
+        lowkey msg, mty = lowerExpr(c, p, argValue(p, argsW, 0), "str")
+        lowkey yo, yt = emitMakeYikes(c, "true", msg)
+        bet yo, yt
+    }
     fr str.slaps(module, "math") && str.slaps(method, "lap") {
         lowkey a, aty = lowerExpr(c, p, argValue(p, argsW, 0), "")
         lowkey b, bty = lowerExpr(c, p, argValue(p, argsW, 1), aty)
@@ -3030,6 +3132,17 @@ finna lowerIntrinsic(c: LowerCtx, p: P, module: str, method: str, methodIdx: int
     bet "0i64", "i64"
 }
 
+// `y.tea(ctx)` — wrap an error, prefixing `"<ctx>: "` to its message (mirror lower_yikes_method).
+finna lowerTea(c: LowerCtx, p: P, methodIdx: int, yop: str) -> (str, str) {
+    lowkey argsW = findKid(p, methodIdx, "args")
+    lowkey ctx, cty = lowerExpr(c, p, argValue(p, argsW, 0), "str")
+    lowkey msg = cat2(yop, ".field(1)")
+    lowkey prefixed = concatStr(c, ctx, "\": \"")
+    lowkey full = concatStr(c, prefixed, msg)
+    lowkey yo, yt = emitMakeYikes(c, "true", full)
+    bet yo, yt
+}
+
 // `recv.method(args)` where `recv` is a value — a user receiver method (mirror lower_method's user
 // branch): the receiver becomes the leading argument. Module-name receivers route to intrinsics.
 finna lowerMethodCall(c: LowerCtx, p: P, idx: int) -> (str, str) {
@@ -3050,6 +3163,12 @@ finna lowerMethodCall(c: LowerCtx, p: P, idx: int) -> (str, str) {
     }
     lowkey fi = lookupFn(c, methodName)
     fr fi < 0 {
+        // Not a user method — try a value method on the receiver's type (yikes.tea).
+        lowkey yop, yty = lowerExpr(c, p, recvE, "")
+        fr isYikesTy(yty) && str.slaps(methodName, "tea") && isPlace(yop) {
+            lowkey to, tt = lowerTea(c, p, idx, yop)
+            bet to, tt
+        }
         lcFail(c)
         bet "0i64", "i64"
     }
@@ -3332,6 +3451,25 @@ finna lowerBinary(c: LowerCtx, p: P, idx: int, hint: str) -> (str, str) {
         lowkey so, st = lowerShortCircuit(c, p, idx, opTag)
         bet so, st
     }
+    // `x == ghosted` / `x != ghosted`: for a yikes operand this reads its `present` flag.
+    lowkey lIsGhost = str.slaps(firstWord(lab(p, kidAt(p, idx, 0))), "ghosted")
+    lowkey rIsGhost = str.slaps(firstWord(lab(p, kidAt(p, idx, 1))), "ghosted")
+    fr (str.slaps(opTag, "eq") || str.slaps(opTag, "ne")) && (lIsGhost || rIsGhost) {
+        lowkey otherE = kidAt(p, idx, 1)
+        fr rIsGhost { otherE = kidAt(p, idx, 0) }
+        lowkey oop, oty = lowerExpr(c, p, otherE, "")
+        fr isYikesTy(oty) && isPlace(oop) {
+            lowkey present = cat2(oop, ".field(0)")
+            fr str.slaps(opTag, "ne") {
+                bet present, "bool"
+            }
+            lowkey t = newLocal(c, "bool")
+            emitAssign(c, t, cat3("not(", present, ")"))
+            bet reg(t), "bool"
+        }
+        lcFail(c)
+        bet "0i64", "i64"
+    }
     lowkey isCmp = isComparisonTag(opTag)
     lowkey lhint = ""
     fr !isCmp { lhint = hint }
@@ -3434,6 +3572,9 @@ finna lowerPrintValue(c: LowerCtx, opStr: str, ty: str) {
         emitPrintOperand(c, opStr)
     } naw fr str.slaps(ty, "bool") {
         lowerPrintBool(c, opStr)
+    } naw fr isYikesTy(ty) {
+        // A yikes prints as its message (field 1).
+        emitPrintOperand(c, cat2(opStr, ".field(1)"))
     } naw {
         lcFail(c)
     }
@@ -3659,6 +3800,32 @@ finna lowerBet(c: LowerCtx, p: P, stmtIdx: int) {
             i = i + 1
         }
         termRetMulti(c, ops)
+    }
+}
+
+// `bounce y` — early-return-on-error (mirror lower_bounce): if `y.present`, return zeros for the
+// leading slots plus `y`; else fall through.
+finna lowerBounce(c: LowerCtx, p: P, stmtIdx: int) {
+    lowkey op, ty = lowerExpr(c, p, kidAt(p, stmtIdx, 0), "")
+    lowkey ret = c.curRet[0]
+    fr !isYikesTy(ty) || !isPlace(op) || !isTupleTy(ret) {
+        lcFail(c)
+    } naw {
+        lowkey present = cat2(op, ".field(0)")
+        lowkey ncomp = tupleArity(ret)
+        lowkey retOps = vec.new[str]()
+        lowkey i = 0
+        vibin i < ncomp - 1 {
+            retOps.stack(zeroOperand(c, tupleComponentAt(ret, i)))
+            i = i + 1
+        }
+        retOps.stack(op)
+        lowkey condEnd = curId(c)
+        lowkey merge = reserveBlock(c)
+        lowkey thenBb = newBlock(c)
+        termRetMulti(c, retOps)
+        setBranch(c, condEnd, present, thenBb, merge)
+        selectBlock(c, merge)
     }
 }
 
@@ -3900,6 +4067,8 @@ finna lowerStmt(c: LowerCtx, p: P, stmtIdx: int) {
         lowerAssign(c, p, stmtIdx)
     } naw fr str.slaps(h, "bet") {
         lowerBet(c, p, stmtIdx)
+    } naw fr str.slaps(h, "bounce") {
+        lowerBounce(c, p, stmtIdx)
     } naw fr str.slaps(h, "fr") {
         lowerFr(c, p, stmtIdx)
     } naw fr str.slaps(h, "vibin") {
