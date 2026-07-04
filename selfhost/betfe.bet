@@ -2735,16 +2735,112 @@ finna lowerExpr(c: LowerCtx, p: P, idx: int, hint: str) -> (str, str) {
     bet "0i64", "i64"
 }
 
+// The stdlib module namespaces (mirror is_module).
+finna isModule(name: str) -> bool {
+    bet str.slaps(name, "spill") || str.slaps(name, "str") || str.slaps(name, "math") || str.slaps(name, "mem") || str.slaps(name, "bytes") || str.slaps(name, "fmt") || str.slaps(name, "stash") || str.slaps(name, "vec") || str.slaps(name, "yikes") || str.slaps(name, "fs") || str.slaps(name, "sys")
+}
+
+// `str_ptr(s)` / `str_len(s)` into fresh temps; return their ids.
+finna emitStrPtr(c: LowerCtx, sop: str) -> int {
+    lowkey t = newLocal(c, "rawptr")
+    lowkey sb = sbNew()
+    sb.add("str_ptr(")
+    sb.add(sop)
+    sb.add(")")
+    emitAssign(c, t, sb.finish())
+    bet t
+}
+
+finna emitStrLen(c: LowerCtx, sop: str) -> int {
+    lowkey t = newLocal(c, "u64")
+    lowkey sb = sbNew()
+    sb.add("str_len(")
+    sb.add(sop)
+    sb.add(")")
+    emitAssign(c, t, sb.finish())
+    bet t
+}
+
+// A stdlib module intrinsic call (mirror lower_intrinsic) — the scalar/str subset. Unhandled
+// (module, method) pairs sentinel the program.
+finna lowerIntrinsic(c: LowerCtx, p: P, module: str, method: str, methodIdx: int) -> (str, str) {
+    lowkey argsW = findKid(p, methodIdx, "args")
+    fr str.slaps(module, "math") && str.slaps(method, "lap") {
+        lowkey a, aty = lowerExpr(c, p, argValue(p, argsW, 0), "")
+        lowkey b, bty = lowerExpr(c, p, argValue(p, argsW, 1), aty)
+        lowkey t = newLocal(c, aty)
+        lowkey sb = sbNew()
+        sb.add("add.wrap(")
+        sb.add(a)
+        sb.add(", ")
+        sb.add(b)
+        sb.add(")")
+        emitAssign(c, t, sb.finish())
+        bet reg(t), aty
+    }
+    fr str.slaps(module, "str") && str.slaps(method, "glow") {
+        lowkey s, sty = lowerExpr(c, p, argValue(p, argsW, 0), "str")
+        lowkey sp = emitStrPtr(c, s)
+        lowkey sl = emitStrLen(c, s)
+        getExtern(c, "extern \"C\" fn bet_str_upper(rawptr, u64) -> rawptr")
+        lowkey out = newLocal(c, "rawptr")
+        lowkey cb = sbNew()
+        cb.add("call_extern @bet_str_upper(")
+        cb.add(reg(sp))
+        cb.add(", ")
+        cb.add(reg(sl))
+        cb.add(")")
+        emitAssign(c, out, cb.finish())
+        lowkey result = newLocal(c, "str")
+        lowkey mb = sbNew()
+        mb.add("make_str(")
+        mb.add(reg(out))
+        mb.add(", ")
+        mb.add(reg(sl))
+        mb.add(")")
+        emitAssign(c, result, mb.finish())
+        bet reg(result), "str"
+    }
+    fr str.slaps(module, "str") && str.slaps(method, "slaps") {
+        lowkey a, aty = lowerExpr(c, p, argValue(p, argsW, 0), "str")
+        lowkey b, bty = lowerExpr(c, p, argValue(p, argsW, 1), "str")
+        lowkey ap = emitStrPtr(c, a)
+        lowkey al = emitStrLen(c, a)
+        lowkey bp = emitStrPtr(c, b)
+        lowkey bl = emitStrLen(c, b)
+        getExtern(c, "extern \"C\" fn bet_str_eq(rawptr, u64, rawptr, u64) -> bool")
+        lowkey out = newLocal(c, "bool")
+        lowkey cb = sbNew()
+        cb.add("call_extern @bet_str_eq(")
+        cb.add(reg(ap))
+        cb.add(", ")
+        cb.add(reg(al))
+        cb.add(", ")
+        cb.add(reg(bp))
+        cb.add(", ")
+        cb.add(reg(bl))
+        cb.add(")")
+        emitAssign(c, out, cb.finish())
+        bet reg(out), "bool"
+    }
+    lcFail(c)
+    bet "0i64", "i64"
+}
+
 // `recv.method(args)` where `recv` is a value — a user receiver method (mirror lower_method's user
-// branch): the receiver becomes the leading argument. Module-name receivers (intrinsics) defer.
+// branch): the receiver becomes the leading argument. Module-name receivers route to intrinsics.
 finna lowerMethodCall(c: LowerCtx, p: P, idx: int) -> (str, str) {
     lowkey methodName = afterFirst(lab(p, idx))
     lowkey recvW = findKid(p, idx, "receiver")
     lowkey recvE = kidAt(p, recvW, 0)
-    // A bare-name receiver that is not a value (local/const) is a module namespace -> intrinsic.
+    // A bare-name receiver that is neither a value (local/const) nor a function is a module.
     fr str.slaps(firstWord(lab(p, recvE)), "name") && kidCount(p, recvE) == 0 {
         lowkey rn = afterFirst(lab(p, recvE))
-        fr lookupLocal(c, rn) < 0 && lookupConst(c, rn) < 0 && lookupGlobalConst(c, rn) < 0 {
+        fr lookupLocal(c, rn) < 0 && lookupConst(c, rn) < 0 && lookupGlobalConst(c, rn) < 0 && lookupFn(c, rn) < 0 {
+            fr isModule(rn) {
+                lowkey io, it = lowerIntrinsic(c, p, rn, methodName, idx)
+                bet io, it
+            }
             lcFail(c)
             bet "0i64", "i64"
         }

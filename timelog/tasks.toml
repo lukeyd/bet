@@ -396,8 +396,11 @@ size = 13
 # NAME(ops) with fields in DECL order matched by name), `base.field` place projection (read + assign
 # target), mapTypeNode recognizes struct type names, and receiver methods (receiver is the leading
 # param %0; `recv.method(args)` -> `call @method(recv, args)`; module-name receivers still defer to
-# intrinsics). 22/59 byte-identical. Deferred (each a further increment): vec[T] indexing/squad,
-# math.* + other module intrinsics, multi-return/tuples, first-class fn values, sums (moods/vibe),
+# intrinsics). 22/59 byte-identical. C4.8 added the module-intrinsic dispatch (isModule + a
+# lowerIntrinsic routed from lowerMethodCall): math.lap (add.wrap), str.glow (bet_str_upper +
+# make_str), str.slaps (bet_str_eq) — unlocks strings + wrapping. 24/59. Deferred (each a further
+# increment): remaining str/bytes/mem/fs/sys intrinsics, vec[T] indexing/squad,
+# multi-return/tuples, first-class fn values, sums (moods/vibe),
 # errors (yikes/bounce/sheesh), memory (crib/tag/holla/cop), collections (vec/stash), the remaining
 # str/bytes/fs/mem/sys intrinsics + FFI, generics/monomorphization, then the 11-reference programs.
 status = "doing"
