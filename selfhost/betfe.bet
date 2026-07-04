@@ -1935,6 +1935,12 @@ drip LowerCtx {
     gConstNames: vec[str],
     gConstVals: vec[str],
     gConstTys: vec[str],
+    structNames: vec[str],
+    structDecls: vec[str],
+    fieldStruct: vec[str],
+    fieldNames: vec[str],
+    fieldTypes: vec[str],
+    fieldIdx: vec[int],
     loopIncr: vec[int],
     loopExit: vec[int]
 }
@@ -1952,7 +1958,7 @@ finna lcNew() -> LowerCtx {
     blks.stack(blkNew())
     lowkey cur = vec.new[int]()
     cur.stack(0)
-    bet LowerCtx{ externs: ex, fns: vec.new[str](), fnNames: vec.new[str](), fnParamCsv: vec.new[str](), fnRet: vec.new[str](), localTypes: vec.new[str](), paramCount: pc, curRet: cr, blocks: blks, curBlock: cur, ok: okc, bindNames: vec.new[str](), bindIds: vec.new[int](), constNames: vec.new[str](), constVals: vec.new[str](), constTys: vec.new[str](), gConstNames: vec.new[str](), gConstVals: vec.new[str](), gConstTys: vec.new[str](), loopIncr: vec.new[int](), loopExit: vec.new[int]() }
+    bet LowerCtx{ externs: ex, fns: vec.new[str](), fnNames: vec.new[str](), fnParamCsv: vec.new[str](), fnRet: vec.new[str](), localTypes: vec.new[str](), paramCount: pc, curRet: cr, blocks: blks, curBlock: cur, ok: okc, bindNames: vec.new[str](), bindIds: vec.new[int](), constNames: vec.new[str](), constVals: vec.new[str](), constTys: vec.new[str](), gConstNames: vec.new[str](), gConstVals: vec.new[str](), gConstTys: vec.new[str](), structNames: vec.new[str](), structDecls: vec.new[str](), fieldStruct: vec.new[str](), fieldNames: vec.new[str](), fieldTypes: vec.new[str](), fieldIdx: vec.new[int](), loopIncr: vec.new[int](), loopExit: vec.new[int]() }
 }
 
 // --- per-function reset (structs pass by value, so drain the shared-handle vecs in place) ---
@@ -2200,6 +2206,49 @@ finna lookupGlobalConst(c: LowerCtx, name: str) -> int {
     bet 0 - 1
 }
 
+// --- struct registry (global; struct types are values spelled by their name) ---
+finna isStruct(c: LowerCtx, name: str) -> bool {
+    lowkey n = c.structNames.gang() as int
+    lowkey i = 0
+    vibin i < n {
+        fr str.slaps(c.structNames[i], name) { bet nocap }
+        i = i + 1
+    }
+    bet cap
+}
+
+finna addField(c: LowerCtx, sname: str, fname: str, fty: str, pos: int) {
+    c.fieldStruct.stack(sname)
+    c.fieldNames.stack(fname)
+    c.fieldTypes.stack(fty)
+    c.fieldIdx.stack(pos)
+}
+
+// The declaration position of field `fname` in struct `sname`, or -1.
+finna structFieldIndex(c: LowerCtx, sname: str, fname: str) -> int {
+    lowkey n = c.fieldNames.gang() as int
+    lowkey i = 0
+    vibin i < n {
+        fr str.slaps(c.fieldStruct[i], sname) && str.slaps(c.fieldNames[i], fname) {
+            bet c.fieldIdx[i]
+        }
+        i = i + 1
+    }
+    bet 0 - 1
+}
+
+finna structFieldType(c: LowerCtx, sname: str, fname: str) -> str {
+    lowkey n = c.fieldNames.gang() as int
+    lowkey i = 0
+    vibin i < n {
+        fr str.slaps(c.fieldStruct[i], sname) && str.slaps(c.fieldNames[i], fname) {
+            bet c.fieldTypes[i]
+        }
+        i = i + 1
+    }
+    bet ""
+}
+
 // --- scalar type helpers ---
 finna isSignedIntTy(t: str) -> bool {
     bet str.slaps(t, "i8") || str.slaps(t, "i16") || str.slaps(t, "i32") || str.slaps(t, "i64")
@@ -2372,8 +2421,10 @@ finna isReg(s: str) -> bool {
 // The .mir type string for a type node (scalar named types only in C4.2).
 finna mapTypeNode(c: LowerCtx, p: P, tyNode: int) -> str {
     fr str.slaps(firstWord(lab(p, tyNode)), "named") {
-        lowkey m = mapScalar(afterFirst(lab(p, tyNode)))
+        lowkey nm = afterFirst(lab(p, tyNode))
+        lowkey m = mapScalar(nm)
         fr !isEmpty(m) { bet m }
+        fr isStruct(c, nm) { bet nm }
     }
     lcFail(c)
     bet "i64"
@@ -2471,6 +2522,20 @@ finna findKid(p: P, idx: int, name: str) -> int {
         i = i + 1
     }
     bet -1
+}
+
+// Like findKid but matches on the first label word (for labeled-payload nodes like `receiver c`).
+finna findKidWord(p: P, idx: int, word: str) -> int {
+    lowkey n = kidCount(p, idx)
+    lowkey i = 0
+    vibin i < n {
+        lowkey k = kidAt(p, idx, i)
+        fr str.slaps(firstWord(lab(p, k)), word) {
+            bet k
+        }
+        i = i + 1
+    }
+    bet 0 - 1
 }
 
 // Undo the dump `quote`: strip the surrounding quotes and decode \\ \" \n \t \r back to bytes.
@@ -2580,6 +2645,15 @@ finna emitAssign(c: LowerCtx, dst: int, rhs: str) {
     emitStmt(c, sb.finish())
 }
 
+// `<place> = <rhs>` — emit an assignment to an arbitrary place string (a field/index projection).
+finna emitPlaceAssign(c: LowerCtx, place: str, rhs: str) {
+    lowkey sb = sbNew()
+    sb.add(place)
+    sb.add(" = ")
+    sb.add(rhs)
+    emitStmt(c, sb.finish())
+}
+
 // Widen an int operand to the print word type (mirror coerce_int): no-op if already `to`.
 finna coerceInt(c: LowerCtx, opStr: str, from: str, to: str) -> str {
     fr str.slaps(from, to) { bet opStr }
@@ -2641,12 +2715,140 @@ finna lowerExpr(c: LowerCtx, p: P, idx: int, hint: str) -> (str, str) {
         lowkey xo, xt = lowerIndex(c, p, idx)
         bet xo, xt
     }
+    fr str.slaps(h, "struct") {
+        lowkey so, st = lowerStructLit(c, p, idx)
+        bet so, st
+    }
+    fr str.slaps(h, "field") {
+        lowkey fo, ft = fieldAccessStr(c, p, idx)
+        bet fo, ft
+    }
     fr str.slaps(h, "call") {
         lowkey lo, lt = lowerCall(c, p, idx)
         bet lo, lt
     }
+    fr str.slaps(h, "method") {
+        lowkey mo, mt = lowerMethodCall(c, p, idx)
+        bet mo, mt
+    }
     lcFail(c)
     bet "0i64", "i64"
+}
+
+// `recv.method(args)` where `recv` is a value — a user receiver method (mirror lower_method's user
+// branch): the receiver becomes the leading argument. Module-name receivers (intrinsics) defer.
+finna lowerMethodCall(c: LowerCtx, p: P, idx: int) -> (str, str) {
+    lowkey methodName = afterFirst(lab(p, idx))
+    lowkey recvW = findKid(p, idx, "receiver")
+    lowkey recvE = kidAt(p, recvW, 0)
+    // A bare-name receiver that is not a value (local/const) is a module namespace -> intrinsic.
+    fr str.slaps(firstWord(lab(p, recvE)), "name") && kidCount(p, recvE) == 0 {
+        lowkey rn = afterFirst(lab(p, recvE))
+        fr lookupLocal(c, rn) < 0 && lookupConst(c, rn) < 0 && lookupGlobalConst(c, rn) < 0 {
+            lcFail(c)
+            bet "0i64", "i64"
+        }
+    }
+    lowkey fi = lookupFn(c, methodName)
+    fr fi < 0 {
+        lcFail(c)
+        bet "0i64", "i64"
+    }
+    lowkey paramCsv = c.fnParamCsv[fi]
+    lowkey retTy = c.fnRet[fi]
+    lowkey rop, rty = lowerExpr(c, p, recvE, csvAt(paramCsv, 0))
+    lowkey argStrs = vec.new[str]()
+    argStrs.stack(rop)
+    lowkey argsW = findKid(p, idx, "args")
+    lowkey na = kidCount(p, argsW)
+    lowkey ai = 0
+    vibin ai < na {
+        lowkey aop, aty = lowerExpr(c, p, argValue(p, argsW, ai), csvAt(paramCsv, ai + 1))
+        argStrs.stack(aop)
+        ai = ai + 1
+    }
+    lowkey res = newLocal(c, retTy)
+    lowkey sb = sbNew()
+    sb.add("call @")
+    sb.add(methodName)
+    sb.add("(")
+    sb.add(joinComma(argStrs))
+    sb.add(")")
+    emitAssign(c, res, sb.finish())
+    bet reg(res), retTy
+}
+
+// `Name{ f: v, .. }` — a struct literal materialized into a temp (mirror lower_struct_lit). Field
+// operands are built in DECLARATION order (matched by name), each lowered with its field type.
+finna lowerStructLit(c: LowerCtx, p: P, idx: int) -> (str, str) {
+    lowkey name = afterFirst(lab(p, idx))
+    fr !isStruct(c, name) {
+        lcFail(c)
+        bet "0i64", "i64"
+    }
+    lowkey fieldsW = findKid(p, idx, "fields")
+    lowkey ops = vec.new[str]()
+    lowkey nf = c.fieldNames.gang() as int
+    lowkey i = 0
+    vibin i < nf && lcOk(c) {
+        fr str.slaps(c.fieldStruct[i], name) {
+            lowkey declName = c.fieldNames[i]
+            lowkey declTy = c.fieldTypes[i]
+            lowkey valIdx = litFieldValue(p, fieldsW, declName)
+            fr valIdx < 0 {
+                lcFail(c)
+            } naw {
+                lowkey op, oty = lowerExpr(c, p, valIdx, declTy)
+                ops.stack(op)
+            }
+        }
+        i = i + 1
+    }
+    lowkey tmp = newLocal(c, name)
+    lowkey sb = sbNew()
+    sb.add("make ")
+    sb.add(name)
+    sb.add("(")
+    sb.add(joinComma(ops))
+    sb.add(")")
+    emitAssign(c, tmp, sb.finish())
+    bet reg(tmp), name
+}
+
+// The value node of the literal field named `fname` inside a `fields` node, or -1.
+finna litFieldValue(p: P, fieldsW: int, fname: str) -> int {
+    lowkey n = kidCount(p, fieldsW)
+    lowkey i = 0
+    vibin i < n {
+        lowkey fnode = kidAt(p, fieldsW, i)
+        fr str.slaps(afterFirst(lab(p, fnode)), fname) {
+            bet kidAt(p, fnode, 0)
+        }
+        i = i + 1
+    }
+    bet 0 - 1
+}
+
+// `base.field` — a place projection used as an operand (mirror lower_field). The base must be an
+// addressable struct place (a bare register); returns (`%b.field(i)`, field type).
+finna fieldAccessStr(c: LowerCtx, p: P, idx: int) -> (str, str) {
+    lowkey fname = afterFirst(lab(p, idx))
+    lowkey bop, bty = lowerExpr(c, p, kidAt(p, idx, 0), "")
+    fr !isStruct(c, bty) || !isReg(bop) {
+        lcFail(c)
+        bet "0i64", "i64"
+    }
+    lowkey fidx = structFieldIndex(c, bty, fname)
+    fr fidx < 0 {
+        lcFail(c)
+        bet "0i64", "i64"
+    }
+    lowkey sb = sbNew()
+    sb.add(bop)
+    sb.add(".field(")
+    sb.add(itoa(fidx))
+    sb.add(")")
+    bet sb.finish(), structFieldType(c, bty, fname)
 }
 
 // `[a, b, c]` — a fixed array literal materialized into a temp (mirror lower_array_lit).
@@ -3025,6 +3227,17 @@ finna lowerAssign(c: LowerCtx, p: P, stmtIdx: int) {
     lowkey vw = kidAt(p, stmtIdx, 1)
     fr kidCount(p, tw) != 1 || kidCount(p, vw) != 1 {
         lcFail(c)
+    } naw fr str.slaps(firstWord(lab(p, kidAt(p, tw, 0))), "field") {
+        // `base.field = expr` — assign through a field place (compound field-assign deferred).
+        fr !str.slaps(opTag, "eq") {
+            lcFail(c)
+        } naw {
+            lowkey place, fty = fieldAccessStr(c, p, kidAt(p, tw, 0))
+            fr lcOk(c) {
+                lowkey val, vty = lowerExpr(c, p, kidAt(p, vw, 0), fty)
+                emitPlaceAssign(c, place, val)
+            }
+        }
     } naw {
         lowkey te = kidAt(p, tw, 0)
         lowkey lid = 0 - 1
@@ -3260,17 +3473,6 @@ finna lowerBlock(c: LowerCtx, p: P, blockIdx: int) {
     }
 }
 
-// True when the function has a receiver kid (a method) — not lowered in this subset.
-finna hasReceiverKid(p: P, funcIdx: int) -> bool {
-    lowkey n = kidCount(p, funcIdx)
-    lowkey i = 0
-    vibin i < n {
-        fr str.slaps(firstWord(lab(p, kidAt(p, funcIdx, i))), "receiver") { bet nocap }
-        i = i + 1
-    }
-    bet cap
-}
-
 // The comma-joined .mir param types of a `params` node.
 finna collectParamTypes(c: LowerCtx, p: P, pw: int) -> str {
     lowkey sb = sbNew()
@@ -3300,12 +3502,17 @@ finna registerFn(c: LowerCtx, p: P, funcIdx: int) {
     lowkey g = findKid(p, funcIdx, "generics")
     fr g < 0 || !isEmpty(afterFirst(lab(p, g))) {
         lcFail(c)
-    } naw fr hasReceiverKid(p, funcIdx) {
-        lcFail(c)
     } naw {
+        // A receiver method's receiver is a leading parameter (mirror has_receiver).
         lowkey pw = findKid(p, funcIdx, "params")
+        lowkey csv = collectParamTypes(c, p, pw)
+        lowkey recvW = findKidWord(p, funcIdx, "receiver")
+        fr recvW >= 0 {
+            lowkey rty = mapTypeNode(c, p, kidAt(p, recvW, 0))
+            fr isEmpty(csv) { csv = rty } naw { csv = cat3(rty, ",", csv) }
+        }
         c.fnNames.stack(name)
-        c.fnParamCsv.stack(collectParamTypes(c, p, pw))
+        c.fnParamCsv.stack(csv)
         c.fnRet.stack(collectRetType(c, p, funcIdx))
     }
 }
@@ -3339,6 +3546,58 @@ finna lowerGlobalConst(c: LowerCtx, p: P, stmtIdx: int) {
     }
 }
 
+// Register a `drip` struct: render its `struct NAME { .. }` decl and record its fields (mirror
+// the struct prescan + text.rs struct_def). Generic structs are deferred (sentinel).
+finna registerStruct(c: LowerCtx, p: P, dripIdx: int) {
+    lowkey name = afterFirst(afterFirst(lab(p, dripIdx)))
+    lowkey g = findKid(p, dripIdx, "generics")
+    fr g >= 0 && !isEmpty(afterFirst(lab(p, g))) {
+        lcFail(c)
+    } naw {
+        lowkey sb = sbNew()
+        sb.add("struct ")
+        sb.add(name)
+        sb.add(" {")
+        lowkey nk = kidCount(p, dripIdx)
+        lowkey pos = 0
+        lowkey i = 0
+        vibin i < nk {
+            lowkey k = kidAt(p, dripIdx, i)
+            fr str.slaps(firstWord(lab(p, k)), "field") {
+                lowkey visName = afterFirst(lab(p, k))
+                lowkey vis = firstWord(visName)
+                lowkey fname = afterFirst(visName)
+                lowkey fty = mapTypeNode(c, p, kidAt(p, k, 0))
+                fr pos == 0 { sb.add(" ") } naw { sb.add(", ") }
+                sb.add(vis)
+                sb.add(" ")
+                sb.add(fname)
+                sb.add(": ")
+                sb.add(fty)
+                addField(c, name, fname, fty, pos)
+                pos = pos + 1
+            }
+            i = i + 1
+        }
+        sb.add(" }")
+        c.structNames.stack(name)
+        c.structDecls.stack(sb.finish())
+    }
+}
+
+// Pre-pass: register every top-level struct before consts/functions reference its type.
+finna collectStructs(c: LowerCtx, p: P, root: int) {
+    lowkey n = kidCount(p, root)
+    lowkey i = 0
+    vibin i < n && lcOk(c) {
+        lowkey it = kidAt(p, root, i)
+        fr str.slaps(firstWord(lab(p, it)), "drip") {
+            registerStruct(c, p, it)
+        }
+        i = i + 1
+    }
+}
+
 // Pre-pass: evaluate every top-level const so functions resolve them regardless of order.
 finna collectConsts(c: LowerCtx, p: P, root: int) {
     lowkey n = kidCount(p, root)
@@ -3357,14 +3616,25 @@ finna lowerFunc(c: LowerCtx, p: P, funcIdx: int) {
     lowkey name = afterFirst(afterFirst(lab(p, funcIdx)))
     lowkey fi = lookupFn(c, name)
     lowkey pw = findKid(p, funcIdx, "params")
-    lowkey pcount = kidCount(p, pw)
+    lowkey recvW = findKidWord(p, funcIdx, "receiver")
+    lowkey explicit = kidCount(p, pw)
+    lowkey pcount = explicit
+    fr recvW >= 0 { pcount = explicit + 1 }
     lowkey ret = c.fnRet[fi]
     resetFn(c, pcount, ret)
+    lowkey slot = 0
+    // A receiver method binds its receiver as the leading parameter %0.
+    fr recvW >= 0 {
+        c.localTypes.stack(mapTypeNode(c, p, kidAt(p, recvW, 0)))
+        bindLocal(c, afterFirst(lab(p, recvW)), 0)
+        slot = 1
+    }
     lowkey i = 0
-    vibin i < pcount {
+    vibin i < explicit {
         lowkey paramNode = kidAt(p, pw, i)
         c.localTypes.stack(mapTypeNode(c, p, kidAt(p, paramNode, 0)))
-        bindLocal(c, afterFirst(lab(p, paramNode)), i)
+        bindLocal(c, afterFirst(lab(p, paramNode)), slot)
+        slot = slot + 1
         i = i + 1
     }
     lowerBlock(c, p, findKid(p, funcIdx, "block"))
@@ -3430,9 +3700,17 @@ finna finishFn(c: LowerCtx, sigLine: str) {
     c.fns.stack(sb.finish())
 }
 
-// Assemble the module: extern decls, then each function prefixed with a blank line.
+// Assemble the module: struct decls, then extern decls, then each function prefixed with a blank
+// line (mirror the text.rs print order: structs, sums, externs, funcs).
 finna assembleModule(c: LowerCtx) -> str {
     lowkey sb = sbNew()
+    lowkey nst = c.structDecls.gang() as int
+    lowkey s = 0
+    vibin s < nst {
+        sb.add(c.structDecls[s])
+        sb.add("\n")
+        s = s + 1
+    }
     lowkey ne = c.externs.gang() as int
     lowkey i = 0
     vibin i < ne {
@@ -3454,6 +3732,7 @@ finna assembleModule(c: LowerCtx) -> str {
 // C4 doesn't lower yet.
 finna emitMir(p: P, root: int) -> str {
     lowkey c = lcNew()
+    collectStructs(c, p, root)
     collectConsts(c, p, root)
     collectFns(c, p, root)
     lowkey n = kidCount(p, root)
@@ -3465,6 +3744,8 @@ finna emitMir(p: P, root: int) -> str {
             // pull is a no-op import — ignored.
         } naw fr str.slaps(h, "const") {
             // top-level consts were evaluated in the collectConsts pre-pass.
+        } naw fr str.slaps(h, "drip") {
+            // structs were registered in the collectStructs pre-pass.
         } naw fr str.slaps(h, "func") {
             lowerFunc(c, p, it)
         } naw {

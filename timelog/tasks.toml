@@ -391,8 +391,13 @@ size = 13
 # a global const scope (gConst*) evaluated in a collectConsts pre-pass and NOT drained per-function
 # (function-local `facts` still shadow via the drained const scope, checked first); unlocks programs
 # whose module-level facts feed scalar arithmetic (fixed-point, bam-angles). 19/59 byte-identical.
-# Deferred (each a further increment): vec[T] indexing/squad, math.* + other module intrinsics,
-# structs (drip/field/struct-lit) + receiver methods, sums (moods/vibe),
+# C4.7 added structs + receiver methods: a global struct registry (names + rendered `struct NAME {
+# VIS f: T }` decls printed before externs + flat field arrays), `Name{..}` struct literals (make
+# NAME(ops) with fields in DECL order matched by name), `base.field` place projection (read + assign
+# target), mapTypeNode recognizes struct type names, and receiver methods (receiver is the leading
+# param %0; `recv.method(args)` -> `call @method(recv, args)`; module-name receivers still defer to
+# intrinsics). 22/59 byte-identical. Deferred (each a further increment): vec[T] indexing/squad,
+# math.* + other module intrinsics, multi-return/tuples, first-class fn values, sums (moods/vibe),
 # errors (yikes/bounce/sheesh), memory (crib/tag/holla/cop), collections (vec/stash), the remaining
 # str/bytes/fs/mem/sys intrinsics + FFI, generics/monomorphization, then the 11-reference programs.
 status = "doing"
