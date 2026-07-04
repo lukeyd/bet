@@ -1951,6 +1951,9 @@ drip LowerCtx {
     externFnParamCsv: vec[str],
     externFnRet: vec[str],
     externFnDecl: vec[str],
+    cribGlobalNames: vec[str],
+    cribGlobalElems: vec[str],
+    cribGlobalCaps: vec[str],
     loopIncr: vec[int],
     loopExit: vec[int],
     // --- generics / monomorphization ---
@@ -1982,7 +1985,7 @@ finna lcNew() -> LowerCtx {
     blks.stack(blkNew())
     lowkey cur = vec.new[int]()
     cur.stack(0)
-    bet LowerCtx{ externs: ex, fns: vec.new[str](), fnNames: vec.new[str](), fnParamCsv: vec.new[str](), fnRet: vec.new[str](), localTypes: vec.new[str](), paramCount: pc, curRet: cr, blocks: blks, curBlock: cur, ok: okc, bindNames: vec.new[str](), bindIds: vec.new[int](), constNames: vec.new[str](), constVals: vec.new[str](), constTys: vec.new[str](), gConstNames: vec.new[str](), gConstVals: vec.new[str](), gConstTys: vec.new[str](), structNames: vec.new[str](), structDecls: vec.new[str](), fieldStruct: vec.new[str](), fieldNames: vec.new[str](), fieldTypes: vec.new[str](), fieldIdx: vec.new[int](), sumNames: vec.new[str](), sumDecls: vec.new[str](), variantSum: vec.new[str](), variantNames: vec.new[str](), variantIdx: vec.new[int](), variantPayload: vec.new[str](), externFnNames: vec.new[str](), externFnParamCsv: vec.new[str](), externFnRet: vec.new[str](), externFnDecl: vec.new[str](), loopIncr: vec.new[int](), loopExit: vec.new[int](), substNames: vec.new[str](), substTypes: vec.new[str](), genFnNames: vec.new[str](), genFnIdx: vec.new[int](), genStructNames: vec.new[str](), genStructIdx: vec.new[int](), moQName: vec.new[str](), moQMangled: vec.new[str](), moQArgs: vec.new[str]() }
+    bet LowerCtx{ externs: ex, fns: vec.new[str](), fnNames: vec.new[str](), fnParamCsv: vec.new[str](), fnRet: vec.new[str](), localTypes: vec.new[str](), paramCount: pc, curRet: cr, blocks: blks, curBlock: cur, ok: okc, bindNames: vec.new[str](), bindIds: vec.new[int](), constNames: vec.new[str](), constVals: vec.new[str](), constTys: vec.new[str](), gConstNames: vec.new[str](), gConstVals: vec.new[str](), gConstTys: vec.new[str](), structNames: vec.new[str](), structDecls: vec.new[str](), fieldStruct: vec.new[str](), fieldNames: vec.new[str](), fieldTypes: vec.new[str](), fieldIdx: vec.new[int](), sumNames: vec.new[str](), sumDecls: vec.new[str](), variantSum: vec.new[str](), variantNames: vec.new[str](), variantIdx: vec.new[int](), variantPayload: vec.new[str](), externFnNames: vec.new[str](), externFnParamCsv: vec.new[str](), externFnRet: vec.new[str](), externFnDecl: vec.new[str](), cribGlobalNames: vec.new[str](), cribGlobalElems: vec.new[str](), cribGlobalCaps: vec.new[str](), loopIncr: vec.new[int](), loopExit: vec.new[int](), substNames: vec.new[str](), substTypes: vec.new[str](), genFnNames: vec.new[str](), genFnIdx: vec.new[int](), genStructNames: vec.new[str](), genStructIdx: vec.new[int](), moQName: vec.new[str](), moQMangled: vec.new[str](), moQArgs: vec.new[str]() }
 }
 
 // --- per-function reset (structs pass by value, so drain the shared-handle vecs in place) ---
@@ -2624,6 +2627,25 @@ finna mapVal(t: str) -> str {
     }
     bet ""
 }
+// --- memory-model handle types: `crib ELEM` (arena), `tag ELEM` (slot handle),
+// `ref ELEM` (a live borrow). Spelled `<kw> ELEM`, matching text.rs `crib/tag/ref {}`. ---
+finna cribTyStr(elem: str) -> str { bet cat2("crib ", elem) }
+
+finna isCribTy(t: str) -> bool { bet str.slaps(firstWord(t), "crib") }
+
+finna cribElem(t: str) -> str { bet afterFirst(t) }
+
+finna tagTyStr(elem: str) -> str { bet cat2("tag ", elem) }
+
+finna isTagTy(t: str) -> bool { bet str.slaps(firstWord(t), "tag") }
+
+finna tagElem(t: str) -> str { bet afterFirst(t) }
+
+finna refTyStr(elem: str) -> str { bet cat2("ref ", elem) }
+
+finna isRefTy(t: str) -> bool { bet str.slaps(firstWord(t), "ref") }
+
+finna refElem(t: str) -> str { bet afterFirst(t) }
 
 // --- tuple types, spelled `(A, B, ..)` (multi-return values) ---
 finna isTupleTy(t: str) -> bool {
@@ -3108,6 +3130,14 @@ finna mapTypeNode(c: LowerCtx, p: P, tyNode: int) -> str {
         sb.add(mapTypeNode(c, p, kidAt(p, retW, 0)))
         bet sb.finish()
     }
+    // A `tag T` handle type node is `tag` with the element type as its child.
+    fr str.slaps(firstWord(lab(p, tyNode)), "tag") {
+        bet tagTyStr(mapTypeNode(c, p, kidAt(p, tyNode, 0)))
+    }
+    // A `crib T` arena type node is `crib` with the element type as its child.
+    fr str.slaps(firstWord(lab(p, tyNode)), "crib") {
+        bet cribTyStr(mapTypeNode(c, p, kidAt(p, tyNode, 0)))
+    }
     lcFail(c)
     bet "i64"
 }
@@ -3437,6 +3467,14 @@ finna lowerExpr(c: LowerCtx, p: P, idx: int, hint: str) -> (str, str) {
         lowkey mo, mt = lowerMethodCall(c, p, idx)
         bet mo, mt
     }
+    fr str.slaps(h, "cop") {
+        lowkey po, pt = lowerCop(c, p, idx)
+        bet po, pt
+    }
+    fr str.slaps(h, "trust") {
+        lowkey ro, rt = lowerTrust(c, p, idx)
+        bet ro, rt
+    }
     fr str.slaps(h, "ghosted") {
         // `ghosted` in a yikes context is the no-error value `{ present: false }`.
         fr isYikesTy(hint) {
@@ -3754,6 +3792,13 @@ finna lowerIntrinsic(c: LowerCtx, p: P, module: str, method: str, methodIdx: int
         cb.add(")")
         emitAssign(c, out, cb.finish())
         bet reg(out), "bool"
+    }
+    fr str.slaps(module, "mem") && str.slaps(method, "scratch") {
+        // `mem.scratch()` — the thread's built-in per-frame bump arena (a `crib void`).
+        getExtern(c, "extern \"C\" fn bet_scratch() -> crib void")
+        lowkey tmp = newLocal(c, "crib void")
+        emitAssign(c, tmp, "call_extern @bet_scratch()")
+        bet reg(tmp), "crib void"
     }
     lcFail(c)
     bet "0i64", "i64"
@@ -4152,26 +4197,135 @@ finna litFieldValue(p: P, fieldsW: int, fname: str) -> int {
     bet 0 - 1
 }
 
+// `Name{ f: v, .. }` cop-init — the struct-literal payload of a `cop`, spelled `Name{0: op, ..}`
+// with fields in DECLARATION order (mirror lower_cop struct arm + text.rs cop_init StructLit).
+finna copStructInit(c: LowerCtx, p: P, initNode: int, name: str) -> str {
+    lowkey fieldsW = findKid(p, initNode, "fields")
+    lowkey parts = vec.new[str]()
+    lowkey nf = c.fieldNames.gang() as int
+    lowkey i = 0
+    vibin i < nf && lcOk(c) {
+        fr str.slaps(c.fieldStruct[i], name) {
+            lowkey declName = c.fieldNames[i]
+            lowkey declTy = c.fieldTypes[i]
+            lowkey valIdx = litFieldValue(p, fieldsW, declName)
+            fr valIdx < 0 {
+                lcFail(c)
+            } naw {
+                lowkey op, oty = lowerExpr(c, p, valIdx, declTy)
+                parts.stack(cat3(itoa(c.fieldIdx[i]), ": ", op))
+            }
+        }
+        i = i + 1
+    }
+    bet cat3(name, "{", cat2(joinComma(parts), "}"))
+}
+
+// `Sum::Variant(op, ..)` cop-init — the sum-variant payload of a `cop` (mirror lower_cop variant
+// arm + text.rs cop_init SumVariant). Args lower with their declared payload types.
+finna copVariantInit(c: LowerCtx, p: P, initNode: int, vi: int) -> str {
+    lowkey vname = afterFirst(lab(p, initNode))
+    lowkey payloadCsv = c.variantPayload[vi]
+    lowkey argsW = findKid(p, initNode, "args")
+    lowkey ops = vec.new[str]()
+    lowkey vn = kidCount(p, argsW)
+    lowkey k = 0
+    vibin k < vn {
+        lowkey aop, aty = lowerExpr(c, p, argValue(p, argsW, k), csvAt(payloadCsv, k))
+        ops.stack(aop)
+        k = k + 1
+    }
+    lowkey head = cat3(c.variantSum[vi], "::", vname)
+    fr vn == 0 { bet head }
+    bet cat2(head, cat3("(", joinComma(ops), ")"))
+}
+
+// `cop INIT in CRIB` — allocate into an arena (mirror lower_cop). Lowers the crib operand first,
+// then the init payload; a typed crib hands back `tag elem`, a bump (`crib void`) hands back a
+// live `ref Struct`. `%t = cop(%crib, INIT)`.
+finna lowerCop(c: LowerCtx, p: P, idx: int) -> (str, str) {
+    lowkey initNode = kidAt(p, idx, 0)
+    lowkey cribW = kidAt(p, idx, 1)
+    lowkey cribOp, cribTy = lowerExpr(c, p, kidAt(p, cribW, 0), "")
+    fr !isCribTy(cribTy) {
+        lcFail(c)
+        bet "0i64", "i64"
+    }
+    lowkey elem = cribElem(cribTy)
+    lowkey isBump = str.slaps(elem, "void")
+    lowkey initH = firstWord(lab(p, initNode))
+    lowkey initStr = ""
+    lowkey resTy = ""
+    fr str.slaps(initH, "struct") {
+        lowkey sname = afterFirst(lab(p, initNode))
+        fr !isStruct(c, sname) {
+            lcFail(c)
+            bet "0i64", "i64"
+        }
+        initStr = copStructInit(c, p, initNode, sname)
+        fr isBump { resTy = refTyStr(sname) } naw { resTy = tagTyStr(elem) }
+    } naw fr str.slaps(initH, "variant") {
+        lowkey vi = lookupVariant(c, afterFirst(lab(p, initNode)))
+        fr isBump || !isSum(c, elem) || vi < 0 {
+            lcFail(c)
+            bet "0i64", "i64"
+        }
+        initStr = copVariantInit(c, p, initNode, vi)
+        resTy = tagTyStr(elem)
+    } naw {
+        lcFail(c)
+        bet "0i64", "i64"
+    }
+    fr !lcOk(c) {
+        bet "0i64", "i64"
+    }
+    lowkey tmp = newLocal(c, resTy)
+    emitAssign(c, tmp, cat3("cop(", cribOp, cat3(", ", initStr, ")")))
+    bet reg(tmp), resTy
+}
+
+// `tag.trust() in CRIB` — the unchecked escape hatch (mirror lower_trust). Lowers the tag operand
+// first, then the crib; yields a live `ref elem`. `%t = trust(%crib, %tag)`.
+finna lowerTrust(c: LowerCtx, p: P, idx: int) -> (str, str) {
+    lowkey tagOp, tagTy = lowerExpr(c, p, kidAt(p, idx, 0), "")
+    lowkey cribOp, cribTy = lowerExpr(c, p, kidAt(p, idx, 1), "")
+    fr !isCribTy(cribTy) {
+        lcFail(c)
+        bet "0i64", "i64"
+    }
+    lowkey resTy = refTyStr(cribElem(cribTy))
+    lowkey tmp = newLocal(c, resTy)
+    emitAssign(c, tmp, cat3("trust(", cribOp, cat3(", ", tagOp, ")")))
+    bet reg(tmp), resTy
+}
+
 // `base.field` — a place projection used as an operand (mirror lower_field). The base must be an
 // addressable struct place (a bare register); returns (`%b.field(i)`, field type).
 finna fieldAccessStr(c: LowerCtx, p: P, idx: int) -> (str, str) {
     lowkey fname = afterFirst(lab(p, idx))
     lowkey bop, bty = lowerExpr(c, p, kidAt(p, idx, 0), "")
-    fr !isStruct(c, bty) || !isReg(bop) {
+    // Auto-deref a `ref Struct` base (as produced by `trust`/`holla`/bump `cop`): `%b.deref.field`.
+    lowkey sname = bty
+    lowkey base = bop
+    fr isRefTy(bty) {
+        sname = refElem(bty)
+        base = cat2(bop, ".deref")
+    }
+    fr !isStruct(c, sname) || !isReg(bop) {
         lcFail(c)
         bet "0i64", "i64"
     }
-    lowkey fidx = structFieldIndex(c, bty, fname)
+    lowkey fidx = structFieldIndex(c, sname, fname)
     fr fidx < 0 {
         lcFail(c)
         bet "0i64", "i64"
     }
     lowkey sb = sbNew()
-    sb.add(bop)
+    sb.add(base)
     sb.add(".field(")
     sb.add(itoa(fidx))
     sb.add(")")
-    bet sb.finish(), structFieldType(c, bty, fname)
+    bet sb.finish(), structFieldType(c, sname, fname)
 }
 
 // `[a, b, c]` — a fixed array literal materialized into a temp (mirror lower_array_lit).
@@ -4386,6 +4540,14 @@ finna lowerName(c: LowerCtx, p: P, idx: int) -> (str, str) {
     lowkey gi = lookupGlobalConst(c, nm)
     fr gi >= 0 {
         bet c.gConstVals[gi], c.gConstTys[gi]
+    }
+    // A module-level crib: load its handle from the backing global (mirror lower_name crib arm).
+    lowkey cgi = lookupCribGlobal(c, nm)
+    fr cgi >= 0 {
+        lowkey cty = cribTyStr(c.cribGlobalElems[cgi])
+        lowkey tmp = newLocal(c, cty)
+        emitAssign(c, tmp, cat3("crib_global(@", nm, ")"))
+        bet reg(tmp), cty
     }
     // A bare name that is a nullary `moods` variant is a value constructor.
     lowkey vi = lookupVariant(c, nm)
@@ -4932,13 +5094,20 @@ finna lowerVibin(c: LowerCtx, p: P, vibinIdx: int) {
 // each arm downcasts + binds its payload; the merge block is a reserved landing pad.
 finna lowerVibe(c: LowerCtx, p: P, vibeIdx: int) {
     lowkey sop, sty = lowerExpr(c, p, kidAt(p, vibeIdx, 0), "")
-    fr !isSum(c, sty) || !isPlace(sop) {
+    // Auto-deref a `ref Sum` scrutinee (as produced by `holla`/`trust` over a sum crib).
+    lowkey sumName = sty
+    lowkey scrut = sop
+    fr isRefTy(sty) {
+        sumName = refElem(sty)
+        scrut = cat2(sop, ".deref")
+    }
+    fr !isSum(c, sumName) || !isPlace(sop) {
         lcFail(c)
     } naw {
         lowkey disc = newLocal(c, "u32")
         lowkey db = sbNew()
         db.add("discriminant(")
-        db.add(sop)
+        db.add(scrut)
         db.add(")")
         emitAssign(c, disc, db.finish())
         lowkey switchBlock = curId(c)
@@ -4968,7 +5137,7 @@ finna lowerVibe(c: LowerCtx, p: P, vibeIdx: int) {
                         lowkey fty = csvAt(payloadCsv, j)
                         lowkey l = newLocal(c, fty)
                         lowkey fb = sbNew()
-                        fb.add(sop)
+                        fb.add(scrut)
                         fb.add(".downcast(")
                         fb.add(itoa(c.variantIdx[vi]))
                         fb.add(").field(")
@@ -5054,6 +5223,76 @@ finna lowerSquad(c: LowerCtx, p: P, squadIdx: int) {
     }
 }
 
+// `crib NAME [: T[N]]` — a function-local arena (mirror lower_crib_decl). A typed slab keeps its
+// element/capacity; a bare `crib NAME` is an untyped bump crib (`crib void`). `%l = crib_new[E; N]`.
+finna lowerCribDecl(c: LowerCtx, p: P, stmtIdx: int) {
+    lowkey elem, capa = cribDeclElemAndCap(c, p, stmtIdx)
+    lowkey l = newLocal(c, cribTyStr(elem))
+    lowkey sb = sbNew()
+    sb.add("crib_new[")
+    sb.add(elem)
+    sb.add("; ")
+    sb.add(capa)
+    sb.add("]")
+    emitAssign(c, l, sb.finish())
+    bindLocal(c, afterFirst(afterFirst(lab(p, stmtIdx))), l)
+}
+
+// `holla BIND = TAG in CRIB { live } ghosted { }` — checked tag resolution (mirror lower_holla).
+// The merge block is reserved first (so it prints before the arms); the check-block terminator is
+// a `holla_check(tag, crib, resolvedRef) -> live else ghosted`.
+finna lowerHolla(c: LowerCtx, p: P, stmtIdx: int) {
+    lowkey binding = afterFirst(lab(p, stmtIdx))
+    lowkey tagW = findKid(p, stmtIdx, "tag")
+    lowkey cribW = findKid(p, stmtIdx, "crib")
+    lowkey liveW = findKid(p, stmtIdx, "live")
+    lowkey ghostedW = findKid(p, stmtIdx, "ghosted")
+    lowkey tagOp, tagTy = lowerExpr(c, p, kidAt(p, tagW, 0), "")
+    lowkey cribOp, cribTy = lowerExpr(c, p, kidAt(p, cribW, 0), "")
+    fr !isCribTy(cribTy) {
+        lcFail(c)
+    } naw {
+        lowkey resolved = newLocal(c, refTyStr(cribElem(cribTy)))
+        lowkey checkBlock = curId(c)
+        lowkey merge = reserveBlock(c)
+        lowkey liveBb = newBlock(c)
+        bindLocal(c, binding, resolved)
+        lowerBlock(c, p, findKid(p, liveW, "block"))
+        termGoto(c, merge)
+        lowkey ghostedBb = newBlock(c)
+        lowerBlock(c, p, findKid(p, ghostedW, "block"))
+        termGoto(c, merge)
+        setHolla(c, checkBlock, tagOp, cribOp, reg(resolved), liveBb, ghostedBb)
+        selectBlock(c, merge)
+    }
+}
+
+// `holla_check(tag, crib, resolved) -> bbLive else bbGhosted` on a reserved check block.
+finna setHolla(c: LowerCtx, from: int, tagOp: str, cribOp: str, resolved: str, liveBb: int, ghostedBb: int) {
+    lowkey sb = sbNew()
+    sb.add("holla_check(")
+    sb.add(tagOp)
+    sb.add(", ")
+    sb.add(cribOp)
+    sb.add(", ")
+    sb.add(resolved)
+    sb.add(") -> bb")
+    sb.add(itoa(liveBb))
+    sb.add(" else bb")
+    sb.add(itoa(ghostedBb))
+    setTerm(c, from, sb.finish())
+}
+
+// `evict CRIB` — free an arena in O(1) (mirror lower_stmt Evict): a plain `evict %crib` statement.
+finna lowerEvict(c: LowerCtx, p: P, stmtIdx: int) {
+    lowkey cribOp, cribTy = lowerExpr(c, p, kidAt(p, stmtIdx, 0), "")
+    fr !isCribTy(cribTy) {
+        lcFail(c)
+    } naw {
+        emitStmt(c, cat2("evict ", cribOp))
+    }
+}
+
 // Lower one statement (mirror lower_stmt) — the scalar subset.
 finna lowerStmt(c: LowerCtx, p: P, stmtIdx: int) {
     lowkey h = firstWord(lab(p, stmtIdx))
@@ -5077,6 +5316,12 @@ finna lowerStmt(c: LowerCtx, p: P, stmtIdx: int) {
         lowerVibe(c, p, stmtIdx)
     } naw fr str.slaps(h, "squad") {
         lowerSquad(c, p, stmtIdx)
+    } naw fr str.slaps(h, "crib") {
+        lowerCribDecl(c, p, stmtIdx)
+    } naw fr str.slaps(h, "holla") {
+        lowerHolla(c, p, stmtIdx)
+    } naw fr str.slaps(h, "evict") {
+        lowerEvict(c, p, stmtIdx)
     } naw fr str.slaps(h, "dip") {
         fr inLoop(c) { termGoto(c, loopExitTop(c)) } naw { lcFail(c) }
     } naw fr str.slaps(h, "skip") {
@@ -5211,6 +5456,51 @@ finna lookupExtern(c: LowerCtx, name: str) -> int {
         i = i + 1
     }
     bet 0 - 1
+}
+
+// Index of the module-level crib arena named `name`, or -1.
+finna lookupCribGlobal(c: LowerCtx, name: str) -> int {
+    lowkey n = c.cribGlobalNames.gang() as int
+    lowkey i = 0
+    vibin i < n {
+        fr str.slaps(c.cribGlobalNames[i], name) { bet i }
+        i = i + 1
+    }
+    bet 0 - 1
+}
+
+// The (element type, capacity text) of a `crib` decl node (mirror crib_elem_and_cap): a `T[N]`
+// typed slab, a bare `T` typed crib (cap 0), or an untyped bump crib (`void`, cap 0).
+finna cribDeclElemAndCap(c: LowerCtx, p: P, cribIdx: int) -> (str, str) {
+    fr kidCount(p, cribIdx) == 0 {
+        bet "void", "0"
+    }
+    lowkey tnode = kidAt(p, cribIdx, 0)
+    fr str.slaps(firstWord(lab(p, tnode)), "array") {
+        bet mapTypeNode(c, p, kidAt(p, tnode, 0)), afterFirst(lab(p, tnode))
+    }
+    bet mapTypeNode(c, p, tnode), "0"
+}
+
+// Prescan: register a module-level `crib NAME: T[N]` arena so any function can reference it and
+// so its `crib @NAME: T[N]` decl prints in the module header (mirror lower_items pass 1).
+finna registerCribGlobal(c: LowerCtx, p: P, cribIdx: int) {
+    lowkey elem, capa = cribDeclElemAndCap(c, p, cribIdx)
+    c.cribGlobalNames.stack(afterFirst(afterFirst(lab(p, cribIdx))))
+    c.cribGlobalElems.stack(elem)
+    c.cribGlobalCaps.stack(capa)
+}
+
+finna collectCribGlobals(c: LowerCtx, p: P, root: int) {
+    lowkey n = kidCount(p, root)
+    lowkey i = 0
+    vibin i < n && lcOk(c) {
+        lowkey it = kidAt(p, root, i)
+        fr str.slaps(firstWord(lab(p, it)), "crib") {
+            registerCribGlobal(c, p, it)
+        }
+        i = i + 1
+    }
 }
 
 // Evaluate a top-level `const` item into the global scope (mirror lowerConst, global storage).
@@ -5481,8 +5771,8 @@ finna finishFn(c: LowerCtx, sigLine: str) {
     c.fns.stack(sb.finish())
 }
 
-// Assemble the module: struct decls, then extern decls, then each function prefixed with a blank
-// line (mirror the text.rs print order: structs, sums, externs, funcs).
+// Assemble the module: struct decls, sum decls, extern decls, crib-global decls, then each
+// function prefixed with a blank line (mirror text.rs order: structs, sums, externs, cribs, funcs).
 finna assembleModule(c: LowerCtx) -> str {
     lowkey sb = sbNew()
     lowkey nst = c.structDecls.gang() as int
@@ -5506,6 +5796,18 @@ finna assembleModule(c: LowerCtx) -> str {
         sb.add("\n")
         i = i + 1
     }
+    lowkey ncg = c.cribGlobalNames.gang() as int
+    lowkey cg = 0
+    vibin cg < ncg {
+        sb.add("crib @")
+        sb.add(c.cribGlobalNames[cg])
+        sb.add(": ")
+        sb.add(c.cribGlobalElems[cg])
+        sb.add("[")
+        sb.add(c.cribGlobalCaps[cg])
+        sb.add("]\n")
+        cg = cg + 1
+    }
     lowkey nf = c.fns.gang() as int
     lowkey j = 0
     vibin j < nf {
@@ -5522,6 +5824,7 @@ finna emitMir(p: P, root: int) -> str {
     lowkey c = lcNew()
     collectTypeNames(c, p, root)
     collectTypeDefs(c, p, root)
+    collectCribGlobals(c, p, root)
     collectConsts(c, p, root)
     collectExterns(c, p, root)
     collectFns(c, p, root)
@@ -5540,6 +5843,8 @@ finna emitMir(p: P, root: int) -> str {
             // structs were registered in the type prescan.
         } naw fr str.slaps(h, "moods") {
             // sums were registered in the type prescan.
+        } naw fr str.slaps(h, "crib") {
+            // module-level crib arenas were registered in the crib prescan.
         } naw fr str.slaps(h, "func") {
             // Concrete functions are lowered in place; generic ones are instantiated on demand
             // (their bodies are drained from the work-list after all concrete funcs, below).
