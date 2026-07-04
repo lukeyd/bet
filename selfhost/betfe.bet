@@ -4177,6 +4177,46 @@ finna lowerMethodCall(c: LowerCtx, p: P, idx: int) -> (str, str) {
             lowkey mo, mt = lowerStashMethod(c, p, idx, yop, mapKey(yty), mapVal(yty), methodName)
             bet mo, mt
         }
+        // A `finna(..)`-typed struct field named like the method — an indirect call through it
+        // (mirror lower_fn_field_call): `%r = call_indirect %recv.deref.field(i)(args)`. The base
+        // must be an addressable place; a `ref Struct` receiver auto-derefs.
+        fr isPlace(yop) {
+            lowkey sname = yty
+            lowkey base = yop
+            fr isRefTy(yty) {
+                sname = refElem(yty)
+                base = cat2(yop, ".deref")
+            }
+            fr isStruct(c, sname) {
+                lowkey ffi = structFieldIndex(c, sname, methodName)
+                fr ffi >= 0 {
+                    lowkey fpty = structFieldType(c, sname, methodName)
+                    fr isFnPtrTy(fpty) {
+                        lowkey fptr = cat3(base, ".field(", cat2(itoa(ffi), ")"))
+                        lowkey fpCsv = fnPtrParams(fpty)
+                        lowkey fpRet = fnPtrRet(fpty)
+                        lowkey fargsW = findKid(p, idx, "args")
+                        lowkey fargs = vec.new[str]()
+                        lowkey fnr = kidCount(p, fargsW)
+                        lowkey fk = 0
+                        vibin fk < fnr {
+                            lowkey aop, aty = lowerExpr(c, p, argValue(p, fargsW, fk), csvAt(fpCsv, fk))
+                            fargs.stack(aop)
+                            fk = fk + 1
+                        }
+                        lowkey fres = newLocal(c, fpRet)
+                        lowkey fsb = sbNew()
+                        fsb.add("call_indirect ")
+                        fsb.add(fptr)
+                        fsb.add("(")
+                        fsb.add(joinComma(fargs))
+                        fsb.add(")")
+                        emitAssign(c, fres, fsb.finish())
+                        bet reg(fres), fpRet
+                    }
+                }
+            }
+        }
         lcFail(c)
         bet "0i64", "i64"
     }
