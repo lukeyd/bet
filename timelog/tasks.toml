@@ -376,11 +376,17 @@ size = 13
 # name/const resolution, the arithmetic/bitwise/shift/comparison binops (add.trap/wrap, .na, byte-
 # exact temp numbering), unary (neg/not/bitnot), casts (zext/sext/trunc/itof/ftoi/fresize), facts
 # (compile-time-inlined literals + unary-neg), single-target = and compound-assign, and int(signed/
-# unsigned coerce)/str/float printing. `betfe --emit mir` is byte-identical to `bet build --emit mir`
-# for 9/59 corpus programs (3 basics + 02-values arithmetic/casts/compound-assign/lowkey-facts/
-# numeric-tower + 09-bit-math/bit-ops); the rest emit the `%%UNSUPPORTED%%` sentinel (logged by the
-# selfhost C4 gate, not asserted). Deferred: user functions (multi-fn + params + calls + value bet),
-# control flow + short-circuit + bool print (need multi-block CFG), structs/sums/collections, generics.
+# unsigned coerce)/str/float printing. C4.3 added the multi-block CFG (block list + terminator
+# cells + reserveBlock for id-order-correct merge/exit blocks) and control flow: fr/naw chains
+# (emit_if_chain), vibin loops, short-circuit &&/||, bool printing. C4.4 generalized to full modules:
+# a collect pass pre-registers every fn signature, each fn lowers into a drained-in-place per-fn
+# state, params bind to %0.. (no `let`), calls lower args with param-type hints -> `call @NAME`,
+# value bet -> `return %op`, non-void fall-through -> `unreachable`. `betfe --emit mir` is byte-
+# identical for 14/59 corpus programs; the rest emit the `%%UNSUPPORTED%%` sentinel (logged by the
+# selfhost C4 gate, not asserted — 0 false-supported). Deferred (each a further increment): arrays/
+# slices/indexing + squad, structs (drip/field/struct-lit) + receiver methods, sums (moods/vibe),
+# errors (yikes/bounce/sheesh), memory (crib/tag/holla/cop), collections (vec/stash), the remaining
+# str/bytes/fs/mem/sys intrinsics + FFI, generics/monomorphization, then the 11-reference programs.
 status = "doing"
 
 [[task]]
