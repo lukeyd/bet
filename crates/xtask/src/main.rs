@@ -1259,11 +1259,48 @@ fn selfhost_run(bin: &Path, root: &Path, tmp: &Path) -> Result<()> {
     let mir_lowered = mir_parity(bin, &betfe, &bet_files, &corpus_root)?;
     let checked = bet_files.len();
 
+    // 6. C6/M8 self-host FIXPOINT: betfe must lower its OWN source (selfhost/betfe.bet) to `.mir`
+    //    byte-identical to the Rust frontend — the self-hosting proof that the frontend processes
+    //    itself exactly like the reference compiler.
+    let self_src = root.join("selfhost").join("betfe.bet");
+    let self_betfe = std::process::Command::new(&betfe)
+        .arg("--emit")
+        .arg("mir")
+        .arg(&self_src)
+        .output()
+        .context("running `betfe --emit mir selfhost/betfe.bet`")?;
+    let self_rust = std::process::Command::new(bin)
+        .arg("build")
+        .arg("--emit")
+        .arg("mir")
+        .arg(&self_src)
+        .output()
+        .context("running `bet build --emit mir selfhost/betfe.bet`")?;
+    if !self_rust.status.success() {
+        bail!(
+            "reference `bet build --emit mir betfe.bet` failed:\n{}",
+            String::from_utf8_lossy(&self_rust.stderr)
+        );
+    }
+    if self_betfe.stdout == b"%%UNSUPPORTED%%\n" {
+        bail!("self-host fixpoint regressed: betfe sentinels its own source (selfhost/betfe.bet)");
+    }
+    if self_betfe.stdout != self_rust.stdout {
+        bail!(
+            "self-host fixpoint broken: betfe's `.mir` for its own source is not byte-identical to \
+             the Rust frontend's ({} vs {} bytes)",
+            self_betfe.stdout.len(),
+            self_rust.stdout.len()
+        );
+    }
+    let self_lines = self_rust.stdout.iter().filter(|&&b| b == b'\n').count();
+
     println!(
         "selfhost: OK — betfe -> .mir -> backend -> binary prints {expected:?}; \
          .mir byte-identical to the Rust frontend; \
          C1 `--emit tokens` + C3 `--emit ast` byte-identical across {checked} corpus programs; \
-         C4 `--emit mir` byte-identical across {mir_lowered}/{checked} (rest emit the sentinel — not yet lowered)"
+         C4 `--emit mir` byte-identical across {mir_lowered}/{checked} (rest emit the sentinel — not yet lowered); \
+         C6/M8 FIXPOINT: betfe lowers its own {self_lines}-line source byte-identical to the reference frontend"
     );
     Ok(())
 }

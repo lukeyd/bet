@@ -472,7 +472,16 @@ status = "done"
 slug = "selfhost-fixpoint"
 name = "C6/M8: stage-2/stage-3 build + byte-identical binary assertion + 3-way harness wired into CI"
 size = 3
-status = "todo"
+# DONE. The self-hosting FIXPOINT holds: `betfe --emit mir selfhost/betfe.bet` is byte-identical
+# (27386 lines) to `bet build --emit mir selfhost/betfe.bet` — betfe lowers its OWN source exactly
+# like the reference frontend. Stable three-way: stage-3 (betfe rebuilt from betfe's own .mir)
+# re-emits the identical .mir. Bring-up needed just two additions beyond the 57/59 corpus subset:
+# fs.peepText (bet_fs_read — the file-read intrinsic only betfe's main uses) and a str.at eval-order
+# fix (index lowered before the byte-slice view; corpus hid it because all corpus indices are consts).
+# A `betfe --emit failfn` diagnostic pinpointed `main` as the sole failing function. WIRED INTO CI:
+# `cargo xtask selfhost` now asserts the fixpoint (step 6) and fails on any regression, so the
+# self-host property is enforced on every selfhost.yml run.
+status = "done"
 
 # ─────────────────────── The gate this plan STOPS at (out of scope) ───────────────────────
 
