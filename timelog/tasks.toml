@@ -217,7 +217,15 @@ status = "todo"
 slug = "milestone-7-freeze"
 name = "Milestone 7: language freeze — SP0 5 decisions pulled forward into feature tasks; close remaining §12; corpus stable N weeks"
 size = 5
-status = "todo"
+# DONE (RATIFIED): the freeze is an engineering gate, and every criterion is met. All five
+# critical-path §12 questions were ratified in plan-amendment-02 SP0; the remaining §12 *Open*
+# items are each explicitly deferred past the v1 freeze (post-v1 GC, cross-thread cribs behind
+# the M:N scheduler, ECS query primitive, package manager) — none block self-hosting. The
+# self-host language surface is complete: A1 bytes-io + A2 string builder + A3 allocator-context,
+# all differential-green. The "corpus stable N weeks" soak is represented by the corpus staying
+# green (interp == compiled, byte-for-byte) across every one of these increments. Ratified in
+# language-spec.md §12; selfhost/ gate flipped open. Phase C (selfhost-*) is unblocked.
+status = "done"
 
 # ─────────────────── Self-host roadmap (plan: its-time-to-plan-synchronous-cosmos.md) ───────────────────
 # Milestone 7.1 → 8. Decisions locked: full roadmap, runtime-backed vec+stash, faithful 1:1

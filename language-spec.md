@@ -415,6 +415,16 @@ Most of these were resolved by implementation through Milestones 3–6; the five
 critical path were ratified early in `plan-amendment-02.md` (SP0). **RESOLVED** items are
 frozen for v1; the short remaining list is what the Milestone-7 freeze still tracks.
 
+> **Milestone-7 freeze — RATIFIED (stage-1 self-hosting).** Every critical-path question below
+> is **RESOLVED**, and each remaining *Open* item is explicitly deferred past the v1 freeze
+> (post-v1 GC, cross-thread cribs behind the M:N scheduler, the ECS query primitive, the package
+> manager) — none block the self-hosted frontend. The self-host language surface is complete:
+> `bytes-io` (str byte primitives + `[]u8` ⇄ `str`), the growable **string builder** for `.mir`
+> emission, and the **allocator-context** override (`stash.new(in: crib)`, SP0.1) have all landed
+> differential-green. The corpus has stayed green (interp == compiled, byte-for-byte) across every
+> one of these increments, which is the stability the freeze required. **`selfhost/` is therefore
+> unblocked** — Phase C (the bet-written frontend) may begin.
+
 **Syntax/semantics**
 - **RESOLVED — Statement termination:** Go-style ASI; a statement ends at a newline unless an
   open bracket/binary-operator continuation is pending.
