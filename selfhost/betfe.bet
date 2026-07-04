@@ -2522,9 +2522,24 @@ finna arrayLenStr(t: str) -> str {
     bet ""
 }
 
+// --- slices, spelled `[]ELEM` (a fat {ptr,len} view; indexed like an array) ---
+finna isSliceTy(t: str) -> bool {
+    fr str.len(t) < 2 { bet cap }
+    bet str.at(t, 0) == 91 && str.at(t, 1) == 93
+}
+
+finna sliceElem(t: str) -> str {
+    bet str.sub(t, 2, str.len(t))
+}
+
+finna sliceTyStr(elem: str) -> str {
+    bet cat2("[]", elem)
+}
+
 // Element hint from an array/slice type hint, else "".
 finna arrayElemHint(hint: str) -> str {
     fr isArrayTy(hint) { bet arrayElem(hint) }
+    fr isSliceTy(hint) { bet sliceElem(hint) }
     bet ""
 }
 
@@ -2647,6 +2662,10 @@ finna mapTypeNode(c: LowerCtx, p: P, tyNode: int) -> str {
         }
         fr isStruct(c, nm) { bet nm }
         fr isSum(c, nm) { bet nm }
+    }
+    // A `[]T` slice type node is `slice` with the element type as its child.
+    fr str.slaps(firstWord(lab(p, tyNode)), "slice") {
+        bet sliceTyStr(mapTypeNode(c, p, kidAt(p, tyNode, 0)))
     }
     lcFail(c)
     bet "i64"
@@ -3100,6 +3119,54 @@ finna lowerIntrinsic(c: LowerCtx, p: P, module: str, method: str, methodIdx: int
         emitAssign(c, result, mb.finish())
         bet reg(result), "str"
     }
+    fr str.slaps(module, "bytes") && str.slaps(method, "readU32le") {
+        lowkey buf, bty = lowerExpr(c, p, argValue(p, argsW, 0), "")
+        lowkey off, oty = lowerExpr(c, p, argValue(p, argsW, 1), "i64")
+        fr !isPlace(buf) {
+            lcFail(c)
+            bet "0i64", "i64"
+        }
+        lowkey acc = newLocal(c, "u32")
+        emitAssign(c, acc, "0u32")
+        lowkey k = 0
+        vibin k < 4 {
+            lowkey idxL = newLocal(c, "i64")
+            lowkey ib = sbNew()
+            ib.add("add.wrap(")
+            ib.add(off)
+            ib.add(", ")
+            ib.add(itoa(k))
+            ib.add("i64)")
+            emitAssign(c, idxL, ib.finish())
+            lowkey bz = newLocal(c, "u32")
+            lowkey zb = sbNew()
+            zb.add("cast.zext(")
+            zb.add(buf)
+            zb.add(".index(")
+            zb.add(reg(idxL))
+            zb.add(") as u32)")
+            emitAssign(c, bz, zb.finish())
+            lowkey sh = newLocal(c, "u32")
+            lowkey shb = sbNew()
+            shb.add("shl.na(")
+            shb.add(reg(bz))
+            shb.add(", ")
+            shb.add(itoa(8 * k))
+            shb.add("u32)")
+            emitAssign(c, sh, shb.finish())
+            lowkey orr = newLocal(c, "u32")
+            lowkey ob = sbNew()
+            ob.add("bitor.na(")
+            ob.add(reg(acc))
+            ob.add(", ")
+            ob.add(reg(sh))
+            ob.add(")")
+            emitAssign(c, orr, ob.finish())
+            emitAssign(c, acc, reg(orr))
+            k = k + 1
+        }
+        bet reg(acc), "u32"
+    }
     fr str.slaps(module, "sys") && str.slaps(method, "argc") {
         getExtern(c, "extern \"C\" fn bet_arg_count() -> u64")
         lowkey n = newLocal(c, "u64")
@@ -3488,6 +3555,21 @@ finna lowerArrayLit(c: LowerCtx, p: P, idx: int, hint: str) -> (str, str) {
     sb.add(joinComma(ops))
     sb.add(")")
     emitAssign(c, tmp, sb.finish())
+    // In a slice context (`[]T`), materialize a slice over the freshly built array's storage.
+    fr isSliceTy(hint) {
+        lowkey dptr = emitAddrOf(c, reg(tmp))
+        lowkey sl = newLocal(c, sliceTyStr(elemTy))
+        lowkey msb = sbNew()
+        msb.add("make_slice[")
+        msb.add(elemTy)
+        msb.add("](")
+        msb.add(reg(dptr))
+        msb.add(", ")
+        msb.add(itoa(nk))
+        msb.add("u64)")
+        emitAssign(c, sl, msb.finish())
+        bet reg(sl), sliceTyStr(elemTy)
+    }
     bet reg(tmp), aty
 }
 
@@ -3499,11 +3581,12 @@ finna lowerIndex(c: LowerCtx, p: P, idx: int) -> (str, str) {
         lowkey vo, vt = lowerVecIndex(c, p, idx, bop, vecElem(bty))
         bet vo, vt
     }
-    fr !isArrayTy(bty) || !isReg(bop) {
+    fr !(isArrayTy(bty) || isSliceTy(bty)) || !isReg(bop) {
         lcFail(c)
         bet "0i64", "i64"
     }
     lowkey elem = arrayElem(bty)
+    fr isSliceTy(bty) { elem = sliceElem(bty) }
     lowkey iop, ity = lowerExpr(c, p, kidAt(p, idx, 1), "i64")
     lowkey sb = sbNew()
     sb.add(bop)

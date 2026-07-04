@@ -420,6 +420,10 @@ size = 13
 # now resolves as a type (`named vec` + elem child) for struct fields/params; unspecified field vis
 # maps to hush. Non-spill method statements (xs.stack(..)) lower + discard. Unlocks vec/vec-shared/
 # vec-aggregates. 37/59 byte-identical; 0 false-supported.
+# C4.14 added the `[]T` slice value model: a `slice` type node -> `[]ELEM`, array literals in a
+# slice-typed context materialize `make_slice[ELEM](addr_of(arr), N u64)`, slice indexing (like
+# arrays), and the bytes.readU32le intrinsic (unrolled 4x: add.wrap idx / cast.zext byte / shl / bitor
+# accumulate). Unlocks bytes-parse. 38/59 byte-identical.
 status = "doing"
 
 [[task]]
