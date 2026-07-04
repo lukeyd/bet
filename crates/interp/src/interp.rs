@@ -1033,8 +1033,12 @@ impl<'p> Interp<'p> {
                     "bytes" => return self.call_bytes(env, method, args).map(|v| vec![v]),
                     // `yikes.new(msg)` constructs an error value.
                     "yikes" => return self.call_yikes(env, method, args).map(|v| vec![v]),
-                    // `stash.new[K, V]()` constructs an empty hash map.
+                    // `stash.new[K, V]()` — or `stash.new(in: crib)`, the allocator-context
+                    // override (SP0.1). The interpreter has no arena allocator, so `in:` is
+                    // validated (must be a crib) then a no-op: the map is the same shared handle
+                    // either way, so observable behavior matches the compiled path.
                     "stash" if method == "new" => {
+                        self.eval_alloc_ctx_arg(env, args)?;
                         return Ok(vec![Value::Stash(Rc::new(RefCell::new(Vec::new())))]);
                     }
                     // `vec.new[T]()` constructs an empty growable vec — a shared, reference-counted
@@ -1120,6 +1124,27 @@ impl<'p> Interp<'p> {
                 Ok(vec![Value::Array(out)])
             }
             other => Err(RunError::Undefined(format!("array.{other}"))),
+        }
+    }
+
+    /// Evaluate an optional `in: <crib>` allocator-context argument (the SP0.1 override shared by
+    /// the collection constructors). The interpreter has no arena allocator, so the context is
+    /// evaluated for its side effects and validated to be a crib, then discarded — the resulting
+    /// collection is identical, matching the compiled path's observable behavior. Positional args
+    /// are rejected.
+    fn eval_alloc_ctx_arg(&mut self, env: &mut Env, args: &[Arg]) -> Result<(), RunError> {
+        match args {
+            [] => Ok(()),
+            [a] if a.label.as_deref() == Some("in") => match self.eval_expr(env, &a.value)? {
+                Value::Crib(_) => Ok(()),
+                other => Err(RunError::Type(format!(
+                    "`in:` needs a crib allocator context, got {}",
+                    other.type_name()
+                ))),
+            },
+            _ => Err(RunError::Type(
+                "collection constructor takes only an optional `in: <crib>`".into(),
+            )),
         }
     }
 

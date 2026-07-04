@@ -345,6 +345,12 @@ interp = "pass"
 compiled = "pass"
 
 [[program]]
+path = "10-stdlib/stash-in-crib"
+covers = ["stdlib.stash", "memory.crib"]
+interp = "pass"
+compiled = "pass"
+
+[[program]]
 path = "10-stdlib/bytes-parse"
 covers = ["stdlib.bytes", "values.array-literal"]
 interp = "pass"

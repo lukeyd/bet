@@ -2043,7 +2043,7 @@ impl LowerCtx {
         {
             // `stash.new[K, V]()` / `vec.new[T]()` are the intrinsics that need their type args.
             if name == "stash" && method == "new" {
-                return self.lower_stash_new(generics);
+                return self.lower_stash_new(generics, args);
             }
             if name == "vec" && method == "new" {
                 return self.lower_vec_new(generics);
@@ -2211,14 +2211,29 @@ impl LowerCtx {
     // === stash (hash maps) ===================================================
 
     /// `stash.new[K, V]()` — create an empty map. Lowered to `bet_map_new(size_of[V])`.
-    fn lower_stash_new(&mut self, generics: &[ast::Type]) -> Result<(Operand, TyId), String> {
+    ///
+    /// With the `in: <crib>` allocator-context override (SP0.1) the creation is scoped by
+    /// `bet_ctx_push(crib)` … `bet_ctx_pop()`, redirecting the ambient allocator for the
+    /// duration. Routing `bet_map_new`'s own allocations through that context is a deliberate
+    /// runtime follow-up (see `runtime` `bet_alloc` note); the language surface + scoped
+    /// push/pop are what this task lands, so `stash.new(in: astCrib)` is a valid, wired form.
+    fn lower_stash_new(
+        &mut self,
+        generics: &[ast::Type],
+        args: &[ast::Arg],
+    ) -> Result<(Operand, TyId), String> {
         if generics.len() != 2 {
             return Err("`stash.new` takes two type arguments `[K, V]`".into());
         }
+        let ctx_crib = self.alloc_ctx_arg(args)?;
         let k = self.map_type(&generics[0])?;
         let v = self.map_type(&generics[1])?;
         let map_ty = self.m.intern_ty(TyKind::Map(k, v));
         let usize_t = self.m.t_int(IntWidth::W64, false);
+        if let Some((crib_op, crib_ty)) = &ctx_crib {
+            let push = self.get_extern("bet_ctx_push", vec![*crib_ty], vec![]);
+            self.emit_extern_call(push, &[], vec![crib_op.clone()])?;
+        }
         let vsize = self.new_local(usize_t);
         self.fb().assign(Place::local(vsize), Rvalue::SizeOf(v));
         let ext = self.get_extern("bet_map_new", vec![usize_t], vec![map_ty]);
@@ -2230,7 +2245,31 @@ impl LowerCtx {
                 vec![Operand::Copy(Place::local(vsize))],
             ),
         );
+        if ctx_crib.is_some() {
+            let pop = self.get_extern("bet_ctx_pop", vec![], vec![]);
+            self.emit_extern_call(pop, &[], vec![])?;
+        }
         Ok((Operand::Copy(Place::local(tmp)), map_ty))
+    }
+
+    /// Lower an optional `in: <crib>` allocator-context argument, shared by the collection
+    /// constructors. Returns the lowered crib operand + its (crib) type when present. Rejects
+    /// positional args and non-crib contexts.
+    fn alloc_ctx_arg(&mut self, args: &[ast::Arg]) -> Result<Option<(Operand, TyId)>, String> {
+        match args {
+            [] => Ok(None),
+            [a] if a.label.as_deref() == Some("in") => {
+                let (op, ty) = self.lower_expr(&a.value, None)?;
+                if !matches!(self.m.ty(ty), TyKind::Crib(_)) {
+                    return Err(format!(
+                        "`in:` needs a crib allocator context ({:?})",
+                        self.m.ty(ty)
+                    ));
+                }
+                Ok(Some((op, ty)))
+            }
+            _ => Err("collection constructor takes only an optional `in: <crib>`".into()),
+        }
     }
 
     /// Dispatch a method on a `stash[K, V]` value: `put`, `peep`, `yeet`, or `gang`.

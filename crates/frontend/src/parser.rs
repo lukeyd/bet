@@ -1213,13 +1213,21 @@ impl<'a> Parser<'a> {
     }
 
     fn arg(&mut self) -> PResult<Arg> {
-        // Optional `label:` — an identifier immediately followed by `:`.
+        // Optional `label:` — an identifier immediately followed by `:`. The `in` keyword is
+        // also accepted as a label so the allocator-context override `stash.new(in: crib)`
+        // (SP0.1) parses; `in` never lexes as an `Ident`, so it needs its own arm.
         let label = if matches!(self.peek(), Some(Token::Ident(_)))
             && matches!(self.peek2(), Some(Token::Colon))
         {
             let l = self.ident()?;
             self.pos += 1; // the `:`
             Some(l)
+        } else if matches!(self.peek(), Some(Token::In))
+            && matches!(self.peek2(), Some(Token::Colon))
+        {
+            self.expect(&Token::In)?;
+            self.expect(&Token::Colon)?;
+            Some("in".to_string())
         } else {
             None
         };

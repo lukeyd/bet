@@ -106,7 +106,18 @@ status = "done"
 slug = "fnd-alloc"
 name = "Foundation: allocator-context mechanism — decide (implicit-param vs ctx-struct) + plumbing for stash.new(in: crib)"
 size = 5
-status = "todo"
+# DONE per plan-amendment-02 SP0.1: DECISION = implicit ambient thread-local allocator context
+# (the bet_ctx_* stack the ABI already ships), with an `in: <crib>` override. PLUMBING landed,
+# no ABI change: the parser accepts `in:` as a named-arg label (`in` is a keyword, so its own
+# arm in arg()); `stash.new[K,V](in: crib)` lowers to bet_ctx_push(crib) … bet_map_new …
+# bet_ctx_pop() (crib passes with its `crib` type — ABI-lowers to a ptr like AllocCtx, dedups by
+# name across element types like bet_vec_push). `cop … in <crib>` was already the direct-handle
+# case SP0.1 names. Interp validates `in:` is a crib then no-ops (no arena allocator), so
+# observable behavior is identical -> interp==compiled byte-for-byte (10-stdlib/stash-in-crib,
+# proven wired by the emitted .mir: push/map_new/pop). NOTE (deliberate follow-up, spec-
+# sanctioned at runtime bet_alloc:82-85): routing bet_map_new's own bytes through the context
+# arena is NOT done — the surface + scoped push/pop are what closes the §12 freeze decision.
+status = "done"
 
 # ─────────────────────── Track 1 — value model & compiled path ───────────────────────
 

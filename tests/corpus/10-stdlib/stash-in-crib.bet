@@ -1,0 +1,28 @@
+// stash-in-crib — the allocator-context override (SP0.1): `stash.new[K,V](in: <crib>)` scopes
+// the map's construction to a named arena, the exact pattern the self-hosted compiler uses for
+// symbol tables (`stash.new[str, Symbol](in: astCrib)`). The `in:` form lowers to
+// bet_ctx_push(crib) … bet_ctx_pop() around bet_map_new; the map's observable behavior is
+// identical to a default stash, so interp and compiled agree byte-for-byte. `mem.scratch()` is
+// equally a valid context. (Routing the map's backing bytes through the arena is a runtime
+// follow-up; this proves the language surface + scoped push/pop are wired end-to-end.)
+pull "spill"
+pull "stash"
+pull "mem"
+
+finna main() {
+    crib symbols                                     // arena the symbol table lives in
+    lowkey syms = stash.new[str, int](in: symbols)
+    syms.put("x", 1)
+    syms.put("y", 2)
+    syms.put("x", 42)                                // overwrite
+
+    lowkey v, ok = syms.peep("x")
+    fr ok { spill.it(v) } naw { spill.it("miss") }   // 42
+    spill.it(syms.gang())                            // 2
+
+    // The built-in scratch arena is equally a valid allocator context.
+    lowkey tmp = stash.new[str, int](in: mem.scratch())
+    tmp.put("k", 7)
+    lowkey w, ok2 = tmp.peep("k")
+    fr ok2 { spill.it(w) } naw { spill.it("miss") }  // 7
+}
