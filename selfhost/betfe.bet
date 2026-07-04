@@ -2528,6 +2528,20 @@ finna arrayElemHint(hint: str) -> str {
     bet ""
 }
 
+// --- runtime-backed vec[T]: a handle, spelled `vec[ELEM]` ---
+finna isVecTy(t: str) -> bool {
+    fr str.len(t) < 5 { bet cap }
+    bet str.at(t, 0) == 118 && str.at(t, 1) == 101 && str.at(t, 2) == 99 && str.at(t, 3) == 91
+}
+
+finna vecElem(t: str) -> str {
+    bet str.sub(t, 4, str.len(t) - 1)
+}
+
+finna vecTyStr(elem: str) -> str {
+    bet cat3("vec[", elem, "]")
+}
+
 // --- tuple types, spelled `(A, B, ..)` (multi-return values) ---
 finna isTupleTy(t: str) -> bool {
     fr str.len(t) < 2 { bet cap }
@@ -2626,6 +2640,10 @@ finna mapTypeNode(c: LowerCtx, p: P, tyNode: int) -> str {
         fr str.slaps(nm, "yikes") {
             ensureYikes(c)
             bet "__yikes"
+        }
+        // A `vec[T]` type node is `named vec` with the element type as its child.
+        fr str.slaps(nm, "vec") && kidCount(p, tyNode) > 0 {
+            bet vecTyStr(mapTypeNode(c, p, kidAt(p, tyNode, 0)))
         }
         fr isStruct(c, nm) { bet nm }
         fr isSum(c, nm) { bet nm }
@@ -2856,6 +2874,30 @@ finna emitPlaceAssign(c: LowerCtx, place: str, rhs: str) {
     sb.add(" = ")
     sb.add(rhs)
     emitStmt(c, sb.finish())
+}
+
+// `%t = addr_of(<target>)` into a fresh rawptr temp; returns its id.
+finna emitAddrOf(c: LowerCtx, target: str) -> int {
+    lowkey t = newLocal(c, "rawptr")
+    lowkey sb = sbNew()
+    sb.add("addr_of(")
+    sb.add(target)
+    sb.add(")")
+    emitAssign(c, t, sb.finish())
+    bet t
+}
+
+// `%t = call_extern @NAME(a, b, ..)` into a fresh temp of `retTy`; returns its id. Voids too.
+finna emitExternCall(c: LowerCtx, retTy: str, name: str, args: vec[str]) -> int {
+    lowkey r = newLocal(c, retTy)
+    lowkey sb = sbNew()
+    sb.add("call_extern @")
+    sb.add(name)
+    sb.add("(")
+    sb.add(joinComma(args))
+    sb.add(")")
+    emitAssign(c, r, sb.finish())
+    bet r
 }
 
 // Widen an int operand to the print word type (mirror coerce_int): no-op if already `to`.
@@ -3132,6 +3174,147 @@ finna lowerIntrinsic(c: LowerCtx, p: P, module: str, method: str, methodIdx: int
     bet "0i64", "i64"
 }
 
+// `vec.new[T]()` — an empty growable vec (mirror lower_vec_new): size_of[T] + bet_vec_new(size).
+finna lowerVecNew(c: LowerCtx, p: P, methodIdx: int) -> (str, str) {
+    lowkey targsW = findKid(p, methodIdx, "typeargs")
+    fr targsW < 0 || kidCount(p, targsW) != 1 {
+        lcFail(c)
+        bet "0i64", "i64"
+    }
+    lowkey elem = mapTypeNode(c, p, kidAt(p, targsW, 0))
+    lowkey vecTy = vecTyStr(elem)
+    lowkey esize = newLocal(c, "u64")
+    lowkey sb = sbNew()
+    sb.add("size_of[")
+    sb.add(elem)
+    sb.add("]")
+    emitAssign(c, esize, sb.finish())
+    lowkey ext = sbNew()
+    ext.add("extern \"C\" fn bet_vec_new(u64) -> ")
+    ext.add(vecTy)
+    getExtern(c, ext.finish())
+    lowkey args = vec.new[str]()
+    args.stack(reg(esize))
+    lowkey tmp = emitExternCall(c, vecTy, "bet_vec_new", args)
+    bet reg(tmp), vecTy
+}
+
+// The `extern "C" fn NAME(<paramList>) -> RET` decl string.
+finna vecExternDecl(name: str, paramList: str, ret: str) -> str {
+    lowkey sb = sbNew()
+    sb.add("extern \"C\" fn ")
+    sb.add(name)
+    sb.add("(")
+    sb.add(paramList)
+    sb.add(") -> ")
+    sb.add(ret)
+    bet sb.finish()
+}
+
+// Dispatch a method on a `vec[T]` value: stack (push), pop, gang (length) (mirror lower_vec_method).
+finna lowerVecMethod(c: LowerCtx, p: P, methodIdx: int, vecOp: str, elem: str, method: str) -> (str, str) {
+    lowkey vecTy = vecTyStr(elem)
+    lowkey argsW = findKid(p, methodIdx, "args")
+    fr str.slaps(method, "stack") {
+        lowkey val, vty = lowerExpr(c, p, argValue(p, argsW, 0), elem)
+        lowkey el = newLocal(c, elem)
+        emitAssign(c, el, val)
+        lowkey ptr = emitAddrOf(c, reg(el))
+        getExtern(c, vecExternDecl("bet_vec_push", cat3(vecTy, ", ", "rawptr"), "void"))
+        lowkey args = vec.new[str]()
+        args.stack(vecOp)
+        args.stack(reg(ptr))
+        lowkey r = emitExternCall(c, "void", "bet_vec_push", args)
+        bet reg(r), "void"
+    }
+    fr str.slaps(method, "gang") {
+        getExtern(c, vecExternDecl("bet_vec_len", vecTy, "u64"))
+        lowkey args = vec.new[str]()
+        args.stack(vecOp)
+        lowkey r = emitExternCall(c, "u64", "bet_vec_len", args)
+        bet reg(r), "u64"
+    }
+    fr str.slaps(method, "pop") {
+        lowkey out = newLocal(c, elem)
+        lowkey ptr = emitAddrOf(c, reg(out))
+        getExtern(c, vecExternDecl("bet_vec_pop", cat3(vecTy, ", ", "rawptr"), "bool"))
+        lowkey args = vec.new[str]()
+        args.stack(vecOp)
+        args.stack(reg(ptr))
+        lowkey ok = emitExternCall(c, "bool", "bet_vec_pop", args)
+        bet reg(out), elem
+    }
+    lcFail(c)
+    bet "0i64", "i64"
+}
+
+// `v[i]` for a `vec[T]` — a runtime read into a fresh slot via bet_vec_get (mirror lower_vec_index).
+finna lowerVecIndex(c: LowerCtx, p: P, indexIdx: int, vecOp: str, elem: str) -> (str, str) {
+    lowkey vecTy = vecTyStr(elem)
+    lowkey iop, ity = lowerExpr(c, p, kidAt(p, indexIdx, 1), "u64")
+    lowkey iu = coerceInt(c, iop, ity, "u64")
+    lowkey out = newLocal(c, elem)
+    lowkey ptr = emitAddrOf(c, reg(out))
+    getExtern(c, vecExternDecl("bet_vec_get", cat3(vecTy, ", ", "u64, rawptr"), "bool"))
+    lowkey args = vec.new[str]()
+    args.stack(vecOp)
+    args.stack(iu)
+    args.stack(reg(ptr))
+    lowkey ok = emitExternCall(c, "bool", "bet_vec_get", args)
+    bet reg(out), elem
+}
+
+// `squad x in v { .. }` for a `vec[T]` — a counter loop bounded by bet_vec_len (mirror
+// lower_vec_squad). The counter is u64; each iteration binds `x = bet_vec_get(v, ctr)`.
+finna lowerVecSquad(c: LowerCtx, p: P, squadIdx: int, vecOp: str, elem: str, var: str) {
+    lowkey vecTy = vecTyStr(elem)
+    getExtern(c, vecExternDecl("bet_vec_len", vecTy, "u64"))
+    lowkey lenArgs = vec.new[str]()
+    lenArgs.stack(vecOp)
+    lowkey len = emitExternCall(c, "u64", "bet_vec_len", lenArgs)
+    lowkey ctr = newLocal(c, "u64")
+    emitAssign(c, ctr, "0u64")
+    lowkey pre = curId(c)
+    lowkey header = reserveBlock(c)
+    setGoto(c, pre, header)
+    selectBlock(c, header)
+    lowkey cond = newLocal(c, "bool")
+    lowkey csb = sbNew()
+    csb.add("lt.na(")
+    csb.add(reg(ctr))
+    csb.add(", ")
+    csb.add(reg(len))
+    csb.add(")")
+    emitAssign(c, cond, csb.finish())
+    lowkey headerEnd = curId(c)
+    lowkey bodyBb = newBlock(c)
+    lowkey exit = reserveBlock(c)
+    setBranch(c, headerEnd, reg(cond), bodyBb, exit)
+    selectBlock(c, bodyBb)
+    lowkey elemLocal = newLocal(c, elem)
+    lowkey ptr = emitAddrOf(c, reg(elemLocal))
+    getExtern(c, vecExternDecl("bet_vec_get", cat3(vecTy, ", ", "u64, rawptr"), "bool"))
+    lowkey getArgs = vec.new[str]()
+    getArgs.stack(vecOp)
+    getArgs.stack(reg(ctr))
+    getArgs.stack(reg(ptr))
+    lowkey got = emitExternCall(c, "bool", "bet_vec_get", getArgs)
+    bindLocal(c, var, elemLocal)
+    lowkey incr = reserveBlock(c)
+    pushLoop(c, incr, exit)
+    lowerBlock(c, p, kidAt(p, squadIdx, 1))
+    popLoop(c)
+    termGoto(c, incr)
+    selectBlock(c, incr)
+    lowkey isb = sbNew()
+    isb.add("add.wrap(")
+    isb.add(reg(ctr))
+    isb.add(", 1u64)")
+    emitAssign(c, ctr, isb.finish())
+    termGoto(c, header)
+    selectBlock(c, exit)
+}
+
 // `y.tea(ctx)` — wrap an error, prefixing `"<ctx>: "` to its message (mirror lower_yikes_method).
 finna lowerTea(c: LowerCtx, p: P, methodIdx: int, yop: str) -> (str, str) {
     lowkey argsW = findKid(p, methodIdx, "args")
@@ -3154,6 +3337,11 @@ finna lowerMethodCall(c: LowerCtx, p: P, idx: int) -> (str, str) {
         lowkey rn = afterFirst(lab(p, recvE))
         fr lookupLocal(c, rn) < 0 && lookupConst(c, rn) < 0 && lookupGlobalConst(c, rn) < 0 && lookupFn(c, rn) < 0 {
             fr isModule(rn) {
+                // `vec.new[T]()` needs its type arg, so it bypasses the plain intrinsic dispatch.
+                fr str.slaps(rn, "vec") && str.slaps(methodName, "new") {
+                    lowkey vo, vt = lowerVecNew(c, p, idx)
+                    bet vo, vt
+                }
                 lowkey io, it = lowerIntrinsic(c, p, rn, methodName, idx)
                 bet io, it
             }
@@ -3163,11 +3351,15 @@ finna lowerMethodCall(c: LowerCtx, p: P, idx: int) -> (str, str) {
     }
     lowkey fi = lookupFn(c, methodName)
     fr fi < 0 {
-        // Not a user method — try a value method on the receiver's type (yikes.tea).
+        // Not a user method — try a value method on the receiver's type (yikes.tea / vec.*).
         lowkey yop, yty = lowerExpr(c, p, recvE, "")
         fr isYikesTy(yty) && str.slaps(methodName, "tea") && isPlace(yop) {
             lowkey to, tt = lowerTea(c, p, idx, yop)
             bet to, tt
+        }
+        fr isVecTy(yty) {
+            lowkey vo, vt = lowerVecMethod(c, p, idx, yop, vecElem(yty), methodName)
+            bet vo, vt
         }
         lcFail(c)
         bet "0i64", "i64"
@@ -3303,6 +3495,10 @@ finna lowerArrayLit(c: LowerCtx, p: P, idx: int, hint: str) -> (str, str) {
 // the base must be an addressable place (a bare register) and vec[T] indexing is deferred.
 finna lowerIndex(c: LowerCtx, p: P, idx: int) -> (str, str) {
     lowkey bop, bty = lowerExpr(c, p, kidAt(p, idx, 0), "")
+    fr isVecTy(bty) {
+        lowkey vo, vt = lowerVecIndex(c, p, idx, bop, vecElem(bty))
+        bet vo, vt
+    }
     fr !isArrayTy(bty) || !isReg(bop) {
         lcFail(c)
         bet "0i64", "i64"
@@ -3664,6 +3860,9 @@ finna lowerExprStmt(c: LowerCtx, p: P, stmtIdx: int) {
         lowerSpill(c, p, e)
     } naw fr str.slaps(firstWord(lab(p, e)), "call") {
         lowkey dop, dty = lowerCall(c, p, e)
+    } naw fr str.slaps(firstWord(lab(p, e)), "method") {
+        // A non-spill method statement (e.g. `xs.stack(10)`): lower and discard its result.
+        lowkey mop, mty = lowerMethodCall(c, p, e)
     } naw {
         lcFail(c)
     }
@@ -4006,7 +4205,9 @@ finna lowerVibe(c: LowerCtx, p: P, vibeIdx: int) {
 finna lowerSquad(c: LowerCtx, p: P, squadIdx: int) {
     lowkey var = afterFirst(lab(p, squadIdx))
     lowkey iop, ity = lowerExpr(c, p, kidAt(p, squadIdx, 0), "")
-    fr !isArrayTy(ity) || !isReg(iop) {
+    fr isVecTy(ity) {
+        lowerVecSquad(c, p, squadIdx, iop, vecElem(ity), var)
+    } naw fr !isArrayTy(ity) || !isReg(iop) {
         lcFail(c)
     } naw {
         lowkey elem = arrayElem(ity)
@@ -4261,6 +4462,8 @@ finna buildStructDef(c: LowerCtx, p: P, dripIdx: int) {
             fr str.slaps(firstWord(lab(p, k)), "field") {
                 lowkey visName = afterFirst(lab(p, k))
                 lowkey vis = firstWord(visName)
+                // An unspecified field visibility defaults to private (`hush`).
+                fr str.slaps(vis, "default") { vis = "hush" }
                 lowkey fname = afterFirst(visName)
                 lowkey fty = mapTypeNode(c, p, kidAt(p, k, 0))
                 fr pos == 0 { sb.add(" ") } naw { sb.add(", ") }

@@ -414,6 +414,12 @@ size = 13
 # construction, the `!= ghosted`/`== ghosted` present-flag idiom, spill of a yikes (prints .msg),
 # `bounce` (early return of zeros + err), and `.tea` (bet_str_concat wrap). yeet/sheesh stay sentinel
 # (unlowered in the Rust frontend too). Unlocks yikes-basics/bounce/tea-wrap. 34/59 byte-identical.
+# C4.13 added the runtime-backed vec[T]: vec.new[T]() (size_of[T] + bet_vec_new), value methods
+# stack/pop/gang (bet_vec_push/pop/len via addr_of out-slots), v[i] indexing (bet_vec_get into a
+# fresh slot, index coerced to u64), and vec squad (u64 counter loop bounded by bet_vec_len). vec[T]
+# now resolves as a type (`named vec` + elem child) for struct fields/params; unspecified field vis
+# maps to hush. Non-spill method statements (xs.stack(..)) lower + discard. Unlocks vec/vec-shared/
+# vec-aggregates. 37/59 byte-identical; 0 false-supported.
 status = "doing"
 
 [[task]]
