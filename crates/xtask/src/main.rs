@@ -1245,9 +1245,63 @@ fn selfhost_run(bin: &Path, root: &Path, tmp: &Path) -> Result<()> {
         );
     }
 
+    // 5. C1 lexer parity: for every corpus program, betfe's `--emit tokens` must be byte-identical
+    //    to the Rust frontend's. This is the per-layer differential (self-host plan B1/C1) that
+    //    localizes any lexer regression to a single program.
+    let corpus_root = root.join("tests").join("corpus");
+    let mut bet_files = Vec::new();
+    walk_files(&corpus_root, &mut bet_files).context("walking tests/corpus")?;
+    bet_files.retain(|p| p.extension().and_then(|e| e.to_str()) == Some("bet"));
+    bet_files.sort();
+    let mut mismatches = Vec::new();
+    for f in &bet_files {
+        let rust = std::process::Command::new(bin)
+            .args(["build", "--emit", "tokens"])
+            .arg(f)
+            .output()
+            .with_context(|| format!("`bet build --emit tokens {}`", f.display()))?;
+        if !rust.status.success() {
+            bail!(
+                "reference `--emit tokens` failed for {}:\n{}",
+                f.display(),
+                String::from_utf8_lossy(&rust.stderr)
+            );
+        }
+        let mine = std::process::Command::new(&betfe)
+            .args(["--emit", "tokens"])
+            .arg(f)
+            .output()
+            .with_context(|| format!("`betfe --emit tokens {}`", f.display()))?;
+        if !mine.status.success() {
+            bail!(
+                "betfe `--emit tokens` failed for {}:\n{}",
+                f.display(),
+                String::from_utf8_lossy(&mine.stderr)
+            );
+        }
+        if mine.stdout != rust.stdout {
+            mismatches.push(
+                f.strip_prefix(&corpus_root)
+                    .unwrap_or(f)
+                    .display()
+                    .to_string(),
+            );
+        }
+    }
+    if !mismatches.is_empty() {
+        bail!(
+            "C1 lexer: {} of {} corpus programs have non-identical token dumps (betfe vs Rust):\n  {}",
+            mismatches.len(),
+            bet_files.len(),
+            mismatches.join("\n  ")
+        );
+    }
+    let toks_checked = bet_files.len();
+
     println!(
         "selfhost: OK — betfe -> .mir -> backend -> binary prints {expected:?}; \
-         .mir byte-identical to the Rust frontend"
+         .mir byte-identical to the Rust frontend; \
+         C1 lexer `--emit tokens` byte-identical across {toks_checked} corpus programs"
     );
     Ok(())
 }

@@ -305,7 +305,19 @@ status = "done"
 slug = "selfhost-lexer"
 name = "C1: port lexer.rs -> bet (keywords, operators, numeric tower, string/byte literals, ASI); verify --emit=tokens diff on corpus"
 size = 5
-status = "todo"
+# DONE. The lexer lives inline in selfhost/betfe.bet (single-file: `pull` is a no-op and `bet
+# build` compiles ONE file, so there are no source imports — the whole frontend shares one file,
+# like the Rust `frontend` crate holds lexer/parser/lower together). `betfe --emit tokens <file>`
+# reads via sys.arg (A5) + fs.peepText (A1), tokenizes with a hand-written scanner (no logos), runs
+# the L6 ASI pass, and prints dump.rs's exact format. Token = a `drip{kind,text,hasText}` where
+# kind is the canonical dump tag (NOT a 70-variant moods) — keyword tags == spellings, so the
+# scanner sets kind=word and emit just prints kind; byte-identical output for a fraction of the
+# code (C3 can revisit the representation). Verified: `cargo xtask selfhost` now diffs `--emit
+# tokens` betfe-vs-Rust across ALL 59 corpus programs, byte-identical (floats/hex/bin, every
+# keyword+operator, comments, escaped strings, ASI). Gotcha banked: vec.gang() is UNSIGNED (cast
+# `as int` for signed loops) and multi-line bool exprs must break AFTER `||`/`&&` (ASI). The no-arg
+# betfe still emits the fixed hello .mir (C0 tracer) until real lowering lands at C4/C5.
+status = "done"
 
 [[task]]
 slug = "selfhost-ast"

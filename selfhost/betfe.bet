@@ -1,24 +1,33 @@
 // betfe — the self-hosted `bet` frontend's entry point (Milestone 7.1, Phase C).
 //
-// The eventual shape is: read a `.bet` source, lex → parse → lower, and PRINT the `.mir` text to
+// The eventual shape is: read a `.bet` source, lex -> parse -> lower, and PRINT the `.mir` text to
 // stdout, where the existing Rust backend takes over (`bet build foo.mir`). The only contract is
 // the `.mir` textual format (crates/midir/src/text.rs); no FFI into Rust is needed.
 //
-// C0 status — TRACER BULLET. This does not yet lex or parse anything; it emits a fixed program's
-// `.mir` (the `hello` oracle: print "hi") using the growable string builder (A2). Its job is to
-// prove the self-hosted pipeline end-to-end:
+// SINGLE FILE, on purpose: `pull` is a no-op (the stdlib is compiler intrinsics) and `bet build`
+// compiles ONE source file — there are no source imports. So the whole frontend lives here, the
+// way the Rust `frontend` crate holds lexer.rs / parser.rs / lower.rs together and `--emit <kind>`
+// stops after the relevant phase. Each phase is a section below.
 //
-//     betfe.bet --(Rust compiler)--> betfe binary --(run)--> hello.mir --(backend)--> a.out --> "hi"
+// C1 status — the LEXER is real. `betfe --emit tokens <file>` reads the file (sys.arg + fs.peepText,
+// A5/A1), tokenizes it, and prints the post-ASI token stream in the exact format of
+// crates/frontend/src/dump.rs (verified byte-identical against `bet build --emit tokens` over the
+// whole corpus by `cargo xtask selfhost`). With NO args betfe still emits the fixed `hello` .mir
+// (the C0 tracer) so the end-to-end `.mir` -> backend -> binary pipeline stays proven; that fixed
+// path retires at C4/C5 when real lowering lands. C2/C3 add parse + `--emit ast`; C4 adds lower.
 //
-// `cargo xtask selfhost` drives exactly that and checks the binary prints "hi". C1–C5 replace
-// `emitHelloMir` with real lexing / parsing / lowering that mirror crates/frontend/src/*.rs; the
-// StrBuilder and the emit/write structure below are what they grow into.
+// A Token here is a `drip { kind, text, hasText }` where `kind` is the canonical DUMP TAG (not a
+// 70-variant `moods` sum). This is deliberate: dump.rs maps every keyword to its own spelling, so
+// the scanner sets `kind = word` for keywords and emit just prints `kind` — byte-identical output
+// (the actual deliverable) with a fraction of the code. C3 can revisit the representation when the
+// parser needs exhaustive matching.
 pull "spill"
 pull "str"
 pull "vec"
+pull "fs"
+pull "sys"
 
-// --- the growable string builder the `.mir` emitter is built on (A2, inline per the no-source-
-// imports model: the stdlib is intrinsics, so shared helpers live in the selfhost program). ---
+// --- the growable string builder the emitters are built on (A2). ---
 drip StrBuilder {
     buf: vec[u8]
 }
@@ -35,9 +44,611 @@ finna (sb: StrBuilder) finish() -> str {
     bet sb.buf.str()
 }
 
+// ===========================================================================
+// C1 — the lexer (mirror of crates/frontend/src/lexer.rs).
+// ===========================================================================
+
+// A lexical token. `kind` is the canonical dump tag; `text` is the payload for the five tokens
+// that carry one (ident / int / float / str / byte); `hasText` selects the `<tag> <payload>` form.
+drip Token {
+    kind: str,
+    text: str,
+    hasText: bool
+}
+
+finna tok0(k: str) -> Token {
+    bet Token{ kind: k, text: "", hasText: cap }
+}
+
+finna tok1(k: str, t: str) -> Token {
+    bet Token{ kind: k, text: t, hasText: nocap }
+}
+
+// --- byte classifiers (bytes compared as ints, as str.at returns them). ---
+
+finna isDigit(c: int) -> bool {
+    bet c >= 48 && c <= 57
+}
+
+finna isAlpha(c: int) -> bool {
+    bet (c >= 97 && c <= 122) || (c >= 65 && c <= 90)
+}
+
+finna isIdentStart(c: int) -> bool {
+    bet isAlpha(c) || c == 95
+}
+
+finna isIdentCont(c: int) -> bool {
+    bet isAlpha(c) || isDigit(c) || c == 95
+}
+
+finna isHexDigit(c: int) -> bool {
+    bet isDigit(c) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70)
+}
+
+finna isDecCont(c: int) -> bool {
+    bet isDigit(c) || c == 95
+}
+
+// Value of a hex/dec digit byte (0 for anything else — callers guard the class first).
+finna hexVal(c: int) -> int {
+    fr c >= 48 && c <= 57 {
+        bet c - 48
+    }
+    fr c >= 97 && c <= 102 {
+        bet c - 97 + 10
+    }
+    fr c >= 65 && c <= 70 {
+        bet c - 65 + 10
+    }
+    bet 0
+}
+
+// The 32 L2 keywords (dump tag == surface spelling, per dump.rs::token_tag).
+finna isKeyword(w: str) -> bool {
+    bet str.slaps(w, "finna") ||
+        str.slaps(w, "bet") ||
+        str.slaps(w, "lowkey") ||
+        str.slaps(w, "facts") ||
+        str.slaps(w, "drip") ||
+        str.slaps(w, "moods") ||
+        str.slaps(w, "pull") ||
+        str.slaps(w, "extern") ||
+        str.slaps(w, "fr") ||
+        str.slaps(w, "naw") ||
+        str.slaps(w, "vibin") ||
+        str.slaps(w, "squad") ||
+        str.slaps(w, "dip") ||
+        str.slaps(w, "skip") ||
+        str.slaps(w, "vibe") ||
+        str.slaps(w, "slide") ||
+        str.slaps(w, "yeet") ||
+        str.slaps(w, "sheesh") ||
+        str.slaps(w, "bounce") ||
+        str.slaps(w, "nocap") ||
+        str.slaps(w, "cap") ||
+        str.slaps(w, "ghosted") ||
+        str.slaps(w, "flex") ||
+        str.slaps(w, "hush") ||
+        str.slaps(w, "crib") ||
+        str.slaps(w, "cop") ||
+        str.slaps(w, "evict") ||
+        str.slaps(w, "tag") ||
+        str.slaps(w, "holla") ||
+        str.slaps(w, "trust") ||
+        str.slaps(w, "in") ||
+        str.slaps(w, "as")
+}
+
+// Whether a newline right after a token of `kind` TERMINATES the statement (grammar §L6).
+finna endsStatement(k: str) -> bool {
+    bet str.slaps(k, "ident") ||
+        str.slaps(k, "int") ||
+        str.slaps(k, "float") ||
+        str.slaps(k, "str") ||
+        str.slaps(k, "byte") ||
+        str.slaps(k, "nocap") ||
+        str.slaps(k, "cap") ||
+        str.slaps(k, "ghosted") ||
+        str.slaps(k, "rparen") ||
+        str.slaps(k, "rbracket") ||
+        str.slaps(k, "rbrace") ||
+        str.slaps(k, "bet") ||
+        str.slaps(k, "dip") ||
+        str.slaps(k, "skip") ||
+        str.slaps(k, "bounce")
+}
+
+// --- literal helpers ---
+
+// Digit-string -> int in the given radix, skipping `_` separators.
+finna parseNumVal(s: str, radix: int) -> int {
+    lowkey acc = 0
+    lowkey n = str.len(s)
+    lowkey i = 0
+    vibin i < n {
+        lowkey c = str.at(s, i)
+        fr c != 95 {
+            acc = acc * radix + hexVal(c)
+        }
+        i = i + 1
+    }
+    bet acc
+}
+
+// Non-negative int -> its decimal string (the dump prints the parsed VALUE, not the source).
+finna itoa(n: int) -> str {
+    fr n == 0 {
+        bet "0"
+    }
+    lowkey digits = vec.new[u8]()
+    lowkey x = n
+    vibin x > 0 {
+        digits.stack(((x % 10) + 48) as u8)
+        x = x / 10
+    }
+    // Reverse (digits were produced least-significant-first). NOTE: vec.gang() is UNSIGNED —
+    // cast to int or `i >= 0` never fails and `i - 1` wraps at 0 (an infinite loop).
+    lowkey out = vec.new[u8]()
+    lowkey i = (digits.gang() as int) - 1
+    vibin i >= 0 {
+        out.stack(digits[i])
+        i = i - 1
+    }
+    bet out.str()
+}
+
+// Strip `_` separators from a numeric source slice (used for the float payload).
+finna cleanNum(s: str) -> str {
+    lowkey out = vec.new[u8]()
+    lowkey n = str.len(s)
+    lowkey i = 0
+    vibin i < n {
+        lowkey c = str.at(s, i)
+        fr c != 95 {
+            out.stack(c as u8)
+        }
+        i = i + 1
+    }
+    bet out.str()
+}
+
+// Re-quote a string VALUE with the dump's minimal escape set (mirror dump.rs::quote).
+finna quote(s: str) -> str {
+    lowkey out = vec.new[u8]()
+    out.stack(34 as u8)
+    lowkey n = str.len(s)
+    lowkey i = 0
+    vibin i < n {
+        lowkey c = str.at(s, i)
+        fr c == 92 {
+            out.stack(92 as u8)
+            out.stack(92 as u8)
+        } naw fr c == 34 {
+            out.stack(92 as u8)
+            out.stack(34 as u8)
+        } naw fr c == 10 {
+            out.stack(92 as u8)
+            out.stack(110 as u8)
+        } naw fr c == 9 {
+            out.stack(92 as u8)
+            out.stack(116 as u8)
+        } naw fr c == 13 {
+            out.stack(92 as u8)
+            out.stack(114 as u8)
+        } naw {
+            out.stack(c as u8)
+        }
+        i = i + 1
+    }
+    out.stack(34 as u8)
+    bet out.str()
+}
+
+// Decode a string literal's escapes to its byte VALUE (mirror lexer.rs::unescape_str). `\xHH` is
+// encoded as the UTF-8 of U+00HH, matching Rust's char->String path.
+finna unescapeStr(s: str) -> str {
+    lowkey out = vec.new[u8]()
+    lowkey n = str.len(s)
+    lowkey i = 0
+    vibin i < n {
+        lowkey c = str.at(s, i)
+        fr c == 92 {
+            i = i + 1
+            lowkey e = str.at(s, i)
+            fr e == 110 {
+                out.stack(10 as u8)
+            } naw fr e == 116 {
+                out.stack(9 as u8)
+            } naw fr e == 114 {
+                out.stack(13 as u8)
+            } naw fr e == 92 {
+                out.stack(92 as u8)
+            } naw fr e == 34 {
+                out.stack(34 as u8)
+            } naw fr e == 39 {
+                out.stack(39 as u8)
+            } naw fr e == 48 {
+                out.stack(0 as u8)
+            } naw fr e == 120 {
+                lowkey v = hexVal(str.at(s, i + 1)) * 16 + hexVal(str.at(s, i + 2))
+                fr v < 128 {
+                    out.stack(v as u8)
+                } naw {
+                    out.stack((192 + (v / 64)) as u8)
+                    out.stack((128 + (v % 64)) as u8)
+                }
+                i = i + 2
+            } naw {
+                out.stack(e as u8)
+            }
+            i = i + 1
+        } naw {
+            out.stack(c as u8)
+            i = i + 1
+        }
+    }
+    bet out.str()
+}
+
+// The L6 ASI pass: collapse `newline` tokens into statement-terminating `semi`s (mirror
+// lexer.rs::apply_asi).
+finna applyAsi(raw: vec[Token]) -> vec[Token] {
+    lowkey out = vec.new[Token]()
+    lowkey prevEnds = cap
+    lowkey n = raw.gang() as int
+    lowkey i = 0
+    vibin i < n {
+        lowkey t = raw[i]
+        fr str.slaps(t.kind, "newline") {
+            fr prevEnds {
+                out.stack(tok0("semi"))
+                prevEnds = cap
+            }
+        } naw fr str.slaps(t.kind, "semi") {
+            prevEnds = cap
+            out.stack(t)
+        } naw {
+            prevEnds = endsStatement(t.kind)
+            out.stack(t)
+        }
+        i = i + 1
+    }
+    bet out
+}
+
+// Tokenize a whole source string into the post-ASI token stream (mirror lexer.rs::tokenize).
+finna lex(src: str) -> vec[Token] {
+    lowkey raw = vec.new[Token]()
+    lowkey n = str.len(src)
+    lowkey i = 0
+    vibin i < n {
+        lowkey c = str.at(src, i)
+
+        // whitespace (spaces / tabs)
+        fr c == 32 || c == 9 {
+            i = i + 1
+            skip
+        }
+        // newline
+        fr c == 10 {
+            raw.stack(tok0("newline"))
+            i = i + 1
+            skip
+        }
+        // carriage return (\r or \r\n) -> one newline
+        fr c == 13 {
+            i = i + 1
+            fr i < n && str.at(src, i) == 10 {
+                i = i + 1
+            }
+            raw.stack(tok0("newline"))
+            skip
+        }
+        // comments: `//` to end of line, `/* ... */` non-nesting
+        fr c == 47 && i + 1 < n && (str.at(src, i + 1) == 47 || str.at(src, i + 1) == 42) {
+            fr str.at(src, i + 1) == 47 {
+                i = i + 2
+                vibin i < n && str.at(src, i) != 10 {
+                    i = i + 1
+                }
+            } naw {
+                i = i + 2
+                vibin i < n {
+                    fr str.at(src, i) == 42 && i + 1 < n && str.at(src, i + 1) == 47 {
+                        i = i + 2
+                        dip
+                    }
+                    i = i + 1
+                }
+            }
+            skip
+        }
+        // identifiers / keywords
+        fr isIdentStart(c) {
+            lowkey s0 = i
+            vibin i < n && isIdentCont(str.at(src, i)) {
+                i = i + 1
+            }
+            lowkey word = str.sub(src, s0, i)
+            fr isKeyword(word) {
+                raw.stack(tok0(word))
+            } naw {
+                raw.stack(tok1("ident", word))
+            }
+            skip
+        }
+        // numeric tower: hex / bin / decimal / float
+        fr isDigit(c) {
+            lowkey s0 = i
+            fr c == 48 && i + 1 < n && str.at(src, i + 1) == 120 {
+                i = i + 2
+                lowkey ds = i
+                vibin i < n && (isHexDigit(str.at(src, i)) || str.at(src, i) == 95) {
+                    i = i + 1
+                }
+                raw.stack(tok1("int", itoa(parseNumVal(str.sub(src, ds, i), 16))))
+            } naw fr c == 48 && i + 1 < n && str.at(src, i + 1) == 98 {
+                i = i + 2
+                lowkey ds = i
+                vibin i < n && (str.at(src, i) == 48 || str.at(src, i) == 49 || str.at(src, i) == 95) {
+                    i = i + 1
+                }
+                raw.stack(tok1("int", itoa(parseNumVal(str.sub(src, ds, i), 2))))
+            } naw {
+                vibin i < n && isDecCont(str.at(src, i)) {
+                    i = i + 1
+                }
+                lowkey isFloat = cap
+                // fractional part: `.` must be followed by a digit (else it's a Dot token)
+                fr i < n && str.at(src, i) == 46 && i + 1 < n && isDigit(str.at(src, i + 1)) {
+                    isFloat = nocap
+                    i = i + 1
+                    vibin i < n && isDecCont(str.at(src, i)) {
+                        i = i + 1
+                    }
+                }
+                // exponent: `e`/`E` then optional sign then a digit
+                fr i < n && (str.at(src, i) == 101 || str.at(src, i) == 69) {
+                    lowkey j = i + 1
+                    fr j < n && (str.at(src, j) == 43 || str.at(src, j) == 45) {
+                        j = j + 1
+                    }
+                    fr j < n && isDigit(str.at(src, j)) {
+                        isFloat = nocap
+                        i = j
+                        vibin i < n && isDecCont(str.at(src, i)) {
+                            i = i + 1
+                        }
+                    }
+                }
+                fr isFloat {
+                    raw.stack(tok1("float", cleanNum(str.sub(src, s0, i))))
+                } naw {
+                    raw.stack(tok1("int", itoa(parseNumVal(str.sub(src, s0, i), 10))))
+                }
+            }
+            skip
+        }
+        // string literal
+        fr c == 34 {
+            i = i + 1
+            lowkey cs = i
+            vibin i < n && str.at(src, i) != 34 {
+                fr str.at(src, i) == 92 {
+                    i = i + 1
+                }
+                i = i + 1
+            }
+            lowkey inner = str.sub(src, cs, i)
+            i = i + 1
+            raw.stack(tok1("str", quote(unescapeStr(inner))))
+            skip
+        }
+        // byte literal
+        fr c == 39 {
+            i = i + 1
+            lowkey bv = 0
+            fr str.at(src, i) == 92 {
+                i = i + 1
+                lowkey e = str.at(src, i)
+                fr e == 110 {
+                    bv = 10
+                } naw fr e == 116 {
+                    bv = 9
+                } naw fr e == 114 {
+                    bv = 13
+                } naw fr e == 92 {
+                    bv = 92
+                } naw fr e == 34 {
+                    bv = 34
+                } naw fr e == 39 {
+                    bv = 39
+                } naw fr e == 48 {
+                    bv = 0
+                } naw fr e == 120 {
+                    bv = hexVal(str.at(src, i + 1)) * 16 + hexVal(str.at(src, i + 2))
+                    i = i + 2
+                } naw {
+                    bv = e
+                }
+                i = i + 1
+            } naw {
+                bv = str.at(src, i)
+                i = i + 1
+            }
+            i = i + 1
+            raw.stack(tok1("byte", itoa(bv)))
+            skip
+        }
+
+        // operators & punctuation (longest match wins)
+        lowkey c1 = 0
+        fr i + 1 < n {
+            c1 = str.at(src, i + 1)
+        }
+        lowkey c2 = 0
+        fr i + 2 < n {
+            c2 = str.at(src, i + 2)
+        }
+        fr c == 60 && c1 == 60 && c2 == 61 {
+            raw.stack(tok0("shleq"))
+            i = i + 3
+        } naw fr c == 62 && c1 == 62 && c2 == 61 {
+            raw.stack(tok0("shreq"))
+            i = i + 3
+        } naw fr c == 45 && c1 == 62 {
+            raw.stack(tok0("arrow"))
+            i = i + 2
+        } naw fr c == 61 && c1 == 61 {
+            raw.stack(tok0("eqeq"))
+            i = i + 2
+        } naw fr c == 33 && c1 == 61 {
+            raw.stack(tok0("ne"))
+            i = i + 2
+        } naw fr c == 60 && c1 == 61 {
+            raw.stack(tok0("le"))
+            i = i + 2
+        } naw fr c == 62 && c1 == 61 {
+            raw.stack(tok0("ge"))
+            i = i + 2
+        } naw fr c == 60 && c1 == 60 {
+            raw.stack(tok0("shl"))
+            i = i + 2
+        } naw fr c == 62 && c1 == 62 {
+            raw.stack(tok0("shr"))
+            i = i + 2
+        } naw fr c == 38 && c1 == 38 {
+            raw.stack(tok0("andand"))
+            i = i + 2
+        } naw fr c == 124 && c1 == 124 {
+            raw.stack(tok0("oror"))
+            i = i + 2
+        } naw fr c == 43 && c1 == 61 {
+            raw.stack(tok0("pluseq"))
+            i = i + 2
+        } naw fr c == 45 && c1 == 61 {
+            raw.stack(tok0("minuseq"))
+            i = i + 2
+        } naw fr c == 42 && c1 == 61 {
+            raw.stack(tok0("stareq"))
+            i = i + 2
+        } naw fr c == 47 && c1 == 61 {
+            raw.stack(tok0("slasheq"))
+            i = i + 2
+        } naw fr c == 37 && c1 == 61 {
+            raw.stack(tok0("percenteq"))
+            i = i + 2
+        } naw fr c == 38 && c1 == 61 {
+            raw.stack(tok0("ampeq"))
+            i = i + 2
+        } naw fr c == 124 && c1 == 61 {
+            raw.stack(tok0("pipeeq"))
+            i = i + 2
+        } naw fr c == 94 && c1 == 61 {
+            raw.stack(tok0("careteq"))
+            i = i + 2
+        } naw fr c == 60 {
+            raw.stack(tok0("lt"))
+            i = i + 1
+        } naw fr c == 62 {
+            raw.stack(tok0("gt"))
+            i = i + 1
+        } naw fr c == 61 {
+            raw.stack(tok0("eq"))
+            i = i + 1
+        } naw fr c == 43 {
+            raw.stack(tok0("plus"))
+            i = i + 1
+        } naw fr c == 45 {
+            raw.stack(tok0("minus"))
+            i = i + 1
+        } naw fr c == 42 {
+            raw.stack(tok0("star"))
+            i = i + 1
+        } naw fr c == 47 {
+            raw.stack(tok0("slash"))
+            i = i + 1
+        } naw fr c == 37 {
+            raw.stack(tok0("percent"))
+            i = i + 1
+        } naw fr c == 38 {
+            raw.stack(tok0("amp"))
+            i = i + 1
+        } naw fr c == 124 {
+            raw.stack(tok0("pipe"))
+            i = i + 1
+        } naw fr c == 94 {
+            raw.stack(tok0("caret"))
+            i = i + 1
+        } naw fr c == 126 {
+            raw.stack(tok0("tilde"))
+            i = i + 1
+        } naw fr c == 33 {
+            raw.stack(tok0("bang"))
+            i = i + 1
+        } naw fr c == 46 {
+            raw.stack(tok0("dot"))
+            i = i + 1
+        } naw fr c == 44 {
+            raw.stack(tok0("comma"))
+            i = i + 1
+        } naw fr c == 58 {
+            raw.stack(tok0("colon"))
+            i = i + 1
+        } naw fr c == 59 {
+            raw.stack(tok0("semi"))
+            i = i + 1
+        } naw fr c == 91 {
+            raw.stack(tok0("lbracket"))
+            i = i + 1
+        } naw fr c == 93 {
+            raw.stack(tok0("rbracket"))
+            i = i + 1
+        } naw fr c == 40 {
+            raw.stack(tok0("lparen"))
+            i = i + 1
+        } naw fr c == 41 {
+            raw.stack(tok0("rparen"))
+            i = i + 1
+        } naw fr c == 123 {
+            raw.stack(tok0("lbrace"))
+            i = i + 1
+        } naw fr c == 125 {
+            raw.stack(tok0("rbrace"))
+            i = i + 1
+        } naw {
+            // unknown byte — the Rust lexer errors here; we skip so the diff localizes it.
+            i = i + 1
+        }
+    }
+    bet applyAsi(raw)
+}
+
+// Print the post-ASI token stream, one token per line, EXACTLY as dump.rs::tokens does.
+finna emitTokens(toks: vec[Token]) -> str {
+    lowkey sb = sbNew()
+    lowkey n = toks.gang() as int
+    lowkey i = 0
+    vibin i < n {
+        lowkey t = toks[i]
+        sb.add(t.kind)
+        fr t.hasText {
+            sb.add(" ")
+            sb.add(t.text)
+        }
+        sb.add("\n")
+        i = i + 1
+    }
+    bet sb.finish()
+}
+
+// ===========================================================================
+// C0 tracer — the fixed `hello` .mir emission (retires at C4/C5 when real lowering lands).
+// ===========================================================================
+
 // Emit the `.mir` for the `hello` program (`spill.it("hi")`), matching the Rust frontend's
-// canonical printer (crates/midir/src/text.rs) line for line. This is the fixed stand-in for the
-// real lower→emit pipeline the later phases install.
+// canonical printer (crates/midir/src/text.rs) line for line.
 finna emitHelloMir() -> str {
     lowkey sb = sbNew()
     sb.add("extern \"C\" fn bet_print(rawptr, u64) -> void\n")
@@ -56,6 +667,14 @@ finna emitHelloMir() -> str {
 }
 
 finna main() {
-    // stdout is the `.mir` text; the driver/xtask hook pipes it into the backend.
-    spill.it(emitHelloMir())
+    // `betfe --emit tokens <file>` prints the token dump; with no args, the C0 tracer emits the
+    // fixed hello .mir for the backend hand-off.
+    fr sys.argc() >= 4 &&
+        str.slaps(sys.arg(1), "--emit") &&
+        str.slaps(sys.arg(2), "tokens") {
+        lowkey src = fs.peepText(sys.arg(3))
+        spill.f("{}", emitTokens(lex(src)))
+    } naw {
+        spill.it(emitHelloMir())
+    }
 }
