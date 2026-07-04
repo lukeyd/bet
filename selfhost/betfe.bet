@@ -4002,6 +4002,55 @@ finna lowerVecMethod(c: LowerCtx, p: P, methodIdx: int, vecOp: str, elem: str, m
         lowkey ok = emitExternCall(c, "bool", "bet_vec_pop", args)
         bet reg(out), elem
     }
+    // `v.append(s)` → bet_vec_extend(vec, str_ptr, str_len): bulk-append a str's raw bytes.
+    // The string-builder primitive; restricted to `vec[u8]` (mirror lower_vec_method).
+    fr str.slaps(method, "append") {
+        fr !str.slaps(elem, "u8") {
+            lcFail(c)
+            bet "0i64", "i64"
+        }
+        lowkey s, sty = lowerExpr(c, p, argValue(p, argsW, 0), "str")
+        lowkey sp = emitStrPtr(c, s)
+        lowkey sl = emitStrLen(c, s)
+        getExtern(c, vecExternDecl("bet_vec_extend", cat3(vecTy, ", ", "rawptr, u64"), "void"))
+        lowkey args = vec.new[str]()
+        args.stack(vecOp)
+        args.stack(reg(sp))
+        args.stack(reg(sl))
+        lowkey r = emitExternCall(c, "void", "bet_vec_extend", args)
+        bet reg(r), "void"
+    }
+    // `v.str()` → an owned `str` copied out of a `vec[u8]`'s buffer: bet_vec_data + bet_vec_len,
+    // then bet_str_concat (with an empty second run) so the result outlives later mutation
+    // (mirror lower_vec_method's `str` arm). Restricted to `vec[u8]`.
+    fr str.slaps(method, "str") {
+        fr !str.slaps(elem, "u8") {
+            lcFail(c)
+            bet "0i64", "i64"
+        }
+        getExtern(c, vecExternDecl("bet_vec_data", vecTy, "rawptr"))
+        lowkey dataArgs = vec.new[str]()
+        dataArgs.stack(vecOp)
+        lowkey data = emitExternCall(c, "rawptr", "bet_vec_data", dataArgs)
+        getExtern(c, vecExternDecl("bet_vec_len", vecTy, "u64"))
+        lowkey lenArgs = vec.new[str]()
+        lenArgs.stack(vecOp)
+        lowkey len = emitExternCall(c, "u64", "bet_vec_len", lenArgs)
+        getExtern(c, "extern \"C\" fn bet_str_concat(rawptr, u64, rawptr, u64) -> rawptr")
+        lowkey outPtr = newLocal(c, "rawptr")
+        lowkey cb = sbNew()
+        cb.add("call_extern @bet_str_concat(")
+        cb.add(reg(data))
+        cb.add(", ")
+        cb.add(reg(len))
+        cb.add(", ")
+        cb.add(reg(data))
+        cb.add(", 0u64)")
+        emitAssign(c, outPtr, cb.finish())
+        lowkey result = newLocal(c, "str")
+        emitAssign(c, result, call2("make_str", reg(outPtr), reg(len)))
+        bet reg(result), "str"
+    }
     lcFail(c)
     bet "0i64", "i64"
 }
