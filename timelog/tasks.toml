@@ -120,7 +120,13 @@ status = "done"
 slug = "bytes-io"
 name = "§2.7 slices & bytes: []u8, str byte-len/index/non-copy slice, str.bytes/fromBytes, fs.peep/peepText, bytes module"
 size = 13
-status = "todo"
+# DONE (language surface): str.len/at/sub (byte-len/index/non-copy slice), str.bytes,
+# str.fromBytes (checked, bet_str_valid) + str.fromBytesTrust (unchecked), []u8 via
+# SlicePtr/SliceLen midir projections + text round-trip, bytes.readU32le (pre-existing).
+# All differential-green (10-stdlib/str-bytes). The lexer-critical trio is proven end-to-end
+# by 11-reference/mini-lexer. fs.peep/peepText/drop (file read+write) fold into C0 scaffold
+# (betfe read->...->write), where they're naturally exercised.
+status = "done"
 
 [[task]]
 slug = "ffi-rawptr"
@@ -220,8 +226,13 @@ slug = "compiled-collections"
 name = "A4: runtime-backed growable vec[T] + stash on the COMPILED path (rt-abi/midir/backend/runtime/interp parity); promote 10-stdlib to compiled=pass"
 size = 13
 # vec[T] core DONE (bet_vec_* ABI; new/stack/pop/gang/index/squad; 10-stdlib/vec compiled=pass;
-# stash was already compiled=pass). Remaining sliver: higher-order .vibeCheck/.glowUp on vec +
-# squadops.bet -> vec.new rewrite (not on the compiler's critical path — it uses squad loops).
+# stash was already compiled=pass). HARDENED for self-hosting: (1) multiple vec element types in
+# one program (get_extern now keys on full signature — was aliasing bet_vec_push onto the first
+# element type); (2) shared-handle semantics in the interp (Value::Vec is Rc<RefCell>, so a vec
+# passed to a fn / in a struct aliases like the compiled VecHandle — was value-copied). Both were
+# hard blockers, now differential-green (10-stdlib/vec-aggregates, vec-shared). vec[struct] and
+# vec[sum] both work. Remaining sliver: higher-order .vibeCheck/.glowUp on vec on the COMPILED
+# path (interp done) + squadops.bet -> vec.new rewrite (not on the compiler's critical path).
 status = "doing"
 
 # Phase B — verification infra (NEW; B2 corpus-parity + B3 freeze already exist above)
