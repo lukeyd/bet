@@ -1,0 +1,21 @@
+// str byte primitives — the lexer's string-walking core: byte length, byte indexing, and
+// non-copying substrings, plus a `[]u8` view. `str.at` returns the byte as an `int` (0..=255)
+// so callers can classify characters with plain integer comparisons; `str.sub` shares storage
+// with the source string. These back the self-hosted lexer (no lexer can exist without them).
+pull "spill"
+pull "str"
+pull "bytes"
+
+finna main() {
+    lowkey s = "hello"
+    spill.it(str.len(s))        // 5
+    spill.it(str.at(s, 0))      // 104  ('h')
+    spill.it(str.at(s, 4))      // 111  ('o')
+    spill.it(str.sub(s, 1, 4))  // ell
+    spill.it(str.sub(s, 0, 5))  // hello
+    spill.it(str.sub(s, 5, 5))  // (empty)
+
+    // A `[]u8` view feeds the existing byte reader: "ABCD" little-endian = 0x44434241.
+    lowkey bs = str.bytes("ABCD")
+    spill.it(bytes.readU32le(bs, 0))   // 1145258561
+}

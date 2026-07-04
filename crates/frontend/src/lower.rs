@@ -2725,6 +2725,86 @@ impl LowerCtx {
                 );
                 Ok((Operand::Copy(Place::local(result)), strt))
             }
+            // `str.len(s)` — the byte length of `s`, as an `int` (the fat-`str` len projection).
+            ("str", "len") => {
+                if args.len() != 1 {
+                    return Err("`str.len` takes a single string".into());
+                }
+                let usize_t = self.m.t_int(IntWidth::W64, false);
+                let i64t = self.m.t_i64();
+                let strt = self.m.t_str();
+                let (s, _) = self.lower_expr(&args[0].value, Some(strt))?;
+                let lenu = self.new_local(usize_t);
+                self.fb().assign(Place::local(lenu), Rvalue::StrLen(s));
+                let out = self.coerce_int(Operand::Copy(Place::local(lenu)), usize_t, i64t);
+                Ok((out, i64t))
+            }
+            // `str.at(s, i)` — the byte at index `i`, zero-extended to an `int` (0..=255). Reads
+            // through a transient `[]u8` view; `Proj::Index` is an unchecked GEP + load.
+            ("str", "at") => {
+                if args.len() != 2 {
+                    return Err("`str.at` takes a string and a byte index".into());
+                }
+                let i64t = self.m.t_i64();
+                let strt = self.m.t_str();
+                let (s, _) = self.lower_expr(&args[0].value, Some(strt))?;
+                let (idx, ity) = self.lower_expr(&args[1].value, Some(i64t))?;
+                let idx = self.coerce_int(idx, ity, i64t);
+                let b = self.str_byteslice_local(s);
+                let elem = extend(&Place::local(b), Proj::Index(idx));
+                let out = self.new_local(i64t);
+                self.fb().assign(
+                    Place::local(out),
+                    Rvalue::Cast(Operand::Copy(elem), i64t, CastKind::IntZext),
+                );
+                Ok((Operand::Copy(Place::local(out)), i64t))
+            }
+            // `str.sub(s, start, end)` — the non-copying byte substring `s[start..end]`. Builds a
+            // fresh `str` fat value over `StrPtr(s) + start` with length `end - start`.
+            ("str", "sub") => {
+                if args.len() != 3 {
+                    return Err("`str.sub` takes a string and start/end byte offsets".into());
+                }
+                let i64t = self.m.t_i64();
+                let rawptr = self.m.intern_ty(TyKind::RawPtr);
+                let strt = self.m.t_str();
+                let (s, _) = self.lower_expr(&args[0].value, Some(strt))?;
+                let (start, sty) = self.lower_expr(&args[1].value, Some(i64t))?;
+                let start = self.coerce_int(start, sty, i64t);
+                let (end, ety) = self.lower_expr(&args[2].value, Some(i64t))?;
+                let end = self.coerce_int(end, ety, i64t);
+                let b = self.str_byteslice_local(s);
+                // `&view[start]` = base data pointer advanced by `start` bytes (GEP, no deref).
+                let elem = extend(&Place::local(b), Proj::Index(start.clone()));
+                let dptr = self.new_local(rawptr);
+                self.fb().assign(Place::local(dptr), Rvalue::AddrOf(elem));
+                let newlen = self.new_local(i64t);
+                self.fb().assign(
+                    Place::local(newlen),
+                    Rvalue::BinOp(BinOp::Sub, end, start, ArithMode::Wrap),
+                );
+                let result = self.new_local(strt);
+                self.fb().assign(
+                    Place::local(result),
+                    Rvalue::MakeStr {
+                        data: Operand::Copy(Place::local(dptr)),
+                        len: Operand::Copy(Place::local(newlen)),
+                    },
+                );
+                Ok((Operand::Copy(Place::local(result)), strt))
+            }
+            // `str.bytes(s)` — a non-copying `[]u8` view sharing `s`'s storage.
+            ("str", "bytes") => {
+                if args.len() != 1 {
+                    return Err("`str.bytes` takes a single string".into());
+                }
+                let strt = self.m.t_str();
+                let u8t = self.m.t_int(IntWidth::W8, false);
+                let (s, _) = self.lower_expr(&args[0].value, Some(strt))?;
+                let b = self.str_byteslice_local(s);
+                let slice_ty = self.m.intern_ty(TyKind::Slice(u8t));
+                Ok((Operand::Copy(Place::local(b)), slice_ty))
+            }
             // `str.glow(s)` — an ASCII-uppercased copy of `s`.
             ("str", "glow") => {
                 if args.len() != 1 {
@@ -2831,6 +2911,31 @@ impl LowerCtx {
                 "stdlib intrinsic `{module}.{method}` is not yet lowered"
             )),
         }
+    }
+
+    /// Materialize a `[]u8` slice value viewing a `str` operand's storage (`{ StrPtr, StrLen }`),
+    /// returning the local that holds it. The backbone of `str.at`/`sub`/`bytes`: once the string
+    /// is a slice, the existing `Proj::Index` / `AddrOf` machinery walks its bytes.
+    fn str_byteslice_local(&mut self, s: Operand) -> LocalId {
+        let rawptr = self.m.intern_ty(TyKind::RawPtr);
+        let usize_t = self.m.t_int(IntWidth::W64, false);
+        let u8t = self.m.t_int(IntWidth::W8, false);
+        let slice_ty = self.m.intern_ty(TyKind::Slice(u8t));
+        let sp = self.new_local(rawptr);
+        self.fb()
+            .assign(Place::local(sp), Rvalue::StrPtr(s.clone()));
+        let sl = self.new_local(usize_t);
+        self.fb().assign(Place::local(sl), Rvalue::StrLen(s));
+        let b = self.new_local(slice_ty);
+        self.fb().assign(
+            Place::local(b),
+            Rvalue::MakeSlice {
+                data: Operand::Copy(Place::local(sp)),
+                len: Operand::Copy(Place::local(sl)),
+                elem: u8t,
+            },
+        );
+        b
     }
 
     fn lower_call(

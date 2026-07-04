@@ -1378,9 +1378,41 @@ impl<'p> Interp<'p> {
         match (method, vals.as_slice()) {
             ("glow", [Value::Str(s)]) => Ok(Value::Str(s.to_uppercase())),
             ("slaps", [Value::Str(a), Value::Str(b)]) => Ok(Value::Bool(a == b)),
-            (m @ ("glow" | "slaps"), _) => Err(RunError::Type(format!(
-                "str.{m} called with the wrong argument shape"
-            ))),
+            // `str.len(s)` — byte length as an `int` (matches the fat-`str` len projection).
+            ("len", [Value::Str(s)]) => Ok(Value::Int(s.len() as i64)),
+            // `str.at(s, i)` — the byte at index `i`, as an `int` (0..=255).
+            ("at", [Value::Str(s), Value::Int(i)]) if *i >= 0 => {
+                let bytes = s.as_bytes();
+                let i = *i as usize;
+                match bytes.get(i) {
+                    Some(b) => Ok(Value::Int(i64::from(*b))),
+                    None => Err(RunError::Type(format!(
+                        "str.at index {i} out of range (len {})",
+                        bytes.len()
+                    ))),
+                }
+            }
+            // `str.sub(s, start, end)` — the byte substring `s[start..end]`.
+            ("sub", [Value::Str(s), Value::Int(a), Value::Int(b)]) if *a >= 0 && *b >= *a => {
+                let bytes = s.as_bytes();
+                let (a, b) = (*a as usize, *b as usize);
+                if b > bytes.len() {
+                    return Err(RunError::Type(format!(
+                        "str.sub end {b} out of range (len {})",
+                        bytes.len()
+                    )));
+                }
+                Ok(Value::Str(
+                    String::from_utf8_lossy(&bytes[a..b]).into_owned(),
+                ))
+            }
+            // `str.bytes(s)` — a `[]u8` view (each element a byte value).
+            ("bytes", [Value::Str(s)]) => Ok(Value::Array(
+                s.as_bytes().iter().map(|b| Value::Byte(*b)).collect(),
+            )),
+            (m @ ("glow" | "slaps" | "len" | "at" | "sub" | "bytes"), _) => Err(RunError::Type(
+                format!("str.{m} called with the wrong argument shape"),
+            )),
             (other, _) => Err(RunError::Unsupported(format!("str.{other}"))),
         }
     }
