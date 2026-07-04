@@ -9,18 +9,20 @@
 // way the Rust `frontend` crate holds lexer.rs / parser.rs / lower.rs together and `--emit <kind>`
 // stops after the relevant phase. Each phase is a section below.
 //
-// C1 status — the LEXER is real. `betfe --emit tokens <file>` reads the file (sys.arg + fs.peepText,
-// A5/A1), tokenizes it, and prints the post-ASI token stream in the exact format of
-// crates/frontend/src/dump.rs (verified byte-identical against `bet build --emit tokens` over the
-// whole corpus by `cargo xtask selfhost`). With NO args betfe still emits the fixed `hello` .mir
-// (the C0 tracer) so the end-to-end `.mir` -> backend -> binary pipeline stays proven; that fixed
-// path retires at C4/C5 when real lowering lands. C2/C3 add parse + `--emit ast`; C4 adds lower.
+// C1+C2+C3 status — the LEXER and PARSER are real. `betfe --emit tokens <file>` prints the post-ASI
+// token stream and `--emit ast <file>` prints the parsed AST, both in the exact format of
+// crates/frontend/src/dump.rs and both verified byte-identical against `bet build --emit <kind>`
+// over the WHOLE corpus by `cargo xtask selfhost`. With NO args betfe still emits the fixed `hello`
+// .mir (the C0 tracer) so the end-to-end `.mir` -> backend -> binary pipeline stays proven; that
+// fixed path retires at C4/C5 when real lowering lands. C4 adds lower + `--emit mir`.
 //
 // A Token here is a `drip { kind, text, hasText }` where `kind` is the canonical DUMP TAG (not a
 // 70-variant `moods` sum). This is deliberate: dump.rs maps every keyword to its own spelling, so
 // the scanner sets `kind = word` for keywords and emit just prints `kind` — byte-identical output
-// (the actual deliverable) with a fraction of the code. C3 can revisit the representation when the
-// parser needs exhaustive matching.
+// (the actual deliverable) with a fraction of the code. The parser (C3) matches on these kind
+// strings and, since the lexer already normalized payloads to their dump forms, builds AST-dump
+// labels by plain concatenation. See the C3 section header for the AST representation (a label-tree
+// index arena) and the bet-semantics gotchas that shaped it.
 pull "spill"
 pull "str"
 pull "vec"
@@ -644,6 +646,1227 @@ finna emitTokens(toks: vec[Token]) -> str {
 }
 
 // ===========================================================================
+// C3 — the parser (mirror of crates/frontend/src/parser.rs).
+//
+// Builds a LABEL-TREE arena: every line of the AST dump (dump.rs::ast) is one Node{label,kids}.
+// A parse function advances a shared cursor and returns the index of the node it built; emitAst
+// walks the tree printing label at depth and recursing kids at depth+1 — so the output is
+// byte-identical to dump.rs::ast BY CONSTRUCTION. The lexer already normalized payloads to their
+// dump forms (quoted strings, itoa'd ints), so labels are built by plain concatenation.
+//
+// bet gotchas honored here: (1) structs pass BY VALUE, so all mutable parser state lives in
+// shared-handle vecs — `pos`/`ns` are 1-element cells mutated via pop+stack (v[i]=x does NOT
+// lower on the compiled path). (2) vec.gang() is UNSIGNED, cast `as int` for signed loops.
+// (3) multi-line bool exprs would ASI-split, so conditions stay on one line.
+// ===========================================================================
+
+// A parse tree node: `label` is the exact AST-dump line; `kids` are child node indices.
+drip Node {
+    label: str,
+    kids: vec[int]
+}
+
+// The parser state. Every mutable field is a shared-handle vec (see the by-value note above):
+// `toks` the post-ASI stream, `pos` a 1-elem cursor cell, `nodes` the arena, `ns` a 1-elem
+// no-struct flag cell (§L6 rule 3: a header `{` reads as a block, not a struct literal).
+drip P {
+    toks: vec[Token],
+    pos: vec[int],
+    nodes: vec[Node],
+    ns: vec[int]
+}
+
+// --- tiny string helpers (labels are built by concatenation) ---
+finna isEmpty(s: str) -> bool {
+    bet str.len(s) == 0
+}
+
+finna sp2(a: str, b: str) -> str {
+    lowkey sb = sbNew()
+    sb.add(a)
+    sb.add(" ")
+    sb.add(b)
+    bet sb.finish()
+}
+
+finna sp3(a: str, b: str, c: str) -> str {
+    bet sp2(sp2(a, b), c)
+}
+
+// --- arena ---
+finna mkNode(p: P, label: str) -> int {
+    lowkey i = p.nodes.gang() as int
+    p.nodes.stack(Node{ label: label, kids: vec.new[int]() })
+    bet i
+}
+
+finna addKid(p: P, parent: int, child: int) {
+    p.nodes[parent].kids.stack(child)
+}
+
+// --- cursor cell (a 1-elem vec mutated via pop+stack) ---
+finna curGet(p: P) -> int {
+    bet p.pos[0]
+}
+
+finna curSet(p: P, v: int) {
+    p.pos.pop()
+    p.pos.stack(v)
+}
+
+finna adv(p: P) {
+    curSet(p, curGet(p) + 1)
+}
+
+finna toksLen(p: P) -> int {
+    bet p.toks.gang() as int
+}
+
+finna atEof(p: P) -> bool {
+    bet curGet(p) >= toksLen(p)
+}
+
+finna curKind(p: P) -> str {
+    fr atEof(p) { bet "" }
+    bet p.toks[curGet(p)].kind
+}
+
+finna curText(p: P) -> str {
+    fr atEof(p) { bet "" }
+    bet p.toks[curGet(p)].text
+}
+
+finna peek2Kind(p: P) -> str {
+    lowkey j = curGet(p) + 1
+    fr j >= toksLen(p) { bet "" }
+    bet p.toks[j].kind
+}
+
+finna check(p: P, k: str) -> bool {
+    bet str.slaps(curKind(p), k)
+}
+
+finna eat(p: P, k: str) -> bool {
+    fr check(p, k) {
+        adv(p)
+        bet nocap
+    }
+    bet cap
+}
+
+// Best-effort: on valid corpus input the expected token is always present. On invalid input we
+// leave the cursor put so the AST diff localizes the divergence (no silent recovery).
+finna expect(p: P, k: str) {
+    fr check(p, k) { adv(p) }
+}
+
+finna ident(p: P) -> str {
+    lowkey t = curText(p)
+    adv(p)
+    bet t
+}
+
+finna skipSemis(p: P) {
+    vibin check(p, "semi") { adv(p) }
+}
+
+// --- no_struct flag cell ---
+finna nsGet(p: P) -> bool {
+    bet p.ns[0] == 1
+}
+
+finna nsSet(p: P, v: bool) {
+    p.ns.pop()
+    fr v { p.ns.stack(1) } naw { p.ns.stack(0) }
+}
+
+// --- types (§S3) ---
+finna parseType(p: P) -> int {
+    // `[]T` — slice.
+    fr check(p, "lbracket") {
+        adv(p)
+        expect(p, "rbracket")
+        lowkey inner = parseType(p)
+        lowkey n = mkNode(p, "slice")
+        addKid(p, n, inner)
+        bet n
+    }
+    fr eat(p, "tag") {
+        lowkey inner = parseType(p)
+        lowkey n = mkNode(p, "tag")
+        addKid(p, n, inner)
+        bet n
+    }
+    fr eat(p, "crib") {
+        lowkey inner = parseType(p)
+        lowkey n = mkNode(p, "crib-ty")
+        addKid(p, n, inner)
+        bet n
+    }
+    fr eat(p, "finna") {
+        expect(p, "lparen")
+        lowkey fnNode = mkNode(p, "fn-ty")
+        lowkey paramsNode = mkNode(p, "params")
+        fr !check(p, "rparen") {
+            addKid(p, paramsNode, parseType(p))
+            vibin eat(p, "comma") {
+                addKid(p, paramsNode, parseType(p))
+            }
+        }
+        expect(p, "rparen")
+        expect(p, "arrow")
+        lowkey retNode = mkNode(p, "ret")
+        addKid(p, retNode, parseType(p))
+        addKid(p, fnNode, paramsNode)
+        addKid(p, fnNode, retNode)
+        bet fnNode
+    }
+    // A named type (`int`, `stash[str, i64]`, `Enemy`) or `rawptr`.
+    lowkey name = ident(p)
+    fr str.slaps(name, "rawptr") {
+        bet mkNode(p, "rawptr")
+    }
+    lowkey node = mkNode(p, sp2("named", name))
+    // Generic args: `[` NOT immediately followed by an int literal.
+    fr check(p, "lbracket") && !str.slaps(peek2Kind(p), "int") {
+        adv(p)
+        addKid(p, node, parseType(p))
+        vibin eat(p, "comma") {
+            addKid(p, node, parseType(p))
+        }
+        expect(p, "rbracket")
+    }
+    // Trailing fixed-array dims: `Enemy[1000]`.
+    vibin check(p, "lbracket") && str.slaps(peek2Kind(p), "int") {
+        adv(p)
+        lowkey sizeText = curText(p)
+        adv(p)
+        expect(p, "rbracket")
+        lowkey arr = mkNode(p, sp2("array", sizeText))
+        addKid(p, arr, node)
+        node = arr
+    }
+    bet node
+}
+
+// --- expressions (§E1 precedence ladder) ---
+// A header expression: unparenthesized struct literals disabled so a trailing `{` is a block.
+finna exprHeader(p: P) -> int {
+    lowkey saved = nsGet(p)
+    nsSet(p, nocap)
+    lowkey e = parseExpr(p)
+    nsSet(p, saved)
+    bet e
+}
+
+// A sub-expression with struct literals RE-enabled (inside brackets).
+finna fullExpr(p: P) -> int {
+    lowkey saved = nsGet(p)
+    nsSet(p, cap)
+    lowkey e = parseExpr(p)
+    nsSet(p, saved)
+    bet e
+}
+
+finna parseExpr(p: P) -> int {
+    bet orExpr(p)
+}
+
+finna mkBinary(p: P, opTag: str, l: int, r: int) -> int {
+    lowkey n = mkNode(p, sp2("binary", opTag))
+    addKid(p, n, l)
+    addKid(p, n, r)
+    bet n
+}
+
+finna orExpr(p: P) -> int {
+    lowkey lhs = andExpr(p)
+    vibin eat(p, "oror") {
+        lowkey rhs = andExpr(p)
+        lhs = mkBinary(p, "or", lhs, rhs)
+    }
+    bet lhs
+}
+
+finna andExpr(p: P) -> int {
+    lowkey lhs = cmpExpr(p)
+    vibin eat(p, "andand") {
+        lowkey rhs = cmpExpr(p)
+        lhs = mkBinary(p, "and", lhs, rhs)
+    }
+    bet lhs
+}
+
+finna cmpTag(p: P) -> str {
+    fr check(p, "eqeq") { bet "eq" }
+    fr check(p, "ne") { bet "ne" }
+    fr check(p, "lt") { bet "lt" }
+    fr check(p, "le") { bet "le" }
+    fr check(p, "gt") { bet "gt" }
+    fr check(p, "ge") { bet "ge" }
+    bet ""
+}
+
+finna cmpExpr(p: P) -> int {
+    lowkey lhs = bitorExpr(p)
+    lowkey opTag = cmpTag(p)
+    vibin !isEmpty(opTag) {
+        adv(p)
+        lowkey rhs = bitorExpr(p)
+        lhs = mkBinary(p, opTag, lhs, rhs)
+        opTag = cmpTag(p)
+    }
+    bet lhs
+}
+
+finna bitorExpr(p: P) -> int {
+    lowkey lhs = bitxorExpr(p)
+    vibin eat(p, "pipe") {
+        lowkey rhs = bitxorExpr(p)
+        lhs = mkBinary(p, "bitor", lhs, rhs)
+    }
+    bet lhs
+}
+
+finna bitxorExpr(p: P) -> int {
+    lowkey lhs = bitandExpr(p)
+    vibin eat(p, "caret") {
+        lowkey rhs = bitandExpr(p)
+        lhs = mkBinary(p, "bitxor", lhs, rhs)
+    }
+    bet lhs
+}
+
+finna bitandExpr(p: P) -> int {
+    lowkey lhs = shiftExpr(p)
+    vibin eat(p, "amp") {
+        lowkey rhs = shiftExpr(p)
+        lhs = mkBinary(p, "bitand", lhs, rhs)
+    }
+    bet lhs
+}
+
+finna shiftTag(p: P) -> str {
+    fr check(p, "shl") { bet "shl" }
+    fr check(p, "shr") { bet "shr" }
+    bet ""
+}
+
+finna shiftExpr(p: P) -> int {
+    lowkey lhs = addExpr(p)
+    lowkey opTag = shiftTag(p)
+    vibin !isEmpty(opTag) {
+        adv(p)
+        lowkey rhs = addExpr(p)
+        lhs = mkBinary(p, opTag, lhs, rhs)
+        opTag = shiftTag(p)
+    }
+    bet lhs
+}
+
+finna addTag(p: P) -> str {
+    fr check(p, "plus") { bet "add" }
+    fr check(p, "minus") { bet "sub" }
+    bet ""
+}
+
+finna addExpr(p: P) -> int {
+    lowkey lhs = mulExpr(p)
+    lowkey opTag = addTag(p)
+    vibin !isEmpty(opTag) {
+        adv(p)
+        lowkey rhs = mulExpr(p)
+        lhs = mkBinary(p, opTag, lhs, rhs)
+        opTag = addTag(p)
+    }
+    bet lhs
+}
+
+finna mulTag(p: P) -> str {
+    fr check(p, "star") { bet "mul" }
+    fr check(p, "slash") { bet "div" }
+    fr check(p, "percent") { bet "rem" }
+    bet ""
+}
+
+finna mulExpr(p: P) -> int {
+    lowkey lhs = castExpr(p)
+    lowkey opTag = mulTag(p)
+    vibin !isEmpty(opTag) {
+        adv(p)
+        lowkey rhs = castExpr(p)
+        lhs = mkBinary(p, opTag, lhs, rhs)
+        opTag = mulTag(p)
+    }
+    bet lhs
+}
+
+finna castExpr(p: P) -> int {
+    lowkey e = unaryExpr(p)
+    vibin eat(p, "as") {
+        lowkey ty = parseType(p)
+        lowkey n = mkNode(p, "cast")
+        addKid(p, n, e)
+        addKid(p, n, ty)
+        e = n
+    }
+    bet e
+}
+
+finna unaryExpr(p: P) -> int {
+    lowkey opTag = ""
+    fr check(p, "bang") {
+        opTag = "not"
+    } naw fr check(p, "tilde") {
+        opTag = "bitnot"
+    } naw fr check(p, "minus") {
+        opTag = "neg"
+    }
+    fr isEmpty(opTag) {
+        bet postfixExpr(p)
+    }
+    adv(p)
+    lowkey operand = unaryExpr(p)
+    lowkey n = mkNode(p, sp2("unary", opTag))
+    addKid(p, n, operand)
+    bet n
+}
+
+finna postfixExpr(p: P) -> int {
+    lowkey e = primary(p)
+    vibin nocap {
+        fr check(p, "dot") {
+            adv(p)
+            fr eat(p, "trust") {
+                expect(p, "lparen")
+                expect(p, "rparen")
+                expect(p, "in")
+                lowkey cribE = primary(p)
+                lowkey n = mkNode(p, "trust")
+                addKid(p, n, e)
+                addKid(p, n, cribE)
+                e = n
+            } naw {
+                lowkey name = ident(p)
+                lowkey gens = maybeGenericArgs(p)
+                fr check(p, "lparen") {
+                    lowkey argsNode = callArgs(p)
+                    lowkey n = mkNode(p, sp2("method", name))
+                    lowkey recv = mkNode(p, "receiver")
+                    addKid(p, recv, e)
+                    addKid(p, n, recv)
+                    addTypeargs(p, n, gens)
+                    addKid(p, n, argsNode)
+                    e = n
+                } naw {
+                    lowkey n = mkNode(p, sp2("field", name))
+                    addKid(p, n, e)
+                    addTypeargs(p, n, gens)
+                    e = n
+                }
+            }
+        } naw fr check(p, "lparen") {
+            lowkey argsNode = callArgs(p)
+            lowkey n = mkNode(p, "call")
+            lowkey callee = mkNode(p, "callee")
+            addKid(p, callee, e)
+            addKid(p, n, callee)
+            addKid(p, n, argsNode)
+            e = n
+        } naw fr check(p, "lbracket") {
+            adv(p)
+            lowkey index = fullExpr(p)
+            expect(p, "rbracket")
+            lowkey n = mkNode(p, "index")
+            addKid(p, n, e)
+            addKid(p, n, index)
+            e = n
+        } naw {
+            dip
+        }
+    }
+    bet e
+}
+
+finna primary(p: P) -> int {
+    fr check(p, "int") {
+        lowkey t = curText(p)
+        adv(p)
+        bet mkNode(p, sp2("int", t))
+    }
+    fr check(p, "float") {
+        lowkey t = curText(p)
+        adv(p)
+        bet mkNode(p, sp2("float", t))
+    }
+    fr check(p, "str") {
+        lowkey t = curText(p)
+        adv(p)
+        bet mkNode(p, sp2("str", t))
+    }
+    fr check(p, "byte") {
+        lowkey t = curText(p)
+        adv(p)
+        bet mkNode(p, sp2("byte", t))
+    }
+    fr check(p, "nocap") {
+        adv(p)
+        bet mkNode(p, "bool true")
+    }
+    fr check(p, "cap") {
+        adv(p)
+        bet mkNode(p, "bool false")
+    }
+    fr check(p, "ghosted") {
+        adv(p)
+        bet mkNode(p, "ghosted")
+    }
+    fr check(p, "cop") {
+        bet copExpr(p)
+    }
+    fr check(p, "lparen") {
+        adv(p)
+        lowkey inner = fullExpr(p)
+        expect(p, "rparen")
+        bet inner
+    }
+    fr check(p, "lbracket") {
+        bet arrayLit(p)
+    }
+    // ident: a name reference or a struct literal.
+    lowkey name = ident(p)
+    lowkey gens = maybeGenericArgs(p)
+    fr !nsGet(p) && check(p, "lbrace") {
+        bet structLitBody(p, name, gens)
+    }
+    lowkey n = mkNode(p, sp2("name", name))
+    addTypeargs(p, n, gens)
+    bet n
+}
+
+// `[ "[" typeList "]" ]` after a name — generic instantiation, returned as a list of type-node
+// indices (empty if not a generic list). Only consumed when the bracket group is followed by `(`
+// (a call) or, where struct literals are allowed, `{`.
+finna maybeGenericArgs(p: P) -> vec[int] {
+    lowkey out = vec.new[int]()
+    fr !check(p, "lbracket") {
+        bet out
+    }
+    lowkey after = peekAfterMatchingBracket(p)
+    lowkey looksGeneric = cap
+    fr str.slaps(after, "lparen") {
+        looksGeneric = nocap
+    } naw fr str.slaps(after, "lbrace") {
+        looksGeneric = !nsGet(p)
+    }
+    fr !looksGeneric {
+        bet out
+    }
+    adv(p)
+    out.stack(parseType(p))
+    vibin eat(p, "comma") {
+        out.stack(parseType(p))
+    }
+    expect(p, "rbracket")
+    bet out
+}
+
+// A `typeargs` wrapper over a generic-arg list — attached only when the list is non-empty.
+finna addTypeargs(p: P, parent: int, tys: vec[int]) {
+    lowkey n = tys.gang() as int
+    fr n > 0 {
+        lowkey w = mkNode(p, "typeargs")
+        lowkey i = 0
+        vibin i < n {
+            addKid(p, w, tys[i])
+            i = i + 1
+        }
+        addKid(p, parent, w)
+    }
+}
+
+// The token kind immediately following the bracket group that starts at the current `[`
+// (balanced across all bracket kinds). Disambiguates generics from indexing.
+finna peekAfterMatchingBracket(p: P) -> str {
+    lowkey depth = 0
+    lowkey i = curGet(p)
+    lowkey n = toksLen(p)
+    vibin i < n {
+        lowkey k = p.toks[i].kind
+        fr str.slaps(k, "lbracket") || str.slaps(k, "lparen") || str.slaps(k, "lbrace") {
+            depth = depth + 1
+        } naw fr str.slaps(k, "rbracket") || str.slaps(k, "rparen") || str.slaps(k, "rbrace") {
+            depth = depth - 1
+            fr depth == 0 {
+                lowkey j = i + 1
+                fr j < n { bet p.toks[j].kind }
+                bet ""
+            }
+        }
+        i = i + 1
+    }
+    bet ""
+}
+
+finna structLitBody(p: P, name: str, gens: vec[int]) -> int {
+    lowkey saved = nsGet(p)
+    nsSet(p, cap)
+    expect(p, "lbrace")
+    lowkey node = mkNode(p, sp2("struct", name))
+    addTypeargs(p, node, gens)
+    lowkey fieldsNode = mkNode(p, "fields")
+    vibin nocap {
+        skipSemis(p)
+        fr check(p, "rbrace") || atEof(p) { dip }
+        lowkey fname = ident(p)
+        expect(p, "colon")
+        lowkey value = parseExpr(p)
+        lowkey fnode = mkNode(p, sp2("field", fname))
+        addKid(p, fnode, value)
+        addKid(p, fieldsNode, fnode)
+        skipSemis(p)
+        fr !eat(p, "comma") {
+            skipSemis(p)
+        }
+    }
+    expect(p, "rbrace")
+    nsSet(p, saved)
+    addKid(p, node, fieldsNode)
+    bet node
+}
+
+finna arrayLit(p: P) -> int {
+    lowkey saved = nsGet(p)
+    nsSet(p, cap)
+    expect(p, "lbracket")
+    lowkey node = mkNode(p, "array-lit")
+    fr !check(p, "rbracket") {
+        addKid(p, node, parseExpr(p))
+        vibin eat(p, "comma") {
+            fr check(p, "rbracket") { dip }
+            addKid(p, node, parseExpr(p))
+        }
+    }
+    expect(p, "rbracket")
+    nsSet(p, saved)
+    bet node
+}
+
+finna copExpr(p: P) -> int {
+    expect(p, "cop")
+    lowkey node = mkNode(p, "cop")
+    addKid(p, node, copInit(p))
+    expect(p, "in")
+    lowkey cribE = postfixExpr(p)
+    lowkey cribW = mkNode(p, "crib")
+    addKid(p, cribW, cribE)
+    addKid(p, node, cribW)
+    bet node
+}
+
+finna copInit(p: P) -> int {
+    lowkey name = ident(p)
+    lowkey gens = maybeGenericArgs(p)
+    fr check(p, "lbrace") {
+        bet structLitBody(p, name, gens)
+    }
+    fr check(p, "lparen") {
+        lowkey argsNode = callArgs(p)
+        lowkey n = mkNode(p, sp2("variant", name))
+        addKid(p, n, argsNode)
+        bet n
+    }
+    // Nullary variant — dump.rs still emits an (empty) `args` wrapper.
+    lowkey n = mkNode(p, sp2("variant", name))
+    addKid(p, n, mkNode(p, "args"))
+    bet n
+}
+
+finna callArgs(p: P) -> int {
+    lowkey saved = nsGet(p)
+    nsSet(p, cap)
+    expect(p, "lparen")
+    lowkey node = mkNode(p, "args")
+    fr !check(p, "rparen") {
+        addKid(p, node, parseArg(p))
+        vibin eat(p, "comma") {
+            fr check(p, "rparen") { dip }
+            addKid(p, node, parseArg(p))
+        }
+    }
+    expect(p, "rparen")
+    nsSet(p, saved)
+    bet node
+}
+
+finna parseArg(p: P) -> int {
+    // Optional `label:` — an ident (or the `in` keyword) immediately followed by `:`.
+    lowkey label = ""
+    lowkey hasLabel = cap
+    fr str.slaps(curKind(p), "ident") && str.slaps(peek2Kind(p), "colon") {
+        label = ident(p)
+        expect(p, "colon")
+        hasLabel = nocap
+    } naw fr str.slaps(curKind(p), "in") && str.slaps(peek2Kind(p), "colon") {
+        expect(p, "in")
+        expect(p, "colon")
+        label = "in"
+        hasLabel = nocap
+    }
+    lowkey value = parseExpr(p)
+    lowkey node = 0
+    fr hasLabel {
+        node = mkNode(p, sp2("arg", label))
+    } naw {
+        node = mkNode(p, "arg")
+    }
+    addKid(p, node, value)
+    bet node
+}
+
+// --- statements (§S4) ---
+finna parseBlock(p: P) -> int {
+    expect(p, "lbrace")
+    lowkey node = mkNode(p, "block")
+    vibin nocap {
+        skipSemis(p)
+        fr check(p, "rbrace") || atEof(p) { dip }
+        addKid(p, node, parseStmt(p))
+    }
+    expect(p, "rbrace")
+    bet node
+}
+
+finna stmtEnds(p: P) -> bool {
+    bet atEof(p) || check(p, "semi") || check(p, "rbrace")
+}
+
+finna parseStmt(p: P) -> int {
+    fr check(p, "lowkey") { bet varDecl(p, "hush") }
+    fr check(p, "facts") { bet constDecl(p, "hush") }
+    fr check(p, "crib") { bet cribDecl(p, "hush") }
+    fr check(p, "fr") { bet frStmt(p) }
+    fr check(p, "vibin") { bet vibinStmt(p) }
+    fr check(p, "squad") { bet squadStmt(p) }
+    fr check(p, "vibe") { bet vibeStmt(p) }
+    fr check(p, "holla") { bet hollaStmt(p) }
+    fr check(p, "sheesh") { bet sheeshStmt(p) }
+    fr check(p, "evict") {
+        adv(p)
+        lowkey n = mkNode(p, "evict")
+        addKid(p, n, parseExpr(p))
+        bet n
+    }
+    fr check(p, "slide") {
+        adv(p)
+        lowkey n = mkNode(p, "slide")
+        addKid(p, n, parseExpr(p))
+        bet n
+    }
+    fr check(p, "bet") {
+        adv(p)
+        lowkey n = mkNode(p, "bet")
+        fr !stmtEnds(p) {
+            addKid(p, n, parseExpr(p))
+            vibin eat(p, "comma") {
+                addKid(p, n, parseExpr(p))
+            }
+        }
+        bet n
+    }
+    fr check(p, "bounce") {
+        adv(p)
+        lowkey n = mkNode(p, "bounce")
+        addKid(p, n, parseExpr(p))
+        bet n
+    }
+    fr check(p, "yeet") {
+        adv(p)
+        expect(p, "lparen")
+        lowkey e = parseExpr(p)
+        expect(p, "rparen")
+        lowkey n = mkNode(p, "yeet")
+        addKid(p, n, e)
+        bet n
+    }
+    fr check(p, "dip") {
+        adv(p)
+        bet mkNode(p, "dip")
+    }
+    fr check(p, "skip") {
+        adv(p)
+        bet mkNode(p, "skip")
+    }
+    bet exprOrAssign(p)
+}
+
+finna exprOrAssign(p: P) -> int {
+    lowkey first = parseExpr(p)
+    lowkey op = assignTag(p)
+    fr check(p, "comma") || !isEmpty(op) {
+        lowkey targets = mkNode(p, "targets")
+        addKid(p, targets, first)
+        vibin eat(p, "comma") {
+            addKid(p, targets, parseExpr(p))
+        }
+        op = assignTag(p)
+        adv(p)
+        lowkey values = mkNode(p, "values")
+        addKid(p, values, parseExpr(p))
+        vibin eat(p, "comma") {
+            addKid(p, values, parseExpr(p))
+        }
+        lowkey n = mkNode(p, sp2("assign", op))
+        addKid(p, n, targets)
+        addKid(p, n, values)
+        bet n
+    }
+    lowkey n = mkNode(p, "expr-stmt")
+    addKid(p, n, first)
+    bet n
+}
+
+finna assignTag(p: P) -> str {
+    fr check(p, "eq") { bet "eq" }
+    fr check(p, "pluseq") { bet "addeq" }
+    fr check(p, "minuseq") { bet "subeq" }
+    fr check(p, "stareq") { bet "muleq" }
+    fr check(p, "slasheq") { bet "diveq" }
+    fr check(p, "percenteq") { bet "remeq" }
+    fr check(p, "ampeq") { bet "andeq" }
+    fr check(p, "pipeeq") { bet "oreq" }
+    fr check(p, "careteq") { bet "xoreq" }
+    fr check(p, "shleq") { bet "shleq" }
+    fr check(p, "shreq") { bet "shreq" }
+    bet ""
+}
+
+finna frStmt(p: P) -> int {
+    expect(p, "fr")
+    lowkey node = mkNode(p, "fr")
+    addKid(p, node, exprHeader(p))
+    addKid(p, node, parseBlock(p))
+    vibin eat(p, "naw") {
+        fr eat(p, "fr") {
+            lowkey elif = mkNode(p, "elif")
+            addKid(p, elif, exprHeader(p))
+            addKid(p, elif, parseBlock(p))
+            addKid(p, node, elif)
+        } naw {
+            lowkey els = mkNode(p, "else")
+            addKid(p, els, parseBlock(p))
+            addKid(p, node, els)
+            dip
+        }
+    }
+    bet node
+}
+
+finna vibinStmt(p: P) -> int {
+    expect(p, "vibin")
+    lowkey node = mkNode(p, "vibin")
+    addKid(p, node, exprHeader(p))
+    addKid(p, node, parseBlock(p))
+    bet node
+}
+
+finna squadStmt(p: P) -> int {
+    expect(p, "squad")
+    lowkey var = ident(p)
+    expect(p, "in")
+    lowkey node = mkNode(p, sp2("squad", var))
+    addKid(p, node, exprHeader(p))
+    addKid(p, node, parseBlock(p))
+    bet node
+}
+
+finna vibeStmt(p: P) -> int {
+    expect(p, "vibe")
+    lowkey node = mkNode(p, "vibe")
+    addKid(p, node, exprHeader(p))
+    expect(p, "lbrace")
+    vibin nocap {
+        skipSemis(p)
+        fr check(p, "rbrace") || atEof(p) { dip }
+        fr eat(p, "naw") {
+            lowkey def = mkNode(p, "default")
+            addKid(p, def, parseBlock(p))
+            addKid(p, node, def)
+            skipSemis(p)
+            dip
+        }
+        addKid(p, node, matchArm(p))
+    }
+    expect(p, "rbrace")
+    bet node
+}
+
+finna matchArm(p: P) -> int {
+    lowkey variant = ident(p)
+    lowkey binds = ""
+    fr eat(p, "lparen") {
+        binds = ident(p)
+        vibin eat(p, "comma") {
+            binds = sp2(binds, ident(p))
+        }
+        expect(p, "rparen")
+    }
+    lowkey label = ""
+    fr isEmpty(binds) {
+        label = sp2("arm", variant)
+    } naw {
+        label = sp3("arm", variant, binds)
+    }
+    lowkey node = mkNode(p, label)
+    addKid(p, node, parseBlock(p))
+    bet node
+}
+
+finna hollaStmt(p: P) -> int {
+    expect(p, "holla")
+    lowkey binding = ident(p)
+    expect(p, "eq")
+    lowkey tagE = parseExpr(p)
+    expect(p, "in")
+    lowkey cribE = exprHeader(p)
+    lowkey live = parseBlock(p)
+    expect(p, "ghosted")
+    lowkey ghost = parseBlock(p)
+    lowkey node = mkNode(p, sp2("holla", binding))
+    lowkey tagW = mkNode(p, "tag")
+    addKid(p, tagW, tagE)
+    addKid(p, node, tagW)
+    lowkey cribW = mkNode(p, "crib")
+    addKid(p, cribW, cribE)
+    addKid(p, node, cribW)
+    lowkey liveW = mkNode(p, "live")
+    addKid(p, liveW, live)
+    addKid(p, node, liveW)
+    lowkey ghostW = mkNode(p, "ghosted")
+    addKid(p, ghostW, ghost)
+    addKid(p, node, ghostW)
+    bet node
+}
+
+finna sheeshStmt(p: P) -> int {
+    expect(p, "sheesh")
+    lowkey node = mkNode(p, "sheesh")
+    addKid(p, node, parseBlock(p))
+    fr eat(p, "naw") {
+        lowkey name = ident(p)
+        lowkey b = parseBlock(p)
+        lowkey rec = mkNode(p, sp2("recover", name))
+        addKid(p, rec, b)
+        addKid(p, node, rec)
+    }
+    bet node
+}
+
+finna varDecl(p: P, vis: str) -> int {
+    expect(p, "lowkey")
+    lowkey targets = ident(p)
+    vibin eat(p, "comma") {
+        targets = sp2(targets, ident(p))
+    }
+    lowkey hasTy = cap
+    lowkey tyNode = 0
+    fr eat(p, "colon") {
+        hasTy = nocap
+        tyNode = parseType(p)
+    }
+    expect(p, "eq")
+    lowkey node = mkNode(p, sp3("var", vis, targets))
+    fr hasTy {
+        lowkey tw = mkNode(p, "type")
+        addKid(p, tw, tyNode)
+        addKid(p, node, tw)
+    }
+    lowkey values = mkNode(p, "values")
+    addKid(p, values, parseExpr(p))
+    vibin eat(p, "comma") {
+        addKid(p, values, parseExpr(p))
+    }
+    addKid(p, node, values)
+    bet node
+}
+
+finna constDecl(p: P, vis: str) -> int {
+    expect(p, "facts")
+    lowkey name = ident(p)
+    lowkey hasTy = cap
+    lowkey tyNode = 0
+    fr eat(p, "colon") {
+        hasTy = nocap
+        tyNode = parseType(p)
+    }
+    expect(p, "eq")
+    lowkey value = parseExpr(p)
+    lowkey node = mkNode(p, sp3("const", vis, name))
+    fr hasTy {
+        lowkey tw = mkNode(p, "type")
+        addKid(p, tw, tyNode)
+        addKid(p, node, tw)
+    }
+    lowkey vw = mkNode(p, "value")
+    addKid(p, vw, value)
+    addKid(p, node, vw)
+    bet node
+}
+
+finna cribDecl(p: P, vis: str) -> int {
+    expect(p, "crib")
+    lowkey name = ident(p)
+    lowkey node = mkNode(p, sp3("crib", vis, name))
+    fr eat(p, "colon") {
+        addKid(p, node, parseType(p))
+    }
+    bet node
+}
+
+// --- top-level items (§S1) ---
+finna parseProgram(p: P) -> int {
+    lowkey root = mkNode(p, "program")
+    vibin nocap {
+        skipSemis(p)
+        fr atEof(p) { dip }
+        addKid(p, root, topItem(p))
+    }
+    bet root
+}
+
+finna topItem(p: P) -> int {
+    fr check(p, "pull") { bet pullItem(p) }
+    fr check(p, "extern") { bet externDecl(p) }
+    lowkey vis = "hush"
+    fr eat(p, "flex") { vis = "flex" }
+    fr check(p, "finna") { bet fnDecl(p, vis) }
+    fr check(p, "drip") { bet dripDecl(p, vis) }
+    fr check(p, "moods") { bet moodsDecl(p, vis) }
+    fr check(p, "crib") { bet cribDecl(p, vis) }
+    fr check(p, "facts") { bet constDecl(p, vis) }
+    fr check(p, "lowkey") { bet varDecl(p, vis) }
+    // Unexpected (never on valid input) — a placeholder so the diff localizes it.
+    adv(p)
+    bet mkNode(p, "unexpected")
+}
+
+finna pullItem(p: P) -> int {
+    expect(p, "pull")
+    lowkey mod = curText(p)
+    adv(p)
+    bet mkNode(p, sp2("pull", mod))
+}
+
+finna externDecl(p: P) -> int {
+    expect(p, "extern")
+    lowkey abi = curText(p)
+    adv(p)
+    expect(p, "finna")
+    lowkey name = ident(p)
+    lowkey node = mkNode(p, sp3("extern", abi, name))
+    addKid(p, node, paramList(p))
+    addKid(p, node, optRetSingle(p))
+    bet node
+}
+
+finna fnDecl(p: P, vis: str) -> int {
+    expect(p, "finna")
+    lowkey hasRecv = check(p, "lparen")
+    lowkey recvNode = 0
+    fr hasRecv {
+        recvNode = receiver(p)
+    }
+    lowkey name = ident(p)
+    lowkey gens = genericParams(p)
+    lowkey node = mkNode(p, sp3("func", vis, name))
+    fr hasRecv {
+        addKid(p, node, recvNode)
+    }
+    addGenerics(p, node, gens)
+    addKid(p, node, paramList(p))
+    addKid(p, node, optRet(p))
+    addKid(p, node, parseBlock(p))
+    bet node
+}
+
+finna receiver(p: P) -> int {
+    expect(p, "lparen")
+    lowkey name = ident(p)
+    expect(p, "colon")
+    lowkey ty = parseType(p)
+    expect(p, "rparen")
+    lowkey node = mkNode(p, sp2("receiver", name))
+    addKid(p, node, ty)
+    bet node
+}
+
+// `[ "[" ident { "," ident } "]" ]` — a generic parameter list, joined into a single string.
+finna genericParams(p: P) -> str {
+    lowkey out = ""
+    fr eat(p, "lbracket") {
+        out = ident(p)
+        vibin eat(p, "comma") {
+            out = sp2(out, ident(p))
+        }
+        expect(p, "rbracket")
+    }
+    bet out
+}
+
+// The `generics` line (bare when empty, else `generics T U`).
+finna addGenerics(p: P, parent: int, gens: str) {
+    fr isEmpty(gens) {
+        addKid(p, parent, mkNode(p, "generics"))
+    } naw {
+        addKid(p, parent, mkNode(p, sp2("generics", gens)))
+    }
+}
+
+finna paramList(p: P) -> int {
+    expect(p, "lparen")
+    lowkey node = mkNode(p, "params")
+    fr !check(p, "rparen") {
+        addKid(p, node, param(p))
+        vibin eat(p, "comma") {
+            addKid(p, node, param(p))
+        }
+    }
+    expect(p, "rparen")
+    bet node
+}
+
+finna param(p: P) -> int {
+    lowkey name = ident(p)
+    expect(p, "colon")
+    lowkey ty = parseType(p)
+    lowkey node = mkNode(p, sp2("param", name))
+    addKid(p, node, ty)
+    bet node
+}
+
+finna optRet(p: P) -> int {
+    fr !eat(p, "arrow") {
+        bet mkNode(p, "ret none")
+    }
+    fr eat(p, "lparen") {
+        lowkey node = mkNode(p, "ret multi")
+        addKid(p, node, parseType(p))
+        vibin eat(p, "comma") {
+            addKid(p, node, parseType(p))
+        }
+        expect(p, "rparen")
+        bet node
+    }
+    lowkey node = mkNode(p, "ret single")
+    addKid(p, node, parseType(p))
+    bet node
+}
+
+finna optRetSingle(p: P) -> int {
+    fr eat(p, "arrow") {
+        lowkey node = mkNode(p, "ret single")
+        addKid(p, node, parseType(p))
+        bet node
+    }
+    bet mkNode(p, "ret none")
+}
+
+finna dripDecl(p: P, vis: str) -> int {
+    expect(p, "drip")
+    lowkey name = ident(p)
+    lowkey gens = genericParams(p)
+    lowkey node = mkNode(p, sp3("drip", vis, name))
+    addGenerics(p, node, gens)
+    expect(p, "lbrace")
+    vibin nocap {
+        skipSemis(p)
+        fr check(p, "rbrace") || atEof(p) { dip }
+        addKid(p, node, fieldDecl(p))
+        skipSemis(p)
+        eat(p, "comma")
+    }
+    expect(p, "rbrace")
+    bet node
+}
+
+finna fieldDecl(p: P) -> int {
+    lowkey fvis = "default"
+    fr eat(p, "flex") {
+        fvis = "flex"
+    } naw fr eat(p, "hush") {
+        fvis = "hush"
+    }
+    lowkey name = ident(p)
+    expect(p, "colon")
+    lowkey ty = parseType(p)
+    lowkey node = mkNode(p, sp3("field", fvis, name))
+    addKid(p, node, ty)
+    bet node
+}
+
+finna moodsDecl(p: P, vis: str) -> int {
+    expect(p, "moods")
+    lowkey name = ident(p)
+    lowkey gens = genericParams(p)
+    lowkey node = mkNode(p, sp3("moods", vis, name))
+    addGenerics(p, node, gens)
+    expect(p, "lbrace")
+    vibin nocap {
+        skipSemis(p)
+        fr check(p, "rbrace") || atEof(p) { dip }
+        addKid(p, node, variant(p))
+        skipSemis(p)
+        eat(p, "comma")
+    }
+    expect(p, "rbrace")
+    bet node
+}
+
+finna variant(p: P) -> int {
+    lowkey name = ident(p)
+    lowkey node = mkNode(p, sp2("variant", name))
+    fr eat(p, "lparen") {
+        addKid(p, node, parseType(p))
+        vibin eat(p, "comma") {
+            addKid(p, node, parseType(p))
+        }
+        expect(p, "rparen")
+    }
+    bet node
+}
+
+// Walk the label-tree, printing each node's label at `depth` and recursing kids at depth+1.
+finna emitNode(p: P, idx: int, depth: int, sb: StrBuilder) {
+    lowkey d = 0
+    vibin d < depth {
+        sb.add("  ")
+        d = d + 1
+    }
+    sb.add(p.nodes[idx].label)
+    sb.add("\n")
+    lowkey kids = p.nodes[idx].kids
+    lowkey n = kids.gang() as int
+    lowkey i = 0
+    vibin i < n {
+        emitNode(p, kids[i], depth + 1, sb)
+        i = i + 1
+    }
+}
+
+// Parse a token stream and print its AST dump, EXACTLY as dump.rs::ast does.
+finna emitAst(toks: vec[Token]) -> str {
+    lowkey pos = vec.new[int]()
+    pos.stack(0)
+    lowkey ns = vec.new[int]()
+    ns.stack(0)
+    lowkey p = P{ toks: toks, pos: pos, nodes: vec.new[Node](), ns: ns }
+    lowkey root = parseProgram(p)
+    lowkey sb = sbNew()
+    emitNode(p, root, 0, sb)
+    bet sb.finish()
+}
+
+// ===========================================================================
 // C0 tracer — the fixed `hello` .mir emission (retires at C4/C5 when real lowering lands).
 // ===========================================================================
 
@@ -667,13 +1890,16 @@ finna emitHelloMir() -> str {
 }
 
 finna main() {
-    // `betfe --emit tokens <file>` prints the token dump; with no args, the C0 tracer emits the
-    // fixed hello .mir for the backend hand-off.
-    fr sys.argc() >= 4 &&
-        str.slaps(sys.arg(1), "--emit") &&
-        str.slaps(sys.arg(2), "tokens") {
+    // `betfe --emit tokens <file>` prints the token dump; `--emit ast <file>` prints the AST dump.
+    // With no args the C0 tracer emits the fixed hello .mir for the backend hand-off. Conditions
+    // stay on one line so ASI doesn't split the multi-clause `&&` (a line ending in `)` gets a
+    // statement-terminating semicolon).
+    fr sys.argc() >= 4 && str.slaps(sys.arg(1), "--emit") && str.slaps(sys.arg(2), "tokens") {
         lowkey src = fs.peepText(sys.arg(3))
         spill.f("{}", emitTokens(lex(src)))
+    } naw fr sys.argc() >= 4 && str.slaps(sys.arg(1), "--emit") && str.slaps(sys.arg(2), "ast") {
+        lowkey src = fs.peepText(sys.arg(3))
+        spill.f("{}", emitAst(lex(src)))
     } naw {
         spill.it(emitHelloMir())
     }

@@ -65,6 +65,16 @@ size = 2
 status = "done"
 
 [[task]]
+slug = "ci-cost-gating"
+name = "CI cost: path-filter ci.yml to core changes + add cheap selfhost.yml (skip 6-way matrix on selfhost/ports/docs)"
+size = 2
+# DONE in b9ae57a: ci.yml's 6-way matrix is path-filtered to core changes, and a cheap selfhost.yml
+# runs `cargo xtask selfhost` (path-filtered to selfhost/ + the Rust frontend it depends on). That
+# gate now also enforces the C3 `--emit ast` parity added here, so the self-hosted parser is
+# CI-covered without paying for the full matrix on selfhost-only changes.
+status = "done"
+
+[[task]]
 slug = "frontend"
 name = "Fan-out core: frontend library — lexer, parser, AST, typecheck, broad midir emit (remaining lowering broken out below)"
 size = 21
@@ -326,13 +336,34 @@ status = "done"
 slug = "selfhost-ast"
 name = "C2: AST as moods+drip, tag-linked in cribs (mirror ast.rs; scale up mini-compiler.bet's shape)"
 size = 3
-status = "todo"
+# DONE, but as an INDEX-ARENA LABEL-TREE, not tag-linked cribs. Design driven by probing bet's
+# actual semantics on BOTH paths (interp + compiled): (1) structs pass BY VALUE — scalar-field
+# mutation via a method/free-fn does NOT propagate; (2) `v[i] = x` index-assignment does NOT lower
+# on the compiled path; (3) vecs ARE shared handles (mutations via .stack/.pop propagate through a
+# by-value struct across call levels). So all mutable parser state lives in shared-handle vecs. The
+# AST node is `drip Node{ label: str, kids: vec[int] }` where label is the EXACT dump line — one
+# node per dump line — held in a `vec[Node]` arena inside `drip P`; the cursor + no_struct flag are
+# 1-element vec cells mutated via pop+stack. This makes --emit ast byte-identical BY CONSTRUCTION
+# (emit = walk, print label at depth, recurse kids) and sidesteps generational-tag ceremony. C4
+# (lower) can enrich node kinds if the tree-walk needs typed dispatch. Folds into selfhost-parser.
+status = "done"
 
 [[task]]
 slug = "selfhost-parser"
 name = "C3: port parser.rs -> bet (recursive descent, generics disambiguation); verify --emit=ast diff"
 size = 8
-status = "todo"
+# DONE. Faithful port of parser.rs (1351 LOC) into selfhost/betfe.bet: full §E1 precedence ladder
+# (Go rule: bitwise binds tighter than comparisons), the §S3 type grammar (slice/tag/crib/fn-ty/
+# named+generics/trailing array dims), every statement + item, generics-vs-index disambiguation
+# (peek_after_matching_bracket), and the §L6 no_struct header rule. Builds the C2 label-tree;
+# `betfe --emit ast <f>` is byte-identical to `bet build --emit ast` (dump.rs::ast) across ALL 59
+# corpus programs incl. the self-referential mini-lexer(379)/mini-compiler(255)/mir-emitter(244) —
+# wired as a permanent `cargo xtask selfhost` gate (emit_parity, alongside C1 tokens). Gotchas
+# banked: `tag`/`crib` are KEYWORDS so can't be bet variable/param names (used opTag/tagE/cribE);
+# recursion + mutual recursion work on both paths. A separate deterministic bug was found & deferred
+# (see selfhost-emit note): the .mir TEXT round-trip mis-binds overloaded vec externs — blocks
+# M8 fixpoint, NOT C3 (betfe compiles via the direct .bet->bin path; --emit ast is stdout text).
+status = "done"
 
 [[task]]
 slug = "selfhost-lower"
@@ -344,6 +375,16 @@ status = "todo"
 slug = "selfhost-emit"
 name = "C5: .mir textual printer in bet matching crates/midir/src/text.rs exactly (enables byte-identical .mir)"
 size = 3
+# BLOCKER found during C3 design (2026-07-04): the .mir TEXT round-trip mis-binds overloaded
+# externs. Frontend emits one extern per vec element type (A4), all named e.g. `bet_vec_push`
+# (distinct ExternIds in-memory). The text printer prints them by NAME and the parser prescan
+# (midir/src/text.rs ~L749 `externs.entry(name).or_insert`) is first-wins, so `call_extern
+# @bet_vec_push` on a vec[i64] binds to the vec[Node] extern -> validator "Vec(TyId1) vs
+# Vec(TyId3)". `bet build p.mir` fails 300/300; `bet build --emit mir p.bet` and the DIRECT
+# `bet build p.bet -o p` both pass (calls carry ExternId, never serialize to name). Must fix
+# before M8 fixpoint (betfe emits its own vec-heavy .mir which must build). Fix: signature-aware
+# call_extern resolution in the text parser (it already tracks local types), + a print->parse->
+# validate regression test on a 2-vec-element module. Does NOT block C3 (AST dump is stdout text).
 status = "todo"
 
 [[task]]
