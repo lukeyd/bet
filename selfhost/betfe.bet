@@ -3035,6 +3035,15 @@ finna emitStrLen(c: LowerCtx, sop: str) -> int {
     bet t
 }
 
+// A non-copying `[]u8` byte view over a str (mirror str_byteslice_local); returns the slice place.
+finna strByteslice(c: LowerCtx, s: str) -> str {
+    lowkey sp = emitStrPtr(c, s)
+    lowkey sl = emitStrLen(c, s)
+    lowkey slc = newLocal(c, "[]u8")
+    emitAssign(c, slc, call2("make_slice[u8]", reg(sp), reg(sl)))
+    bet reg(slc)
+}
+
 // Concatenate two str operands into a fresh str via bet_str_concat (mirror concat_str); returns
 // the result str operand.
 finna concatStr(c: LowerCtx, a: str, b: str) -> str {
@@ -3207,13 +3216,81 @@ finna lowerIntrinsic(c: LowerCtx, p: P, module: str, method: str, methodIdx: int
     fr str.slaps(module, "str") && str.slaps(method, "len") {
         lowkey s, sty = lowerExpr(c, p, argValue(p, argsW, 0), "str")
         lowkey lenu = newLocal(c, "u64")
-        lowkey lb = sbNew()
-        lb.add("str_len(")
-        lb.add(s)
-        lb.add(")")
-        emitAssign(c, lenu, lb.finish())
+        emitAssign(c, lenu, call1("str_len", s))
         lowkey out = coerceInt(c, reg(lenu), "u64", "i64")
         bet out, "i64"
+    }
+    fr str.slaps(module, "str") && str.slaps(method, "at") {
+        lowkey s, sty = lowerExpr(c, p, argValue(p, argsW, 0), "str")
+        lowkey slc = strByteslice(c, s)
+        lowkey idx, ity = lowerExpr(c, p, argValue(p, argsW, 1), "i64")
+        lowkey idxc = coerceInt(c, idx, ity, "i64")
+        lowkey out = newLocal(c, "i64")
+        lowkey sb = sbNew()
+        sb.add("cast.zext(")
+        sb.add(slc)
+        sb.add(".index(")
+        sb.add(idxc)
+        sb.add(") as i64)")
+        emitAssign(c, out, sb.finish())
+        bet reg(out), "i64"
+    }
+    fr str.slaps(module, "str") && str.slaps(method, "sub") {
+        lowkey s, sty = lowerExpr(c, p, argValue(p, argsW, 0), "str")
+        lowkey start, stty = lowerExpr(c, p, argValue(p, argsW, 1), "i64")
+        lowkey startc = coerceInt(c, start, stty, "i64")
+        lowkey endd, ety = lowerExpr(c, p, argValue(p, argsW, 2), "i64")
+        lowkey endc = coerceInt(c, endd, ety, "i64")
+        lowkey slc = strByteslice(c, s)
+        lowkey isb = sbNew()
+        isb.add(slc)
+        isb.add(".index(")
+        isb.add(startc)
+        isb.add(")")
+        lowkey dptr = emitAddrOf(c, isb.finish())
+        lowkey newlen = newLocal(c, "i64")
+        emitAssign(c, newlen, call2("sub.wrap", endc, startc))
+        lowkey result = newLocal(c, "str")
+        emitAssign(c, result, call2("make_str", reg(dptr), reg(newlen)))
+        bet reg(result), "str"
+    }
+    fr str.slaps(module, "str") && str.slaps(method, "bytes") {
+        lowkey s, sty = lowerExpr(c, p, argValue(p, argsW, 0), "str")
+        lowkey slc = strByteslice(c, s)
+        bet slc, "[]u8"
+    }
+    fr str.slaps(module, "str") && str.slaps(method, "fromBytesTrust") {
+        lowkey sl, slty = lowerExpr(c, p, argValue(p, argsW, 0), "")
+        fr !isPlace(sl) {
+            lcFail(c)
+            bet "0i64", "i64"
+        }
+        lowkey sp = newLocal(c, "rawptr")
+        emitAssign(c, sp, call1("slice_ptr", sl))
+        lowkey slen = newLocal(c, "u64")
+        emitAssign(c, slen, call1("slice_len", sl))
+        lowkey result = newLocal(c, "str")
+        emitAssign(c, result, call2("make_str", reg(sp), reg(slen)))
+        bet reg(result), "str"
+    }
+    fr str.slaps(module, "str") && str.slaps(method, "fromBytes") {
+        lowkey sl, slty = lowerExpr(c, p, argValue(p, argsW, 0), "")
+        fr !isPlace(sl) {
+            lcFail(c)
+            bet "0i64", "i64"
+        }
+        lowkey sp = newLocal(c, "rawptr")
+        emitAssign(c, sp, call1("slice_ptr", sl))
+        lowkey slen = newLocal(c, "u64")
+        emitAssign(c, slen, call1("slice_len", sl))
+        getExtern(c, "extern \"C\" fn bet_str_valid(rawptr, u64) -> u64")
+        lowkey valid = newLocal(c, "u64")
+        emitAssign(c, valid, call2("call_extern @bet_str_valid", reg(sp), reg(slen)))
+        lowkey newlen = newLocal(c, "u64")
+        emitAssign(c, newlen, call2("mul.wrap", reg(slen), reg(valid)))
+        lowkey result = newLocal(c, "str")
+        emitAssign(c, result, call2("make_str", reg(sp), reg(newlen)))
+        bet reg(result), "str"
     }
     fr str.slaps(module, "str") && str.slaps(method, "slaps") {
         lowkey a, aty = lowerExpr(c, p, argValue(p, argsW, 0), "str")
@@ -3827,6 +3904,27 @@ finna constLiteral(c: LowerCtx, p: P, idx: int, hint: str) -> (str, str) {
 
 finna cat3(a: str, b: str, cc: str) -> str {
     bet cat2(cat2(a, b), cc)
+}
+
+// `name(a)` / `name(a, b)` — rvalue/terminator text builders.
+finna call1(name: str, a: str) -> str {
+    lowkey sb = sbNew()
+    sb.add(name)
+    sb.add("(")
+    sb.add(a)
+    sb.add(")")
+    bet sb.finish()
+}
+
+finna call2(name: str, a: str, b: str) -> str {
+    lowkey sb = sbNew()
+    sb.add(name)
+    sb.add("(")
+    sb.add(a)
+    sb.add(", ")
+    sb.add(b)
+    sb.add(")")
+    bet sb.finish()
 }
 
 // Type-directed value print (mirror lower_print_value) for the scalar subset.

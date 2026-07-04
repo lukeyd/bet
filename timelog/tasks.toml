@@ -424,6 +424,11 @@ size = 13
 # slice-typed context materialize `make_slice[ELEM](addr_of(arr), N u64)`, slice indexing (like
 # arrays), and the bytes.readU32le intrinsic (unrolled 4x: add.wrap idx / cast.zext byte / shl / bitor
 # accumulate). Unlocks bytes-parse. 38/59 byte-identical.
+# C4.15 added the str byte intrinsics on top of the slice model: str.at (byteslice + cast.zext
+# index), str.sub (addr_of(view.index(start)) + sub.wrap len + make_str), str.bytes (the []u8 view),
+# str.fromBytesTrust (slice_ptr/len + make_str) and str.fromBytes (+ bet_str_valid gate: len *= valid).
+# This completed the lexer's string-walking core -> 11-reference/mini-lexer is now byte-identical
+# (the first self-hosted reference program to fully lower). Unlocks str-bytes + mini-lexer. 40/59.
 status = "doing"
 
 [[task]]
