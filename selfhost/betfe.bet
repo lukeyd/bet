@@ -1932,6 +1932,9 @@ drip LowerCtx {
     constNames: vec[str],
     constVals: vec[str],
     constTys: vec[str],
+    gConstNames: vec[str],
+    gConstVals: vec[str],
+    gConstTys: vec[str],
     loopIncr: vec[int],
     loopExit: vec[int]
 }
@@ -1949,7 +1952,7 @@ finna lcNew() -> LowerCtx {
     blks.stack(blkNew())
     lowkey cur = vec.new[int]()
     cur.stack(0)
-    bet LowerCtx{ externs: ex, fns: vec.new[str](), fnNames: vec.new[str](), fnParamCsv: vec.new[str](), fnRet: vec.new[str](), localTypes: vec.new[str](), paramCount: pc, curRet: cr, blocks: blks, curBlock: cur, ok: okc, bindNames: vec.new[str](), bindIds: vec.new[int](), constNames: vec.new[str](), constVals: vec.new[str](), constTys: vec.new[str](), loopIncr: vec.new[int](), loopExit: vec.new[int]() }
+    bet LowerCtx{ externs: ex, fns: vec.new[str](), fnNames: vec.new[str](), fnParamCsv: vec.new[str](), fnRet: vec.new[str](), localTypes: vec.new[str](), paramCount: pc, curRet: cr, blocks: blks, curBlock: cur, ok: okc, bindNames: vec.new[str](), bindIds: vec.new[int](), constNames: vec.new[str](), constVals: vec.new[str](), constTys: vec.new[str](), gConstNames: vec.new[str](), gConstVals: vec.new[str](), gConstTys: vec.new[str](), loopIncr: vec.new[int](), loopExit: vec.new[int]() }
 }
 
 // --- per-function reset (structs pass by value, so drain the shared-handle vecs in place) ---
@@ -2167,11 +2170,29 @@ finna addConst(c: LowerCtx, name: str, val: str, ty: str) {
     c.constTys.stack(ty)
 }
 
-// Index of the const named `name`, or -1.
+// Index of the (function-local) const named `name`, or -1.
 finna lookupConst(c: LowerCtx, name: str) -> int {
     lowkey i = (c.constNames.gang() as int) - 1
     vibin i >= 0 {
         fr str.slaps(c.constNames[i], name) {
+            bet i
+        }
+        i = i - 1
+    }
+    bet 0 - 1
+}
+
+// Top-level consts live in a separate scope that survives per-function resets.
+finna addGlobalConst(c: LowerCtx, name: str, val: str, ty: str) {
+    c.gConstNames.stack(name)
+    c.gConstVals.stack(val)
+    c.gConstTys.stack(ty)
+}
+
+finna lookupGlobalConst(c: LowerCtx, name: str) -> int {
+    lowkey i = (c.gConstNames.gang() as int) - 1
+    vibin i >= 0 {
+        fr str.slaps(c.gConstNames[i], name) {
             bet i
         }
         i = i - 1
@@ -2732,6 +2753,10 @@ finna lowerName(c: LowerCtx, p: P, idx: int) -> (str, str) {
     lowkey ci = lookupConst(c, nm)
     fr ci >= 0 {
         bet c.constVals[ci], c.constTys[ci]
+    }
+    lowkey gi = lookupGlobalConst(c, nm)
+    fr gi >= 0 {
+        bet c.gConstVals[gi], c.gConstTys[gi]
     }
     lcFail(c)
     bet "0i64", "i64"
@@ -3297,6 +3322,36 @@ finna collectFns(c: LowerCtx, p: P, root: int) {
     }
 }
 
+// Evaluate a top-level `const` item into the global scope (mirror lowerConst, global storage).
+finna lowerGlobalConst(c: LowerCtx, p: P, stmtIdx: int) {
+    lowkey nm = afterFirst(afterFirst(lab(p, stmtIdx)))
+    fr hasSpace(nm) {
+        lcFail(c)
+    } naw {
+        lowkey tw = findKid(p, stmtIdx, "type")
+        lowkey hintTy = ""
+        fr tw >= 0 {
+            hintTy = mapTypeNode(c, p, kidAt(p, tw, 0))
+        }
+        lowkey vw = findKid(p, stmtIdx, "value")
+        lowkey op, ty = constLiteral(c, p, kidAt(p, vw, 0), hintTy)
+        addGlobalConst(c, nm, op, ty)
+    }
+}
+
+// Pre-pass: evaluate every top-level const so functions resolve them regardless of order.
+finna collectConsts(c: LowerCtx, p: P, root: int) {
+    lowkey n = kidCount(p, root)
+    lowkey i = 0
+    vibin i < n && lcOk(c) {
+        lowkey it = kidAt(p, root, i)
+        fr str.slaps(firstWord(lab(p, it)), "const") {
+            lowerGlobalConst(c, p, it)
+        }
+        i = i + 1
+    }
+}
+
 // Lower one function to .mir text (mirror lower_func + lower_fn_core).
 finna lowerFunc(c: LowerCtx, p: P, funcIdx: int) {
     lowkey name = afterFirst(afterFirst(lab(p, funcIdx)))
@@ -3399,6 +3454,7 @@ finna assembleModule(c: LowerCtx) -> str {
 // C4 doesn't lower yet.
 finna emitMir(p: P, root: int) -> str {
     lowkey c = lcNew()
+    collectConsts(c, p, root)
     collectFns(c, p, root)
     lowkey n = kidCount(p, root)
     lowkey i = 0
@@ -3407,6 +3463,8 @@ finna emitMir(p: P, root: int) -> str {
         lowkey h = firstWord(lab(p, it))
         fr str.slaps(h, "pull") {
             // pull is a no-op import — ignored.
+        } naw fr str.slaps(h, "const") {
+            // top-level consts were evaluated in the collectConsts pre-pass.
         } naw fr str.slaps(h, "func") {
             lowerFunc(c, p, it)
         } naw {

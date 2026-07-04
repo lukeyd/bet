@@ -387,8 +387,12 @@ size = 13
 # array literals (`array[ELEM](..)` into a temp), `base[i]` place-projection indexing (arrays only,
 # addressable base), `squad x in xs` as a counter loop (ctr<N header / body binds x=xs[ctr] /
 # incr ctr+=1.wrap / exit), a loop stack (loopIncr/loopExit) threaded through vibin+squad, and
-# dip(break)->exit / skip(continue)->incr. 17/59 byte-identical. Deferred (each a further increment):
-# vec[T] indexing/squad, structs (drip/field/struct-lit) + receiver methods, sums (moods/vibe),
+# dip(break)->exit / skip(continue)->incr. 17/59 byte-identical. C4.6 added top-level `const` items:
+# a global const scope (gConst*) evaluated in a collectConsts pre-pass and NOT drained per-function
+# (function-local `facts` still shadow via the drained const scope, checked first); unlocks programs
+# whose module-level facts feed scalar arithmetic (fixed-point, bam-angles). 19/59 byte-identical.
+# Deferred (each a further increment): vec[T] indexing/squad, math.* + other module intrinsics,
+# structs (drip/field/struct-lit) + receiver methods, sums (moods/vibe),
 # errors (yikes/bounce/sheesh), memory (crib/tag/holla/cop), collections (vec/stash), the remaining
 # str/bytes/fs/mem/sys intrinsics + FFI, generics/monomorphization, then the 11-reference programs.
 status = "doing"
