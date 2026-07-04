@@ -427,6 +427,44 @@ fn detects_empty_and_bad_entry_and_bad_id() {
     );
 }
 
+#[test]
+fn overloaded_externs_round_trip() {
+    // The frontend emits one vec-ABI extern per element type, all sharing a C symbol name, so a
+    // `call_extern @name` is ambiguous on re-parse. `bet_vec_push` overloads differ in a PARAMETER
+    // type (resolved by the argument); `bet_vec_new` overloads differ ONLY in RETURN type (resolved
+    // by the assignment destination). Both must survive print -> parse -> validate. Regression for
+    // the .mir-text extern-overload bug: before the signature-aware parser resolution, every call
+    // bound to the first same-named extern and the validator rejected the module.
+    let src = "\
+struct Node { hush kids: vec[i64] }
+extern \"C\" fn bet_vec_new(u64) -> vec[i64]
+extern \"C\" fn bet_vec_new(u64) -> vec[Node]
+extern \"C\" fn bet_vec_push(vec[i64], rawptr) -> void
+extern \"C\" fn bet_vec_push(vec[Node], rawptr) -> void
+fn f() -> void {
+  let %0: u64
+  let %1: vec[i64]
+  let %2: vec[Node]
+  let %3: rawptr
+  let %4: void
+  let %5: void
+  bb0:
+    %0 = 0u64
+    %3 = str_ptr(\"x\")
+    %1 = call_extern @bet_vec_new(%0)
+    %2 = call_extern @bet_vec_new(%0)
+    %4 = call_extern @bet_vec_push(%1, %3)
+    %5 = call_extern @bet_vec_push(%2, %3)
+    return
+}
+";
+    let m = parse(src).expect("overloaded-extern fixture should parse");
+    validate(&m).expect("overloaded externs must resolve by signature/destination");
+    // The resolution must also survive a full text round-trip.
+    let m2 = parse(&print(&m)).expect("reprint should re-parse");
+    validate(&m2).expect("re-parsed module must still validate");
+}
+
 // --- hand-written .mir fixtures (also the backend's Step-2 inputs) ---
 
 #[test]

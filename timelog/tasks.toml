@@ -360,9 +360,9 @@ size = 8
 # corpus programs incl. the self-referential mini-lexer(379)/mini-compiler(255)/mir-emitter(244) —
 # wired as a permanent `cargo xtask selfhost` gate (emit_parity, alongside C1 tokens). Gotchas
 # banked: `tag`/`crib` are KEYWORDS so can't be bet variable/param names (used opTag/tagE/cribE);
-# recursion + mutual recursion work on both paths. A separate deterministic bug was found & deferred
-# (see selfhost-emit note): the .mir TEXT round-trip mis-binds overloaded vec externs — blocks
-# M8 fixpoint, NOT C3 (betfe compiles via the direct .bet->bin path; --emit ast is stdout text).
+# recursion + mutual recursion work on both paths. A separate deterministic .mir-text-roundtrip bug
+# (overloaded vec externs mis-binding on re-parse) was found during this work and has since been
+# FIXED (see the selfhost-emit note) — it never blocked C3 but would have blocked the M8 fixpoint.
 status = "done"
 
 [[task]]
@@ -375,16 +375,16 @@ status = "todo"
 slug = "selfhost-emit"
 name = "C5: .mir textual printer in bet matching crates/midir/src/text.rs exactly (enables byte-identical .mir)"
 size = 3
-# BLOCKER found during C3 design (2026-07-04): the .mir TEXT round-trip mis-binds overloaded
-# externs. Frontend emits one extern per vec element type (A4), all named e.g. `bet_vec_push`
-# (distinct ExternIds in-memory). The text printer prints them by NAME and the parser prescan
-# (midir/src/text.rs ~L749 `externs.entry(name).or_insert`) is first-wins, so `call_extern
-# @bet_vec_push` on a vec[i64] binds to the vec[Node] extern -> validator "Vec(TyId1) vs
-# Vec(TyId3)". `bet build p.mir` fails 300/300; `bet build --emit mir p.bet` and the DIRECT
-# `bet build p.bet -o p` both pass (calls carry ExternId, never serialize to name). Must fix
-# before M8 fixpoint (betfe emits its own vec-heavy .mir which must build). Fix: signature-aware
-# call_extern resolution in the text parser (it already tracks local types), + a print->parse->
-# validate regression test on a 2-vec-element module. Does NOT block C3 (AST dump is stdout text).
+# NOTE — a .mir-text-roundtrip prerequisite for this task was FIXED ahead of it (2026-07-04):
+# overloaded vec/map externs (the frontend emits one per element type, all sharing a C symbol
+# name) used to mis-bind on re-parse — `call_extern @name` resolved first-wins, so `bet build
+# p.mir` failed on any 2-vec-element program (would have blocked the M8 fixpoint: betfe emitting
+# its own vec-heavy .mir). Fixed in midir/src/text.rs by signature-aware `call_extern` resolution:
+# the parser now tracks local types (cur_locals) + the assignment destination (dest_ty) and picks
+# the same-named extern whose params match the args and whose return matches the destination
+# (needed for `bet_vec_new`, whose overloads differ ONLY in return type). Regression test:
+# midir/tests/midir.rs::overloaded_externs_round_trip. C5 itself (the bet-side .mir printer) is
+# still TODO.
 status = "todo"
 
 [[task]]

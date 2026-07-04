@@ -708,7 +708,9 @@ fn lex_str(bytes: &[char], i: &mut usize) -> Result<Tok, ParseError> {
 /// Parse `.mir` text into a module.
 pub fn parse(src: &str) -> Result<Module, ParseError> {
     let toks = lex(src)?;
-    let (struct_ids, sum_ids, func_ids, extern_ids, crib_global_ids) = prescan(&toks);
+    // `extern_ids` (name→first id) is intentionally ignored: overloaded externs share a name, so
+    // calls are resolved structurally by `Parser::resolve_extern` over the full extern table.
+    let (struct_ids, sum_ids, func_ids, _extern_ids, crib_global_ids) = prescan(&toks);
     let mut p = Parser {
         toks,
         pos: 0,
@@ -716,8 +718,9 @@ pub fn parse(src: &str) -> Result<Module, ParseError> {
         struct_ids,
         sum_ids,
         func_ids,
-        extern_ids,
         crib_global_ids,
+        cur_locals: Vec::new(),
+        dest_ty: None,
     };
     p.module()?;
     Ok(p.m)
@@ -797,8 +800,13 @@ struct Parser {
     struct_ids: HashMap<String, StructId>,
     sum_ids: HashMap<String, SumId>,
     func_ids: HashMap<String, FuncId>,
-    extern_ids: HashMap<String, ExternId>,
     crib_global_ids: HashMap<String, CribGlobalId>,
+    /// Types of the current function's locals (params + `let`s), used to resolve overloaded
+    /// extern calls by argument/destination type. Populated by [`Parser::fn_decl`].
+    cur_locals: Vec<TyId>,
+    /// The type of the place on the left of the assignment currently being parsed (if any) —
+    /// disambiguates overloaded externs that differ only in return type.
+    dest_ty: Option<TyId>,
 }
 
 impl Parser {
@@ -991,6 +999,10 @@ impl Parser {
         self.expect(&Tok::LParen)?;
         let mut params = Vec::new();
         let mut locals = Vec::new();
+        // Track local types on `self` so overloaded `call_extern` resolution can see them. The
+        // printer emits every `let` before any block body, so this is complete by the time a
+        // statement is parsed.
+        self.cur_locals.clear();
         while !self.eat(&Tok::RParen) {
             if !params.is_empty() {
                 self.expect(&Tok::Comma)?;
@@ -1005,6 +1017,7 @@ impl Parser {
                 name: None,
                 kind: LocalKind::Param,
             });
+            self.cur_locals.push(ty);
         }
         self.expect(&Tok::Arrow)?;
         let rets = self.ret_types()?;
@@ -1027,6 +1040,7 @@ impl Parser {
                     name: None,
                     kind: LocalKind::Temp,
                 });
+                self.cur_locals.push(ty);
                 continue;
             }
             // otherwise a block label `bbN:` opening a block body
@@ -1086,8 +1100,108 @@ impl Parser {
         // place = rvalue
         let place = self.place()?;
         self.expect(&Tok::Eq)?;
+        // Record the destination type so `call_extern` can disambiguate overloaded externs whose
+        // signatures differ only in return type (e.g. `bet_vec_new` per element type).
+        self.dest_ty = self.place_ty(&place);
         let rv = self.rvalue()?;
+        self.dest_ty = None;
         Ok(Stmt::Assign(place, rv))
+    }
+
+    /// The interned type of a place, walking projections read-only over the module. Returns
+    /// `None` if a local or projection can't be resolved — treated as a wildcard by
+    /// [`Parser::resolve_extern`]. Records no errors; the validator does the real checking.
+    fn place_ty(&self, place: &Place) -> Option<TyId> {
+        let mut ty = *self.cur_locals.get(place.local.index())?;
+        let mut pending: Option<(SumId, u32)> = None;
+        for proj in &place.proj {
+            match proj {
+                Proj::Field(i) => match pending.take() {
+                    Some((sid, v)) => {
+                        ty = *self
+                            .m
+                            .sum_def(sid)
+                            .variants
+                            .get(v as usize)?
+                            .payload
+                            .get(*i as usize)?;
+                    }
+                    None => match self.m.ty(ty).clone() {
+                        TyKind::Struct(sid) => {
+                            ty = self.m.struct_def(sid).fields.get(*i as usize)?.ty;
+                        }
+                        _ => return None,
+                    },
+                },
+                Proj::Index(_) => match self.m.ty(ty).clone() {
+                    TyKind::Slice(e) | TyKind::Array(e, _) => ty = e,
+                    _ => return None,
+                },
+                Proj::Deref => match self.m.ty(ty).clone() {
+                    TyKind::Ref(e) => ty = e,
+                    _ => return None,
+                },
+                Proj::Downcast(v) => match self.m.ty(ty).clone() {
+                    TyKind::Sum(sid) => pending = Some((sid, *v)),
+                    _ => return None,
+                },
+            }
+        }
+        Some(ty)
+    }
+
+    /// The interned type of an operand, or `None` when it doesn't pin one down (a wildcard for
+    /// overload resolution). Only the cases that appear as overloaded-extern arguments matter.
+    fn operand_ty(&self, op: &Operand) -> Option<TyId> {
+        match op {
+            Operand::Const(Const::Int(_, ty) | Const::Float(_, ty)) => Some(*ty),
+            Operand::Const(_) => None,
+            Operand::Copy(p) | Operand::Move(p) => self.place_ty(p),
+        }
+    }
+
+    /// Resolve a `call_extern @name` to a specific [`ExternId`]. The frontend emits one extern per
+    /// vec/map element type — all sharing a C symbol name — so a name alone is ambiguous on
+    /// re-parse. Pick the same-named extern whose parameter types match the argument types and
+    /// (for overloads that differ only in return type, e.g. `bet_vec_new`) whose single return
+    /// matches the destination. Falls back to the first same-named extern — the only one, and
+    /// correct, when the name is not overloaded.
+    fn resolve_extern(
+        &self,
+        name: &str,
+        args: &[Operand],
+        dest_ty: Option<TyId>,
+    ) -> Option<ExternId> {
+        let mut fallback: Option<ExternId> = None;
+        for (i, ext) in self.m.externs().iter().enumerate() {
+            if ext.name != name {
+                continue;
+            }
+            let eid = ExternId(i as u32);
+            if fallback.is_none() {
+                fallback = Some(eid);
+            }
+            if ext.sig.params.len() != args.len() {
+                continue;
+            }
+            let params_ok = ext
+                .sig
+                .params
+                .iter()
+                .zip(args)
+                .all(|(&pty, arg)| self.operand_ty(arg).is_none_or(|aty| aty == pty));
+            if !params_ok {
+                continue;
+            }
+            let rets_ok = match (dest_ty, ext.sig.rets.as_slice()) {
+                (Some(d), [r]) => *r == d,
+                _ => true,
+            };
+            if rets_ok {
+                return Some(eid);
+            }
+        }
+        fallback
     }
 
     fn terminator(&mut self) -> Result<Terminator, ParseError> {
@@ -1240,11 +1354,14 @@ impl Parser {
                 self.pos += 1;
                 self.expect(&Tok::At)?;
                 let name = self.expect_ident()?;
-                let e = *self
-                    .extern_ids
-                    .get(&name)
-                    .ok_or_else(|| self.err(&format!("unknown extern `{name}`")))?;
                 let args = self.arg_list()?;
+                // The frontend emits one extern per vec/map element type, all sharing a C symbol
+                // name, so a name alone is ambiguous on re-parse. Resolve to the same-named extern
+                // whose parameter types match the arguments (and, for overloads that differ only
+                // in return type, whose return matches the assignment destination).
+                let e = self
+                    .resolve_extern(&name, &args, self.dest_ty)
+                    .ok_or_else(|| self.err(&format!("unknown extern `{name}`")))?;
                 Ok(Rvalue::Call(Callee::Extern(e), args))
             }
             "str_ptr" => {
