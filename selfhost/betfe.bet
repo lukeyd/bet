@@ -3655,6 +3655,23 @@ finna lowerIntrinsic(c: LowerCtx, p: P, module: str, method: str, methodIdx: int
         }
         bet reg(acc), "u32"
     }
+    fr str.slaps(module, "fs") && str.slaps(method, "peepText") {
+        lowkey path, pty = lowerExpr(c, p, argValue(p, argsW, 0), "str")
+        lowkey pp = emitStrPtr(c, path)
+        lowkey pl = emitStrLen(c, path)
+        lowkey outLen = newLocal(c, "u64")
+        emitAssign(c, outLen, "0u64")
+        lowkey outPtr = emitAddrOf(c, reg(outLen))
+        getExtern(c, "extern \"C\" fn bet_fs_read(rawptr, u64, rawptr) -> rawptr")
+        lowkey rdArgs = vec.new[str]()
+        rdArgs.stack(reg(pp))
+        rdArgs.stack(reg(pl))
+        rdArgs.stack(reg(outPtr))
+        lowkey data = emitExternCall(c, "rawptr", "bet_fs_read", rdArgs)
+        lowkey result = newLocal(c, "str")
+        emitAssign(c, result, call2("make_str", reg(data), reg(outLen)))
+        bet reg(result), "str"
+    }
     fr str.slaps(module, "sys") && str.slaps(method, "argc") {
         getExtern(c, "extern \"C\" fn bet_arg_count() -> u64")
         lowkey n = newLocal(c, "u64")
@@ -3701,9 +3718,11 @@ finna lowerIntrinsic(c: LowerCtx, p: P, module: str, method: str, methodIdx: int
     }
     fr str.slaps(module, "str") && str.slaps(method, "at") {
         lowkey s, sty = lowerExpr(c, p, argValue(p, argsW, 0), "str")
-        lowkey slc = strByteslice(c, s)
+        // The index is lowered BEFORE the byte-slice view (mirror lower.rs str.at ordering) — its
+        // temps must precede the str_ptr/str_len/make_slice temps.
         lowkey idx, ity = lowerExpr(c, p, argValue(p, argsW, 1), "i64")
         lowkey idxc = coerceInt(c, idx, ity, "i64")
+        lowkey slc = strByteslice(c, s)
         lowkey out = newLocal(c, "i64")
         lowkey sb = sbNew()
         sb.add("cast.zext(")
@@ -6012,6 +6031,46 @@ finna emitMir(p: P, root: int) -> str {
     bet assembleModule(c)
 }
 
+// Diagnostic: which item first fails to lower (for the self-host fixpoint bring-up). Mirrors
+// emitMir but reports the failing function name instead of the sentinel.
+finna emitFailFn(p: P, root: int) -> str {
+    lowkey c = lcNew()
+    collectTypeNames(c, p, root)
+    collectTypeDefs(c, p, root)
+    collectCribGlobals(c, p, root)
+    collectConsts(c, p, root)
+    collectExterns(c, p, root)
+    collectFns(c, p, root)
+    fr !lcOk(c) { bet "FAIL: collect/prescan (type/const/extern/fn signature)" }
+    lowkey n = kidCount(p, root)
+    lowkey i = 0
+    vibin i < n {
+        lowkey it = kidAt(p, root, i)
+        fr str.slaps(firstWord(lab(p, it)), "func") && !isGenericDecl(p, it) {
+            lowerFunc(c, p, it)
+            fr !lcOk(c) { bet cat2("FAIL fn: ", afterFirst(afterFirst(lab(p, it)))) }
+        }
+        i = i + 1
+    }
+    lowkey qi = 0
+    vibin qi < (c.moQName.gang() as int) {
+        lowerMonoFn(c, p, qi)
+        fr !lcOk(c) { bet cat2("FAIL mono: ", c.moQMangled[qi]) }
+        qi = qi + 1
+    }
+    bet "ALL OK"
+}
+
+finna emitFailFromSrc(src: str) -> str {
+    lowkey pos = vec.new[int]()
+    pos.stack(0)
+    lowkey ns = vec.new[int]()
+    ns.stack(0)
+    lowkey p = P{ toks: lex(src), pos: pos, nodes: vec.new[Node](), ns: ns }
+    lowkey root = parseProgram(p)
+    bet emitFailFn(p, root)
+}
+
 // ===========================================================================
 // C0 tracer — the fixed `hello` .mir emission (retires at C4/C5 when real lowering lands).
 // ===========================================================================
@@ -6049,6 +6108,9 @@ finna main() {
     } naw fr sys.argc() >= 4 && str.slaps(sys.arg(1), "--emit") && str.slaps(sys.arg(2), "mir") {
         lowkey src = fs.peepText(sys.arg(3))
         spill.f("{}", emitMirFromSrc(src))
+    } naw fr sys.argc() >= 4 && str.slaps(sys.arg(1), "--emit") && str.slaps(sys.arg(2), "failfn") {
+        lowkey src = fs.peepText(sys.arg(3))
+        spill.f("{}", emitFailFromSrc(src))
     } naw {
         spill.it(emitHelloMir())
     }
