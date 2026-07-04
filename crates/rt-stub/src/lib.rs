@@ -351,6 +351,12 @@ pub unsafe extern "C" fn bet_str_eq(
     a == b
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_str_valid(ptr: *const u8, len: usize) -> usize {
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    usize::from(std::str::from_utf8(bytes).is_ok())
+}
+
 // ---------------------------------------------------------------------------
 // Filesystem.
 // ---------------------------------------------------------------------------
@@ -763,6 +769,11 @@ mod tests {
 
         assert!(unsafe { bet_str_eq(a.as_ptr(), a.len(), a.as_ptr(), a.len()) });
         assert!(!unsafe { bet_str_eq(a.as_ptr(), a.len(), b.as_ptr(), b.len()) });
+
+        // `bet_str_valid` — 1 for well-formed UTF-8, 0 for a stray continuation/lead byte.
+        assert_eq!(unsafe { bet_str_valid(a.as_ptr(), a.len()) }, 1);
+        let bad = [0xFFu8];
+        assert_eq!(unsafe { bet_str_valid(bad.as_ptr(), bad.len()) }, 0);
     }
 
     #[test]

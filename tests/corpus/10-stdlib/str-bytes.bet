@@ -18,4 +18,13 @@ finna main() {
     // A `[]u8` view feeds the existing byte reader: "ABCD" little-endian = 0x44434241.
     lowkey bs = str.bytes("ABCD")
     spill.it(bytes.readU32le(bs, 0))   // 1145258561
+
+    // `[]u8` -> `str` round-trips. `fromBytesTrust` is the unchecked zero-copy path;
+    // `fromBytes` validates UTF-8, collapsing malformed input to an empty string.
+    spill.it(str.fromBytesTrust(str.bytes("hi")))   // hi
+    lowkey ab: []u8 = [0x41, 0x42]
+    spill.it(str.fromBytesTrust(ab))                // AB
+    spill.it(str.fromBytes(ab))                     // AB  (valid UTF-8)
+    lowkey bad: []u8 = [0xFF]
+    spill.it(str.fromBytes(bad))                    // (empty — invalid UTF-8)
 }

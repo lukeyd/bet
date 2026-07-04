@@ -339,6 +339,17 @@ impl<'a> Checker<'a> {
                     signed: false,
                 })
             }
+            Rvalue::SlicePtr(op) => {
+                self.expect_slice(func, op);
+                Some(TyKind::RawPtr)
+            }
+            Rvalue::SliceLen(op) => {
+                self.expect_slice(func, op);
+                Some(TyKind::Int {
+                    width: IntWidth::W64,
+                    signed: false,
+                })
+            }
             Rvalue::AddrOf(place) => {
                 let _ = self.place_kind(func, place);
                 Some(TyKind::RawPtr)
@@ -374,6 +385,19 @@ impl<'a> Checker<'a> {
             self.errors.push(ValidationError::TypeMismatch {
                 func: func.name.clone(),
                 detail: format!("str projection on non-str operand {k:?}"),
+            });
+        }
+    }
+
+    /// Best-effort: a slice projection (`slice_ptr`/`slice_len`) requires a `[]T` operand.
+    /// Skips the check when the operand's kind can't be determined locally.
+    fn expect_slice(&mut self, func: &Func, op: &Operand) {
+        if let Some(k) = self.operand_kind(func, op)
+            && !matches!(k, TyKind::Slice(_))
+        {
+            self.errors.push(ValidationError::TypeMismatch {
+                func: func.name.clone(),
+                detail: format!("slice projection on non-slice operand {k:?}"),
             });
         }
     }

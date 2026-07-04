@@ -471,6 +471,12 @@ pub unsafe extern "C" fn bet_str_eq(
     a == b
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_str_valid(ptr: *const u8, len: usize) -> usize {
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    usize::from(std::str::from_utf8(bytes).is_ok())
+}
+
 // ---------------------------------------------------------------------------
 // Filesystem.
 // ---------------------------------------------------------------------------

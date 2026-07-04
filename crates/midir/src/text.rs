@@ -318,6 +318,8 @@ impl Printer<'_> {
             }
             Rvalue::StrPtr(op) => format!("str_ptr({})", self.operand(op)),
             Rvalue::StrLen(op) => format!("str_len({})", self.operand(op)),
+            Rvalue::SlicePtr(op) => format!("slice_ptr({})", self.operand(op)),
+            Rvalue::SliceLen(op) => format!("slice_len({})", self.operand(op)),
             Rvalue::AddrOf(place) => format!("addr_of({})", self.place(place)),
             Rvalue::MakeSlice { data, len, elem } => format!(
                 "make_slice[{}]({}, {})",
@@ -1258,6 +1260,20 @@ impl Parser {
                 let op = self.operand()?;
                 self.expect(&Tok::RParen)?;
                 Ok(Rvalue::StrLen(op))
+            }
+            "slice_ptr" => {
+                self.pos += 1;
+                self.expect(&Tok::LParen)?;
+                let op = self.operand()?;
+                self.expect(&Tok::RParen)?;
+                Ok(Rvalue::SlicePtr(op))
+            }
+            "slice_len" => {
+                self.pos += 1;
+                self.expect(&Tok::LParen)?;
+                let op = self.operand()?;
+                self.expect(&Tok::RParen)?;
+                Ok(Rvalue::SliceLen(op))
             }
             "make" => {
                 self.pos += 1;

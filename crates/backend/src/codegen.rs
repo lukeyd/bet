@@ -458,6 +458,9 @@ impl<'c> Cg<'c> {
             Rvalue::Cast(op, ty, kind) => Ok(Some(self.lower_cast(func, locals, op, *ty, *kind)?)),
             Rvalue::StrPtr(op) => Ok(Some(self.str_projection(func, locals, op, 0)?)),
             Rvalue::StrLen(op) => Ok(Some(self.str_projection(func, locals, op, 1)?)),
+            // A slice shares the fat `{ ptr, len }` layout, so the same projection reads it.
+            Rvalue::SlicePtr(op) => Ok(Some(self.str_projection(func, locals, op, 0)?)),
+            Rvalue::SliceLen(op) => Ok(Some(self.str_projection(func, locals, op, 1)?)),
             Rvalue::AddrOf(place) => {
                 let (ptr, _ty) = self.place_ptr(func, locals, place)?;
                 Ok(Some(ptr.into()))

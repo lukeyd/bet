@@ -1410,9 +1410,21 @@ impl<'p> Interp<'p> {
             ("bytes", [Value::Str(s)]) => Ok(Value::Array(
                 s.as_bytes().iter().map(|b| Value::Byte(*b)).collect(),
             )),
-            (m @ ("glow" | "slaps" | "len" | "at" | "sub" | "bytes"), _) => Err(RunError::Type(
-                format!("str.{m} called with the wrong argument shape"),
+            // `str.fromBytesTrust(b)` — unchecked `[]u8` -> `str`.
+            ("fromBytesTrust", [Value::Array(bs)]) => Ok(Value::Str(
+                String::from_utf8_lossy(&bytes_of(bs)?).into_owned(),
             )),
+            // `str.fromBytes(b)` — checked `[]u8` -> `str`, empty on malformed UTF-8.
+            ("fromBytes", [Value::Array(bs)]) => Ok(Value::Str(
+                String::from_utf8(bytes_of(bs)?).unwrap_or_default(),
+            )),
+            (
+                m @ ("glow" | "slaps" | "len" | "at" | "sub" | "bytes" | "fromBytes"
+                | "fromBytesTrust"),
+                _,
+            ) => Err(RunError::Type(format!(
+                "str.{m} called with the wrong argument shape"
+            ))),
             (other, _) => Err(RunError::Unsupported(format!("str.{other}"))),
         }
     }
@@ -1477,6 +1489,20 @@ impl<'p> Interp<'p> {
 // ================================================================================
 // Free helpers (no `self`).
 // ================================================================================
+
+/// Collect a `[]u8`-shaped array (elements are byte or in-range int values) into raw bytes,
+/// for `str.fromBytes` / `str.fromBytesTrust`.
+fn bytes_of(vals: &[Value]) -> Result<Vec<u8>, RunError> {
+    vals.iter()
+        .map(|v| match v {
+            Value::Byte(b) => Ok(*b),
+            Value::Int(i) => Ok(*i as u8),
+            _ => Err(RunError::Type(
+                "str.fromBytes* needs a []u8 (byte-valued elements)".into(),
+            )),
+        })
+        .collect()
+}
 
 fn exactly_one(mut vals: Vec<Value>) -> Result<Value, RunError> {
     match vals.len() {

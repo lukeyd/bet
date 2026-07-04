@@ -342,6 +342,12 @@ pub enum Rvalue {
     StrPtr(Operand),
     /// The byte length of a `str` value, as `u64` — the other `str` projection.
     StrLen(Operand),
+    /// The data pointer of a `[]T` slice value, as a `rawptr` — the slice counterpart of
+    /// [`Rvalue::StrPtr`] (both project field 0 of the shared fat `{ ptr, len }` layout).
+    SlicePtr(Operand),
+    /// The element count of a `[]T` slice value, as `u64` — the slice counterpart of
+    /// [`Rvalue::StrLen`] (field 1 of the shared fat `{ ptr, len }`).
+    SliceLen(Operand),
     /// The address of a place's storage, as a `rawptr` (the data pointer for a fat slice,
     /// or an FFI-boundary raw address). The place must be memory-backed (every local is).
     AddrOf(Place),

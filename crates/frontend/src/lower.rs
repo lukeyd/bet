@@ -2805,6 +2805,93 @@ impl LowerCtx {
                 let slice_ty = self.m.intern_ty(TyKind::Slice(u8t));
                 Ok((Operand::Copy(Place::local(b)), slice_ty))
             }
+            // `str.fromBytesTrust(b)` — reinterpret a `[]u8` as a `str` without validating (the
+            // greppable unchecked constructor for the lexer/emitter hot path). Zero-copy.
+            ("str", "fromBytesTrust") => {
+                if args.len() != 1 {
+                    return Err("`str.fromBytesTrust` takes a single byte slice".into());
+                }
+                let (b, bty) = self.lower_expr(&args[0].value, None)?;
+                if !matches!(self.m.ty(bty), TyKind::Slice(_)) {
+                    return Err(format!(
+                        "`str.fromBytesTrust` needs a byte slice ({:?})",
+                        self.m.ty(bty)
+                    ));
+                }
+                let rawptr = self.m.intern_ty(TyKind::RawPtr);
+                let usize_t = self.m.t_int(IntWidth::W64, false);
+                let strt = self.m.t_str();
+                let ptr = self.new_local(rawptr);
+                self.fb()
+                    .assign(Place::local(ptr), Rvalue::SlicePtr(b.clone()));
+                let len = self.new_local(usize_t);
+                self.fb().assign(Place::local(len), Rvalue::SliceLen(b));
+                let result = self.new_local(strt);
+                self.fb().assign(
+                    Place::local(result),
+                    Rvalue::MakeStr {
+                        data: Operand::Copy(Place::local(ptr)),
+                        len: Operand::Copy(Place::local(len)),
+                    },
+                );
+                Ok((Operand::Copy(Place::local(result)), strt))
+            }
+            // `str.fromBytes(b)` — checked `[]u8` -> `str`: validate UTF-8, yielding an empty
+            // string on malformed input. Branchless: `len` is multiplied by the validity bit,
+            // so an invalid buffer collapses to a zero-length (empty) `str`.
+            ("str", "fromBytes") => {
+                if args.len() != 1 {
+                    return Err("`str.fromBytes` takes a single byte slice".into());
+                }
+                let (b, bty) = self.lower_expr(&args[0].value, None)?;
+                if !matches!(self.m.ty(bty), TyKind::Slice(_)) {
+                    return Err(format!(
+                        "`str.fromBytes` needs a byte slice ({:?})",
+                        self.m.ty(bty)
+                    ));
+                }
+                let rawptr = self.m.intern_ty(TyKind::RawPtr);
+                let usize_t = self.m.t_int(IntWidth::W64, false);
+                let strt = self.m.t_str();
+                let ptr = self.new_local(rawptr);
+                self.fb()
+                    .assign(Place::local(ptr), Rvalue::SlicePtr(b.clone()));
+                let len = self.new_local(usize_t);
+                self.fb().assign(Place::local(len), Rvalue::SliceLen(b));
+                // `bet_str_valid` returns 1 (valid) or 0 (invalid) as a usize.
+                let ext = self.get_extern("bet_str_valid", vec![rawptr, usize_t], vec![usize_t]);
+                let valid = self.new_local(usize_t);
+                self.fb().assign(
+                    Place::local(valid),
+                    Rvalue::Call(
+                        Callee::Extern(ext),
+                        vec![
+                            Operand::Copy(Place::local(ptr)),
+                            Operand::Copy(Place::local(len)),
+                        ],
+                    ),
+                );
+                // efflen = len * valid → len when valid, 0 when invalid (an empty str).
+                let efflen = self.new_local(usize_t);
+                self.fb().assign(
+                    Place::local(efflen),
+                    Rvalue::BinOp(
+                        BinOp::Mul,
+                        Operand::Copy(Place::local(len)),
+                        Operand::Copy(Place::local(valid)),
+                        ArithMode::Wrap,
+                    ),
+                );
+                let result = self.new_local(strt);
+                self.fb().assign(
+                    Place::local(result),
+                    Rvalue::MakeStr {
+                        data: Operand::Copy(Place::local(ptr)),
+                        len: Operand::Copy(Place::local(efflen)),
+                    },
+                );
+                Ok((Operand::Copy(Place::local(result)), strt))
+            }
             // `str.glow(s)` — an ASCII-uppercased copy of `s`.
             ("str", "glow") => {
                 if args.len() != 1 {

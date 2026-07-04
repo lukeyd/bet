@@ -258,6 +258,23 @@ fn eval_text_round_trips() {
 }
 
 #[test]
+fn slice_projections_round_trip() {
+    // slice_ptr / slice_len are the fat-slice counterparts of str_ptr / str_len; both must
+    // parse, validate (rawptr / u64 results), and reprint to a fixpoint.
+    let src = "\nfn f(%0: rawptr, %1: u64) -> u64 {\n  let %2: []u8\n  let %3: rawptr\n  let %4: u64\n  bb0:\n    %2 = make_slice[u8](%0, %1)\n    %3 = slice_ptr(%2)\n    %4 = slice_len(%2)\n    return %4\n}\n";
+    let m = parse(src).expect("slice projection fixture should parse");
+    validate(&m).expect("slice projections should validate");
+    let t1 = print(&m);
+    let m2 = parse(&t1).expect("reprint should re-parse");
+    let t2 = print(&m2);
+    assert_eq!(t1, t2, "print/parse must reach a fixpoint");
+    assert!(
+        t1.contains("slice_ptr(%2)") && t1.contains("slice_len(%2)"),
+        "{t1}"
+    );
+}
+
+#[test]
 fn golden_inc_prints_exactly() {
     let mut m = Module::new();
     let i64t = m.t_i64();

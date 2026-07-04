@@ -177,6 +177,11 @@ unsafe extern "C" {
     pub fn bet_str_upper(ptr: *const u8, len: usize) -> *mut u8;
     /// Byte-equality of two strings. Backs `str.slaps`.
     pub fn bet_str_eq(a_ptr: *const u8, a_len: usize, b_ptr: *const u8, b_len: usize) -> bool;
+    /// Whether `[ptr, len)` is well-formed UTF-8, as `1` (valid) or `0` (invalid). Backs the
+    /// checked `str.fromBytes` (the unchecked `str.fromBytesTrust` skips this), which multiplies
+    /// the length by this bit. Returns a `usize` (not `bool`) so the frontend can arithmetic on
+    /// it directly. Pure — allocates nothing.
+    pub fn bet_str_valid(ptr: *const u8, len: usize) -> usize;
 
     // --- filesystem ---
 
