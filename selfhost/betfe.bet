@@ -1947,6 +1947,10 @@ drip LowerCtx {
     variantNames: vec[str],
     variantIdx: vec[int],
     variantPayload: vec[str],
+    externFnNames: vec[str],
+    externFnParamCsv: vec[str],
+    externFnRet: vec[str],
+    externFnDecl: vec[str],
     loopIncr: vec[int],
     loopExit: vec[int]
 }
@@ -1964,7 +1968,7 @@ finna lcNew() -> LowerCtx {
     blks.stack(blkNew())
     lowkey cur = vec.new[int]()
     cur.stack(0)
-    bet LowerCtx{ externs: ex, fns: vec.new[str](), fnNames: vec.new[str](), fnParamCsv: vec.new[str](), fnRet: vec.new[str](), localTypes: vec.new[str](), paramCount: pc, curRet: cr, blocks: blks, curBlock: cur, ok: okc, bindNames: vec.new[str](), bindIds: vec.new[int](), constNames: vec.new[str](), constVals: vec.new[str](), constTys: vec.new[str](), gConstNames: vec.new[str](), gConstVals: vec.new[str](), gConstTys: vec.new[str](), structNames: vec.new[str](), structDecls: vec.new[str](), fieldStruct: vec.new[str](), fieldNames: vec.new[str](), fieldTypes: vec.new[str](), fieldIdx: vec.new[int](), sumNames: vec.new[str](), sumDecls: vec.new[str](), variantSum: vec.new[str](), variantNames: vec.new[str](), variantIdx: vec.new[int](), variantPayload: vec.new[str](), loopIncr: vec.new[int](), loopExit: vec.new[int]() }
+    bet LowerCtx{ externs: ex, fns: vec.new[str](), fnNames: vec.new[str](), fnParamCsv: vec.new[str](), fnRet: vec.new[str](), localTypes: vec.new[str](), paramCount: pc, curRet: cr, blocks: blks, curBlock: cur, ok: okc, bindNames: vec.new[str](), bindIds: vec.new[int](), constNames: vec.new[str](), constVals: vec.new[str](), constTys: vec.new[str](), gConstNames: vec.new[str](), gConstVals: vec.new[str](), gConstTys: vec.new[str](), structNames: vec.new[str](), structDecls: vec.new[str](), fieldStruct: vec.new[str](), fieldNames: vec.new[str](), fieldTypes: vec.new[str](), fieldIdx: vec.new[int](), sumNames: vec.new[str](), sumDecls: vec.new[str](), variantSum: vec.new[str](), variantNames: vec.new[str](), variantIdx: vec.new[int](), variantPayload: vec.new[str](), externFnNames: vec.new[str](), externFnParamCsv: vec.new[str](), externFnRet: vec.new[str](), externFnDecl: vec.new[str](), loopIncr: vec.new[int](), loopExit: vec.new[int]() }
 }
 
 // --- per-function reset (structs pass by value, so drain the shared-handle vecs in place) ---
@@ -2952,6 +2956,54 @@ finna lowerIntrinsic(c: LowerCtx, p: P, module: str, method: str, methodIdx: int
         emitAssign(c, result, mb.finish())
         bet reg(result), "str"
     }
+    fr str.slaps(module, "sys") && str.slaps(method, "argc") {
+        getExtern(c, "extern \"C\" fn bet_arg_count() -> u64")
+        lowkey n = newLocal(c, "u64")
+        emitAssign(c, n, "call_extern @bet_arg_count()")
+        lowkey out = coerceInt(c, reg(n), "u64", "i64")
+        bet out, "i64"
+    }
+    fr str.slaps(module, "sys") && str.slaps(method, "arg") {
+        lowkey idx, ity = lowerExpr(c, p, argValue(p, argsW, 0), "i64")
+        lowkey idxu = coerceInt(c, idx, ity, "u64")
+        lowkey outLen = newLocal(c, "u64")
+        emitAssign(c, outLen, "0u64")
+        lowkey outPtr = newLocal(c, "rawptr")
+        lowkey ab = sbNew()
+        ab.add("addr_of(")
+        ab.add(reg(outLen))
+        ab.add(")")
+        emitAssign(c, outPtr, ab.finish())
+        getExtern(c, "extern \"C\" fn bet_arg_get(u64, rawptr) -> rawptr")
+        lowkey data = newLocal(c, "rawptr")
+        lowkey cb = sbNew()
+        cb.add("call_extern @bet_arg_get(")
+        cb.add(idxu)
+        cb.add(", ")
+        cb.add(reg(outPtr))
+        cb.add(")")
+        emitAssign(c, data, cb.finish())
+        lowkey result = newLocal(c, "str")
+        lowkey mb = sbNew()
+        mb.add("make_str(")
+        mb.add(reg(data))
+        mb.add(", ")
+        mb.add(reg(outLen))
+        mb.add(")")
+        emitAssign(c, result, mb.finish())
+        bet reg(result), "str"
+    }
+    fr str.slaps(module, "str") && str.slaps(method, "len") {
+        lowkey s, sty = lowerExpr(c, p, argValue(p, argsW, 0), "str")
+        lowkey lenu = newLocal(c, "u64")
+        lowkey lb = sbNew()
+        lb.add("str_len(")
+        lb.add(s)
+        lb.add(")")
+        emitAssign(c, lenu, lb.finish())
+        lowkey out = coerceInt(c, reg(lenu), "u64", "i64")
+        bet out, "i64"
+    }
     fr str.slaps(module, "str") && str.slaps(method, "slaps") {
         lowkey a, aty = lowerExpr(c, p, argValue(p, argsW, 0), "str")
         lowkey b, bty = lowerExpr(c, p, argValue(p, argsW, 1), "str")
@@ -3175,6 +3227,31 @@ finna lowerCall(c: LowerCtx, p: P, idx: int) -> (str, str) {
         }
         lowkey mo, mt = emitMakeVariant(c, c.variantSum[vi], nm, vops)
         bet mo, mt
+    }
+    // An `extern "C"` FFI import lowers to `call_extern @NAME` and emits its decl on first use.
+    lowkey ei = lookupExtern(c, nm)
+    fr ei >= 0 {
+        getExtern(c, c.externFnDecl[ei])
+        lowkey ePcsv = c.externFnParamCsv[ei]
+        lowkey eRet = c.externFnRet[ei]
+        lowkey eargsW = findKid(p, idx, "args")
+        lowkey eargs = vec.new[str]()
+        lowkey en = kidCount(p, eargsW)
+        lowkey ek = 0
+        vibin ek < en {
+            lowkey aop, aty = lowerExpr(c, p, argValue(p, eargsW, ek), csvAt(ePcsv, ek))
+            eargs.stack(aop)
+            ek = ek + 1
+        }
+        lowkey eres = newLocal(c, eRet)
+        lowkey esb = sbNew()
+        esb.add("call_extern @")
+        esb.add(nm)
+        esb.add("(")
+        esb.add(joinComma(eargs))
+        esb.add(")")
+        emitAssign(c, eres, esb.finish())
+        bet reg(eres), eRet
     }
     lowkey fi = lookupFn(c, nm)
     fr fi < 0 {
@@ -3919,6 +3996,53 @@ finna collectFns(c: LowerCtx, p: P, root: int) {
     }
 }
 
+// Register an `extern "C" finna NAME(..)` FFI import: its signature (for call-arg hints) and the
+// `extern "C" fn NAME(t, ..) -> R` decl line (added to the module on first use, in use order).
+finna registerExtern(c: LowerCtx, p: P, externIdx: int) {
+    lowkey name = afterFirst(afterFirst(lab(p, externIdx)))
+    lowkey pw = findKid(p, externIdx, "params")
+    lowkey ret = collectRetType(c, p, externIdx)
+    lowkey decl = sbNew()
+    decl.add("extern \"C\" fn ")
+    decl.add(name)
+    decl.add("(")
+    lowkey np = kidCount(p, pw)
+    lowkey j = 0
+    vibin j < np {
+        fr j > 0 { decl.add(", ") }
+        decl.add(mapTypeNode(c, p, kidAt(p, kidAt(p, pw, j), 0)))
+        j = j + 1
+    }
+    decl.add(") -> ")
+    decl.add(ret)
+    c.externFnNames.stack(name)
+    c.externFnParamCsv.stack(collectParamTypes(c, p, pw))
+    c.externFnRet.stack(ret)
+    c.externFnDecl.stack(decl.finish())
+}
+
+finna collectExterns(c: LowerCtx, p: P, root: int) {
+    lowkey n = kidCount(p, root)
+    lowkey i = 0
+    vibin i < n {
+        lowkey it = kidAt(p, root, i)
+        fr str.slaps(firstWord(lab(p, it)), "extern") {
+            registerExtern(c, p, it)
+        }
+        i = i + 1
+    }
+}
+
+finna lookupExtern(c: LowerCtx, name: str) -> int {
+    lowkey n = c.externFnNames.gang() as int
+    lowkey i = 0
+    vibin i < n {
+        fr str.slaps(c.externFnNames[i], name) { bet i }
+        i = i + 1
+    }
+    bet 0 - 1
+}
+
 // Evaluate a top-level `const` item into the global scope (mirror lowerConst, global storage).
 finna lowerGlobalConst(c: LowerCtx, p: P, stmtIdx: int) {
     lowkey nm = afterFirst(afterFirst(lab(p, stmtIdx)))
@@ -4219,6 +4343,7 @@ finna emitMir(p: P, root: int) -> str {
     collectTypeNames(c, p, root)
     collectTypeDefs(c, p, root)
     collectConsts(c, p, root)
+    collectExterns(c, p, root)
     collectFns(c, p, root)
     lowkey n = kidCount(p, root)
     lowkey i = 0
@@ -4227,6 +4352,8 @@ finna emitMir(p: P, root: int) -> str {
         lowkey h = firstWord(lab(p, it))
         fr str.slaps(h, "pull") {
             // pull is a no-op import — ignored.
+        } naw fr str.slaps(h, "extern") {
+            // extern FFI imports were registered in the collectExterns pre-pass.
         } naw fr str.slaps(h, "const") {
             // top-level consts were evaluated in the collectConsts pre-pass.
         } naw fr str.slaps(h, "drip") {
