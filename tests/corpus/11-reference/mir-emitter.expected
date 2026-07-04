@@ -1,0 +1,5 @@
+fn main() {
+  %0 = const 42
+  %1 = add %0, 108
+  %2 = const 0
+}

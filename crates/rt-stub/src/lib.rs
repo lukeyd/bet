@@ -537,6 +537,18 @@ pub unsafe extern "C" fn bet_vec_len(vec: VecHandle) -> usize {
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_vec_data(vec: VecHandle) -> *const u8 {
+    unsafe { vec_ref(vec) }.data.as_ptr()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_vec_extend(vec: VecHandle, ptr: *const u8, len: usize) {
+    let v = unsafe { vec_ref(vec) };
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    v.data.extend_from_slice(bytes);
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn bet_vec_free(vec: VecHandle) {
     if !vec.0.is_null() {
         drop(unsafe { Box::from_raw(vec.0 as *mut DynVec) });
@@ -804,6 +816,22 @@ mod tests {
         assert!(!unsafe { bet_vec_pop(v, out.as_mut_ptr()) });
         assert_eq!(unsafe { bet_vec_len(v) }, 0);
 
+        unsafe { bet_vec_free(v) };
+    }
+
+    #[test]
+    fn vec_extend_data_string_builder() {
+        // The string-builder path: a `vec[u8]` gets bulk-appended str fragments, then read back
+        // as one contiguous buffer. `bet_vec_extend` appends raw bytes; `bet_vec_data` exposes
+        // the buffer that `vec[u8].str()` copies out.
+        let v = unsafe { bet_vec_new(1) };
+        for frag in ["fn ", "main", "()"] {
+            unsafe { bet_vec_extend(v, frag.as_ptr(), frag.len()) };
+        }
+        let len = unsafe { bet_vec_len(v) };
+        assert_eq!(len, 9);
+        let bytes = unsafe { std::slice::from_raw_parts(bet_vec_data(v), len) };
+        assert_eq!(bytes, b"fn main()");
         unsafe { bet_vec_free(v) };
     }
 }

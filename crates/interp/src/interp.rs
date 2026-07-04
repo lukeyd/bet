@@ -1252,6 +1252,29 @@ impl<'p> Interp<'p> {
                     let arg_vals = self.eval_args(env, args)?;
                     vec_stack_pop(&rc, method, arg_vals)
                 }
+                // `v.append(s)` — bulk-append a str's bytes (the string-builder primitive).
+                "append" => {
+                    let arg_vals = self.eval_args(env, args)?;
+                    match arg_vals.as_slice() {
+                        [Value::Str(s)] => {
+                            let mut buf = rc.borrow_mut();
+                            buf.extend(s.bytes().map(Value::Byte));
+                            Ok(Vec::new())
+                        }
+                        _ => Err(RunError::Type("`vec.append` takes a single str".into())),
+                    }
+                }
+                // `v.str()` — collect a `vec[u8]` into an owned str (unchecked, like the compiled
+                // `bet_str_concat` copy; the builder only ever holds valid UTF-8).
+                "str" => {
+                    if !args.is_empty() {
+                        return Err(RunError::Type("`vec.str` takes no arguments".into()));
+                    }
+                    let bytes = bytes_of(rc.borrow().as_slice())?;
+                    Ok(vec![Value::Str(
+                        String::from_utf8_lossy(&bytes).into_owned(),
+                    )])
+                }
                 _ => {
                     let xs = rc.borrow().clone();
                     self.call_array_method(env, xs, method, args)

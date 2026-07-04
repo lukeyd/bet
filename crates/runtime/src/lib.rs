@@ -656,6 +656,18 @@ pub unsafe extern "C" fn bet_vec_len(vec: VecHandle) -> usize {
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_vec_data(vec: VecHandle) -> *const u8 {
+    unsafe { vec_ref(vec) }.data.as_ptr()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_vec_extend(vec: VecHandle, ptr: *const u8, len: usize) {
+    let v = unsafe { vec_ref(vec) };
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+    v.data.extend_from_slice(bytes);
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn bet_vec_free(vec: VecHandle) {
     if !vec.0.is_null() {
         drop(unsafe { Box::from_raw(vec.0 as *mut DynVec) });

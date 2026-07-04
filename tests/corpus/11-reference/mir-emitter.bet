@@ -1,0 +1,64 @@
+// mir-emitter — the string-builder pattern the self-hosted compiler's C5 `.mir` printer is
+// built on. `StrBuilder` wraps a growable `vec[u8]`: `.add` bulk-appends a str fragment
+// (`vec.append`), `.addInt` pushes an integer's decimal digits as bytes (`vec.stack`), and
+// `.finish` copies the buffer out as one owned `str` (`vec.str`). Because `buf` is a shared vec
+// handle, a by-value receiver still mutates the one buffer, so the builder threads through
+// helper methods without `ref`. Emits a small function body byte-identically on the interpreter
+// and the runtime-backed compiled vec — the A2 string builder, and the oracle for C5.
+pull "spill"
+pull "str"
+pull "vec"
+
+drip StrBuilder {
+    buf: vec[u8]
+}
+
+finna sbNew() -> StrBuilder {
+    bet StrBuilder{ buf: vec.new[u8]() }
+}
+
+// Append a str fragment — the emitter's workhorse (mnemonics, punctuation, newlines).
+finna (sb: StrBuilder) add(s: str) {
+    sb.buf.append(s)
+}
+
+// Append a non-negative integer in decimal. Digits come out low-to-high into a scratch buffer,
+// then get pushed in reading order onto the builder as raw bytes ('0' is 48).
+finna (sb: StrBuilder) addInt(n: int) {
+    fr n == 0 {
+        sb.buf.stack(48 as u8)
+    } naw {
+        lowkey digits = vec.new[u8]()
+        lowkey m = n
+        vibin m > 0 {
+            lowkey d = m - (m / 10) * 10
+            digits.stack((48 + d) as u8)
+            m = m / 10
+        }
+        lowkey i = digits.gang()
+        vibin i > 0 {
+            i = i - 1
+            sb.buf.stack(digits[i])
+        }
+    }
+}
+
+// Finalize: an owned `str` copied out of the buffer, independent of further pushes.
+finna (sb: StrBuilder) finish() -> str {
+    bet sb.buf.str()
+}
+
+finna main() {
+    lowkey sb = sbNew()
+    sb.add("fn ")
+    sb.add("main")
+    sb.add("() {\n")
+    sb.add("  %0 = const ")
+    sb.addInt(42)
+    sb.add("\n  %1 = add %0, ")
+    sb.addInt(108)
+    sb.add("\n  %2 = const ")
+    sb.addInt(0)
+    sb.add("\n}")
+    spill.it(sb.finish())
+}

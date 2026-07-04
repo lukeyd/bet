@@ -2418,8 +2418,88 @@ impl LowerCtx {
                 let ext = self.get_extern("bet_vec_len", vec![vec_ty], vec![usize_t]);
                 self.emit_extern_call(ext, &[usize_t], vec![vec_op])
             }
+            // `v.append(s)` → bet_vec_extend(vec, str_ptr, str_len): bulk-append a str's raw
+            // bytes. The string-builder primitive; restricted to `vec[u8]`.
+            "append" => {
+                if args.len() != 1 {
+                    return Err("`vec.append` takes a single str".into());
+                }
+                let u8t = self.m.t_int(IntWidth::W8, false);
+                if e != u8t {
+                    return Err("`vec.append` needs a `vec[u8]`".into());
+                }
+                let strt = self.m.t_str();
+                let (s, _) = self.lower_expr(&args[0].value, Some(strt))?;
+                let sp = self.new_local(rawptr);
+                self.fb()
+                    .assign(Place::local(sp), Rvalue::StrPtr(s.clone()));
+                let sl = self.new_local(usize_t);
+                self.fb().assign(Place::local(sl), Rvalue::StrLen(s));
+                let ext = self.get_extern("bet_vec_extend", vec![vec_ty, rawptr, usize_t], vec![]);
+                self.emit_extern_call(
+                    ext,
+                    &[],
+                    vec![
+                        vec_op,
+                        Operand::Copy(Place::local(sp)),
+                        Operand::Copy(Place::local(sl)),
+                    ],
+                )
+            }
+            // `v.str()` → an owned `str` copied out of a `vec[u8]`'s buffer. Reads the backing
+            // pointer (`bet_vec_data`) + length (`bet_vec_len`), then copies via `bet_str_concat`
+            // (with an empty second run) so the result outlives any later mutation of the vec.
+            "str" => {
+                if !args.is_empty() {
+                    return Err("`vec.str` takes no arguments".into());
+                }
+                let u8t = self.m.t_int(IntWidth::W8, false);
+                if e != u8t {
+                    return Err("`vec.str` needs a `vec[u8]`".into());
+                }
+                let strt = self.m.t_str();
+                let data = self.new_local(rawptr);
+                let dext = self.get_extern("bet_vec_data", vec![vec_ty], vec![rawptr]);
+                self.fb().assign(
+                    Place::local(data),
+                    Rvalue::Call(Callee::Extern(dext), vec![vec_op.clone()]),
+                );
+                let len = self.new_local(usize_t);
+                let lext = self.get_extern("bet_vec_len", vec![vec_ty], vec![usize_t]);
+                self.fb().assign(
+                    Place::local(len),
+                    Rvalue::Call(Callee::Extern(lext), vec![vec_op]),
+                );
+                let cext = self.get_extern(
+                    "bet_str_concat",
+                    vec![rawptr, usize_t, rawptr, usize_t],
+                    vec![rawptr],
+                );
+                let out_ptr = self.new_local(rawptr);
+                self.fb().assign(
+                    Place::local(out_ptr),
+                    Rvalue::Call(
+                        Callee::Extern(cext),
+                        vec![
+                            Operand::Copy(Place::local(data)),
+                            Operand::Copy(Place::local(len)),
+                            Operand::Copy(Place::local(data)),
+                            Operand::Const(Const::Int(0, usize_t)),
+                        ],
+                    ),
+                );
+                let result = self.new_local(strt);
+                self.fb().assign(
+                    Place::local(result),
+                    Rvalue::MakeStr {
+                        data: Operand::Copy(Place::local(out_ptr)),
+                        len: Operand::Copy(Place::local(len)),
+                    },
+                );
+                Ok((Operand::Copy(Place::local(result)), strt))
+            }
             other => Err(format!(
-                "unknown `vec` method `{other}` (have: stack, pop, gang)"
+                "unknown `vec` method `{other}` (have: stack, pop, gang, append, str)"
             )),
         }
     }

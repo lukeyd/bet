@@ -229,6 +229,15 @@ unsafe extern "C" {
     pub fn bet_vec_set(vec: VecHandle, idx: usize, elem_ptr: *const u8) -> bool;
     /// The number of elements in the vec.
     pub fn bet_vec_len(vec: VecHandle) -> usize;
+    /// A read pointer to the vec's contiguous backing buffer (`bet_vec_len(vec) * elem_size`
+    /// bytes). Valid only until the next mutation — a `push`/`extend` may reallocate and
+    /// invalidate it — so callers copy out immediately. Backs `vec[u8].str()` (the string-builder
+    /// finalize), which reads it and copies via [`bet_str_concat`].
+    pub fn bet_vec_data(vec: VecHandle) -> *const u8;
+    /// Append `len` raw bytes at `ptr` to the end of the vec. Assumes a byte-wide element
+    /// (`elem_size == 1`); the frontend restricts it to `vec[u8]`. A bulk `push` for the
+    /// string-builder pattern (`vec[u8].append(str)`).
+    pub fn bet_vec_extend(vec: VecHandle, ptr: *const u8, len: usize);
     /// Destroy a vec and release its backing memory.
     pub fn bet_vec_free(vec: VecHandle);
 

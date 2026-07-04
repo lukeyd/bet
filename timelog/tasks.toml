@@ -219,7 +219,16 @@ status = "todo"
 slug = "selfhost-stdlib"
 name = "A2: write std/{str,bytes,fs} in bet + growable string builder for .mir emission (currently README-only)"
 size = 8
-status = "todo"
+# DONE (reframed by the no-source-imports finding): there is no importable `std/*.bet` — the
+# stdlib is compiler intrinsics, so "std in bet" = str/bytes already landed as intrinsics (A1).
+# The real A2 deliverable is the growable STRING BUILDER for .mir emission: a `StrBuilder` drip
+# over `vec[u8]` with `.add`(append str)/`.addInt`(push decimal bytes)/`.finish`(copy out an
+# owned str), backed by two new vec primitives `vec.append` (bet_vec_extend) + `vec.str`
+# (bet_vec_data + bet_str_concat copy), mirrored on both paths. Proven O(n) and byte-identical
+# interp==compiled by 11-reference/mir-emitter, which emits a real function body — the exact C5
+# pattern. The one remnant, `fs.drop` (file WRITE for emitting .mir), folds into the C0 scaffold
+# alongside fs.peep (betfe read->...->write), where it is naturally exercised.
+status = "done"
 
 [[task]]
 slug = "compiled-collections"
