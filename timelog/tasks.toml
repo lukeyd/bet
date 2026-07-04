@@ -274,9 +274,12 @@ status = "doing"
 slug = "emit-dumps"
 name = "B1: bet build --emit=tokens|ast|mir on the Rust driver for per-layer differential vs the ported frontend"
 size = 3
-# tokens + mir dumps DONE (frontend::dump); --emit=ast intentionally deferred to the C3 parser
-# port so its format is co-designed with the bet reproducer.
-status = "doing"
+# DONE — all three dumps land in frontend::dump. tokens (C1) + mir are diffed byte-identical vs
+# betfe already. --emit=ast is now implemented too: a canonical indented tree (one node/line, 2
+# spaces/level, scalars inlined, spans omitted like the token dump), covering every Item/Type/
+# Stmt/Expr node. All 59 corpus programs dump without error; format pinned by dump::tests::
+# ast_hello + ast_covers_decls_types_and_exprs. This is the contract the C3 parser port reproduces.
+status = "done"
 
 # Phase C — the self-hosted frontend (Milestone 7.1), broken out so the ETA doesn't lump the
 # capstone. Umbrella `selfhost` kept at size 0 as the clock-in target for coordination time.
