@@ -1,0 +1,80 @@
+name: selfhost
+
+# Verifies the self-hosted bet frontend (selfhost/betfe.bet) via `cargo xtask selfhost`:
+# compile betfe with the Rust-built `bet`, run it, and assert (a) betfe's emitted `.mir` is
+# byte-identical to the Rust frontend's canonical dump, (b) the compiled program's stdout ==
+# tests/corpus/01-basics/hello.expected, and (c) betfe's lexer tokens match the Rust lexer for
+# every corpus program. Correctness here is host-independent (token/`.mir` equivalence + a
+# deterministic oracle), so ONE Linux runner is sufficient — the 6-way `ci.yml` matrix buys
+# nothing for selfhost, which is exactly why selfhost changes are kept out of that matrix and
+# routed here instead.
+#
+# Path-filtered to selfhost source plus everything the checks depend on: the Rust frontend
+# (the token-diff oracle), the codegen/link/runtime-ABI crates and rt-stub (betfe is compiled
+# to a native binary and run), xtask (the harness itself), and tests/corpus (the token-diff
+# input set + the hello oracle). Keep the pull_request and push lists in sync by hand — GitHub
+# Actions does not reliably support YAML anchors, so the two lists are duplicated on purpose.
+on:
+  workflow_dispatch: {}
+  pull_request:
+    paths:
+      - "selfhost/**"
+      - "crates/frontend/**"
+      - "crates/backend/**"
+      - "crates/driver/**"
+      - "crates/midir/**"
+      - "crates/rt-abi/**"
+      - "crates/rt-stub/**"
+      - "crates/xtask/**"
+      - "tests/corpus/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/selfhost.yml"
+  push:
+    branches: [main]
+    # Duplicate of the pull_request paths above (no YAML anchors in GH Actions).
+    paths:
+      - "selfhost/**"
+      - "crates/frontend/**"
+      - "crates/backend/**"
+      - "crates/driver/**"
+      - "crates/midir/**"
+      - "crates/rt-abi/**"
+      - "crates/rt-stub/**"
+      - "crates/xtask/**"
+      - "tests/corpus/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/selfhost.yml"
+
+concurrency:
+  group: selfhost-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  selfhost:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # MANDATORY. `cargo xtask selfhost` compiles betfe to a native binary via the LLVM
+      # backend; without LLVM present it prints "selfhost skipped: no LLVM/codegen" and exits
+      # 0 (a false green). This step is the same LLVM-18 install used by backend-llvm.yml.
+      # libzstd-dev: LLVM 18's static libs link against zstd. clang: the link driver.
+      - name: install LLVM 18 (Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18-dev libpolly-18-dev libzstd-dev clang
+          echo "LLVM_SYS_180_PREFIX=/usr/lib/llvm-18" >> "$GITHUB_ENV"
+
+      - name: install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+
+      # Builds `driver --features llvm` + `rt-stub` itself, then runs the full pipeline:
+      # betfe compile+run, `.mir` byte-equivalence, hello oracle, and the corpus token-diff.
+      - name: selfhost pipeline (betfe compile+run, .mir equivalence, corpus token-diff)
+        run: cargo xtask selfhost

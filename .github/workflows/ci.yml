@@ -1,9 +1,45 @@
 name: ci
 
 on:
+  # Path-filtered to CORE (the Rust compiler + its test goldens + build config) so the
+  # expensive 6-way `test` matrix and the `lint` job don't fire on changes that can't affect
+  # them: self-hosted bet source (selfhost/**, verified by selfhost.yml), game ports
+  # (ports/**), the bet-source stdlib scaffolding (std/**), or docs. Every input the `lint`
+  # job reads (crates, corpus, the Rust configs) is in this list, so gating the whole workflow
+  # loses no lint coverage. Keep the pull_request and push lists in sync by hand — GitHub
+  # Actions does not reliably support YAML anchors, so the two lists are duplicated on purpose.
   pull_request:
+    paths:
+      - "crates/**"
+      - "tests/corpus/**"
+      - "tests/mir/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".cargo/config.toml"
+      - "clippy.toml"
+      - "rustfmt.toml"
+      - "graph-allowlist.toml"
+      - "deny.toml"
+      - ".gitattributes"
+      - ".github/workflows/ci.yml"
   push:
     branches: [main]
+    # Duplicate of the pull_request paths above (no YAML anchors in GH Actions).
+    paths:
+      - "crates/**"
+      - "tests/corpus/**"
+      - "tests/mir/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".cargo/config.toml"
+      - "clippy.toml"
+      - "rustfmt.toml"
+      - "graph-allowlist.toml"
+      - "deny.toml"
+      - ".gitattributes"
+      - ".github/workflows/ci.yml"
 
 concurrency:
   group: ci-${{ github.ref }}
