@@ -429,6 +429,17 @@ size = 13
 # str.fromBytesTrust (slice_ptr/len + make_str) and str.fromBytes (+ bet_str_valid gate: len *= valid).
 # This completed the lexer's string-walking core -> 11-reference/mini-lexer is now byte-identical
 # (the first self-hosted reference program to fully lower). Unlocks str-bytes + mini-lexer. 40/59.
+# C4.16-19 (PARALLEL FAN-OUT, 4 worktree agents off f6f9259, integrated serially by the root):
+# stash hash maps (map[K,V], stash.new/put/peep/gang via bet_map_*), first-class functions
+# (fn(P)->R fn-pointer type, @fn refs, call_indirect), generics/monomorphization (base$t0$t1
+# mangling, subst map, generic fn/struct registries + a FIFO instance work-list drained after the
+# concrete funcs; fixed the load-bearing isGenericDecl exact-match bug), and the memory/arena family
+# (crib/tag/ref types, crib decls printed after externs, cop/holla/evict/trust/mem.scratch, ref
+# auto-deref in field/vibe). Merge conflicts were all append-only spine unions (LowerCtx fields +
+# dispatch branches in mapTypeNode); 0 mismatches held throughout. Combined set also unblocked
+# 11-reference/mini-compiler. 53/59 byte-identical. Remaining 6: yeet-sheesh (sheesh unlowered in
+# the Rust frontend too — permanent), squadops/stash-in-crib (wave 2), doom-thinker/mir-emitter
+# (reference), slide-spawn (concurrency).
 status = "doing"
 
 [[task]]
