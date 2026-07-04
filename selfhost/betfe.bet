@@ -1941,6 +1941,12 @@ drip LowerCtx {
     fieldNames: vec[str],
     fieldTypes: vec[str],
     fieldIdx: vec[int],
+    sumNames: vec[str],
+    sumDecls: vec[str],
+    variantSum: vec[str],
+    variantNames: vec[str],
+    variantIdx: vec[int],
+    variantPayload: vec[str],
     loopIncr: vec[int],
     loopExit: vec[int]
 }
@@ -1958,7 +1964,7 @@ finna lcNew() -> LowerCtx {
     blks.stack(blkNew())
     lowkey cur = vec.new[int]()
     cur.stack(0)
-    bet LowerCtx{ externs: ex, fns: vec.new[str](), fnNames: vec.new[str](), fnParamCsv: vec.new[str](), fnRet: vec.new[str](), localTypes: vec.new[str](), paramCount: pc, curRet: cr, blocks: blks, curBlock: cur, ok: okc, bindNames: vec.new[str](), bindIds: vec.new[int](), constNames: vec.new[str](), constVals: vec.new[str](), constTys: vec.new[str](), gConstNames: vec.new[str](), gConstVals: vec.new[str](), gConstTys: vec.new[str](), structNames: vec.new[str](), structDecls: vec.new[str](), fieldStruct: vec.new[str](), fieldNames: vec.new[str](), fieldTypes: vec.new[str](), fieldIdx: vec.new[int](), loopIncr: vec.new[int](), loopExit: vec.new[int]() }
+    bet LowerCtx{ externs: ex, fns: vec.new[str](), fnNames: vec.new[str](), fnParamCsv: vec.new[str](), fnRet: vec.new[str](), localTypes: vec.new[str](), paramCount: pc, curRet: cr, blocks: blks, curBlock: cur, ok: okc, bindNames: vec.new[str](), bindIds: vec.new[int](), constNames: vec.new[str](), constVals: vec.new[str](), constTys: vec.new[str](), gConstNames: vec.new[str](), gConstVals: vec.new[str](), gConstTys: vec.new[str](), structNames: vec.new[str](), structDecls: vec.new[str](), fieldStruct: vec.new[str](), fieldNames: vec.new[str](), fieldTypes: vec.new[str](), fieldIdx: vec.new[int](), sumNames: vec.new[str](), sumDecls: vec.new[str](), variantSum: vec.new[str](), variantNames: vec.new[str](), variantIdx: vec.new[int](), variantPayload: vec.new[str](), loopIncr: vec.new[int](), loopExit: vec.new[int]() }
 }
 
 // --- per-function reset (structs pass by value, so drain the shared-handle vecs in place) ---
@@ -2159,6 +2165,26 @@ finna setBranch(c: LowerCtx, from: int, cond: str, thenBb: int, elseBb: int) {
     setTerm(c, from, sb.finish())
 }
 
+// `switch disc [v0 -> bbA, v1 -> bbB, ..] else bbDefault` — a sum-match dispatch.
+finna setSwitch(c: LowerCtx, from: int, disc: str, caseVals: vec[int], caseBbs: vec[int], defaultBb: int) {
+    lowkey sb = sbNew()
+    sb.add("switch ")
+    sb.add(disc)
+    sb.add(" [")
+    lowkey n = caseVals.gang() as int
+    lowkey i = 0
+    vibin i < n {
+        fr i > 0 { sb.add(", ") }
+        sb.add(itoa(caseVals[i]))
+        sb.add(" -> bb")
+        sb.add(itoa(caseBbs[i]))
+        i = i + 1
+    }
+    sb.add("] else bb")
+    sb.add(itoa(defaultBb))
+    setTerm(c, from, sb.finish())
+}
+
 // --- current-function name/const bindings ---
 finna bindLocal(c: LowerCtx, name: str, id: int) {
     c.bindNames.stack(name)
@@ -2254,6 +2280,63 @@ finna structFieldType(c: LowerCtx, sname: str, fname: str) -> str {
         i = i + 1
     }
     bet ""
+}
+
+// --- sum (moods) registry: sum types are values spelled by their name; variants resolve globally ---
+finna isSum(c: LowerCtx, name: str) -> bool {
+    lowkey n = c.sumNames.gang() as int
+    lowkey i = 0
+    vibin i < n {
+        fr str.slaps(c.sumNames[i], name) { bet nocap }
+        i = i + 1
+    }
+    bet cap
+}
+
+finna addVariant(c: LowerCtx, sum: str, vname: str, idx: int, payload: str) {
+    c.variantSum.stack(sum)
+    c.variantNames.stack(vname)
+    c.variantIdx.stack(idx)
+    c.variantPayload.stack(payload)
+}
+
+// Flat index of the variant named `vname` (unique across the corpus), or -1.
+finna lookupVariant(c: LowerCtx, vname: str) -> int {
+    lowkey n = c.variantNames.gang() as int
+    lowkey i = 0
+    vibin i < n {
+        fr str.slaps(c.variantNames[i], vname) { bet i }
+        i = i + 1
+    }
+    bet 0 - 1
+}
+
+// Count of components in a "," CSV ("" -> 0).
+finna csvLen(csv: str) -> int {
+    fr isEmpty(csv) { bet 0 }
+    lowkey n = str.len(csv)
+    lowkey count = 1
+    lowkey i = 0
+    vibin i < n {
+        fr str.at(csv, i) == 44 { count = count + 1 }
+        i = i + 1
+    }
+    bet count
+}
+
+// Emit `%t = make SUM::Variant(ops)` and return (reg, sum type).
+finna emitMakeVariant(c: LowerCtx, sumName: str, variantName: str, ops: vec[str]) -> (str, str) {
+    lowkey tmp = newLocal(c, sumName)
+    lowkey sb = sbNew()
+    sb.add("make ")
+    sb.add(sumName)
+    sb.add("::")
+    sb.add(variantName)
+    sb.add("(")
+    sb.add(joinComma(ops))
+    sb.add(")")
+    emitAssign(c, tmp, sb.finish())
+    bet reg(tmp), sumName
 }
 
 // --- scalar type helpers ---
@@ -2479,6 +2562,12 @@ finna isReg(s: str) -> bool {
     bet nocap
 }
 
+// True for any place-rooted operand `%..` (a register, possibly with projections).
+finna isPlace(s: str) -> bool {
+    fr str.len(s) == 0 { bet cap }
+    bet str.at(s, 0) == 37
+}
+
 // The .mir type string for a type node (scalar named types only in C4.2).
 finna mapTypeNode(c: LowerCtx, p: P, tyNode: int) -> str {
     fr str.slaps(firstWord(lab(p, tyNode)), "named") {
@@ -2486,6 +2575,7 @@ finna mapTypeNode(c: LowerCtx, p: P, tyNode: int) -> str {
         lowkey m = mapScalar(nm)
         fr !isEmpty(m) { bet m }
         fr isStruct(c, nm) { bet nm }
+        fr isSum(c, nm) { bet nm }
     }
     lcFail(c)
     bet "i64"
@@ -3070,6 +3160,22 @@ finna lowerCall(c: LowerCtx, p: P, idx: int) -> (str, str) {
         lcFail(c)
         bet "0i64", "i64"
     }
+    // A callee that names a `moods` variant (and not a fn) is a value constructor with payload.
+    lowkey vi = lookupVariant(c, nm)
+    fr vi >= 0 && lookupFn(c, nm) < 0 {
+        lowkey payloadCsv = c.variantPayload[vi]
+        lowkey vargsW = findKid(p, idx, "args")
+        lowkey vops = vec.new[str]()
+        lowkey vn = kidCount(p, vargsW)
+        lowkey vk = 0
+        vibin vk < vn {
+            lowkey aop, aty = lowerExpr(c, p, argValue(p, vargsW, vk), csvAt(payloadCsv, vk))
+            vops.stack(aop)
+            vk = vk + 1
+        }
+        lowkey mo, mt = emitMakeVariant(c, c.variantSum[vi], nm, vops)
+        bet mo, mt
+    }
     lowkey fi = lookupFn(c, nm)
     fr fi < 0 {
         lcFail(c)
@@ -3116,6 +3222,12 @@ finna lowerName(c: LowerCtx, p: P, idx: int) -> (str, str) {
     lowkey gi = lookupGlobalConst(c, nm)
     fr gi >= 0 {
         bet c.gConstVals[gi], c.gConstTys[gi]
+    }
+    // A bare name that is a nullary `moods` variant is a value constructor.
+    lowkey vi = lookupVariant(c, nm)
+    fr vi >= 0 && isEmpty(c.variantPayload[vi]) {
+        lowkey mo, mt = emitMakeVariant(c, c.variantSum[vi], nm, vec.new[str]())
+        bet mo, mt
     }
     lcFail(c)
     bet "0i64", "i64"
@@ -3574,6 +3686,76 @@ finna lowerVibin(c: LowerCtx, p: P, vibinIdx: int) {
     selectBlock(c, exit)
 }
 
+// `vibe scrut { Variant(binds) { .. } .. naw { .. } }` (mirror lower_vibe): discriminant + switch;
+// each arm downcasts + binds its payload; the merge block is a reserved landing pad.
+finna lowerVibe(c: LowerCtx, p: P, vibeIdx: int) {
+    lowkey sop, sty = lowerExpr(c, p, kidAt(p, vibeIdx, 0), "")
+    fr !isSum(c, sty) || !isPlace(sop) {
+        lcFail(c)
+    } naw {
+        lowkey disc = newLocal(c, "u32")
+        lowkey db = sbNew()
+        db.add("discriminant(")
+        db.add(sop)
+        db.add(")")
+        emitAssign(c, disc, db.finish())
+        lowkey switchBlock = curId(c)
+        lowkey merge = reserveBlock(c)
+        lowkey caseVals = vec.new[int]()
+        lowkey caseBbs = vec.new[int]()
+        lowkey defaultBody = 0 - 1
+        lowkey nk = kidCount(p, vibeIdx)
+        lowkey i = 1
+        vibin i < nk && lcOk(c) {
+            lowkey arm = kidAt(p, vibeIdx, i)
+            fr str.slaps(firstWord(lab(p, arm)), "default") {
+                defaultBody = kidAt(p, arm, 0)
+            } naw {
+                // "arm Variant b0 b1 .." — first word is the variant, the rest are bindings.
+                lowkey spec = splitSpaces(afterFirst(lab(p, arm)))
+                lowkey vname = spec[0]
+                lowkey vi = lookupVariant(c, vname)
+                fr vi < 0 {
+                    lcFail(c)
+                } naw {
+                    lowkey armBb = newBlock(c)
+                    lowkey payloadCsv = c.variantPayload[vi]
+                    lowkey nb = (spec.gang() as int) - 1
+                    lowkey j = 0
+                    vibin j < nb {
+                        lowkey fty = csvAt(payloadCsv, j)
+                        lowkey l = newLocal(c, fty)
+                        lowkey fb = sbNew()
+                        fb.add(sop)
+                        fb.add(".downcast(")
+                        fb.add(itoa(c.variantIdx[vi]))
+                        fb.add(").field(")
+                        fb.add(itoa(j))
+                        fb.add(")")
+                        emitAssign(c, l, fb.finish())
+                        bindLocal(c, spec[j + 1], l)
+                        j = j + 1
+                    }
+                    lowerBlock(c, p, findKid(p, arm, "block"))
+                    termGoto(c, merge)
+                    caseVals.stack(c.variantIdx[vi])
+                    caseBbs.stack(armBb)
+                }
+            }
+            i = i + 1
+        }
+        lowkey defaultBb = newBlock(c)
+        fr defaultBody >= 0 {
+            lowerBlock(c, p, defaultBody)
+            termGoto(c, merge)
+        } naw {
+            termUnreachable(c)
+        }
+        setSwitch(c, switchBlock, reg(disc), caseVals, caseBbs, defaultBb)
+        selectBlock(c, merge)
+    }
+}
+
 // `squad x in xs { .. }` over a fixed array — a counter loop (mirror lower_squad). The
 // increment block is the `skip` target and the exit block is the `dip` target. vec[T]
 // iterables are deferred (sentinel).
@@ -3645,6 +3827,8 @@ finna lowerStmt(c: LowerCtx, p: P, stmtIdx: int) {
         lowerFr(c, p, stmtIdx)
     } naw fr str.slaps(h, "vibin") {
         lowerVibin(c, p, stmtIdx)
+    } naw fr str.slaps(h, "vibe") {
+        lowerVibe(c, p, stmtIdx)
     } naw fr str.slaps(h, "squad") {
         lowerSquad(c, p, stmtIdx)
     } naw fr str.slaps(h, "dip") {
@@ -3752,14 +3936,26 @@ finna lowerGlobalConst(c: LowerCtx, p: P, stmtIdx: int) {
     }
 }
 
-// Register a `drip` struct: render its `struct NAME { .. }` decl and record its fields (mirror
-// the struct prescan + text.rs struct_def). Generic structs are deferred (sentinel).
-finna registerStruct(c: LowerCtx, p: P, dripIdx: int) {
-    lowkey name = afterFirst(afterFirst(lab(p, dripIdx)))
-    lowkey g = findKid(p, dripIdx, "generics")
-    fr g >= 0 && !isEmpty(afterFirst(lab(p, g))) {
+// True if a `drip`/`moods` item is generic (deferred).
+finna isGenericDecl(p: P, declIdx: int) -> bool {
+    lowkey g = findKid(p, declIdx, "generics")
+    bet g >= 0 && !isEmpty(afterFirst(lab(p, g)))
+}
+
+// Prescan pass 1: register a struct's name so any field/variant type can resolve it.
+finna registerStructName(c: LowerCtx, p: P, dripIdx: int) {
+    fr isGenericDecl(p, dripIdx) {
         lcFail(c)
     } naw {
+        c.structNames.stack(afterFirst(afterFirst(lab(p, dripIdx))))
+    }
+}
+
+// Prescan pass 2: render a struct's `struct NAME { .. }` decl and record its fields (text.rs
+// struct_def). Runs after all names are known, so struct/sum field types resolve either way.
+finna buildStructDef(c: LowerCtx, p: P, dripIdx: int) {
+    fr !isGenericDecl(p, dripIdx) {
+        lowkey name = afterFirst(afterFirst(lab(p, dripIdx)))
         lowkey sb = sbNew()
         sb.add("struct ")
         sb.add(name)
@@ -3786,19 +3982,94 @@ finna registerStruct(c: LowerCtx, p: P, dripIdx: int) {
             i = i + 1
         }
         sb.add(" }")
-        c.structNames.stack(name)
         c.structDecls.stack(sb.finish())
     }
 }
 
-// Pre-pass: register every top-level struct before consts/functions reference its type.
-finna collectStructs(c: LowerCtx, p: P, root: int) {
+// Prescan pass 1: register a sum's name.
+finna registerSumName(c: LowerCtx, p: P, moodsIdx: int) {
+    fr isGenericDecl(p, moodsIdx) {
+        lcFail(c)
+    } naw {
+        c.sumNames.stack(afterFirst(afterFirst(lab(p, moodsIdx))))
+    }
+}
+
+// Prescan pass 2: render a sum's `sum NAME { V(t,..), .. }` decl and record its variants (text.rs
+// sum_def). Payload types are kept as a "," CSV (construction hints) plus a ", " list (the decl).
+finna buildSumDef(c: LowerCtx, p: P, moodsIdx: int) {
+    fr !isGenericDecl(p, moodsIdx) {
+        lowkey name = afterFirst(afterFirst(lab(p, moodsIdx)))
+        lowkey sb = sbNew()
+        sb.add("sum ")
+        sb.add(name)
+        sb.add(" {")
+        lowkey nk = kidCount(p, moodsIdx)
+        lowkey vpos = 0
+        lowkey i = 0
+        vibin i < nk {
+            lowkey k = kidAt(p, moodsIdx, i)
+            fr str.slaps(firstWord(lab(p, k)), "variant") {
+                lowkey vname = afterFirst(lab(p, k))
+                lowkey csv = sbNew()
+                lowkey decl = sbNew()
+                lowkey np = kidCount(p, k)
+                lowkey j = 0
+                vibin j < np {
+                    fr j > 0 {
+                        csv.add(",")
+                        decl.add(", ")
+                    }
+                    lowkey pty = mapTypeNode(c, p, kidAt(p, k, j))
+                    csv.add(pty)
+                    decl.add(pty)
+                    j = j + 1
+                }
+                fr vpos == 0 { sb.add(" ") } naw { sb.add(", ") }
+                sb.add(vname)
+                fr np > 0 {
+                    sb.add("(")
+                    sb.add(decl.finish())
+                    sb.add(")")
+                }
+                addVariant(c, name, vname, vpos, csv.finish())
+                vpos = vpos + 1
+            }
+            i = i + 1
+        }
+        sb.add(" }")
+        c.sumDecls.stack(sb.finish())
+    }
+}
+
+// Prescan pass 1: register all struct + sum type names (so field/variant/param types resolve
+// regardless of declaration order — mirror the frontend prescan that ids all types first).
+finna collectTypeNames(c: LowerCtx, p: P, root: int) {
     lowkey n = kidCount(p, root)
     lowkey i = 0
     vibin i < n && lcOk(c) {
         lowkey it = kidAt(p, root, i)
-        fr str.slaps(firstWord(lab(p, it)), "drip") {
-            registerStruct(c, p, it)
+        lowkey w = firstWord(lab(p, it))
+        fr str.slaps(w, "drip") {
+            registerStructName(c, p, it)
+        } naw fr str.slaps(w, "moods") {
+            registerSumName(c, p, it)
+        }
+        i = i + 1
+    }
+}
+
+// Prescan pass 2: build the struct + sum decls/fields/variants now that all names are known.
+finna collectTypeDefs(c: LowerCtx, p: P, root: int) {
+    lowkey n = kidCount(p, root)
+    lowkey i = 0
+    vibin i < n && lcOk(c) {
+        lowkey it = kidAt(p, root, i)
+        lowkey w = firstWord(lab(p, it))
+        fr str.slaps(w, "drip") {
+            buildStructDef(c, p, it)
+        } naw fr str.slaps(w, "moods") {
+            buildSumDef(c, p, it)
         }
         i = i + 1
     }
@@ -3917,6 +4188,13 @@ finna assembleModule(c: LowerCtx) -> str {
         sb.add("\n")
         s = s + 1
     }
+    lowkey nsm = c.sumDecls.gang() as int
+    lowkey sm = 0
+    vibin sm < nsm {
+        sb.add(c.sumDecls[sm])
+        sb.add("\n")
+        sm = sm + 1
+    }
     lowkey ne = c.externs.gang() as int
     lowkey i = 0
     vibin i < ne {
@@ -3938,7 +4216,8 @@ finna assembleModule(c: LowerCtx) -> str {
 // C4 doesn't lower yet.
 finna emitMir(p: P, root: int) -> str {
     lowkey c = lcNew()
-    collectStructs(c, p, root)
+    collectTypeNames(c, p, root)
+    collectTypeDefs(c, p, root)
     collectConsts(c, p, root)
     collectFns(c, p, root)
     lowkey n = kidCount(p, root)
@@ -3951,7 +4230,9 @@ finna emitMir(p: P, root: int) -> str {
         } naw fr str.slaps(h, "const") {
             // top-level consts were evaluated in the collectConsts pre-pass.
         } naw fr str.slaps(h, "drip") {
-            // structs were registered in the collectStructs pre-pass.
+            // structs were registered in the type prescan.
+        } naw fr str.slaps(h, "moods") {
+            // sums were registered in the type prescan.
         } naw fr str.slaps(h, "func") {
             lowerFunc(c, p, it)
         } naw {
