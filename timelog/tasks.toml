@@ -400,7 +400,7 @@ size = 13
 # lowerIntrinsic routed from lowerMethodCall): math.lap (add.wrap), str.glow (bet_str_upper +
 # make_str), str.slaps (bet_str_eq) — unlocks strings + wrapping. 24/59. Deferred (each a further
 # increment): remaining str/bytes/mem/fs/sys intrinsics, vec[T] indexing/squad,
-# multi-return/tuples, first-class fn values, sums (moods/vibe),
+# first-class fn values, sums (moods/vibe),
 # errors (yikes/bounce/sheesh), memory (crib/tag/holla/cop), collections (vec/stash), the remaining
 # str/bytes/fs/mem/sys intrinsics + FFI, generics/monomorphization, then the 11-reference programs.
 status = "doing"

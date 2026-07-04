@@ -2129,6 +2129,13 @@ finna termRetVal(c: LowerCtx, op: str) {
     }
 }
 
+// `return op0, op1, ..` — a multi-value return (tuple).
+finna termRetMulti(c: LowerCtx, ops: vec[str]) {
+    fr !lcDone(c) {
+        setTerm(c, curId(c), cat2("return ", joinComma(ops)))
+    }
+}
+
 finna termUnreachable(c: LowerCtx) {
     fr !lcDone(c) {
         setTerm(c, curId(c), "unreachable")
@@ -2403,6 +2410,60 @@ finna arrayLenStr(t: str) -> str {
 finna arrayElemHint(hint: str) -> str {
     fr isArrayTy(hint) { bet arrayElem(hint) }
     bet ""
+}
+
+// --- tuple types, spelled `(A, B, ..)` (multi-return values) ---
+finna isTupleTy(t: str) -> bool {
+    fr str.len(t) < 2 { bet cap }
+    bet str.at(t, 0) == 40
+}
+
+finna trimSpace(s: str) -> str {
+    lowkey n = str.len(s)
+    lowkey i = 0
+    vibin i < n && str.at(s, i) == 32 { i = i + 1 }
+    bet str.sub(s, i, n)
+}
+
+// The `idx`-th component type of a tuple `(A, B, ..)` — split at top-level commas.
+finna tupleComponentAt(t: str, idx: int) -> str {
+    lowkey n = str.len(t)
+    lowkey start = 1
+    lowkey depth = 0
+    lowkey cur = 0
+    lowkey i = 1
+    vibin i < n - 1 {
+        lowkey ch = str.at(t, i)
+        fr ch == 40 {
+            depth = depth + 1
+        } naw fr ch == 41 {
+            depth = depth - 1
+        } naw fr ch == 44 && depth == 0 {
+            fr cur == idx { bet trimSpace(str.sub(t, start, i)) }
+            cur = cur + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    fr cur == idx { bet trimSpace(str.sub(t, start, n - 1)) }
+    bet ""
+}
+
+// Split a space-separated target list ("q r") into names.
+finna splitSpaces(s: str) -> vec[str] {
+    lowkey out = vec.new[str]()
+    lowkey n = str.len(s)
+    lowkey start = 0
+    lowkey i = 0
+    vibin i < n {
+        fr str.at(s, i) == 32 {
+            fr i > start { out.stack(str.sub(s, start, i)) }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    fr n > start { out.stack(str.sub(s, start, n)) }
+    bet out
 }
 
 // True for a bare SSA register `%N` with no projection (an addressable place base).
@@ -3282,7 +3343,7 @@ finna lowerExprStmt(c: LowerCtx, p: P, stmtIdx: int) {
 finna lowerVar(c: LowerCtx, p: P, stmtIdx: int) {
     lowkey targets = afterFirst(afterFirst(lab(p, stmtIdx)))
     fr hasSpace(targets) {
-        lcFail(c)
+        lowerVarMulti(c, p, stmtIdx, targets)
     } naw {
         lowkey tw = findKid(p, stmtIdx, "type")
         lowkey declTy = ""
@@ -3296,6 +3357,32 @@ finna lowerVar(c: LowerCtx, p: P, stmtIdx: int) {
         lowkey l = newLocal(c, ty)
         emitAssign(c, l, op)
         bindLocal(c, targets, l)
+    }
+}
+
+// `lowkey a, b = tupleExpr` — destructure a tuple-returning rvalue into one local per name
+// (mirror the multi-binding path: bind each name to `tmp.field(i)`).
+finna lowerVarMulti(c: LowerCtx, p: P, stmtIdx: int, targets: str) {
+    lowkey vw = findKid(p, stmtIdx, "values")
+    lowkey op, vty = lowerExpr(c, p, kidAt(p, vw, 0), "")
+    fr !isTupleTy(vty) || !isReg(op) {
+        lcFail(c)
+    } naw {
+        lowkey names = splitSpaces(targets)
+        lowkey nn = names.gang() as int
+        lowkey i = 0
+        vibin i < nn {
+            lowkey compTy = tupleComponentAt(vty, i)
+            lowkey l = newLocal(c, compTy)
+            lowkey sb = sbNew()
+            sb.add(op)
+            sb.add(".field(")
+            sb.add(itoa(i))
+            sb.add(")")
+            emitAssign(c, l, sb.finish())
+            bindLocal(c, names[i], l)
+            i = i + 1
+        }
     }
 }
 
@@ -3373,7 +3460,16 @@ finna lowerBet(c: LowerCtx, p: P, stmtIdx: int) {
         lowkey op, ty = lowerExpr(c, p, kidAt(p, stmtIdx, 0), c.curRet[0])
         termRetVal(c, op)
     } naw {
-        lcFail(c)
+        // Multi-value return: each value hinted by its tuple component type.
+        lowkey ret = c.curRet[0]
+        lowkey ops = vec.new[str]()
+        lowkey i = 0
+        vibin i < nv {
+            lowkey op, ty = lowerExpr(c, p, kidAt(p, stmtIdx, i), tupleComponentAt(ret, i))
+            ops.stack(op)
+            i = i + 1
+        }
+        termRetMulti(c, ops)
     }
 }
 
@@ -3587,6 +3683,20 @@ finna collectRetType(c: LowerCtx, p: P, funcIdx: int) -> str {
     fr findKid(p, funcIdx, "ret none") >= 0 { bet "void" }
     lowkey rs = findKid(p, funcIdx, "ret single")
     fr rs >= 0 { bet mapTypeNode(c, p, kidAt(p, rs, 0)) }
+    lowkey rm = findKid(p, funcIdx, "ret multi")
+    fr rm >= 0 {
+        lowkey sb = sbNew()
+        sb.add("(")
+        lowkey nk = kidCount(p, rm)
+        lowkey i = 0
+        vibin i < nk {
+            fr i > 0 { sb.add(", ") }
+            sb.add(mapTypeNode(c, p, kidAt(p, rm, i)))
+            i = i + 1
+        }
+        sb.add(")")
+        bet sb.finish()
+    }
     lcFail(c)
     bet "void"
 }
