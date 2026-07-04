@@ -5315,6 +5315,38 @@ finna lowerEvict(c: LowerCtx, p: P, stmtIdx: int) {
     }
 }
 
+// `slide worker()` — spawn a concurrent task via `bet_slide` (mirror lower_slide). Only a bare
+// call of a known, no-arg named function lowers today: materialize its code pointer `@NAME`, bitcast
+// to `rawptr`, and pass it as both the entry and the (unused) task argument. The `u64` TaskHandle is
+// discarded. Anything else (indirect/generic/receiver call, or arguments) sentinels.
+finna lowerSlide(c: LowerCtx, p: P, stmtIdx: int) {
+    lowkey callIdx = kidAt(p, stmtIdx, 0)
+    fr !str.slaps(firstWord(lab(p, callIdx)), "call") {
+        lcFail(c)
+    } naw {
+        lowkey calleeW = findKid(p, callIdx, "callee")
+        lowkey calleeE = kidAt(p, calleeW, 0)
+        lowkey argsW = findKid(p, callIdx, "args")
+        lowkey nm = afterFirst(lab(p, calleeE))
+        lowkey fi = lookupFn(c, nm)
+        fr !str.slaps(firstWord(lab(p, calleeE)), "name") || (argsW >= 0 && kidCount(p, argsW) > 0) || fi < 0 {
+            lcFail(c)
+        } naw {
+            // The worker's code pointer, materialized then bitcast to a raw pointer for the ABI.
+            lowkey fnref = newLocal(c, fnPtrTypeOf(c, fi))
+            emitAssign(c, fnref, cat2("@", nm))
+            lowkey entry = newLocal(c, "rawptr")
+            emitAssign(c, entry, cat3("cast.bitcast(", reg(fnref), " as rawptr)"))
+            // bet_slide(entry, arg) -> TaskHandle (u64); reuse the entry pointer as the unused arg.
+            getExtern(c, "extern \"C\" fn bet_slide(rawptr, rawptr) -> u64")
+            lowkey sargs = vec.new[str]()
+            sargs.stack(reg(entry))
+            sargs.stack(reg(entry))
+            lowkey handle = emitExternCall(c, "u64", "bet_slide", sargs)
+        }
+    }
+}
+
 // Lower one statement (mirror lower_stmt) — the scalar subset.
 finna lowerStmt(c: LowerCtx, p: P, stmtIdx: int) {
     lowkey h = firstWord(lab(p, stmtIdx))
@@ -5344,6 +5376,8 @@ finna lowerStmt(c: LowerCtx, p: P, stmtIdx: int) {
         lowerHolla(c, p, stmtIdx)
     } naw fr str.slaps(h, "evict") {
         lowerEvict(c, p, stmtIdx)
+    } naw fr str.slaps(h, "slide") {
+        lowerSlide(c, p, stmtIdx)
     } naw fr str.slaps(h, "dip") {
         fr inLoop(c) { termGoto(c, loopExitTop(c)) } naw { lcFail(c) }
     } naw fr str.slaps(h, "skip") {
