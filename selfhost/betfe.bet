@@ -2557,6 +2557,60 @@ finna vecTyStr(elem: str) -> str {
     bet cat3("vec[", elem, "]")
 }
 
+// --- stash (hash map) types, spelled `map[K, V]` in MIR (mirror the vec type helpers) ---
+finna isMapTy(t: str) -> bool {
+    fr str.len(t) < 5 { bet cap }
+    bet str.at(t, 0) == 109 && str.at(t, 1) == 97 && str.at(t, 2) == 112 && str.at(t, 3) == 91
+}
+
+finna mapTyStr(k: str, v: str) -> str {
+    lowkey sb = sbNew()
+    sb.add("map[")
+    sb.add(k)
+    sb.add(", ")
+    sb.add(v)
+    sb.add("]")
+    bet sb.finish()
+}
+
+// The key component of a `map[K, V]` type — content up to the top-level comma (depth-aware).
+finna mapKey(t: str) -> str {
+    lowkey n = str.len(t)
+    lowkey depth = 0
+    lowkey i = 4
+    vibin i < n - 1 {
+        lowkey ch = str.at(t, i)
+        fr ch == 91 || ch == 40 {
+            depth = depth + 1
+        } naw fr ch == 93 || ch == 41 {
+            depth = depth - 1
+        } naw fr ch == 44 && depth == 0 {
+            bet trimSpace(str.sub(t, 4, i))
+        }
+        i = i + 1
+    }
+    bet ""
+}
+
+// The value component of a `map[K, V]` type — content after the top-level comma (depth-aware).
+finna mapVal(t: str) -> str {
+    lowkey n = str.len(t)
+    lowkey depth = 0
+    lowkey i = 4
+    vibin i < n - 1 {
+        lowkey ch = str.at(t, i)
+        fr ch == 91 || ch == 40 {
+            depth = depth + 1
+        } naw fr ch == 93 || ch == 41 {
+            depth = depth - 1
+        } naw fr ch == 44 && depth == 0 {
+            bet trimSpace(str.sub(t, i + 1, n - 1))
+        }
+        i = i + 1
+    }
+    bet ""
+}
+
 // --- tuple types, spelled `(A, B, ..)` (multi-return values) ---
 finna isTupleTy(t: str) -> bool {
     fr str.len(t) < 2 { bet cap }
@@ -2659,6 +2713,10 @@ finna mapTypeNode(c: LowerCtx, p: P, tyNode: int) -> str {
         // A `vec[T]` type node is `named vec` with the element type as its child.
         fr str.slaps(nm, "vec") && kidCount(p, tyNode) > 0 {
             bet vecTyStr(mapTypeNode(c, p, kidAt(p, tyNode, 0)))
+        }
+        // A `stash[K, V]` type node is `named stash` with the key/value types as its children.
+        fr str.slaps(nm, "stash") && kidCount(p, tyNode) == 2 {
+            bet mapTyStr(mapTypeNode(c, p, kidAt(p, tyNode, 0)), mapTypeNode(c, p, kidAt(p, tyNode, 1)))
         }
         fr isStruct(c, nm) { bet nm }
         fr isSum(c, nm) { bet nm }
@@ -3318,6 +3376,112 @@ finna lowerIntrinsic(c: LowerCtx, p: P, module: str, method: str, methodIdx: int
     bet "0i64", "i64"
 }
 
+// Serialize a map key to (ptr, len) operands (mirror serialize_key): a str key uses str_ptr/str_len;
+// any other key is spilled to a slot and passed by addr_of + size_of.
+finna serializeKey(c: LowerCtx, p: P, keyIdx: int, kty: str) -> (str, str) {
+    lowkey keyOp, keyT = lowerExpr(c, p, keyIdx, kty)
+    fr str.slaps(kty, "str") {
+        lowkey kp = emitStrPtr(c, keyOp)
+        lowkey kl = emitStrLen(c, keyOp)
+        bet reg(kp), reg(kl)
+    }
+    lowkey slot = newLocal(c, kty)
+    emitAssign(c, slot, keyOp)
+    lowkey kp = emitAddrOf(c, reg(slot))
+    lowkey kl = newLocal(c, "u64")
+    lowkey sb = sbNew()
+    sb.add("size_of[")
+    sb.add(kty)
+    sb.add("]")
+    emitAssign(c, kl, sb.finish())
+    bet reg(kp), reg(kl)
+}
+
+// `stash.new[K, V]()` — an empty hash map (mirror lower_stash_new): size_of[V] + bet_map_new(size).
+// The `in: <crib>` allocator-context form is not lowered in this subset (sentinels).
+finna lowerStashNew(c: LowerCtx, p: P, methodIdx: int) -> (str, str) {
+    lowkey targsW = findKid(p, methodIdx, "typeargs")
+    fr targsW < 0 || kidCount(p, targsW) != 2 {
+        lcFail(c)
+        bet "0i64", "i64"
+    }
+    lowkey argsW = findKid(p, methodIdx, "args")
+    fr argsW >= 0 && kidCount(p, argsW) > 0 {
+        lcFail(c)
+        bet "0i64", "i64"
+    }
+    lowkey k = mapTypeNode(c, p, kidAt(p, targsW, 0))
+    lowkey v = mapTypeNode(c, p, kidAt(p, targsW, 1))
+    lowkey mapTy = mapTyStr(k, v)
+    lowkey vsize = newLocal(c, "u64")
+    lowkey sb = sbNew()
+    sb.add("size_of[")
+    sb.add(v)
+    sb.add("]")
+    emitAssign(c, vsize, sb.finish())
+    lowkey ext = sbNew()
+    ext.add("extern \"C\" fn bet_map_new(u64) -> ")
+    ext.add(mapTy)
+    getExtern(c, ext.finish())
+    lowkey args = vec.new[str]()
+    args.stack(reg(vsize))
+    lowkey tmp = emitExternCall(c, mapTy, "bet_map_new", args)
+    bet reg(tmp), mapTy
+}
+
+// Dispatch a method on a `stash[K, V]` (map) value: put, peep, gang (mirror lower_stash_method).
+// `peep` yields a `(V, bool)` tuple destructured by the caller's `lowkey v, ok = ...`.
+finna lowerStashMethod(c: LowerCtx, p: P, methodIdx: int, mapOp: str, k: str, v: str, method: str) -> (str, str) {
+    lowkey mapTy = mapTyStr(k, v)
+    lowkey argsW = findKid(p, methodIdx, "args")
+    fr str.slaps(method, "put") {
+        lowkey keyPtr, keyLen = serializeKey(c, p, argValue(p, argsW, 0), k)
+        lowkey val, vty = lowerExpr(c, p, argValue(p, argsW, 1), v)
+        lowkey vl = newLocal(c, v)
+        emitAssign(c, vl, val)
+        lowkey valPtr = emitAddrOf(c, reg(vl))
+        getExtern(c, vecExternDecl("bet_map_put", cat2(mapTy, ", rawptr, u64, rawptr"), "void"))
+        lowkey args = vec.new[str]()
+        args.stack(mapOp)
+        args.stack(keyPtr)
+        args.stack(keyLen)
+        args.stack(reg(valPtr))
+        lowkey r = emitExternCall(c, "void", "bet_map_put", args)
+        bet reg(r), "void"
+    }
+    fr str.slaps(method, "peep") {
+        lowkey keyPtr, keyLen = serializeKey(c, p, argValue(p, argsW, 0), k)
+        lowkey out = newLocal(c, v)
+        lowkey valPtr = emitAddrOf(c, reg(out))
+        getExtern(c, vecExternDecl("bet_map_get", cat2(mapTy, ", rawptr, u64, rawptr"), "bool"))
+        lowkey args = vec.new[str]()
+        args.stack(mapOp)
+        args.stack(keyPtr)
+        args.stack(keyLen)
+        args.stack(reg(valPtr))
+        lowkey ok = emitExternCall(c, "bool", "bet_map_get", args)
+        lowkey tupTy = cat3("(", v, ", bool)")
+        lowkey tup = newLocal(c, tupTy)
+        lowkey tsb = sbNew()
+        tsb.add("tuple(")
+        tsb.add(reg(out))
+        tsb.add(", ")
+        tsb.add(reg(ok))
+        tsb.add(")")
+        emitAssign(c, tup, tsb.finish())
+        bet reg(tup), tupTy
+    }
+    fr str.slaps(method, "gang") {
+        getExtern(c, vecExternDecl("bet_map_len", mapTy, "u64"))
+        lowkey args = vec.new[str]()
+        args.stack(mapOp)
+        lowkey r = emitExternCall(c, "u64", "bet_map_len", args)
+        bet reg(r), "u64"
+    }
+    lcFail(c)
+    bet "0i64", "i64"
+}
+
 // `vec.new[T]()` — an empty growable vec (mirror lower_vec_new): size_of[T] + bet_vec_new(size).
 finna lowerVecNew(c: LowerCtx, p: P, methodIdx: int) -> (str, str) {
     lowkey targsW = findKid(p, methodIdx, "typeargs")
@@ -3486,6 +3650,11 @@ finna lowerMethodCall(c: LowerCtx, p: P, idx: int) -> (str, str) {
                     lowkey vo, vt = lowerVecNew(c, p, idx)
                     bet vo, vt
                 }
+                // `stash.new[K, V]()` needs its type args too, so it bypasses plain intrinsic dispatch.
+                fr str.slaps(rn, "stash") && str.slaps(methodName, "new") {
+                    lowkey so, st = lowerStashNew(c, p, idx)
+                    bet so, st
+                }
                 lowkey io, it = lowerIntrinsic(c, p, rn, methodName, idx)
                 bet io, it
             }
@@ -3504,6 +3673,10 @@ finna lowerMethodCall(c: LowerCtx, p: P, idx: int) -> (str, str) {
         fr isVecTy(yty) {
             lowkey vo, vt = lowerVecMethod(c, p, idx, yop, vecElem(yty), methodName)
             bet vo, vt
+        }
+        fr isMapTy(yty) {
+            lowkey mo, mt = lowerStashMethod(c, p, idx, yop, mapKey(yty), mapVal(yty), methodName)
+            bet mo, mt
         }
         lcFail(c)
         bet "0i64", "i64"
