@@ -1,0 +1,45 @@
+// vec of aggregate elements — struct and sum (moods) element types. This is the shape the
+// self-hosted compiler leans on: a token buffer (vec[Token]) and AST-node lists (vec[Node],
+// Node a moods). Proves push / index / length / squad iteration work for non-scalar elements
+// on both the interpreter and the compiled runtime-backed vec[T], byte-identically.
+pull "spill"
+pull "vec"
+
+drip Point { x: int, y: int }
+
+moods Tok {
+    Num(int),
+    Plus,
+    Ident(str),
+}
+
+finna main() {
+    // vec of a struct
+    lowkey ps = vec.new[Point]()
+    ps.stack(Point { x: 1, y: 2 })
+    ps.stack(Point { x: 3, y: 4 })
+    lowkey p = ps[1]
+    spill.it(p.x)          // 3
+    spill.it(ps.gang())    // 2
+    lowkey sx = 0
+    squad q in ps {
+        sx = sx + q.x
+    }
+    spill.it(sx)           // 4
+
+    // vec of a sum type (AST-shaped), matched via vibe
+    lowkey toks = vec.new[Tok]()
+    toks.stack(Num(42))
+    toks.stack(Plus)
+    toks.stack(Ident("foo"))
+    spill.it(toks.gang())  // 3
+    lowkey total = 0
+    squad t in toks {
+        vibe t {
+            Num(n) { total = total + n }
+            Plus { total = total + 1 }
+            Ident(s) { spill.it(s) }   // foo
+        }
+    }
+    spill.it(total)        // 43
+}

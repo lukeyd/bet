@@ -108,7 +108,12 @@ struct LowerCtx {
     /// `bet_print(rawptr, u64) -> void` — the stdout entry point (always present).
     print_extern: ExternId,
     /// Deduped externs synthesized on demand, keyed by `(name, ret-type)`.
-    extern_cache: HashMap<(String, TyId), ExternId>,
+    /// Keyed by the full signature `(name, params, rets)`, not just the name: one C symbol can
+    /// appear under several midir signatures (e.g. `bet_vec_push` per `vec[T]` element type —
+    /// all erase to the same `ptr fn(ptr, ptr)` at the ABI, and the backend dedups the LLVM
+    /// declaration by name). Keying on the name alone would alias distinct element types onto
+    /// the first one's parameter types, tripping the validator.
+    extern_cache: HashMap<(String, Vec<TyId>, Vec<TyId>), ExternId>,
 
     // Per-function state (valid only while lowering a body).
     fb: Option<FuncBuilder>,
@@ -3532,8 +3537,8 @@ impl LowerCtx {
 
     /// Get (or create) a deduped extern with the given name, param, and return types.
     fn get_extern(&mut self, name: &str, params: Vec<TyId>, rets: Vec<TyId>) -> ExternId {
-        let ret_key = *rets.first().unwrap_or(&TyId(u32::MAX));
-        if let Some(&id) = self.extern_cache.get(&(name.to_string(), ret_key)) {
+        let key = (name.to_string(), params.clone(), rets.clone());
+        if let Some(&id) = self.extern_cache.get(&key) {
             return id;
         }
         let id = self.m.add_extern(Extern {
@@ -3541,7 +3546,7 @@ impl LowerCtx {
             abi: "C".into(),
             sig: Sig { params, rets },
         });
-        self.extern_cache.insert((name.to_string(), ret_key), id);
+        self.extern_cache.insert(key, id);
         id
     }
 }
