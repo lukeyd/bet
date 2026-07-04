@@ -1917,7 +1917,13 @@ finna blkNew() -> Block {
 
 drip LowerCtx {
     externs: vec[str],
+    fns: vec[str],
+    fnNames: vec[str],
+    fnParamCsv: vec[str],
+    fnRet: vec[str],
     localTypes: vec[str],
+    paramCount: vec[int],
+    curRet: vec[str],
     blocks: vec[Block],
     curBlock: vec[int],
     ok: vec[int],
@@ -1933,11 +1939,95 @@ finna lcNew() -> LowerCtx {
     ex.stack("extern \"C\" fn bet_print(rawptr, u64) -> void")
     lowkey okc = vec.new[int]()
     okc.stack(1)
+    lowkey pc = vec.new[int]()
+    pc.stack(0)
+    lowkey cr = vec.new[str]()
+    cr.stack("void")
     lowkey blks = vec.new[Block]()
     blks.stack(blkNew())
     lowkey cur = vec.new[int]()
     cur.stack(0)
-    bet LowerCtx{ externs: ex, localTypes: vec.new[str](), blocks: blks, curBlock: cur, ok: okc, bindNames: vec.new[str](), bindIds: vec.new[int](), constNames: vec.new[str](), constVals: vec.new[str](), constTys: vec.new[str]() }
+    bet LowerCtx{ externs: ex, fns: vec.new[str](), fnNames: vec.new[str](), fnParamCsv: vec.new[str](), fnRet: vec.new[str](), localTypes: vec.new[str](), paramCount: pc, curRet: cr, blocks: blks, curBlock: cur, ok: okc, bindNames: vec.new[str](), bindIds: vec.new[int](), constNames: vec.new[str](), constVals: vec.new[str](), constTys: vec.new[str]() }
+}
+
+// --- per-function reset (structs pass by value, so drain the shared-handle vecs in place) ---
+finna drainStr(v: vec[str]) {
+    vibin (v.gang() as int) > 0 { v.pop() }
+}
+
+finna drainInt(v: vec[int]) {
+    vibin (v.gang() as int) > 0 { v.pop() }
+}
+
+finna drainBlk(v: vec[Block]) {
+    vibin (v.gang() as int) > 0 { v.pop() }
+}
+
+finna set1(cell: vec[int], v: int) {
+    cell.pop()
+    cell.stack(v)
+}
+
+finna set1s(cell: vec[str], v: str) {
+    cell.pop()
+    cell.stack(v)
+}
+
+// Reset current-function state for a fresh function; bb0 re-created, cursor at 0.
+finna resetFn(c: LowerCtx, paramCount: int, ret: str) {
+    drainStr(c.localTypes)
+    drainBlk(c.blocks)
+    c.blocks.stack(blkNew())
+    set1(c.curBlock, 0)
+    set1(c.paramCount, paramCount)
+    set1s(c.curRet, ret)
+    drainStr(c.bindNames)
+    drainInt(c.bindIds)
+    drainStr(c.constNames)
+    drainStr(c.constVals)
+    drainStr(c.constTys)
+}
+
+// The index of a registered function named `name`, or -1.
+finna lookupFn(c: LowerCtx, name: str) -> int {
+    lowkey n = c.fnNames.gang() as int
+    lowkey i = 0
+    vibin i < n {
+        fr str.slaps(c.fnNames[i], name) { bet i }
+        i = i + 1
+    }
+    bet 0 - 1
+}
+
+// The i-th comma-separated field of `csv` ("" if out of range).
+finna csvAt(csv: str, idx: int) -> str {
+    lowkey n = str.len(csv)
+    lowkey field = 0
+    lowkey start = 0
+    lowkey i = 0
+    vibin i < n {
+        fr str.at(csv, i) == 44 {
+            fr field == idx { bet str.sub(csv, start, i) }
+            field = field + 1
+            start = i + 1
+        }
+        i = i + 1
+    }
+    fr field == idx { bet str.sub(csv, start, n) }
+    bet ""
+}
+
+// Join a vec of strings with ", ".
+finna joinComma(v: vec[str]) -> str {
+    lowkey sb = sbNew()
+    lowkey n = v.gang() as int
+    lowkey i = 0
+    vibin i < n {
+        fr i > 0 { sb.add(", ") }
+        sb.add(v[i])
+        i = i + 1
+    }
+    bet sb.finish()
 }
 
 // --- basic-block / terminator management (mirror lower.rs new_block/reserve_block/select/term_*) ---
@@ -1994,6 +2084,18 @@ finna termGoto(c: LowerCtx, to: int) {
 finna termRet(c: LowerCtx) {
     fr !lcDone(c) {
         setTerm(c, curId(c), "return")
+    }
+}
+
+finna termRetVal(c: LowerCtx, op: str) {
+    fr !lcDone(c) {
+        setTerm(c, curId(c), cat2("return ", op))
+    }
+}
+
+finna termUnreachable(c: LowerCtx) {
+    fr !lcDone(c) {
+        setTerm(c, curId(c), "unreachable")
     }
 }
 
@@ -2417,8 +2519,53 @@ finna lowerExpr(c: LowerCtx, p: P, idx: int, hint: str) -> (str, str) {
         lowkey co, ct = lowerCast(c, p, idx)
         bet co, ct
     }
+    fr str.slaps(h, "call") {
+        lowkey lo, lt = lowerCall(c, p, idx)
+        bet lo, lt
+    }
     lcFail(c)
     bet "0i64", "i64"
+}
+
+// A direct call to a named user function (mirror lower_call + lower_args + emit_call_result).
+finna lowerCall(c: LowerCtx, p: P, idx: int) -> (str, str) {
+    lowkey calleeW = findKid(p, idx, "callee")
+    lowkey calleeE = kidAt(p, calleeW, 0)
+    // Only a bare (non-generic, non-local) function name is lowered in this subset.
+    fr !str.slaps(firstWord(lab(p, calleeE)), "name") || kidCount(p, calleeE) > 0 {
+        lcFail(c)
+        bet "0i64", "i64"
+    }
+    lowkey nm = afterFirst(lab(p, calleeE))
+    fr lookupLocal(c, nm) >= 0 {
+        lcFail(c)
+        bet "0i64", "i64"
+    }
+    lowkey fi = lookupFn(c, nm)
+    fr fi < 0 {
+        lcFail(c)
+        bet "0i64", "i64"
+    }
+    lowkey paramCsv = c.fnParamCsv[fi]
+    lowkey retTy = c.fnRet[fi]
+    lowkey argsW = findKid(p, idx, "args")
+    lowkey argStrs = vec.new[str]()
+    lowkey na = kidCount(p, argsW)
+    lowkey ai = 0
+    vibin ai < na {
+        lowkey aop, aty = lowerExpr(c, p, argValue(p, argsW, ai), csvAt(paramCsv, ai))
+        argStrs.stack(aop)
+        ai = ai + 1
+    }
+    lowkey res = newLocal(c, retTy)
+    lowkey sb = sbNew()
+    sb.add("call @")
+    sb.add(nm)
+    sb.add("(")
+    sb.add(joinComma(argStrs))
+    sb.add(")")
+    emitAssign(c, res, sb.finish())
+    bet reg(res), retTy
 }
 
 // Lower a bare name: a local (Copy) or an inlined const value (mirror lower_name).
@@ -2652,6 +2799,8 @@ finna lowerExprStmt(c: LowerCtx, p: P, stmtIdx: int) {
     }
     fr isSpill {
         lowerSpill(c, p, e)
+    } naw fr str.slaps(firstWord(lab(p, e)), "call") {
+        lowkey dop, dty = lowerCall(c, p, e)
     } naw {
         lcFail(c)
     }
@@ -2732,10 +2881,14 @@ finna lowerAssign(c: LowerCtx, p: P, stmtIdx: int) {
     }
 }
 
-// `bet` — main is void, so only the zero-value form lowers here; it terminates the block.
+// `bet` — zero values (void) or a single value (mirror lower_bet); multi-value is deferred.
 finna lowerBet(c: LowerCtx, p: P, stmtIdx: int) {
-    fr kidCount(p, stmtIdx) == 0 {
+    lowkey nv = kidCount(p, stmtIdx)
+    fr nv == 0 {
         termRet(c)
+    } naw fr nv == 1 {
+        lowkey op, ty = lowerExpr(c, p, kidAt(p, stmtIdx, 0), c.curRet[0])
+        termRetVal(c, op)
     } naw {
         lcFail(c)
     }
@@ -2871,32 +3024,114 @@ finna lowerBlock(c: LowerCtx, p: P, blockIdx: int) {
     }
 }
 
-// True when `funcIdx` is a `finna main()` with no generics, no params, and no return (the only
-// function shape C4.1 lowers). Its kids are [generics, params, ret, block].
-finna mainIsSimple(p: P, funcIdx: int) -> bool {
-    lowkey g = findKid(p, funcIdx, "generics")
-    lowkey pm = findKid(p, funcIdx, "params")
-    lowkey rt = findKid(p, funcIdx, "ret none")
-    fr g < 0 || pm < 0 || rt < 0 {
-        bet cap
-    }
-    bet kidCount(p, pm) == 0
-}
-
-// Assemble the full .mir text: extern decls, a blank line, then `fn main`.
-finna assembleMir(c: LowerCtx) -> str {
-    lowkey sb = sbNew()
-    lowkey ne = c.externs.gang() as int
+// True when the function has a receiver kid (a method) — not lowered in this subset.
+finna hasReceiverKid(p: P, funcIdx: int) -> bool {
+    lowkey n = kidCount(p, funcIdx)
     lowkey i = 0
-    vibin i < ne {
-        sb.add(c.externs[i])
-        sb.add("\n")
+    vibin i < n {
+        fr str.slaps(firstWord(lab(p, kidAt(p, funcIdx, i))), "receiver") { bet nocap }
         i = i + 1
     }
-    sb.add("\n")
-    sb.add("fn main() -> void {\n")
-    lowkey nl = c.localTypes.gang() as int
+    bet cap
+}
+
+// The comma-joined .mir param types of a `params` node.
+finna collectParamTypes(c: LowerCtx, p: P, pw: int) -> str {
+    lowkey sb = sbNew()
+    lowkey n = kidCount(p, pw)
+    lowkey i = 0
+    vibin i < n {
+        fr i > 0 { sb.add(",") }
+        sb.add(mapTypeNode(c, p, kidAt(p, kidAt(p, pw, i), 0)))
+        i = i + 1
+    }
+    bet sb.finish()
+}
+
+// The .mir return-type string of a function ("void" / a single type; multi-return deferred).
+finna collectRetType(c: LowerCtx, p: P, funcIdx: int) -> str {
+    fr findKid(p, funcIdx, "ret none") >= 0 { bet "void" }
+    lowkey rs = findKid(p, funcIdx, "ret single")
+    fr rs >= 0 { bet mapTypeNode(c, p, kidAt(p, rs, 0)) }
+    lcFail(c)
+    bet "void"
+}
+
+// Pre-register a function's signature so calls resolve regardless of declaration order (mirror the
+// collect pass). Generic / receiver / non-scalar signatures defer the whole program.
+finna registerFn(c: LowerCtx, p: P, funcIdx: int) {
+    lowkey name = afterFirst(afterFirst(lab(p, funcIdx)))
+    lowkey g = findKid(p, funcIdx, "generics")
+    fr g < 0 || !isEmpty(afterFirst(lab(p, g))) {
+        lcFail(c)
+    } naw fr hasReceiverKid(p, funcIdx) {
+        lcFail(c)
+    } naw {
+        lowkey pw = findKid(p, funcIdx, "params")
+        c.fnNames.stack(name)
+        c.fnParamCsv.stack(collectParamTypes(c, p, pw))
+        c.fnRet.stack(collectRetType(c, p, funcIdx))
+    }
+}
+
+finna collectFns(c: LowerCtx, p: P, root: int) {
+    lowkey n = kidCount(p, root)
+    lowkey i = 0
+    vibin i < n {
+        lowkey it = kidAt(p, root, i)
+        fr str.slaps(firstWord(lab(p, it)), "func") {
+            registerFn(c, p, it)
+        }
+        i = i + 1
+    }
+}
+
+// Lower one function to .mir text (mirror lower_func + lower_fn_core).
+finna lowerFunc(c: LowerCtx, p: P, funcIdx: int) {
+    lowkey name = afterFirst(afterFirst(lab(p, funcIdx)))
+    lowkey fi = lookupFn(c, name)
+    lowkey pw = findKid(p, funcIdx, "params")
+    lowkey pcount = kidCount(p, pw)
+    lowkey ret = c.fnRet[fi]
+    resetFn(c, pcount, ret)
+    lowkey i = 0
+    vibin i < pcount {
+        lowkey paramNode = kidAt(p, pw, i)
+        c.localTypes.stack(mapTypeNode(c, p, kidAt(p, paramNode, 0)))
+        bindLocal(c, afterFirst(lab(p, paramNode)), i)
+        i = i + 1
+    }
+    lowerBlock(c, p, findKid(p, funcIdx, "block"))
+    fr str.slaps(ret, "void") {
+        termRet(c)
+    } naw {
+        termUnreachable(c)
+    }
+    lowkey sig = sbNew()
+    sig.add("fn ")
+    sig.add(name)
+    sig.add("(")
+    lowkey ps = vec.new[str]()
     lowkey j = 0
+    vibin j < pcount {
+        ps.stack(cat3(reg(j), ": ", c.localTypes[j]))
+        j = j + 1
+    }
+    sig.add(joinComma(ps))
+    sig.add(") -> ")
+    sig.add(ret)
+    finishFn(c, sig.finish())
+}
+
+// Finish the current function: build its text (signature + temp `let`s + blocks) and stash it.
+// Param locals (index < paramCount) live in the signature, so they get no `let` line.
+finna finishFn(c: LowerCtx, sigLine: str) {
+    lowkey sb = sbNew()
+    sb.add(sigLine)
+    sb.add(" {\n")
+    lowkey pcount = c.paramCount[0]
+    lowkey nl = c.localTypes.gang() as int
+    lowkey j = pcount
     vibin j < nl {
         sb.add("  let ")
         sb.add(reg(j))
@@ -2926,6 +3161,26 @@ finna assembleMir(c: LowerCtx) -> str {
         bi = bi + 1
     }
     sb.add("}\n")
+    c.fns.stack(sb.finish())
+}
+
+// Assemble the module: extern decls, then each function prefixed with a blank line.
+finna assembleModule(c: LowerCtx) -> str {
+    lowkey sb = sbNew()
+    lowkey ne = c.externs.gang() as int
+    lowkey i = 0
+    vibin i < ne {
+        sb.add(c.externs[i])
+        sb.add("\n")
+        i = i + 1
+    }
+    lowkey nf = c.fns.gang() as int
+    lowkey j = 0
+    vibin j < nf {
+        sb.add("\n")
+        sb.add(c.fns[j])
+        j = j + 1
+    }
     bet sb.finish()
 }
 
@@ -2933,31 +3188,25 @@ finna assembleMir(c: LowerCtx) -> str {
 // C4 doesn't lower yet.
 finna emitMir(p: P, root: int) -> str {
     lowkey c = lcNew()
-    lowkey mainBlock = 0 - 1
-    lowkey nItems = kidCount(p, root)
+    collectFns(c, p, root)
+    lowkey n = kidCount(p, root)
     lowkey i = 0
-    vibin i < nItems {
+    vibin i < n && lcOk(c) {
         lowkey it = kidAt(p, root, i)
         lowkey h = firstWord(lab(p, it))
         fr str.slaps(h, "pull") {
             // pull is a no-op import — ignored.
-        } naw fr str.slaps(lab(p, it), "func hush main") && mainIsSimple(p, it) {
-            mainBlock = findKid(p, it, "block")
+        } naw fr str.slaps(h, "func") {
+            lowerFunc(c, p, it)
         } naw {
             lcFail(c)
         }
         i = i + 1
     }
-    fr mainBlock >= 0 && lcOk(c) {
-        lowerBlock(c, p, mainBlock)
-        termRet(c)
-    } naw {
-        lcFail(c)
-    }
     fr !lcOk(c) {
         bet UNSUPPORTED
     }
-    bet assembleMir(c)
+    bet assembleModule(c)
 }
 
 // ===========================================================================
