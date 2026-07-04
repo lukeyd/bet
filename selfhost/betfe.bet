@@ -3833,14 +3833,31 @@ finna lowerStashNew(c: LowerCtx, p: P, methodIdx: int) -> (str, str) {
         lcFail(c)
         bet "0i64", "i64"
     }
+    // The only supported arg is the `in: <crib>` allocator-context override (SP0.1), which scopes
+    // bet_map_new between bet_ctx_push(crib) / bet_ctx_pop().
     lowkey argsW = findKid(p, methodIdx, "args")
+    lowkey cribOp = ""
+    lowkey hasIn = cap
     fr argsW >= 0 && kidCount(p, argsW) > 0 {
-        lcFail(c)
-        bet "0i64", "i64"
+        lowkey a0 = kidAt(p, argsW, 0)
+        fr kidCount(p, argsW) == 1 && str.slaps(afterFirst(lab(p, a0)), "in") {
+            lowkey co, cty = lowerExpr(c, p, kidAt(p, a0, 0), "")
+            cribOp = co
+            hasIn = nocap
+        } naw {
+            lcFail(c)
+            bet "0i64", "i64"
+        }
     }
     lowkey k = mapTypeNode(c, p, kidAt(p, targsW, 0))
     lowkey v = mapTypeNode(c, p, kidAt(p, targsW, 1))
     lowkey mapTy = mapTyStr(k, v)
+    fr hasIn {
+        getExtern(c, "extern \"C\" fn bet_ctx_push(crib void) -> void")
+        lowkey pushArgs = vec.new[str]()
+        pushArgs.stack(cribOp)
+        lowkey pr = emitExternCall(c, "void", "bet_ctx_push", pushArgs)
+    }
     lowkey vsize = newLocal(c, "u64")
     lowkey sb = sbNew()
     sb.add("size_of[")
@@ -3854,6 +3871,11 @@ finna lowerStashNew(c: LowerCtx, p: P, methodIdx: int) -> (str, str) {
     lowkey args = vec.new[str]()
     args.stack(reg(vsize))
     lowkey tmp = emitExternCall(c, mapTy, "bet_map_new", args)
+    fr hasIn {
+        getExtern(c, "extern \"C\" fn bet_ctx_pop() -> void")
+        lowkey popArgs = vec.new[str]()
+        lowkey pr2 = emitExternCall(c, "void", "bet_ctx_pop", popArgs)
+    }
     bet reg(tmp), mapTy
 }
 
