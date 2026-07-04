@@ -437,10 +437,17 @@ size = 13
 # (crib/tag/ref types, crib decls printed after externs, cop/holla/evict/trust/mem.scratch, ref
 # auto-deref in field/vibe). Merge conflicts were all append-only spine unions (LowerCtx fields +
 # dispatch branches in mapTypeNode); 0 mismatches held throughout. Combined set also unblocked
-# 11-reference/mini-compiler. 53/59 byte-identical. Remaining 6: yeet-sheesh (sheesh unlowered in
-# the Rust frontend too — permanent), squadops/stash-in-crib (wave 2), doom-thinker/mir-emitter
-# (reference), slide-spawn (concurrency).
-status = "doing"
+# 11-reference/mini-compiler. 53/59 byte-identical. Then wave 2: C4.20 stash.new(in: crib) allocator
+# override (bet_ctx_push/pop around bet_map_new) -> stash-in-crib (54/59). C4.21-23 (2nd FAN-OUT, 3
+# worktree agents off the 54/59 tip, merged serially): vec.append/vec.str StrBuilder primitives ->
+# mir-emitter; `slide` (spawn-a-task: @fn -> cast.bitcast rawptr -> bet_slide) -> slide-spawn;
+# indirect call through a fn-ptr struct field (recv.deref.field(i) call_indirect) -> doom-thinker.
+# DONE at the 57/59 CEILING: the only 2 remaining sentinels (yeet-sheesh, squadops) ERROR on the
+# reference `bet build --emit mir` itself (sheesh unlowered; vibeCheck unknown — both interp-only
+# corpus programs), so betfe lowers 100% of what the Rust frontend can lower. 0 false-supported,
+# 0 mismatches held across all 23 increments. C5 (.mir printer) folded in throughout — betfe emits
+# text directly, matching midir/src/text.rs byte-for-byte.
+status = "done"
 
 [[task]]
 slug = "selfhost-emit"
@@ -454,9 +461,12 @@ size = 3
 # the parser now tracks local types (cur_locals) + the assignment destination (dest_ty) and picks
 # the same-named extern whose params match the args and whose return matches the destination
 # (needed for `bet_vec_new`, whose overloads differ ONLY in return type). Regression test:
-# midir/tests/midir.rs::overloaded_externs_round_trip. C5 itself (the bet-side .mir printer) is
-# still TODO.
-status = "todo"
+# midir/tests/midir.rs::overloaded_externs_round_trip. C5 DONE — folded into C4: because betfe emits
+# .mir TEXT directly (not an in-memory midir Module), the printer IS the lowering. Every op/type/
+# extern/struct/sum/crib line betfe emits is written to match midir/src/text.rs byte-for-byte, proven
+# by the 57/59 byte-identical corpus (the full text.rs surface exercised: structs, sums, cribs,
+# fn-ptrs, slices, tuples, all rvalues/terminators/projections).
+status = "done"
 
 [[task]]
 slug = "selfhost-fixpoint"
