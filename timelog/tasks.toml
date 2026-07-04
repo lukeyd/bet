@@ -371,14 +371,16 @@ name = "C4: port lower.rs -> bet (folded typecheck + monomorphization + midir co
 size = 13
 # DOING. Grown incrementally in betfe.bet; since betfe emits .mir TEXT, C4 (lower) + C5 (print)
 # merge: walk the AST label-tree and append text matching lower.rs + midir/text.rs EXACTLY (same
-# eager bet_print extern, same SSA temp numbering, same op sequence). C4.1 landed: a print-only
-# `main` (spill.it/spill.f of str+int literals) — the full architecture (LowerCtx with ordered
-# externs + local-type/temp counter + bb0 stmts, emit_print/emit_print_num, split_format, unquote,
-# label-tree accessors). `betfe --emit mir` is byte-identical to `bet build --emit mir` for 3/59
-# corpus programs (hello, comments, spill-format); the other 56 emit the `%%UNSUPPORTED%%` sentinel
-# and are LOGGED, not asserted, by the new `cargo xtask selfhost` C4 gate (mir_parity) — so the
-# subset grows without silent gaps. Next: locals+arithmetic (lowkey/int exprs), then bool/float
-# printing (needs multi-block for bool), then control flow, the value model, intrinsics, generics.
+# eager bet_print extern, same SSA temp numbering, same op sequence). C4.1 landed the architecture
+# (print-only main). C4.2 added the scalar value model for a main-only function: lowkey locals +
+# name/const resolution, the arithmetic/bitwise/shift/comparison binops (add.trap/wrap, .na, byte-
+# exact temp numbering), unary (neg/not/bitnot), casts (zext/sext/trunc/itof/ftoi/fresize), facts
+# (compile-time-inlined literals + unary-neg), single-target = and compound-assign, and int(signed/
+# unsigned coerce)/str/float printing. `betfe --emit mir` is byte-identical to `bet build --emit mir`
+# for 9/59 corpus programs (3 basics + 02-values arithmetic/casts/compound-assign/lowkey-facts/
+# numeric-tower + 09-bit-math/bit-ops); the rest emit the `%%UNSUPPORTED%%` sentinel (logged by the
+# selfhost C4 gate, not asserted). Deferred: user functions (multi-fn + params + calls + value bet),
+# control flow + short-circuit + bool print (need multi-block CFG), structs/sums/collections, generics.
 status = "doing"
 
 [[task]]

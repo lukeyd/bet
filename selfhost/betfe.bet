@@ -1907,7 +1907,13 @@ drip LowerCtx {
     externs: vec[str],
     localTypes: vec[str],
     stmts: vec[str],
-    ok: vec[int]
+    ok: vec[int],
+    done: vec[int],
+    bindNames: vec[str],
+    bindIds: vec[int],
+    constNames: vec[str],
+    constVals: vec[str],
+    constTys: vec[str]
 }
 
 finna lcNew() -> LowerCtx {
@@ -1915,7 +1921,167 @@ finna lcNew() -> LowerCtx {
     ex.stack("extern \"C\" fn bet_print(rawptr, u64) -> void")
     lowkey okc = vec.new[int]()
     okc.stack(1)
-    bet LowerCtx{ externs: ex, localTypes: vec.new[str](), stmts: vec.new[str](), ok: okc }
+    lowkey donec = vec.new[int]()
+    donec.stack(0)
+    bet LowerCtx{ externs: ex, localTypes: vec.new[str](), stmts: vec.new[str](), ok: okc, done: donec, bindNames: vec.new[str](), bindIds: vec.new[int](), constNames: vec.new[str](), constVals: vec.new[str](), constTys: vec.new[str]() }
+}
+
+finna lcDone(c: LowerCtx) -> bool {
+    bet c.done[0] == 1
+}
+
+finna lcSetDone(c: LowerCtx) {
+    c.done.pop()
+    c.done.stack(1)
+}
+
+// --- current-function name/const bindings ---
+finna bindLocal(c: LowerCtx, name: str, id: int) {
+    c.bindNames.stack(name)
+    c.bindIds.stack(id)
+}
+
+// The local id bound to `name` (latest binding wins), or -1.
+finna lookupLocal(c: LowerCtx, name: str) -> int {
+    lowkey i = (c.bindNames.gang() as int) - 1
+    vibin i >= 0 {
+        fr str.slaps(c.bindNames[i], name) {
+            bet c.bindIds[i]
+        }
+        i = i - 1
+    }
+    bet 0 - 1
+}
+
+finna addConst(c: LowerCtx, name: str, val: str, ty: str) {
+    c.constNames.stack(name)
+    c.constVals.stack(val)
+    c.constTys.stack(ty)
+}
+
+// Index of the const named `name`, or -1.
+finna lookupConst(c: LowerCtx, name: str) -> int {
+    lowkey i = (c.constNames.gang() as int) - 1
+    vibin i >= 0 {
+        fr str.slaps(c.constNames[i], name) {
+            bet i
+        }
+        i = i - 1
+    }
+    bet 0 - 1
+}
+
+// --- scalar type helpers ---
+finna isSignedIntTy(t: str) -> bool {
+    bet str.slaps(t, "i8") || str.slaps(t, "i16") || str.slaps(t, "i32") || str.slaps(t, "i64")
+}
+
+finna isUnsignedIntTy(t: str) -> bool {
+    bet str.slaps(t, "u8") || str.slaps(t, "u16") || str.slaps(t, "u32") || str.slaps(t, "u64")
+}
+
+finna isIntTy(t: str) -> bool {
+    bet isSignedIntTy(t) || isUnsignedIntTy(t)
+}
+
+finna isFloatTy(t: str) -> bool {
+    bet str.slaps(t, "f32") || str.slaps(t, "f64")
+}
+
+finna intBits(t: str) -> int {
+    fr str.slaps(t, "i8") || str.slaps(t, "u8") { bet 8 }
+    fr str.slaps(t, "i16") || str.slaps(t, "u16") { bet 16 }
+    fr str.slaps(t, "i32") || str.slaps(t, "u32") { bet 32 }
+    bet 64
+}
+
+finna intHintOrDefault(hint: str) -> str {
+    fr isIntTy(hint) { bet hint }
+    bet "i64"
+}
+
+finna floatHintOrDefault(hint: str) -> str {
+    fr isFloatTy(hint) { bet hint }
+    bet "f64"
+}
+
+finna isComparisonTag(op: str) -> bool {
+    bet str.slaps(op, "eq") || str.slaps(op, "ne") || str.slaps(op, "lt") || str.slaps(op, "le") || str.slaps(op, "gt") || str.slaps(op, "ge")
+}
+
+finna isArithTag(op: str) -> bool {
+    bet str.slaps(op, "add") || str.slaps(op, "sub") || str.slaps(op, "mul") || str.slaps(op, "div") || str.slaps(op, "rem")
+}
+
+// The arithmetic mode suffix for `op` on operands of type `ty` (mirror lower.rs arith_mode).
+finna arithMode(ty: str, op: str) -> str {
+    fr !isArithTag(op) { bet "na" }
+    fr isSignedIntTy(ty) { bet "trap" }
+    fr isUnsignedIntTy(ty) { bet "wrap" }
+    bet "na"
+}
+
+// The cast kind for src -> dst (mirror lower.rs cast_kind).
+finna castKind(src: str, dst: str) -> str {
+    fr isIntTy(src) && isIntTy(dst) {
+        lowkey sw = intBits(src)
+        lowkey dw = intBits(dst)
+        fr dw > sw {
+            fr isSignedIntTy(src) { bet "sext" }
+            bet "zext"
+        }
+        fr dw < sw { bet "trunc" }
+        bet "bitcast"
+    }
+    fr isIntTy(src) && isFloatTy(dst) { bet "itof" }
+    fr isFloatTy(src) && isIntTy(dst) { bet "ftoi" }
+    fr isFloatTy(src) && isFloatTy(dst) { bet "fresize" }
+    bet "bitcast"
+}
+
+// The compound-assign IR op (addeq -> add, ...).
+finna compoundBinop(op: str) -> str {
+    fr str.slaps(op, "addeq") { bet "add" }
+    fr str.slaps(op, "subeq") { bet "sub" }
+    fr str.slaps(op, "muleq") { bet "mul" }
+    fr str.slaps(op, "diveq") { bet "div" }
+    fr str.slaps(op, "remeq") { bet "rem" }
+    fr str.slaps(op, "andeq") { bet "bitand" }
+    fr str.slaps(op, "oreq") { bet "bitor" }
+    fr str.slaps(op, "xoreq") { bet "bitxor" }
+    fr str.slaps(op, "shleq") { bet "shl" }
+    bet "shr"
+}
+
+finna hasSpace(s: str) -> bool {
+    lowkey n = str.len(s)
+    lowkey i = 0
+    vibin i < n {
+        fr str.at(s, i) == 32 { bet nocap }
+        i = i + 1
+    }
+    bet cap
+}
+
+// Map a named-scalar type to its .mir spelling ("" if not a scalar C4.2 handles).
+finna mapScalar(nm: str) -> str {
+    fr str.slaps(nm, "int") { bet "i64" }
+    fr str.slaps(nm, "uint") { bet "u64" }
+    fr str.slaps(nm, "float") { bet "f64" }
+    fr isIntTy(nm) || isFloatTy(nm) { bet nm }
+    fr str.slaps(nm, "bool") || str.slaps(nm, "str") || str.slaps(nm, "rawptr") { bet nm }
+    fr str.slaps(nm, "void") || str.slaps(nm, "nada") { bet "void" }
+    bet ""
+}
+
+// The .mir type string for a type node (scalar named types only in C4.2).
+finna mapTypeNode(c: LowerCtx, p: P, tyNode: int) -> str {
+    fr str.slaps(firstWord(lab(p, tyNode)), "named") {
+        lowkey m = mapScalar(afterFirst(lab(p, tyNode)))
+        fr !isEmpty(m) { bet m }
+    }
+    lcFail(c)
+    bet "i64"
 }
 
 finna lcOk(c: LowerCtx) -> bool {
@@ -2078,22 +2244,21 @@ finna splitFormat(fmt: str) -> vec[Seg] {
     bet segs
 }
 
-// emit_print: str_ptr / str_len / call_extern @bet_print of a literal string (raw bytes).
-finna emitPrint(c: LowerCtx, raw: str) {
-    lowkey q = quote(raw)
+// emit_print_operand: str_ptr / str_len / call_extern @bet_print of a str operand `opStr`.
+finna emitPrintOperand(c: LowerCtx, opStr: str) {
     lowkey ptr = newLocal(c, "rawptr")
     lowkey len = newLocal(c, "u64")
     lowkey res = newLocal(c, "void")
     lowkey s1 = sbNew()
     s1.add(reg(ptr))
     s1.add(" = str_ptr(")
-    s1.add(q)
+    s1.add(opStr)
     s1.add(")")
     emitStmt(c, s1.finish())
     lowkey s2 = sbNew()
     s2.add(reg(len))
     s2.add(" = str_len(")
-    s2.add(q)
+    s2.add(opStr)
     s2.add(")")
     emitStmt(c, s2.finish())
     lowkey s3 = sbNew()
@@ -2104,6 +2269,224 @@ finna emitPrint(c: LowerCtx, raw: str) {
     s3.add(reg(len))
     s3.add(")")
     emitStmt(c, s3.finish())
+}
+
+// emit_print of a literal string (raw bytes) — quoted, then printed as an operand.
+finna emitPrint(c: LowerCtx, raw: str) {
+    emitPrintOperand(c, quote(raw))
+}
+
+// `%dst = <line>` — emit an assignment statement.
+finna emitAssign(c: LowerCtx, dst: int, rhs: str) {
+    lowkey sb = sbNew()
+    sb.add(reg(dst))
+    sb.add(" = ")
+    sb.add(rhs)
+    emitStmt(c, sb.finish())
+}
+
+// Widen an int operand to the print word type (mirror coerce_int): no-op if already `to`.
+finna coerceInt(c: LowerCtx, opStr: str, from: str, to: str) -> str {
+    fr str.slaps(from, to) { bet opStr }
+    lowkey t = newLocal(c, to)
+    lowkey sb = sbNew()
+    sb.add("cast.")
+    sb.add(castKind(from, to))
+    sb.add("(")
+    sb.add(opStr)
+    sb.add(" as ")
+    sb.add(to)
+    sb.add(")")
+    emitAssign(c, t, sb.finish())
+    bet reg(t)
+}
+
+// Lower an expression to (operand, type) strings (mirror lower_expr). Emits temps as needed.
+finna lowerExpr(c: LowerCtx, p: P, idx: int, hint: str) -> (str, str) {
+    lowkey h = firstWord(lab(p, idx))
+    lowkey payload = afterFirst(lab(p, idx))
+    fr str.slaps(h, "int") {
+        lowkey ty = intHintOrDefault(hint)
+        bet cat2(payload, ty), ty
+    }
+    fr str.slaps(h, "float") {
+        lowkey ty = floatHintOrDefault(hint)
+        bet cat2(payload, ty), ty
+    }
+    fr str.slaps(h, "bool") {
+        bet payload, "bool"
+    }
+    fr str.slaps(h, "str") {
+        bet payload, "str"
+    }
+    fr str.slaps(h, "byte") {
+        bet cat2(payload, "u8"), "u8"
+    }
+    fr str.slaps(h, "name") {
+        lowkey no, nt = lowerName(c, p, idx)
+        bet no, nt
+    }
+    fr str.slaps(h, "unary") {
+        lowkey uo, ut = lowerUnary(c, p, idx, hint)
+        bet uo, ut
+    }
+    fr str.slaps(h, "binary") {
+        lowkey bo, bt = lowerBinary(c, p, idx, hint)
+        bet bo, bt
+    }
+    fr str.slaps(h, "cast") {
+        lowkey co, ct = lowerCast(c, p, idx)
+        bet co, ct
+    }
+    lcFail(c)
+    bet "0i64", "i64"
+}
+
+// Lower a bare name: a local (Copy) or an inlined const value (mirror lower_name).
+finna lowerName(c: LowerCtx, p: P, idx: int) -> (str, str) {
+    // A name with generics (a `typeargs` child) is not lowered in this subset.
+    fr kidCount(p, idx) > 0 {
+        lcFail(c)
+        bet "0i64", "i64"
+    }
+    lowkey nm = afterFirst(lab(p, idx))
+    lowkey lid = lookupLocal(c, nm)
+    fr lid >= 0 {
+        bet reg(lid), c.localTypes[lid]
+    }
+    lowkey ci = lookupConst(c, nm)
+    fr ci >= 0 {
+        bet c.constVals[ci], c.constTys[ci]
+    }
+    lcFail(c)
+    bet "0i64", "i64"
+}
+
+finna lowerUnary(c: LowerCtx, p: P, idx: int, hint: str) -> (str, str) {
+    lowkey opTag = afterFirst(lab(p, idx))
+    lowkey io, ity = lowerExpr(c, p, kidAt(p, idx, 0), hint)
+    lowkey resTy = ity
+    fr str.slaps(opTag, "not") { resTy = "bool" }
+    lowkey t = newLocal(c, resTy)
+    lowkey sb = sbNew()
+    sb.add(opTag)
+    sb.add("(")
+    sb.add(io)
+    sb.add(")")
+    emitAssign(c, t, sb.finish())
+    bet reg(t), resTy
+}
+
+finna lowerBinary(c: LowerCtx, p: P, idx: int, hint: str) -> (str, str) {
+    lowkey opTag = afterFirst(lab(p, idx))
+    // Short-circuit `and`/`or` lower to control flow — not in this subset.
+    fr str.slaps(opTag, "and") || str.slaps(opTag, "or") {
+        lcFail(c)
+        bet "0i64", "i64"
+    }
+    lowkey isCmp = isComparisonTag(opTag)
+    lowkey lhint = ""
+    fr !isCmp { lhint = hint }
+    lowkey lo, lty = lowerExpr(c, p, kidAt(p, idx, 0), lhint)
+    lowkey ro, rty = lowerExpr(c, p, kidAt(p, idx, 1), lty)
+    lowkey mode = arithMode(lty, opTag)
+    lowkey resTy = lty
+    fr isCmp { resTy = "bool" }
+    lowkey t = newLocal(c, resTy)
+    lowkey sb = sbNew()
+    sb.add(opTag)
+    sb.add(".")
+    sb.add(mode)
+    sb.add("(")
+    sb.add(lo)
+    sb.add(", ")
+    sb.add(ro)
+    sb.add(")")
+    emitAssign(c, t, sb.finish())
+    bet reg(t), resTy
+}
+
+finna lowerCast(c: LowerCtx, p: P, idx: int) -> (str, str) {
+    lowkey io, ity = lowerExpr(c, p, kidAt(p, idx, 0), "")
+    lowkey dst = mapTypeNode(c, p, kidAt(p, idx, 1))
+    lowkey kind = castKind(ity, dst)
+    lowkey t = newLocal(c, dst)
+    lowkey sb = sbNew()
+    sb.add("cast.")
+    sb.add(kind)
+    sb.add("(")
+    sb.add(io)
+    sb.add(" as ")
+    sb.add(dst)
+    sb.add(")")
+    emitAssign(c, t, sb.finish())
+    bet reg(t), dst
+}
+
+// A restricted constant evaluator for `facts` (mirror const_literal): literals + unary neg.
+finna constLiteral(c: LowerCtx, p: P, idx: int, hint: str) -> (str, str) {
+    lowkey h = firstWord(lab(p, idx))
+    lowkey payload = afterFirst(lab(p, idx))
+    fr str.slaps(h, "int") {
+        lowkey ty = intHintOrDefault(hint)
+        bet cat2(payload, ty), ty
+    }
+    fr str.slaps(h, "float") {
+        lowkey ty = floatHintOrDefault(hint)
+        bet cat2(payload, ty), ty
+    }
+    fr str.slaps(h, "bool") {
+        bet payload, "bool"
+    }
+    fr str.slaps(h, "str") {
+        bet payload, "str"
+    }
+    fr str.slaps(h, "byte") {
+        bet cat2(payload, "u8"), "u8"
+    }
+    fr str.slaps(h, "unary") && str.slaps(payload, "neg") {
+        lowkey inner = kidAt(p, idx, 0)
+        lowkey ih = firstWord(lab(p, inner))
+        fr str.slaps(ih, "int") {
+            lowkey ty = intHintOrDefault(hint)
+            bet cat3("-", afterFirst(lab(p, inner)), ty), ty
+        }
+        fr str.slaps(ih, "float") {
+            lowkey ty = floatHintOrDefault(hint)
+            bet cat3("-", afterFirst(lab(p, inner)), ty), ty
+        }
+    }
+    lcFail(c)
+    bet "0i64", "i64"
+}
+
+finna cat3(a: str, b: str, cc: str) -> str {
+    bet cat2(cat2(a, b), cc)
+}
+
+// Type-directed value print (mirror lower_print_value) for the scalar subset.
+finna lowerPrintValue(c: LowerCtx, opStr: str, ty: str) {
+    fr isSignedIntTy(ty) {
+        lowkey v = coerceInt(c, opStr, ty, "i64")
+        emitPrintNum(c, "extern \"C\" fn bet_print_i64(i64) -> void", "bet_print_i64", v)
+    } naw fr isUnsignedIntTy(ty) {
+        lowkey v = coerceInt(c, opStr, ty, "u64")
+        emitPrintNum(c, "extern \"C\" fn bet_print_u64(u64) -> void", "bet_print_u64", v)
+    } naw fr str.slaps(ty, "f64") {
+        emitPrintNum(c, "extern \"C\" fn bet_print_f64(f64) -> void", "bet_print_f64", opStr)
+    } naw fr str.slaps(ty, "f32") {
+        lowkey t = newLocal(c, "f64")
+        lowkey sb = sbNew()
+        sb.add("cast.fresize(")
+        sb.add(opStr)
+        sb.add(" as f64)")
+        emitAssign(c, t, sb.finish())
+        emitPrintNum(c, "extern \"C\" fn bet_print_f64(f64) -> void", "bet_print_f64", reg(t))
+    } naw fr str.slaps(ty, "str") {
+        emitPrintOperand(c, opStr)
+    } naw {
+        lcFail(c)
+    }
 }
 
 // emit_print_num: call_extern @name(valStr) after ensuring its extern decl (mirror emit_print_num).
@@ -2120,15 +2503,13 @@ finna emitPrintNum(c: LowerCtx, externLine: str, name: str, valStr: str) {
     emitStmt(c, sb.finish())
 }
 
-// Lower a single printed argument expression (the SUPPORTED subset: str / int literals).
+// Lower a single printed argument expression (mirror lower_print_expr).
 finna lowerPrintExpr(c: LowerCtx, p: P, valIdx: int) {
-    lowkey h = firstWord(lab(p, valIdx))
-    fr str.slaps(h, "str") {
-        emitPrint(c, unquote(afterFirst(lab(p, valIdx))))
-    } naw fr str.slaps(h, "int") {
-        emitPrintNum(c, "extern \"C\" fn bet_print_i64(i64) -> void", "bet_print_i64", cat2(afterFirst(lab(p, valIdx)), "i64"))
+    fr str.slaps(firstWord(lab(p, valIdx)), "ghosted") {
+        emitPrint(c, "ghosted")
     } naw {
-        lcFail(c)
+        lowkey op, ty = lowerExpr(c, p, valIdx, "")
+        lowerPrintValue(c, op, ty)
     }
 }
 
@@ -2176,35 +2557,131 @@ finna lowerSpill(c: LowerCtx, p: P, methodIdx: int) {
     }
 }
 
-// Lower one statement (SUPPORTED subset: an expr-stmt that is a spill.it/spill.f call).
-finna lowerStmt(c: LowerCtx, p: P, stmtIdx: int) {
-    fr !str.slaps(lab(p, stmtIdx), "expr-stmt") {
-        lcFail(c)
-    } naw {
-        lowkey e = kidAt(p, stmtIdx, 0)
-        fr !str.slaps(firstWord(lab(p, e)), "method") {
-            lcFail(c)
-        } naw {
-            lowkey recv = findKid(p, e, "receiver")
-            lowkey isSpill = cap
-            fr recv >= 0 && kidCount(p, recv) > 0 {
-                fr str.slaps(lab(p, kidAt(p, recv, 0)), "name spill") {
-                    isSpill = nocap
-                }
-            }
-            fr isSpill {
-                lowerSpill(c, p, e)
-            } naw {
-                lcFail(c)
+// Lower an expr-stmt (SUPPORTED: a spill.it/spill.f call).
+finna lowerExprStmt(c: LowerCtx, p: P, stmtIdx: int) {
+    lowkey e = kidAt(p, stmtIdx, 0)
+    lowkey isSpill = cap
+    fr str.slaps(firstWord(lab(p, e)), "method") {
+        lowkey recv = findKid(p, e, "receiver")
+        fr recv >= 0 && kidCount(p, recv) > 0 {
+            fr str.slaps(lab(p, kidAt(p, recv, 0)), "name spill") {
+                isSpill = nocap
             }
         }
+    }
+    fr isSpill {
+        lowerSpill(c, p, e)
+    } naw {
+        lcFail(c)
+    }
+}
+
+// `lowkey a = expr` — single target (mirror lower_var).
+finna lowerVar(c: LowerCtx, p: P, stmtIdx: int) {
+    lowkey targets = afterFirst(afterFirst(lab(p, stmtIdx)))
+    fr hasSpace(targets) {
+        lcFail(c)
+    } naw {
+        lowkey tw = findKid(p, stmtIdx, "type")
+        lowkey declTy = ""
+        fr tw >= 0 {
+            declTy = mapTypeNode(c, p, kidAt(p, tw, 0))
+        }
+        lowkey vw = findKid(p, stmtIdx, "values")
+        lowkey op, vty = lowerExpr(c, p, kidAt(p, vw, 0), declTy)
+        lowkey ty = vty
+        fr !isEmpty(declTy) { ty = declTy }
+        lowkey l = newLocal(c, ty)
+        emitAssign(c, l, op)
+        bindLocal(c, targets, l)
+    }
+}
+
+// `facts NAME [: T] = literal` — compile-time-evaluated, inlined at use (mirror eval_const).
+finna lowerConst(c: LowerCtx, p: P, stmtIdx: int) {
+    lowkey nm = afterFirst(afterFirst(lab(p, stmtIdx)))
+    fr hasSpace(nm) {
+        lcFail(c)
+    } naw {
+        lowkey tw = findKid(p, stmtIdx, "type")
+        lowkey hintTy = ""
+        fr tw >= 0 {
+            hintTy = mapTypeNode(c, p, kidAt(p, tw, 0))
+        }
+        lowkey vw = findKid(p, stmtIdx, "value")
+        lowkey op, ty = constLiteral(c, p, kidAt(p, vw, 0), hintTy)
+        addConst(c, nm, op, ty)
+    }
+}
+
+// `target op= expr` / `target = expr` for a single local target (mirror lower_assign).
+finna lowerAssign(c: LowerCtx, p: P, stmtIdx: int) {
+    lowkey opTag = afterFirst(lab(p, stmtIdx))
+    lowkey tw = kidAt(p, stmtIdx, 0)
+    lowkey vw = kidAt(p, stmtIdx, 1)
+    fr kidCount(p, tw) != 1 || kidCount(p, vw) != 1 {
+        lcFail(c)
+    } naw {
+        lowkey te = kidAt(p, tw, 0)
+        lowkey lid = 0 - 1
+        fr str.slaps(firstWord(lab(p, te)), "name") && kidCount(p, te) == 0 {
+            lid = lookupLocal(c, afterFirst(lab(p, te)))
+        }
+        fr lid < 0 {
+            lcFail(c)
+        } naw fr str.slaps(opTag, "eq") {
+            lowkey val, vty = lowerExpr(c, p, kidAt(p, vw, 0), c.localTypes[lid])
+            emitAssign(c, lid, val)
+        } naw {
+            lowkey irop = compoundBinop(opTag)
+            lowkey pty = c.localTypes[lid]
+            lowkey rhs, rty = lowerExpr(c, p, kidAt(p, vw, 0), pty)
+            lowkey mode = arithMode(pty, irop)
+            lowkey sb = sbNew()
+            sb.add(irop)
+            sb.add(".")
+            sb.add(mode)
+            sb.add("(")
+            sb.add(reg(lid))
+            sb.add(", ")
+            sb.add(rhs)
+            sb.add(")")
+            emitAssign(c, lid, sb.finish())
+        }
+    }
+}
+
+// `bet` — main is void, so only the zero-value form lowers here; it ends the block.
+finna lowerBet(c: LowerCtx, p: P, stmtIdx: int) {
+    fr kidCount(p, stmtIdx) == 0 {
+        lcSetDone(c)
+    } naw {
+        lcFail(c)
+    }
+}
+
+// Lower one statement (mirror lower_stmt) — the scalar subset.
+finna lowerStmt(c: LowerCtx, p: P, stmtIdx: int) {
+    lowkey h = firstWord(lab(p, stmtIdx))
+    fr str.slaps(h, "expr-stmt") {
+        lowerExprStmt(c, p, stmtIdx)
+    } naw fr str.slaps(h, "var") {
+        lowerVar(c, p, stmtIdx)
+    } naw fr str.slaps(h, "const") {
+        lowerConst(c, p, stmtIdx)
+    } naw fr str.slaps(h, "assign") {
+        lowerAssign(c, p, stmtIdx)
+    } naw fr str.slaps(h, "bet") {
+        lowerBet(c, p, stmtIdx)
+    } naw {
+        lcFail(c)
     }
 }
 
 finna lowerBlock(c: LowerCtx, p: P, blockIdx: int) {
     lowkey n = kidCount(p, blockIdx)
     lowkey i = 0
-    vibin i < n && lcOk(c) {
+    vibin i < n && lcOk(c) && !lcDone(c) {
         lowerStmt(c, p, kidAt(p, blockIdx, i))
         i = i + 1
     }
