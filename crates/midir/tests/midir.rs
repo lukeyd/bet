@@ -625,3 +625,31 @@ fn detects_global_type_mismatch() {
         "{e:?}"
     );
 }
+
+#[test]
+fn mangled_names_round_trip() {
+    // Monomorphization mangles instance names with `$` (e.g. `unbox$str`). The .mir text lexer must
+    // accept `$` in identifiers so a `.mir` containing generic instances re-parses through the
+    // backend. Regression for the self-hosted-frontend text round-trip (`betfe --emit mir | bet
+    // build -`), where user-generic programs would otherwise fail with `lex error: unexpected '$'`.
+    let src = "\
+fn unbox$str(%0: str) -> str {
+  bb0:
+    return %0
+}
+fn main() -> void {
+  let %0: str
+  let %1: str
+  bb0:
+    %0 = \"hi\"
+    %1 = call @unbox$str(%0)
+    return
+}
+";
+    let m = parse(src).expect("mangled-name fixture should parse");
+    let m2 = parse(&print(&m)).expect("reprint should re-parse");
+    assert!(
+        print(&m2).contains("unbox$str"),
+        "mangled name must survive parse -> print -> parse"
+    );
+}

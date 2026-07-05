@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# betself — the `bet` toolchain driven by the SELF-HOSTED frontend.
+#
+#   .bet ──[betfe: the bet-language frontend]──▶ .mir ──[bet: Rust backend+link]──▶ binary
+#
+# Drop-in for `bet build` / `bet run` on the self-host subset (everything betfe can lower,
+# i.e. the 57/59 corpus + betfe itself). Programs betfe can't lower yet emit a clear error
+# instead of a wrong binary.
+#
+# Requires two pre-built artifacts (see `betself --setup` for the one-time build):
+#   $BET   — the Rust `bet` (backend+linker), built with the `llvm` feature   [default: target/release/bet]
+#   $BETFE — the compiled self-hosted frontend                                 [default: ./betfe]
+set -euo pipefail
+root="$(cd "$(dirname "$0")/.." && pwd)"
+BET="${BET:-$root/target/release/bet}"
+[ -x "$BET" ] || BET="$root/target/debug/bet"
+BETFE="${BETFE:-$root/betfe}"
+
+usage() { echo "usage: betself {build|run} <file.bet> [-o out]   |   betself --setup"; }
+
+if [ "${1:-}" = "--setup" ]; then
+  : "${LLVM_SYS_180_PREFIX:?set LLVM_SYS_180_PREFIX (e.g. /opt/homebrew/opt/llvm@18)}"
+  echo ">> building the Rust backend (bet)…"
+  ( cd "$root" && cargo build --release -p driver -p rt-stub --features llvm )
+  echo ">> building the self-hosted frontend (betfe)…"
+  "$root/target/release/bet" build "$root/selfhost/betfe.bet" -o "$root/betfe"
+  echo ">> done: BET=$root/target/release/bet  BETFE=$root/betfe"
+  exit 0
+fi
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  build|run) ;;
+  *) usage; exit 2;;
+esac
+[ -x "$BET" ]   || { echo "betself: missing bet backend ($BET). Run: betself --setup" >&2; exit 1; }
+[ -x "$BETFE" ] || { echo "betself: missing frontend ($BETFE). Run: betself --setup" >&2; exit 1; }
+
+src=""; out=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="${2:?}"; shift 2;;
+    *)  src="$1"; shift;;
+  esac
+done
+[ -n "$src" ] || { usage; exit 2; }
+
+mir="$(mktemp -t betself.XXXXXX).mir"
+trap 'rm -f "$mir"' EXIT
+# --- FRONTEND: the self-hosted bet frontend does lex → parse → lower → emit .mir ---
+"$BETFE" --emit mir "$src" > "$mir"
+if [ "$(head -c 15 "$mir")" = "%%UNSUPPORTED%%" ]; then
+  echo "betself: the self-hosted frontend can't lower '$src' yet (outside the self-host subset)." >&2
+  exit 1
+fi
+# --- BACKEND: the Rust bet compiles the .mir to a native binary ---
+if [ "$cmd" = "build" ]; then
+  "$BET" build "$mir" -o "${out:-${src%.bet}}"
+else
+  bin="$(mktemp -t betself.run.XXXXXX)"; trap 'rm -f "$mir" "$bin"' EXIT
+  "$BET" build "$mir" -o "$bin"
+  "$bin"
+fi

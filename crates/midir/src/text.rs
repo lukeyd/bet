@@ -626,8 +626,12 @@ fn lex(src: &str) -> Result<Vec<Tok>, ParseError> {
             }
             _ if c.is_ascii_digit() => toks.push(lex_num(&bytes, &mut i)),
             _ if c.is_alphabetic() || c == '_' => {
+                // `$` joins monomorphization-mangled names (e.g. `unbox$str`) into one identifier
+                // so the .mir text round-trips (frontend emits `$`, the backend must read it back).
                 let mut s = String::new();
-                while i < bytes.len() && (bytes[i].is_alphanumeric() || bytes[i] == '_') {
+                while i < bytes.len()
+                    && (bytes[i].is_alphanumeric() || bytes[i] == '_' || bytes[i] == '$')
+                {
                     s.push(bytes[i]);
                     i += 1;
                 }
