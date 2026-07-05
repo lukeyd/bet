@@ -28,6 +28,11 @@
 # The taxonomy tracks the spec + plan-amendment-01 §2 feature set. When a new feature
 # lands, add its key here AND a program that covers it — the lint fails otherwise.
 
+# Helper files pulled by a multi-file program's entry (a top-level manifest key, so it must
+# precede the `[features]` table). They are dependencies, not standalone programs: exempt from
+# the `.expected` pairing and never run on their own.
+aux = ["14-modules/geometry"]
+
 [features]
 all = [
   # 01 basics
@@ -61,6 +66,8 @@ all = [
   "ffi.extern",
   # 13 concurrency
   "concurrency.slide",
+  # 14 modules (multi-file source via `pull`)
+  "modules.pull", "modules.qualified", "modules.visibility",
 ]
 
 # --- 01 basics --------------------------------------------------------------
@@ -444,5 +451,15 @@ compiled = "pass"
 [[program]]
 path = "13-concurrency/slide-spawn"
 covers = ["concurrency.slide"]
+interp = "pass"
+compiled = "pass"
+
+# --- 14 modules --------------------------------------------------------------
+# `modules.bet` pulls the sibling `geometry.bet` (an aux helper) and reaches its `flex` exports
+# through the `geometry` namespace — qualified calls, consts, types, and struct literals; its
+# `hush` items stay private. Resolved by `frontend::load` into one program before lowering.
+[[program]]
+path = "14-modules/modules"
+covers = ["modules.pull", "modules.qualified", "modules.visibility"]
 interp = "pass"
 compiled = "pass"

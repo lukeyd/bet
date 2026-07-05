@@ -91,7 +91,13 @@ impl AstDump {
     fn item(&mut self, d: usize, it: &ast::Item) {
         use ast::Item;
         match it {
-            Item::Pull(p) => self.line(d, &format!("pull {}", quote(&p.module))),
+            Item::Pull(p) => {
+                let line = match &p.alias {
+                    Some(a) => format!("pull {} as {a}", quote(&p.module)),
+                    None => format!("pull {}", quote(&p.module)),
+                };
+                self.line(d, &line);
+            }
             Item::Func(f) => {
                 self.line(d, &format!("func {} {}", vis_str(f.vis), f.name));
                 if let Some(r) = &f.receiver {

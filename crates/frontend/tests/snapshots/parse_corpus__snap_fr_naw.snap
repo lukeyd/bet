@@ -7,6 +7,7 @@ Program {
         Pull(
             Pull {
                 module: "spill",
+                alias: None,
                 span: 68..80,
             },
         ),

@@ -145,8 +145,14 @@ impl<'a> Parser<'a> {
         let lo = self.lo();
         self.expect(&Token::Pull)?;
         let module = self.str_lit()?;
+        let alias = if self.eat(&Token::As) {
+            Some(self.ident()?)
+        } else {
+            None
+        };
         Ok(Pull {
             module,
+            alias,
             span: self.span_from(lo),
         })
     }
@@ -467,8 +473,14 @@ impl<'a> Parser<'a> {
                 span: self.span_from(lo),
             });
         }
-        // A named type (`int`, `stash[str, i64]`, `Enemy`) or `rawptr`.
-        let name = self.ident()?;
+        // A named type (`int`, `stash[str, i64]`, `Enemy`) or `rawptr`. A namespace-qualified
+        // type `geometry.Point` is kept as the single dotted name `"geometry.Point"` (the module
+        // resolver splits on the dot); `rawptr` is never qualified.
+        let mut name = self.ident()?;
+        if name != "rawptr" && self.eat(&Token::Dot) {
+            let member = self.ident()?;
+            name = format!("{name}.{member}");
+        }
         let mut ty = if name == "rawptr" {
             Type {
                 kind: TypeKind::RawPtr,
@@ -656,7 +668,13 @@ impl<'a> Parser<'a> {
 
     fn match_arm(&mut self) -> PResult<MatchArm> {
         let lo = self.lo();
-        let variant = self.ident()?;
+        // A variant pattern, possibly namespace-qualified: `geometry.Circle(r)`. The dotted head
+        // is kept as one string; the module resolver splits on the dot.
+        let mut variant = self.ident()?;
+        if self.eat(&Token::Dot) {
+            let member = self.ident()?;
+            variant = format!("{variant}.{member}");
+        }
         let mut bindings = Vec::new();
         if self.eat(&Token::LParen) {
             bindings.push(self.ident()?);
@@ -941,6 +959,22 @@ impl<'a> Parser<'a> {
                                     generics,
                                     args,
                                 },
+                                span: self.span_from(lo),
+                            };
+                        } else if !self.no_struct
+                            && self.check(&Token::LBrace)
+                            && matches!(&e.kind, ExprKind::Name { generics, .. } if generics.is_empty())
+                        {
+                            // A namespace-qualified struct literal: `geometry.Point{ ... }`. The
+                            // base is a bare namespace name; keep the dotted head as one string
+                            // (the module resolver splits on the dot).
+                            let ns = match e.kind {
+                                ExprKind::Name { name, .. } => name,
+                                _ => unreachable!(),
+                            };
+                            let sl = self.struct_lit_body(format!("{ns}.{name}"), generics, lo)?;
+                            e = Expr {
+                                kind: ExprKind::Struct(sl),
                                 span: self.span_from(lo),
                             };
                         } else {

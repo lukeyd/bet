@@ -39,6 +39,36 @@ pub fn lower(prog: &ast::Program) -> Result<Module, String> {
     Ok(cx.m)
 }
 
+/// The built-in stdlib "module" names — the `spill.it` / `math.lap` intrinsic namespaces. These
+/// are compiler intrinsics, not source files: `pull "spill"` is a no-op and a `spill.method(…)`
+/// receiver is dispatched here rather than resolved to a user function. The module loader
+/// (`crate::loader`) consults this so `pull "spill"` is never treated as a file import, and so a
+/// user namespace can't shadow a built-in. This is the single source of truth for the set.
+pub(crate) fn is_builtin_module(name: &str) -> bool {
+    matches!(
+        name,
+        "spill"
+            | "str"
+            | "math"
+            | "mem"
+            | "bytes"
+            | "fmt"
+            | "stash"
+            | "vec"
+            | "yikes"
+            | "fs"
+            | "sys"
+            | "gg"
+            // Stdlib groupings that `pull` names but that aren't dispatched as `module.method`
+            // (squadops ops are collection receiver-methods; time/net are reserved). Listed so the
+            // loader treats `pull "squadops"` as a no-op instead of a self-referential file import.
+            // See language-spec.md §9.2.
+            | "squadops"
+            | "time"
+            | "net"
+    )
+}
+
 /// A resolved `facts` constant: the literal value plus its interned type.
 #[derive(Clone)]
 struct ConstVal {
@@ -2869,21 +2899,7 @@ impl LowerCtx {
     }
 
     fn is_module(&self, name: &str) -> bool {
-        matches!(
-            name,
-            "spill"
-                | "str"
-                | "math"
-                | "mem"
-                | "bytes"
-                | "fmt"
-                | "stash"
-                | "vec"
-                | "yikes"
-                | "fs"
-                | "sys"
-                | "gg"
-        )
+        is_builtin_module(name)
     }
 
     /// Dispatch a method on an `rng` handle (`math.cook`): `roll` (raw 64-bit draw), `frac`

@@ -1,0 +1,12 @@
+// Multi-file program: `pull` a sibling source file and reach its exports through a namespace.
+// Qualified calls (geometry.area), consts (geometry.UNIT), types (geometry.Point) and struct
+// literals (geometry.Point{ .. }) all resolve to the imported module; its `hush` items stay
+// hidden. Runs identically on the interpreter and the compiled backend.
+pull "geometry"
+
+finna main() {
+    spill.it(geometry.area(3, 4))
+    spill.it(geometry.UNIT)
+    lowkey p: geometry.Point = geometry.Point{ x: 2, y: 5 }
+    spill.it(geometry.manhattan(p))
+}

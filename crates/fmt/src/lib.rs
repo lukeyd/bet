@@ -55,6 +55,10 @@ impl Formatter {
             Item::Pull(p) => {
                 self.out.push_str("pull ");
                 self.out.push_str(&escape_str(&p.module));
+                if let Some(alias) = &p.alias {
+                    self.out.push_str(" as ");
+                    self.out.push_str(alias);
+                }
                 self.out.push('\n');
             }
             Item::Func(f) => self.fn_decl(f),

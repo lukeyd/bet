@@ -1,0 +1,20 @@
+// Helper module pulled by modules.bet (an `aux` file — a dependency, not a standalone program).
+// Only its `flex` items cross the import boundary; `scale` is `hush` (private) and stays internal.
+flex facts UNIT: int = 10
+
+flex drip Point {
+    flex x: int
+    flex y: int
+}
+
+flex finna area(w: int, h: int) -> int {
+    bet w * h
+}
+
+flex finna manhattan(p: Point) -> int {
+    bet scale(p.x) + scale(p.y)
+}
+
+finna scale(v: int) -> int {
+    bet v * UNIT
+}

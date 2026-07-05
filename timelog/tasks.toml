@@ -536,3 +536,43 @@ size = 13
 # ("module-level lowkey is not yet lowered"), and nested `holla` on one crib slot DIVERGES
 # interp(snapshot) vs compiled(live-ptr) — hence value-struct threading, which is path-identical.
 status = "done"
+
+# ─────────────────────── Multi-file source: namespaced modules via `pull` ───────────────────────
+# Give `pull` real semantics so bet source can span multiple files. `pull "geometry"` loads a
+# sibling geometry.bet and binds a namespace; exports referenced qualified (geometry.area(x),
+# geometry.Point, geometry.PI), mirroring the spill.it/math.lap dispatch style. Only `flex` items
+# cross the module boundary. Implemented as a frontend load + resolve-and-mangle AST pass so
+# interp/lower/midir/backend are UNCHANGED. betfe stays single-file (self-host port is future work).
+# Plan: ~/.claude/plans/we-need-to-make-imperative-falcon.md
+
+[[task]]
+slug = "modules-multifile"
+name = "Multi-file source: namespaced modules via `pull` (file-graph loader + resolve-and-mangle frontend pass; flex/hush enforced; interp+compiled parity)"
+size = 13
+# DONE. `pull "geometry"` now loads a sibling geometry.bet (relative to the importer; `as` alias +
+# subdirs supported) and binds a namespace; exports are referenced qualified — geometry.area(x),
+# geometry.PI, geometry.Point (type), geometry.Point{..} (literal), geometry.Circle(r) (variant
+# ctor + vibe pattern). Only `flex` items cross the boundary; `hush` access is a compile error.
+# Architecture: two new frontend modules — loader.rs (crate::load: read/parse/dedup-by-normalized-
+# path/cycle-detect the import graph, built-in stdlib names stay intrinsics) + resolve.rs (a
+# resolve-and-mangle AST pass: non-root modules' top-level decls + all refs → `stem$idx$name`;
+# root stays bare so `main` is `main`; `$` is illegal in source idents so no collisions). interp,
+# lower, midir, backend are UNCHANGED — they see one flat merged Program. Driver run/build call
+# frontend::load; --emit stays single-file (differential surface). is_builtin_module centralized +
+# extended (squadops/time/net) so `pull "squadops"` stays a no-op. Verified: 15 loader/resolve unit
+# tests, 6 interp e2e tests, corpus 14-modules/modules (interp+compiled byte-identical, native exe
+# proves `$` survives LLVM), full green gate. betfe (self-hosted frontend) intentionally NOT taught
+# modules — 14-modules excluded from the selfhost --emit differential; a betfe port is future work.
+status = "done"
+
+# ─────────────────────── Frozen Bubble port — make gg a real game platform ───────────────────────
+# Goal: turn gg from "framebuffer + beep" into a platform capable of a pixel-perfect, audio-accurate
+# port of Frozen Bubble (GPL-2 code + freely-licensed PNG/Ogg assets). Extending gg/rt-abi is IN
+# scope (user-authorized; revisits the SP0.4 gg freeze). Sized after the ground-truth investigation
+# below; broken into gg-graphics / gg-audio / asset-pipeline / port sub-tasks once scoped.
+
+[[task]]
+slug = "port-frozen-bubble"
+name = "Frozen Bubble port umbrella: gg graphics (alpha blit + asset loading) + gg audio (PCM mixing) extensions, then a pixel-perfect + audio-accurate port under ports/frozen-bubble"
+size = 21
+status = "doing"

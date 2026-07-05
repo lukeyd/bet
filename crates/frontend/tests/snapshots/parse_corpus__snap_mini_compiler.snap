@@ -7,12 +7,14 @@ Program {
         Pull(
             Pull {
                 module: "spill",
+                alias: None,
                 span: 238..250,
             },
         ),
         Pull(
             Pull {
                 module: "stash",
+                alias: None,
                 span: 251..263,
             },
         ),

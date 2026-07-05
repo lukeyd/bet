@@ -12,8 +12,12 @@
 pub mod ast;
 pub mod dump;
 mod lexer;
+mod loader;
 mod lower;
 mod parser;
+mod resolve;
+
+pub use loader::load;
 
 /// Re-exported so callers (e.g. the `driver`) can hold the produced module without naming
 /// the `midir` crate directly.
@@ -36,6 +40,9 @@ pub enum CompileError {
     Lex(String),
     Parse(String),
     Lower(String),
+    /// Module-graph resolution failure: a missing imported file, an import cycle, a namespace
+    /// collision, or a `flex`/`hush` visibility violation (see [`load`]).
+    Load(String),
 }
 
 impl std::fmt::Display for CompileError {
@@ -44,6 +51,7 @@ impl std::fmt::Display for CompileError {
             CompileError::Lex(m) => write!(f, "lex error: {m}"),
             CompileError::Parse(m) => write!(f, "parse error: {m}"),
             CompileError::Lower(m) => write!(f, "lowering error: {m}"),
+            CompileError::Load(m) => write!(f, "load error: {m}"),
         }
     }
 }
@@ -57,7 +65,14 @@ impl std::error::Error for CompileError {}
 /// full AST→IR pass lands.
 pub fn compile(src: &str) -> Result<Module, CompileError> {
     let program = parse(src)?;
-    let module = lower::lower(&program).map_err(CompileError::Lower)?;
+    compile_program(&program)
+}
+
+/// Lower an already-parsed (and, for multi-file programs, [`load`]-resolved) [`ast::Program`] to
+/// a validated `midir` module. This is the lowering tail of [`compile`], split out so the driver
+/// can feed it a merged multi-file program.
+pub fn compile_program(program: &ast::Program) -> Result<Module, CompileError> {
+    let module = lower::lower(program).map_err(CompileError::Lower)?;
     midir::validate(&module).map_err(|errs| {
         CompileError::Lower(
             errs.iter()

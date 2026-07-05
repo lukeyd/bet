@@ -72,9 +72,8 @@ fn run_program(args: &[String]) -> Result<(), String> {
         input = Some(PathBuf::from(arg));
     }
     let input = input.ok_or("`bet run` needs an input file")?;
-    let src =
-        std::fs::read_to_string(&input).map_err(|e| format!("reading {}: {e}", input.display()))?;
-    let program = frontend::parse(&src).map_err(|e| e.to_string())?;
+    // `frontend::load` resolves the entry file's `pull` imports across files into one program.
+    let program = frontend::load(&input).map_err(|e| e.to_string())?;
     interp::run(&program).map_err(|e| e.to_string())
 }
 
@@ -171,14 +170,18 @@ fn build(args: &[String]) -> Result<(), String> {
 }
 
 /// Produce object bytes for `input`, dispatching on extension: `.mir` straight to the backend,
-/// `.bet` through the frontend first.
+/// `.bet` through the frontend first (resolving `pull` imports across files via
+/// [`frontend::load`], then lowering the merged program with [`frontend::compile_program`]).
 fn compile_object(input: &Path, opts: &backend::EmitOptions) -> Result<Vec<u8>, String> {
-    let src =
-        std::fs::read_to_string(input).map_err(|e| format!("reading {}: {e}", input.display()))?;
     match input.extension().and_then(|e| e.to_str()) {
-        Some("mir") => backend::compile_mir_source(&src, opts).map_err(|e| e.to_string()),
+        Some("mir") => {
+            let src = std::fs::read_to_string(input)
+                .map_err(|e| format!("reading {}: {e}", input.display()))?;
+            backend::compile_mir_source(&src, opts).map_err(|e| e.to_string())
+        }
         Some("bet") | None => {
-            let module = frontend::compile(&src).map_err(|e| e.to_string())?;
+            let program = frontend::load(input).map_err(|e| e.to_string())?;
+            let module = frontend::compile_program(&program).map_err(|e| e.to_string())?;
             backend::compile_to_object(&module, opts).map_err(|e| e.to_string())
         }
         Some(ext) => Err(format!(

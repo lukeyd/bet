@@ -63,10 +63,14 @@ pub enum Item {
     Extern(ExternDecl),
 }
 
-/// `pull "module"` — an import.
+/// `pull "module" [as alias]` — an import. `module` is a slash-separated path relative to the
+/// importing file (`"shapes/geometry"` → `shapes/geometry.bet`); `alias`, when present, renames
+/// the bound namespace (default is the file stem). Built-in stdlib module names (`spill`, `math`,
+/// …) stay intrinsics and never resolve to a file.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Pull {
     pub module: String,
+    pub alias: Option<String>,
     pub span: Span,
 }
 
