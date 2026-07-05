@@ -54,6 +54,7 @@ all = [
   "bits.operators", "bits.bam-angles", "bits.wrapping", "bits.fixed-point",
   # 10 stdlib
   "stdlib.stash", "stdlib.bytes", "stdlib.squadops", "stdlib.vec", "stdlib.str", "stdlib.sys",
+  "stdlib.rng", "stdlib.input",
   # 11 reference oracles
   "reference.compiler", "reference.doom",
   # 12 ffi
@@ -391,6 +392,22 @@ path = "10-stdlib/vec-shared"
 covers = ["stdlib.vec"]
 interp = "pass"
 compiled = "pass"
+
+[[program]]
+path = "10-stdlib/rng-seeded"
+covers = ["stdlib.rng"]
+interp = "pass"
+# Seeded RNG (math.cook) is deterministic on the interpreter today; the compiled path lands with
+# the frontend-lowering workstream. Root should flip this to "pass" and verify once that merges.
+compiled = "skip"
+
+[[program]]
+path = "10-stdlib/read-line-eof"
+covers = ["stdlib.input"]
+interp = "pass"
+# sys.peep() EOF path runs on the interpreter today; compiled codegen for it lands with the
+# frontend-lowering workstream. Root should flip this to "pass" and verify once that merges.
+compiled = "skip"
 
 # --- 11 reference oracles ---------------------------------------------------
 [[program]]
