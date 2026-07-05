@@ -1,0 +1,23 @@
+// rng-seeded — a seeded RNG (math.cook) is fully deterministic: the same literal seed always
+// replays the same stream. This exercises all three draws — upTo(n) (bounded, in [0, n)), roll()
+// (a raw 64-bit draw), and frac() (a unit float, cast to int per the corpus no-bare-float rule) —
+// so the .expected below is generated once from the seed and frozen. No wall-clock, no entropy.
+pull "spill"
+pull "math"
+
+finna main() {
+    lowkey g = math.cook(2026)
+
+    // upTo(n): four bounded rolls, each in [0, n).
+    spill.f("d6={}\n", g.upTo(6))
+    spill.f("d6={}\n", g.upTo(6))
+    spill.f("d20={}\n", g.upTo(20))
+    spill.f("pct={}\n", g.upTo(100))
+
+    // roll(): a raw 64-bit draw, printed via its int display (may be negative).
+    spill.f("roll={}\n", g.roll())
+
+    // frac(): a unit float in [0, 1); scaled and truncated to an int so nothing prints bare.
+    spill.f("milli={}\n", (g.frac() * 1000.0) as int)
+    spill.f("milli={}\n", (g.frac() * 1000.0) as int)
+}

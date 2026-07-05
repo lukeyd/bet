@@ -1,0 +1,13 @@
+// read-line-eof — sys.peep() reads one line from stdin (newline stripped) and returns "" at EOF.
+// Mirrors sys-args: only the DETERMINISTIC, cross-path behavior is asserted. The corpus runner
+// always closes stdin, so the read hits EOF immediately, yielding the empty string: str.len is 0
+// and the echo is empty. Interactive (non-EOF) input is covered by the integration test in
+// crates/driver/tests/stdin_read_line.rs, which pipes a real line in.
+pull "spill"
+pull "sys"
+
+finna main() {
+    lowkey s = sys.peep()
+    spill.f("len={}\n", str.len(s))
+    spill.f("got=[{}]\n", s)
+}
