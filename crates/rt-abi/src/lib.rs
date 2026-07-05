@@ -181,6 +181,10 @@ pub mod event_kind {
     pub const KEY_UP: u32 = 2;
     pub const MOUSE_MOVE: u32 = 3;
     pub const QUIT: u32 = 4;
+    /// A mouse button was pressed. [`Event::code`] is the button (`0` = left, `1` = right).
+    pub const MOUSE_DOWN: u32 = 5;
+    /// A mouse button was released. [`Event::code`] is the button (`0` = left, `1` = right).
+    pub const MOUSE_UP: u32 = 6;
 }
 
 // ---------------------------------------------------------------------------
@@ -396,7 +400,8 @@ unsafe extern "C" {
 
     /// Present a framebuffer to the display.
     pub fn bet_gg_present(fb: *const FrameBuffer);
-    /// Submit `count` interleaved stereo audio frames.
+    /// Submit `count` interleaved `i16` audio *samples* (a stereo frame is two samples) onto the
+    /// output ring for playback.
     pub fn bet_gg_audio(frames: *const i16, count: usize);
     /// Poll the next input event into `out`; returns `false` when the queue is empty.
     pub fn bet_gg_poll(out: *mut Event) -> bool;
@@ -407,6 +412,39 @@ unsafe extern "C" {
     /// fixed default before the window exists / in a headless build. (The 5th `gg` entry point —
     /// amends amendment-02 SP0.4, which reserved exactly four.)
     pub fn bet_gg_size() -> u64;
+
+    // --- gg compositor / mixer / mouse (amendment §SP0.4 raise; headless no-ops in rt-stub) ---
+
+    /// Upload an RGBA8 texture (`w * h` pixels, 4 bytes each in `R,G,B,A` order) to the compositor
+    /// and return its 1-based id (`0` = invalid). The pixels are premultiplied and cached, so the
+    /// caller's buffer need not outlive the call. Backs `gg.tex`.
+    pub fn bet_gg_tex(rgba: *const u8, w: u32, h: u32) -> u32;
+    /// Begin a frame: (re)size the logical canvas to `w * h` and clear it to `clear_argb` (the low
+    /// 24 bits `0x00RR_GGBB`; the canvas itself is opaque). Backs `gg.frame`.
+    pub fn bet_gg_frame(w: u32, h: u32, clear_argb: u32);
+    /// Blit texture `tex` (from [`bet_gg_tex`]) onto the canvas at `(dx, dy)` with premultiplied
+    /// src-over alpha, clipped to the canvas. A `0`/unknown id is ignored. Backs `gg.sprite`.
+    pub fn bet_gg_sprite(tex: u32, dx: i32, dy: i32);
+    /// Fill a `w * h` rectangle at `(dx, dy)` with `argb` (`0xAARR_GGBB`) using src-over alpha,
+    /// clipped to the canvas. Backs `gg.rect`.
+    pub fn bet_gg_rect(dx: i32, dy: i32, w: u32, h: u32, argb: u32);
+    /// Present the composited canvas — aspect-fit (letterboxed) into the window — and pump input.
+    /// Backs `gg.flush`.
+    pub fn bet_gg_flush();
+    /// Register a PCM sound (`byte_len` bytes of interleaved little-endian `i16` samples,
+    /// `channels` channels at `rate` Hz) with the mixer and return its 1-based id (`0` = invalid).
+    /// The samples are copied, so the caller's buffer need not outlive the call. Backs `gg.sound`.
+    pub fn bet_gg_sound(pcm: *const u8, byte_len: usize, channels: u32, rate: u32) -> u32;
+    /// Start playing sound `sound` on a mixer voice at volume `vol_q8` (Q8 fixed point: `256` =
+    /// unity gain), looping if `loop_ != 0`, and return the 1-based voice id (`0` = could not
+    /// play). Backs `gg.play`.
+    pub fn bet_gg_play(sound: u32, loop_: u32, vol_q8: u32) -> u32;
+    /// Stop the voice `voice` (from [`bet_gg_play`]); an unknown or already-finished id is
+    /// ignored. Backs `gg.stop`.
+    pub fn bet_gg_stop(voice: u32);
+    /// The current mouse position in logical-canvas coordinates, packed as
+    /// `(x as u32) << 32 | (y as u32)` (clamped into the canvas). Backs `gg.mouse`.
+    pub fn bet_gg_mouse() -> u64;
 }
 
 #[cfg(test)]

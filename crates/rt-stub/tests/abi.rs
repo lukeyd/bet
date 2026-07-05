@@ -142,6 +142,18 @@ fn platform_layer_is_headless() {
         // present/audio are no-ops in the headless stub.
         bet_gg_present(ptr::null());
         bet_gg_audio(ptr::null(), 0);
+
+        // gg compositor / mixer / mouse — headless: the id-returning entry points yield 0, and
+        // the rest link and no-op.
+        assert_eq!(bet_gg_tex(ptr::null(), 4, 4), 0);
+        assert_eq!(bet_gg_sound(ptr::null(), 0, 1, 44_100), 0);
+        assert_eq!(bet_gg_play(0, 0, 256), 0);
+        assert_eq!(bet_gg_mouse(), 0);
+        bet_gg_frame(320, 240, 0);
+        bet_gg_sprite(0, 0, 0);
+        bet_gg_rect(0, 0, 10, 10, 0);
+        bet_gg_flush();
+        bet_gg_stop(0);
     }
 }
 

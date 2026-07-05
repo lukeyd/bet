@@ -2986,6 +2986,48 @@ impl LowerCtx {
         Ok(Operand::Copy(Place::local(ptr)))
     }
 
+    /// Like [`Self::buffer_base_ptr`], but returns a raw pointer `byteOff` BYTES into the buffer.
+    /// The `gg.tex` / `gg.sound` ABI counts the offset in bytes, but midir has no pointer+int
+    /// arithmetic — only element-granular indexing — so the byte offset is converted to an element
+    /// index by dividing by the element's size (`byteOff / sizeof(T)`). Exact for `byteOff == 0`
+    /// (the demo) and any offset that is a whole multiple of the element size; for a `[]u8` buffer
+    /// `sizeof == 1`, so it matches `bytes.readU32le`'s plain `Index(byteOff)`.
+    fn buffer_byte_ptr(&mut self, buf_arg: &Expr, off_arg: &Expr) -> Result<Operand, String> {
+        let rawptr = self.m.intern_ty(TyKind::RawPtr);
+        let usize_t = self.m.t_int(IntWidth::W64, false);
+        let i64t = self.m.t_i64();
+        let (buf, bufty) = self.lower_expr(buf_arg, None)?;
+        let place = self
+            .operand_place(buf)
+            .ok_or_else(|| "`gg` buffer argument must be addressable".to_string())?;
+        let elem = match self.m.ty(bufty) {
+            TyKind::Array(elem, _) => *elem,
+            TyKind::Slice(elem) => *elem,
+            other => {
+                return Err(format!(
+                    "`gg` buffer argument must be an array or slice ({other:?})"
+                ));
+            }
+        };
+        let (off, offty) = self.lower_expr(off_arg, Some(i64t))?;
+        let off = self.coerce_int(off, offty, i64t);
+        // elem_idx = byteOff / sizeof(T): element-granular GEP (midir has no ptr+int arithmetic).
+        let esize_us = self.new_local(usize_t);
+        self.fb()
+            .assign(Place::local(esize_us), Rvalue::SizeOf(elem));
+        let esize = self.coerce_int(Operand::Copy(Place::local(esize_us)), usize_t, i64t);
+        let idx = self.new_local(i64t);
+        self.fb().assign(
+            Place::local(idx),
+            Rvalue::BinOp(BinOp::Div, off, esize, ArithMode::Trap),
+        );
+        let elem_place = extend(&place, Proj::Index(Operand::Copy(Place::local(idx))));
+        let ptr = self.new_local(rawptr);
+        self.fb()
+            .assign(Place::local(ptr), Rvalue::AddrOf(elem_place));
+        Ok(Operand::Copy(Place::local(ptr)))
+    }
+
     fn lower_intrinsic(
         &mut self,
         module: &str,
@@ -3833,6 +3875,195 @@ impl LowerCtx {
                 self.fb().assign(
                     Place::local(tup),
                     Rvalue::Aggregate(AggKind::Tuple, vec![w, h]),
+                );
+                Ok((Operand::Copy(Place::local(tup)), tuple_ty))
+            }
+            // `gg.tex(buf, byteOff, w, h) -> int` — upload an RGBA8 texture (4 bytes/pixel) from a
+            // byte-offset view of `buf`; returns its 1-based id (u32 -> int, like `gg.ticks`).
+            ("gg", "tex") => {
+                if args.len() != 4 {
+                    return Err(
+                        "`gg.tex` takes a pixel buffer, a byte offset, a width, and a height"
+                            .into(),
+                    );
+                }
+                let rawptr = self.m.intern_ty(TyKind::RawPtr);
+                let u32t = self.m.t_u32();
+                let i64t = self.m.t_i64();
+                let ptr = self.buffer_byte_ptr(&args[0].value, &args[1].value)?;
+                let (w, wty) = self.lower_expr(&args[2].value, Some(u32t))?;
+                let w = self.coerce_int(w, wty, u32t);
+                let (h, hty) = self.lower_expr(&args[3].value, Some(u32t))?;
+                let h = self.coerce_int(h, hty, u32t);
+                let ext = self.get_extern("bet_gg_tex", vec![rawptr, u32t, u32t], vec![u32t]);
+                let id = self.new_local(u32t);
+                self.fb().assign(
+                    Place::local(id),
+                    Rvalue::Call(Callee::Extern(ext), vec![ptr, w, h]),
+                );
+                let v = self.coerce_int(Operand::Copy(Place::local(id)), u32t, i64t);
+                Ok((v, i64t))
+            }
+            // `gg.frame(w, h, color)` — begin a frame: (re)size the canvas and clear to `color`
+            // (`0x00RRGGBB`). Void statement.
+            ("gg", "frame") => {
+                if args.len() != 3 {
+                    return Err("`gg.frame` takes a width, a height, and a clear color".into());
+                }
+                let u32t = self.m.t_u32();
+                let (w, wty) = self.lower_expr(&args[0].value, Some(u32t))?;
+                let w = self.coerce_int(w, wty, u32t);
+                let (h, hty) = self.lower_expr(&args[1].value, Some(u32t))?;
+                let h = self.coerce_int(h, hty, u32t);
+                let (c, cty) = self.lower_expr(&args[2].value, Some(u32t))?;
+                let c = self.coerce_int(c, cty, u32t);
+                let ext = self.get_extern("bet_gg_frame", vec![u32t, u32t, u32t], vec![]);
+                self.emit_extern_call(ext, &[], vec![w, h, c])
+            }
+            // `gg.sprite(tex, x, y)` — src-over blit of texture `tex` at `(x, y)`. Void statement.
+            ("gg", "sprite") => {
+                if args.len() != 3 {
+                    return Err("`gg.sprite` takes a texture id and an x, y position".into());
+                }
+                let u32t = self.m.t_u32();
+                let i32t = self.m.t_int(IntWidth::W32, true);
+                let (t, tty) = self.lower_expr(&args[0].value, Some(u32t))?;
+                let t = self.coerce_int(t, tty, u32t);
+                let (x, xty) = self.lower_expr(&args[1].value, Some(i32t))?;
+                let x = self.coerce_int(x, xty, i32t);
+                let (y, yty) = self.lower_expr(&args[2].value, Some(i32t))?;
+                let y = self.coerce_int(y, yty, i32t);
+                let ext = self.get_extern("bet_gg_sprite", vec![u32t, i32t, i32t], vec![]);
+                self.emit_extern_call(ext, &[], vec![t, x, y])
+            }
+            // `gg.rect(x, y, w, h, color)` — src-over fill with `color` (`0xAARRGGBB`). Void.
+            ("gg", "rect") => {
+                if args.len() != 5 {
+                    return Err("`gg.rect` takes x, y, w, h, and a color".into());
+                }
+                let u32t = self.m.t_u32();
+                let i32t = self.m.t_int(IntWidth::W32, true);
+                let (x, xty) = self.lower_expr(&args[0].value, Some(i32t))?;
+                let x = self.coerce_int(x, xty, i32t);
+                let (y, yty) = self.lower_expr(&args[1].value, Some(i32t))?;
+                let y = self.coerce_int(y, yty, i32t);
+                let (w, wty) = self.lower_expr(&args[2].value, Some(u32t))?;
+                let w = self.coerce_int(w, wty, u32t);
+                let (h, hty) = self.lower_expr(&args[3].value, Some(u32t))?;
+                let h = self.coerce_int(h, hty, u32t);
+                let (c, cty) = self.lower_expr(&args[4].value, Some(u32t))?;
+                let c = self.coerce_int(c, cty, u32t);
+                let ext =
+                    self.get_extern("bet_gg_rect", vec![i32t, i32t, u32t, u32t, u32t], vec![]);
+                self.emit_extern_call(ext, &[], vec![x, y, w, h, c])
+            }
+            // `gg.flush()` — present the composited canvas and pump input. Void statement.
+            ("gg", "flush") => {
+                if !args.is_empty() {
+                    return Err("`gg.flush` takes no arguments".into());
+                }
+                let ext = self.get_extern("bet_gg_flush", vec![], vec![]);
+                self.emit_extern_call(ext, &[], vec![])
+            }
+            // `gg.sound(buf, byteOff, byteLen, channels, rate) -> int` — register a PCM sound from a
+            // byte view of `buf`; returns its 1-based id.
+            ("gg", "sound") => {
+                if args.len() != 5 {
+                    return Err(
+                        "`gg.sound` takes a sample buffer, a byte offset, a byte length, a channel \
+                         count, and a sample rate"
+                            .into(),
+                    );
+                }
+                let rawptr = self.m.intern_ty(TyKind::RawPtr);
+                let usize_t = self.m.t_int(IntWidth::W64, false);
+                let u32t = self.m.t_u32();
+                let i64t = self.m.t_i64();
+                let ptr = self.buffer_byte_ptr(&args[0].value, &args[1].value)?;
+                let (len, lty) = self.lower_expr(&args[2].value, Some(usize_t))?;
+                let len = self.coerce_int(len, lty, usize_t);
+                let (ch, chty) = self.lower_expr(&args[3].value, Some(u32t))?;
+                let ch = self.coerce_int(ch, chty, u32t);
+                let (rate, rty) = self.lower_expr(&args[4].value, Some(u32t))?;
+                let rate = self.coerce_int(rate, rty, u32t);
+                let ext = self.get_extern(
+                    "bet_gg_sound",
+                    vec![rawptr, usize_t, u32t, u32t],
+                    vec![u32t],
+                );
+                let id = self.new_local(u32t);
+                self.fb().assign(
+                    Place::local(id),
+                    Rvalue::Call(Callee::Extern(ext), vec![ptr, len, ch, rate]),
+                );
+                let v = self.coerce_int(Operand::Copy(Place::local(id)), u32t, i64t);
+                Ok((v, i64t))
+            }
+            // `gg.play(soundId, loop, volume) -> int` — start a voice; returns its 1-based id.
+            ("gg", "play") => {
+                if args.len() != 3 {
+                    return Err("`gg.play` takes a sound id, a loop flag, and a volume".into());
+                }
+                let u32t = self.m.t_u32();
+                let i64t = self.m.t_i64();
+                let (s, sty) = self.lower_expr(&args[0].value, Some(u32t))?;
+                let s = self.coerce_int(s, sty, u32t);
+                let (lp, lty) = self.lower_expr(&args[1].value, Some(u32t))?;
+                let lp = self.coerce_int(lp, lty, u32t);
+                let (vol, vty) = self.lower_expr(&args[2].value, Some(u32t))?;
+                let vol = self.coerce_int(vol, vty, u32t);
+                let ext = self.get_extern("bet_gg_play", vec![u32t, u32t, u32t], vec![u32t]);
+                let id = self.new_local(u32t);
+                self.fb().assign(
+                    Place::local(id),
+                    Rvalue::Call(Callee::Extern(ext), vec![s, lp, vol]),
+                );
+                let v = self.coerce_int(Operand::Copy(Place::local(id)), u32t, i64t);
+                Ok((v, i64t))
+            }
+            // `gg.stop(voiceId)` — stop a voice. Void statement.
+            ("gg", "stop") => {
+                if args.len() != 1 {
+                    return Err("`gg.stop` takes a single voice id".into());
+                }
+                let u32t = self.m.t_u32();
+                let (v, vty) = self.lower_expr(&args[0].value, Some(u32t))?;
+                let v = self.coerce_int(v, vty, u32t);
+                let ext = self.get_extern("bet_gg_stop", vec![u32t], vec![]);
+                self.emit_extern_call(ext, &[], vec![v])
+            }
+            // `gg.mouse()` -> (int, int) — the mouse position in logical-canvas coordinates. The ABI
+            // packs it `x << 32 | y`; unpack `x` by a right shift and `y` by truncation (like
+            // `gg.size`), presenting both as `int`.
+            ("gg", "mouse") => {
+                if !args.is_empty() {
+                    return Err("`gg.mouse` takes no arguments".into());
+                }
+                let u64t = self.m.t_int(IntWidth::W64, false);
+                let u32t = self.m.t_u32();
+                let i64t = self.m.t_i64();
+                let ext = self.get_extern("bet_gg_mouse", vec![], vec![u64t]);
+                let raw = self.new_local(u64t);
+                self.fb()
+                    .assign(Place::local(raw), Rvalue::Call(Callee::Extern(ext), vec![]));
+                let xsh = self.new_local(u64t);
+                self.fb().assign(
+                    Place::local(xsh),
+                    Rvalue::BinOp(
+                        BinOp::Shr,
+                        Operand::Copy(Place::local(raw)),
+                        Operand::Const(Const::Int(32, u64t)),
+                        ArithMode::Na,
+                    ),
+                );
+                let x = self.coerce_int(Operand::Copy(Place::local(xsh)), u64t, i64t);
+                let y_u32 = self.coerce_int(Operand::Copy(Place::local(raw)), u64t, u32t);
+                let y = self.coerce_int(y_u32, u32t, i64t);
+                let tuple_ty = self.m.intern_ty(TyKind::Tuple(vec![i64t, i64t]));
+                let tup = self.new_local(tuple_ty);
+                self.fb().assign(
+                    Place::local(tup),
+                    Rvalue::Aggregate(AggKind::Tuple, vec![x, y]),
                 );
                 Ok((Operand::Copy(Place::local(tup)), tuple_ty))
             }

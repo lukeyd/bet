@@ -1792,6 +1792,127 @@ impl<'p> Interp<'p> {
                 ])
             }
             ("size", _) => Err(RunError::Type("`gg.size` takes no arguments".into())),
+            // `gg.tex(buf, byteOff, w, h)` uploads a `w * h` RGBA8 texture from a byte view of the
+            // buffer; returns its 1-based id.
+            ("tex", [pixels, Value::Int(off), Value::Int(w), Value::Int(h)])
+                if *off >= 0 && *w >= 0 && *h >= 0 =>
+            {
+                let (w, h) = (*w as u32, *h as u32);
+                let off = *off as usize;
+                let bytes = marshal_ints(pixels, |i| i as u8).ok_or_else(|| {
+                    RunError::Type("`gg.tex` needs an array of pixel bytes".into())
+                })?;
+                let need = (w as usize) * (h as usize) * 4;
+                let slice: &[u8] = if off <= bytes.len() {
+                    &bytes[off..off.saturating_add(need).min(bytes.len())]
+                } else {
+                    &[]
+                };
+                let id = gg_backend::tex(slice, w, h);
+                Ok(vec![Value::Int(i64::from(id))])
+            }
+            ("tex", _) => Err(RunError::Type(
+                "`gg.tex(buf, byteOff, w, h)` takes a buffer and three non-negative ints".into(),
+            )),
+            // `gg.frame(w, h, color)` begins a frame and clears the canvas to `color` (0x00RRGGBB).
+            ("frame", [Value::Int(w), Value::Int(h), Value::Int(c)]) if *w >= 0 && *h >= 0 => {
+                gg_backend::frame(*w as u32, *h as u32, *c as u32);
+                Ok(Vec::new())
+            }
+            ("frame", _) => Err(RunError::Type(
+                "`gg.frame(w, h, color)` takes two non-negative dimensions and a color".into(),
+            )),
+            // `gg.sprite(tex, x, y)` blits texture `tex` at `(x, y)`.
+            ("sprite", [Value::Int(t), Value::Int(x), Value::Int(y)]) => {
+                gg_backend::sprite(*t as u32, *x as i32, *y as i32);
+                Ok(Vec::new())
+            }
+            ("sprite", _) => Err(RunError::Type(
+                "`gg.sprite(tex, x, y)` takes a texture id and an x, y position".into(),
+            )),
+            // `gg.rect(x, y, w, h, color)` fills a rectangle with `color` (0xAARRGGBB).
+            (
+                "rect",
+                [
+                    Value::Int(x),
+                    Value::Int(y),
+                    Value::Int(w),
+                    Value::Int(h),
+                    Value::Int(c),
+                ],
+            ) => {
+                gg_backend::rect(*x as i32, *y as i32, *w as u32, *h as u32, *c as u32);
+                Ok(Vec::new())
+            }
+            ("rect", _) => Err(RunError::Type(
+                "`gg.rect(x, y, w, h, color)` takes four ints and a color".into(),
+            )),
+            // `gg.flush()` presents the composited canvas and pumps input.
+            ("flush", []) => {
+                gg_backend::flush();
+                Ok(Vec::new())
+            }
+            ("flush", _) => Err(RunError::Type("`gg.flush` takes no arguments".into())),
+            // `gg.sound(buf, byteOff, byteLen, channels, rate)` registers a PCM sound; returns its
+            // 1-based id. The interp buffer is a `[]i16`; serialize it to interleaved LE bytes to
+            // mirror the compiled path's raw byte view (documented convention — not corpus-tested,
+            // since a live window is non-deterministic).
+            (
+                "sound",
+                [
+                    samples,
+                    Value::Int(off),
+                    Value::Int(len),
+                    Value::Int(ch),
+                    Value::Int(rate),
+                ],
+            ) if *off >= 0 && *len >= 0 && *ch >= 0 && *rate >= 0 => {
+                let pcm = marshal_ints(samples, |i| i as i16).ok_or_else(|| {
+                    RunError::Type("`gg.sound` needs an array of sample integers".into())
+                })?;
+                let mut all = Vec::with_capacity(pcm.len() * 2);
+                for s in &pcm {
+                    all.extend_from_slice(&s.to_le_bytes());
+                }
+                let off = *off as usize;
+                let slice: &[u8] = if off <= all.len() {
+                    &all[off..off.saturating_add(*len as usize).min(all.len())]
+                } else {
+                    &[]
+                };
+                let id = gg_backend::sound(slice, *ch as u32, *rate as u32);
+                Ok(vec![Value::Int(i64::from(id))])
+            }
+            ("sound", _) => Err(RunError::Type(
+                "`gg.sound(buf, byteOff, byteLen, channels, rate)` takes a buffer and four \
+                 non-negative ints"
+                    .into(),
+            )),
+            // `gg.play(soundId, loop, volume)` starts a voice; returns its 1-based id.
+            ("play", [Value::Int(s), Value::Int(lp), Value::Int(vol)]) if *s >= 0 && *vol >= 0 => {
+                let id = gg_backend::play(*s as u32, *lp as u32, *vol as u32);
+                Ok(vec![Value::Int(i64::from(id))])
+            }
+            ("play", _) => Err(RunError::Type(
+                "`gg.play(soundId, loop, volume)` takes a sound id, a loop flag, and a volume"
+                    .into(),
+            )),
+            // `gg.stop(voiceId)` stops a voice.
+            ("stop", [Value::Int(v)]) if *v >= 0 => {
+                gg_backend::stop(*v as u32);
+                Ok(Vec::new())
+            }
+            ("stop", _) => Err(RunError::Type("`gg.stop` takes a single voice id".into())),
+            // `gg.mouse()` returns the mouse `(x, y)` in logical-canvas coords; the ABI packs
+            // `x << 32 | y`.
+            ("mouse", []) => {
+                let v = gg_backend::mouse();
+                Ok(vec![
+                    Value::Int((v >> 32) as i64),
+                    Value::Int((v & 0xFFFF_FFFF) as i64),
+                ])
+            }
+            ("mouse", _) => Err(RunError::Type("`gg.mouse` takes no arguments".into())),
             (other, _) => Err(RunError::Unsupported(format!("gg.{other}"))),
         }
     }

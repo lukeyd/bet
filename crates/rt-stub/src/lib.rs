@@ -849,6 +849,49 @@ pub unsafe extern "C" fn bet_gg_size() -> u64 {
     (960u64 << 32) | 640
 }
 
+// gg compositor / mixer / mouse — headless (no window, no audio device): id-returning entry
+// points yield `0` (invalid) and the rest are no-ops, matching `gg-backend`'s headless `imp`.
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_tex(_rgba: *const u8, _w: u32, _h: u32) -> u32 {
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_frame(_w: u32, _h: u32, _clear_argb: u32) {}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_sprite(_tex: u32, _dx: i32, _dy: i32) {}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_rect(_dx: i32, _dy: i32, _w: u32, _h: u32, _argb: u32) {}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_flush() {}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_sound(
+    _pcm: *const u8,
+    _byte_len: usize,
+    _channels: u32,
+    _rate: u32,
+) -> u32 {
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_play(_sound: u32, _loop: u32, _vol_q8: u32) -> u32 {
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_stop(_voice: u32) {}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_mouse() -> u64 {
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
