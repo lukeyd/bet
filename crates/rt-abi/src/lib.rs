@@ -200,6 +200,9 @@ unsafe extern "C" {
 
     /// Allocate `size` bytes at `align` from the current allocator context.
     pub fn bet_alloc(size: usize, align: usize) -> *mut u8;
+    /// Allocate `size` **zero-initialized** bytes at `align`. Backs `mem.slab[T](n)`, whose
+    /// `[]T` buffers must start zeroed to match the interpreter (`Value::Array` of `0`s).
+    pub fn bet_alloc_zeroed(size: usize, align: usize) -> *mut u8;
     /// Free a block previously returned by [`bet_alloc`] with the same `size`/`align`.
     pub fn bet_free(ptr: *mut u8, size: usize, align: usize);
     /// Resize a block, preserving its contents up to `min(old_size, new_size)`.
@@ -399,6 +402,11 @@ unsafe extern "C" {
     pub fn bet_gg_poll(out: *mut Event) -> bool;
     /// A monotonic high-resolution timer, in nanoseconds.
     pub fn bet_gg_ticks() -> u64;
+    /// The current window size, packed as `width << 32 | height`. Tracks live resizes, so a
+    /// program can size its framebuffer to the window for true dynamic resolution; returns a
+    /// fixed default before the window exists / in a headless build. (The 5th `gg` entry point —
+    /// amends amendment-02 SP0.4, which reserved exactly four.)
+    pub fn bet_gg_size() -> u64;
 }
 
 #[cfg(test)]

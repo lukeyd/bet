@@ -105,6 +105,12 @@ struct LowerCtx {
     /// The synthesized `__yikes { present: bool, msg: str }` struct backing the `yikes` type in
     /// the compiled path (created lazily on first use of `yikes`).
     yikes_sid: Option<StructId>,
+    /// The synthesized `__gg_FrameBuffer { pixels: rawptr, width, height, stride: u32 }` struct
+    /// matching `rt-abi`'s `#[repr(C)] FrameBuffer` (created lazily on first `gg.blit`).
+    frame_sid: Option<StructId>,
+    /// The synthesized `__gg_Event { kind, code: u32, x, y: i32 }` struct matching `rt-abi`'s
+    /// `#[repr(C)] Event` (created lazily on first `gg.poll`).
+    event_sid: Option<StructId>,
     /// `bet_print(rawptr, u64) -> void` — the stdout entry point (always present).
     print_extern: ExternId,
     /// Deduped externs synthesized on demand, keyed by `(name, ret-type)`.
@@ -159,6 +165,8 @@ impl LowerCtx {
             next_mono_fid: 0,
             subst: HashMap::new(),
             yikes_sid: None,
+            frame_sid: None,
+            event_sid: None,
             print_extern,
             extern_cache: HashMap::new(),
             fb: None,
@@ -495,6 +503,81 @@ impl LowerCtx {
             ),
         );
         (Operand::Copy(Place::local(tmp)), sty)
+    }
+
+    /// The (lazily-created) `__gg_FrameBuffer` struct id. Its field layout matches `rt-abi`'s
+    /// `#[repr(C)] FrameBuffer { pixels: *mut u32, width: u32, height: u32, stride: u32 }`: a
+    /// leading `rawptr` (forcing 8-byte alignment) followed by three `u32`s.
+    fn frame_struct(&mut self) -> StructId {
+        if let Some(sid) = self.frame_sid {
+            return sid;
+        }
+        let rawptr = self.m.intern_ty(TyKind::RawPtr);
+        let u32t = self.m.t_u32();
+        let sid = self.m.add_struct(StructDef {
+            name: "__gg_FrameBuffer".into(),
+            fields: vec![
+                Field {
+                    name: "pixels".into(),
+                    ty: rawptr,
+                    vis: Vis::Hush,
+                },
+                Field {
+                    name: "width".into(),
+                    ty: u32t,
+                    vis: Vis::Hush,
+                },
+                Field {
+                    name: "height".into(),
+                    ty: u32t,
+                    vis: Vis::Hush,
+                },
+                Field {
+                    name: "stride".into(),
+                    ty: u32t,
+                    vis: Vis::Hush,
+                },
+            ],
+        });
+        self.frame_sid = Some(sid);
+        sid
+    }
+
+    /// The (lazily-created) `__gg_Event` struct id, matching `rt-abi`'s
+    /// `#[repr(C)] Event { kind: u32, code: u32, x: i32, y: i32 }`.
+    fn event_struct(&mut self) -> StructId {
+        if let Some(sid) = self.event_sid {
+            return sid;
+        }
+        let u32t = self.m.t_u32();
+        let i32t = self.m.t_int(IntWidth::W32, true);
+        let sid = self.m.add_struct(StructDef {
+            name: "__gg_Event".into(),
+            fields: vec![
+                Field {
+                    name: "kind".into(),
+                    ty: u32t,
+                    vis: Vis::Hush,
+                },
+                Field {
+                    name: "code".into(),
+                    ty: u32t,
+                    vis: Vis::Hush,
+                },
+                Field {
+                    name: "x".into(),
+                    ty: i32t,
+                    vis: Vis::Hush,
+                },
+                Field {
+                    name: "y".into(),
+                    ty: i32t,
+                    vis: Vis::Hush,
+                },
+            ],
+        });
+        self.event_sid = Some(sid);
+        sid
     }
 
     /// The zero value of a scalar/`str` type, for the leading slots of a `bounce` early return.
@@ -1136,7 +1219,16 @@ impl LowerCtx {
         let place = self.lower_place(&targets[0])?;
         let pty = self.place_ty(&place)?;
         if op == ast::AssignOp::Eq {
-            let (val, _) = self.lower_expr(&values[0], Some(pty))?;
+            let (val, vty) = self.lower_expr(&values[0], Some(pty))?;
+            // Coerce an integer RHS to the target's integer type (width/sign), e.g. an `int`
+            // value stored into an `i16` slot (`beepbuf[i] = amp`). A no-op when the types match.
+            let val = if matches!(self.m.ty(vty), TyKind::Int { .. })
+                && matches!(self.m.ty(pty), TyKind::Int { .. })
+            {
+                self.coerce_int(val, vty, pty)
+            } else {
+                val
+            };
             self.fb().assign(place, Rvalue::Use(val));
             return Ok(());
         }
@@ -2050,6 +2142,9 @@ impl LowerCtx {
             if name == "vec" && method == "new" {
                 return self.lower_vec_new(generics);
             }
+            if name == "mem" && method == "slab" {
+                return self.lower_mem_slab(generics, args);
+            }
             return self.lower_intrinsic(name, method, args);
         }
         if !generics.is_empty() {
@@ -2379,6 +2474,75 @@ impl LowerCtx {
     }
 
     // === vec (growable arrays) ================================================
+
+    /// `mem.slab[T](n) -> []T` — a heap-allocated, zero-initialized buffer of `n` elements,
+    /// returned as a `[]T` slice. Fills the gap fixed-array literals (compile-time enumerated),
+    /// append-only `vec`, and handle-accessed `crib` slabs leave: a random-access mutable buffer
+    /// of runtime length (e.g. a framebuffer). `T` must be a scalar type (size == a valid align).
+    /// Lowered to `bet_alloc_zeroed(n * size_of[T], size_of[T])` wrapped in a `MakeSlice`.
+    fn lower_mem_slab(
+        &mut self,
+        generics: &[ast::Type],
+        args: &[ast::Arg],
+    ) -> Result<(Operand, TyId), String> {
+        if generics.len() != 1 {
+            return Err("`mem.slab` takes one type argument `[T]`".into());
+        }
+        if args.len() != 1 {
+            return Err("`mem.slab` takes a single element count `n`".into());
+        }
+        let e = self.map_type(&generics[0])?;
+        let rawptr = self.m.intern_ty(TyKind::RawPtr);
+        let usize_t = self.m.t_int(IntWidth::W64, false);
+        let i64t = self.m.t_i64();
+
+        // n (element count), coerced to usize.
+        let (n, nty) = self.lower_expr(&args[0].value, Some(i64t))?;
+        let n_us = self.coerce_int(n, nty, usize_t);
+
+        // esize = size_of[T] (also used as the allocation alignment — valid for scalar T).
+        let esize = self.new_local(usize_t);
+        self.fb().assign(Place::local(esize), Rvalue::SizeOf(e));
+
+        // bytes = n * esize.
+        let bytes = self.new_local(usize_t);
+        self.fb().assign(
+            Place::local(bytes),
+            Rvalue::BinOp(
+                BinOp::Mul,
+                n_us.clone(),
+                Operand::Copy(Place::local(esize)),
+                ArithMode::Wrap,
+            ),
+        );
+
+        // ptr = bet_alloc_zeroed(bytes, esize).
+        let ext = self.get_extern("bet_alloc_zeroed", vec![usize_t, usize_t], vec![rawptr]);
+        let ptr = self.new_local(rawptr);
+        self.fb().assign(
+            Place::local(ptr),
+            Rvalue::Call(
+                Callee::Extern(ext),
+                vec![
+                    Operand::Copy(Place::local(bytes)),
+                    Operand::Copy(Place::local(esize)),
+                ],
+            ),
+        );
+
+        // slice = { ptr, n } over the fresh storage.
+        let slice_ty = self.m.intern_ty(TyKind::Slice(e));
+        let sl = self.new_local(slice_ty);
+        self.fb().assign(
+            Place::local(sl),
+            Rvalue::MakeSlice {
+                data: Operand::Copy(Place::local(ptr)),
+                len: n_us,
+                elem: e,
+            },
+        );
+        Ok((Operand::Copy(Place::local(sl)), slice_ty))
+    }
 
     /// `vec.new[T]()` — create an empty growable array. Lowered to `bet_vec_new(size_of[T])`.
     fn lower_vec_new(&mut self, generics: &[ast::Type]) -> Result<(Operand, TyId), String> {
@@ -2718,6 +2882,7 @@ impl LowerCtx {
                 | "yikes"
                 | "fs"
                 | "sys"
+                | "gg"
         )
     }
 
@@ -2776,6 +2941,33 @@ impl LowerCtx {
             }
             other => Err(format!("unknown `rng` method `{other}`")),
         }
+    }
+
+    /// Lower an array/slice argument and take the address of its storage as a `rawptr` — the base
+    /// pointer the `gg.*` externs expect for a pixel/sample buffer. An array's address is its
+    /// first element's; a slice's data pointer is reached by projecting element 0 through its fat
+    /// pointer.
+    fn buffer_base_ptr(&mut self, arg: &Expr) -> Result<Operand, String> {
+        let rawptr = self.m.intern_ty(TyKind::RawPtr);
+        let (buf, bufty) = self.lower_expr(arg, None)?;
+        let place = self
+            .operand_place(buf)
+            .ok_or_else(|| "`gg` buffer argument must be addressable".to_string())?;
+        let base = match self.m.ty(bufty) {
+            TyKind::Array(..) => place,
+            TyKind::Slice(_) => {
+                let i64t = self.m.t_i64();
+                extend(&place, Proj::Index(Operand::Const(Const::Int(0, i64t))))
+            }
+            other => {
+                return Err(format!(
+                    "`gg` buffer argument must be an array or slice ({other:?})"
+                ));
+            }
+        };
+        let ptr = self.new_local(rawptr);
+        self.fb().assign(Place::local(ptr), Rvalue::AddrOf(base));
+        Ok(Operand::Copy(Place::local(ptr)))
     }
 
     fn lower_intrinsic(
@@ -3297,6 +3489,139 @@ impl LowerCtx {
                     .assign(Place::local(tmp), Rvalue::Call(Callee::Extern(ext), vec![]));
                 Ok((Operand::Copy(Place::local(tmp)), crib_ty))
             }
+            // `gg.blit(pixels, w, h)` — present a framebuffer. Build a `FrameBuffer` in a stack
+            // slot (`pixels` = the array's base pointer, `stride` = `width`) and hand its address
+            // to `bet_gg_present`. Used as a void statement.
+            ("gg", "blit") => {
+                if args.len() != 3 {
+                    return Err("`gg.blit` takes a pixel buffer, a width, and a height".into());
+                }
+                let rawptr = self.m.intern_ty(TyKind::RawPtr);
+                let u32t = self.m.t_u32();
+                let pixels = self.buffer_base_ptr(&args[0].value)?;
+                let (w, wty) = self.lower_expr(&args[1].value, Some(u32t))?;
+                let w = self.coerce_int(w, wty, u32t);
+                let (h, hty) = self.lower_expr(&args[2].value, Some(u32t))?;
+                let h = self.coerce_int(h, hty, u32t);
+                let sid = self.frame_struct();
+                let sty = self.m.intern_ty(TyKind::Struct(sid));
+                let fb_slot = self.new_local(sty);
+                // Fields in declaration order: pixels, width, height, stride (= width).
+                self.fb().assign(
+                    Place::local(fb_slot),
+                    Rvalue::Aggregate(AggKind::Struct(sid), vec![pixels, w.clone(), h, w]),
+                );
+                let fb_ptr = self.new_local(rawptr);
+                self.fb()
+                    .assign(Place::local(fb_ptr), Rvalue::AddrOf(Place::local(fb_slot)));
+                let ext = self.get_extern("bet_gg_present", vec![rawptr], vec![]);
+                self.emit_extern_call(ext, &[], vec![Operand::Copy(Place::local(fb_ptr))])
+            }
+            // `gg.audio(samples, cnt)` — submit `cnt` interleaved stereo frames. Void statement.
+            ("gg", "audio") => {
+                if args.len() != 2 {
+                    return Err("`gg.audio` takes a sample buffer and a frame count".into());
+                }
+                let rawptr = self.m.intern_ty(TyKind::RawPtr);
+                let usize_t = self.m.t_int(IntWidth::W64, false);
+                let frames = self.buffer_base_ptr(&args[0].value)?;
+                let (cnt, cty) = self.lower_expr(&args[1].value, Some(usize_t))?;
+                let cnt = self.coerce_int(cnt, cty, usize_t);
+                let ext = self.get_extern("bet_gg_audio", vec![rawptr, usize_t], vec![]);
+                self.emit_extern_call(ext, &[], vec![frames, cnt])
+            }
+            // `gg.poll()` -> (int, int) — poll the next input event into a stack slot, then return
+            // `(kind, code)` zero-extended to `int`. The `bool` result and `x`/`y` are ignored; a
+            // NONE event (`kind == 0`) means the queue was empty.
+            ("gg", "poll") => {
+                if !args.is_empty() {
+                    return Err("`gg.poll` takes no arguments".into());
+                }
+                let rawptr = self.m.intern_ty(TyKind::RawPtr);
+                let boolt = self.m.t_bool();
+                let u32t = self.m.t_u32();
+                let i64t = self.m.t_i64();
+                let sid = self.event_struct();
+                let ev_ty = self.m.intern_ty(TyKind::Struct(sid));
+                // An uninitialized `Event`-shaped slot; the extern fills it in (cf. `stash.peep`).
+                let ev = self.new_local(ev_ty);
+                let ev_ptr = self.new_local(rawptr);
+                self.fb()
+                    .assign(Place::local(ev_ptr), Rvalue::AddrOf(Place::local(ev)));
+                let ext = self.get_extern("bet_gg_poll", vec![rawptr], vec![boolt]);
+                // Bind and discard the `bool` (emptiness is signalled by `kind == NONE == 0`).
+                let discard = self.new_local(boolt);
+                self.fb().assign(
+                    Place::local(discard),
+                    Rvalue::Call(
+                        Callee::Extern(ext),
+                        vec![Operand::Copy(Place::local(ev_ptr))],
+                    ),
+                );
+                // kind = ev.0 (u32@0), code = ev.1 (u32@4); zero-extend each to `int`.
+                let kind_u = Operand::Copy(extend(&Place::local(ev), Proj::Field(0)));
+                let kind = self.coerce_int(kind_u, u32t, i64t);
+                let code_u = Operand::Copy(extend(&Place::local(ev), Proj::Field(1)));
+                let code = self.coerce_int(code_u, u32t, i64t);
+                let tuple_ty = self.m.intern_ty(TyKind::Tuple(vec![i64t, i64t]));
+                let tup = self.new_local(tuple_ty);
+                self.fb().assign(
+                    Place::local(tup),
+                    Rvalue::Aggregate(AggKind::Tuple, vec![kind, code]),
+                );
+                Ok((Operand::Copy(Place::local(tup)), tuple_ty))
+            }
+            // `gg.ticks()` -> int — a monotonic nanosecond timer, presented as `int`.
+            ("gg", "ticks") => {
+                if !args.is_empty() {
+                    return Err("`gg.ticks` takes no arguments".into());
+                }
+                let u64t = self.m.t_int(IntWidth::W64, false);
+                let i64t = self.m.t_i64();
+                let ext = self.get_extern("bet_gg_ticks", vec![], vec![u64t]);
+                let raw = self.new_local(u64t);
+                self.fb()
+                    .assign(Place::local(raw), Rvalue::Call(Callee::Extern(ext), vec![]));
+                let v = self.coerce_int(Operand::Copy(Place::local(raw)), u64t, i64t);
+                Ok((v, i64t))
+            }
+            // `gg.size()` -> (int, int) — the live window `(width, height)`, for true dynamic
+            // resolution. The ABI packs it as `w << 32 | h`; unpack `w` by a right shift and `h`
+            // by truncating to the low 32 bits, presenting both as `int` (like `gg.poll`).
+            ("gg", "size") => {
+                if !args.is_empty() {
+                    return Err("`gg.size` takes no arguments".into());
+                }
+                let u64t = self.m.t_int(IntWidth::W64, false);
+                let u32t = self.m.t_u32();
+                let i64t = self.m.t_i64();
+                let ext = self.get_extern("bet_gg_size", vec![], vec![u64t]);
+                let raw = self.new_local(u64t);
+                self.fb()
+                    .assign(Place::local(raw), Rvalue::Call(Callee::Extern(ext), vec![]));
+                // w = raw >> 32
+                let wsh = self.new_local(u64t);
+                self.fb().assign(
+                    Place::local(wsh),
+                    Rvalue::BinOp(
+                        BinOp::Shr,
+                        Operand::Copy(Place::local(raw)),
+                        Operand::Const(Const::Int(32, u64t)),
+                        ArithMode::Na,
+                    ),
+                );
+                let w = self.coerce_int(Operand::Copy(Place::local(wsh)), u64t, i64t);
+                // h = raw truncated to its low 32 bits
+                let h_u32 = self.coerce_int(Operand::Copy(Place::local(raw)), u64t, u32t);
+                let h = self.coerce_int(h_u32, u32t, i64t);
+                let tuple_ty = self.m.intern_ty(TyKind::Tuple(vec![i64t, i64t]));
+                let tup = self.new_local(tuple_ty);
+                self.fb().assign(
+                    Place::local(tup),
+                    Rvalue::Aggregate(AggKind::Tuple, vec![w, h]),
+                );
+                Ok((Operand::Copy(Place::local(tup)), tuple_ty))
+            }
             ("spill", _) => {
                 Err("`spill.*` is a statement-level print, not a value expression".into())
             }
@@ -3605,6 +3930,28 @@ impl LowerCtx {
                     .position(|f| f.name == *name)
                     .ok_or_else(|| format!("struct `{}` has no field `{name}`", def.name))?;
                 Ok(extend(&place, Proj::Field(idx as u32)))
+            }
+            // `base[i] = v` — an array or slice element place. (A `vec` element is not an
+            // assignable place: it's a runtime handle, written only via its methods.)
+            ExprKind::Index { base, index } => {
+                let base_place = self.lower_place(base)?;
+                let bty = self.place_ty(&base_place)?;
+                match self.m.ty(bty) {
+                    TyKind::Array(..) | TyKind::Slice(_) => {}
+                    TyKind::Vec(_) => {
+                        return Err(
+                            "cannot assign to a `vec` element (vec is append-only; use an array \
+                             or `mem.slab`)"
+                                .into(),
+                        );
+                    }
+                    other => {
+                        return Err(format!("cannot index-assign a non-array/slice ({other:?})"));
+                    }
+                }
+                let i64t = self.m.t_i64();
+                let (iop, _ity) = self.lower_expr(index, Some(i64t))?;
+                Ok(extend(&base_place, Proj::Index(iop)))
             }
             _ => Err("unsupported assignment target".into()),
         }

@@ -1,0 +1,22 @@
+[package]
+name = "gg-backend"
+description = "bet's native gg platform backend: a minifb window + cpal audio behind the optional `desktop` feature; headless no-ops (zero heavy deps) without it"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# minifb (window/framebuffer present + input) and cpal (audio output) are pulled in ONLY when
+# the `desktop` feature is on. The default build compiles the crate to headless no-ops with no
+# heavy transitive dependencies — the whole point of gating them behind `dep:` optional deps.
+[dependencies]
+rt-abi = { path = "../rt-abi" }
+minifb = { version = "0.27", optional = true }
+cpal   = { version = "0.15", optional = true }
+
+[features]
+# Turn on the real desktop backend (window + audio + input). OFF by default.
+desktop = ["dep:minifb", "dep:cpal"]
+
+[lints]
+workspace = true

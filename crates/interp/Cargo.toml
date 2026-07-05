@@ -9,6 +9,13 @@ publish.workspace = true
 [dependencies]
 frontend = { path = "../frontend" }
 rt-abi   = { path = "../rt-abi" }
+# The `gg.*` intrinsics route through the shared platform backend, so `bet run` and a compiled
+# binary present/poll/play through the same window. Headless (no heavy deps) unless `gg-desktop`.
+gg-backend = { path = "../gg-backend" }
+
+[features]
+# Enable the real desktop backend behind the interpreter's `gg.*` intrinsics.
+gg-desktop = ["gg-backend/desktop"]
 
 [lints]
 workspace = true

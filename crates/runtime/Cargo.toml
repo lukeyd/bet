@@ -16,6 +16,14 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 rt-abi = { path = "../rt-abi" }
+# The native `gg` platform layer. Depended on unconditionally, but headless (zero heavy deps)
+# unless `gg-desktop` is on — so the default `libruntime.a` stays a pure headless runtime.
+gg-backend = { path = "../gg-backend" }
+
+[features]
+# Turn the four `bet_gg_*` entry points into a real window/audio/input backend (via
+# gg-backend's `desktop` feature). OFF by default: `cargo build` links no minifb/cpal.
+gg-desktop = ["gg-backend/desktop"]
 
 [lints]
 workspace = true

@@ -199,15 +199,15 @@ status = "todo"
 
 [[task]]
 slug = "gg-platform"
-name = "gg platform layer: per-OS windowed framebuffer/audio-ring/input backends in runtime (macOS+Linux) + gg.* intrinsics in lower+interp"
+name = "gg platform layer: per-OS windowed framebuffer/audio-ring/input backends in runtime (macOS validated; Linux link-wiring pending) + gg.* intrinsics in lower+interp"
 size = 21
-status = "todo"
+status = "done"
 
 [[task]]
 slug = "milestone-6-pong"
 name = "Milestone 6: Pong demo (gamedev shakeout on gg before Doom) — windowed, input + audio"
 size = 8
-status = "todo"
+status = "done"
 
 # ─────────────────────── Track 5 — infra / tooling / freeze ───────────────────────
 

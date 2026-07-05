@@ -10,14 +10,17 @@
 # driver names the archive as a string and links it into the *compiled program* at build time;
 # the staticlibs are built as their own workspace members.
 [allow]
-midir    = []
-rt-abi   = []
-rt-stub  = ["rt-abi"]
-runtime  = ["rt-abi"]
-frontend = ["midir"]
-backend  = ["midir", "rt-abi"]
-interp   = ["frontend", "rt-abi"]
-fmt      = ["frontend"]
-lsp      = ["frontend"]
-driver   = ["frontend", "backend", "interp", "fmt"]
-xtask    = []
+midir      = []
+rt-abi     = []
+rt-stub    = ["rt-abi"]
+# gg-backend is the native `gg` platform layer (window/audio/input); it only knows the ABI.
+gg-backend = ["rt-abi"]
+# runtime + interp both drive the platform layer through gg-backend (the `gg-desktop` feature).
+runtime    = ["rt-abi", "gg-backend"]
+frontend   = ["midir"]
+backend    = ["midir", "rt-abi"]
+interp     = ["frontend", "rt-abi", "gg-backend"]
+fmt        = ["frontend"]
+lsp        = ["frontend"]
+driver     = ["frontend", "backend", "interp", "fmt"]
+xtask      = []

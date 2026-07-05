@@ -42,6 +42,9 @@ use std::collections::HashMap;
 use std::io::Write as _;
 use std::sync::{Mutex, OnceLock};
 use std::thread::JoinHandle;
+// `Instant` backs only the headless `bet_gg_ticks`; the desktop build gets its clock from
+// `gg-backend`, so gate the import to avoid an unused-import warning under `gg-desktop`.
+#[cfg(not(feature = "gg-desktop"))]
 use std::time::Instant;
 
 /// The base name of this crate's static library (`libruntime.a` → `-lruntime`). The driver
@@ -88,6 +91,11 @@ fn align_up(addr: usize, align: usize) -> usize {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bet_alloc(size: usize, align: usize) -> *mut u8 {
     unsafe { alloc::alloc(layout(size, align)) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_alloc_zeroed(size: usize, align: usize) -> *mut u8 {
+    unsafe { alloc::alloc_zeroed(layout(size, align)) }
 }
 
 #[unsafe(no_mangle)]
@@ -959,16 +967,24 @@ pub unsafe extern "C" fn bet_print_f64(v: f64) {
 }
 
 // ---------------------------------------------------------------------------
-// Platform layer — headless (Null-RHI style, matches rt-stub). Real per-OS backends
-// (framebuffer present, audio ring buffer, input) are the next milestone.
+// Platform layer. Headless by default (Null-RHI style, matches rt-stub); with the
+// `gg-desktop` feature, the four entry points delegate to `gg-backend`'s real
+// minifb window + cpal audio + input queue. The `extern "C"` signatures (frozen in
+// rt-abi) are byte-for-byte identical in both builds — the feature only changes the
+// body, so swapping a headless `libruntime.a` for a desktop one is a pure rebuild.
 // ---------------------------------------------------------------------------
 
+// --- headless (default: no `gg-desktop`) — the exact prior Null-RHI behavior. ---
+
+#[cfg(not(feature = "gg-desktop"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bet_gg_present(_fb: *const FrameBuffer) {}
 
+#[cfg(not(feature = "gg-desktop"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bet_gg_audio(_frames: *const i16, _count: usize) {}
 
+#[cfg(not(feature = "gg-desktop"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bet_gg_poll(out: *mut Event) -> bool {
     if !out.is_null() {
@@ -984,8 +1000,60 @@ pub unsafe extern "C" fn bet_gg_poll(out: *mut Event) -> bool {
     false
 }
 
+#[cfg(not(feature = "gg-desktop"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bet_gg_ticks() -> u64 {
     static START: OnceLock<Instant> = OnceLock::new();
     START.get_or_init(Instant::now).elapsed().as_nanos() as u64
+}
+
+// --- desktop (`gg-desktop`) — delegate to the real gg-backend. ---
+
+#[cfg(feature = "gg-desktop")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_present(fb: *const FrameBuffer) {
+    if fb.is_null() {
+        return;
+    }
+    // SAFETY: the frozen contract says `fb` (when non-null) points to a valid `FrameBuffer`
+    // whose `pixels` addresses `stride * height` readable `u32`s.
+    let fb = unsafe { &*fb };
+    gg_backend::present(fb.pixels as *const u32, fb.width, fb.height, fb.stride);
+}
+
+#[cfg(feature = "gg-desktop")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_audio(frames: *const i16, count: usize) {
+    if frames.is_null() || count == 0 {
+        return;
+    }
+    // SAFETY: the caller guarantees `frames` addresses `count` readable `i16`s.
+    let samples = unsafe { std::slice::from_raw_parts(frames, count) };
+    gg_backend::audio(samples);
+}
+
+#[cfg(feature = "gg-desktop")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_poll(out: *mut Event) -> bool {
+    let ev = gg_backend::poll();
+    if !out.is_null() {
+        // SAFETY: `out` (when non-null) points to a writable `Event`.
+        unsafe {
+            *out = ev;
+        }
+    }
+    ev.kind != event_kind::NONE
+}
+
+#[cfg(feature = "gg-desktop")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_ticks() -> u64 {
+    gg_backend::ticks()
+}
+
+/// `bet_gg_size` — the 5th gg primitive (dynamic resolution). Not cfg-split: `gg_backend::size`
+/// reports the live window size under `gg-desktop` and the fixed headless default otherwise.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_size() -> u64 {
+    gg_backend::size()
 }

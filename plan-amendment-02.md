@@ -133,6 +133,13 @@ inside the runtime" promise and the freeze.
 
 **Closes:** §8 "how much SDL-equivalent surface `gg` absorbs."
 
+**Amendment (post-M6, Pong dynamic resolution):** a **fifth** primitive, `gg.size() -> (w, h)`
+(`bet_gg_size`, packed `w<<32|h`), was added. A program that renders at the window's native
+resolution (fills/resizes the window, no upscaling) must learn the drawable size, which the
+original four cannot report. This is the one deliberate expansion of the SP0.4 floor; the
+"framebuffer + audio + input + timing + size" set is the new ceiling. GPU/shaders/multi-window
+remain out.
+
 ---
 
 ## SP0.5 — Wrapping-arithmetic naming → **`math.wrapAdd` / `wrapSub` / `wrapMul`**

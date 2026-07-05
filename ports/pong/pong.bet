@@ -1,0 +1,344 @@
+// pong.bet — a `bet` port of PONG with TRUE DYNAMIC RESOLUTION, and the shakeout for the `gg`
+// platform layer. It exercises all FIVE gg primitives:
+//   * video  — `gg.blit(fb, w, h)` presents a software-rendered 32-bit RGBA framebuffer
+//   * input  — `gg.poll()` drains keyboard/quit events (a `(kind, code)` pair)
+//   * audio  — `gg.audio(samples, count)` pushes interleaved-stereo i16 sound
+//   * timing — `gg.ticks()` monotonic nanoseconds, for frame pacing
+//   * SIZE   — `gg.size()` the live window `(width, height)`, so the framebuffer matches the
+//              window pixel-for-pixel and the field fills the whole (resizable) window
+//
+// Runs on the interpreter (`bet run`) and compiles native (`bet build`); both drive the same
+// windowed backend through the shared `gg-backend` crate — see ports/pong/README.md.
+//
+// Design notes (bet's memory/value model):
+//   * The framebuffer / keystate / beep are heap `[]T` buffers from `mem.slab[T](n)`. The
+//     framebuffer is REALLOCATED whenever the window resizes, so it always matches the window.
+//   * ALL framebuffer writes stay INLINE in `main`: a slice shares its backing pointer when
+//     compiled but is deep-copied in the interpreter, so passing `fb` to a mutating helper would
+//     diverge. Game state is value-threaded through `Game`; per-frame geometry through `Dims`.
+//   * Resolution-independence: `Game` stores the ball DIRECTION (±1), not a velocity — speed is
+//     derived from the current size each frame, so the ball auto-scales with resolution.
+//   * One statement per line (newline-separated); integer math only; unary minus is `0 - x`.
+pull "spill"
+
+facts WHITE: u32 = 0x00FFFFFF
+facts BLACK: u32 = 0x00000000
+
+// keycodes (must match gg-backend's `key` mapping)
+facts KEY_W: int = 87
+facts KEY_S: int = 83
+facts KEY_UP: int = 256
+facts KEY_DOWN: int = 257
+facts KEY_ESC: int = 27
+
+// event kinds (rt-abi event_kind)
+facts EV_NONE: int = 0
+facts EV_KEYDOWN: int = 1
+facts EV_KEYUP: int = 2
+facts EV_QUIT: int = 4
+
+// audio
+facts SR: int = 44100
+facts BEEP_FRAMES: int = 2600
+
+// Per-frame geometry, all derived from the current window size (fill-window, no letterbox).
+drip Dims {
+    flex w: int
+    flex h: int
+    flex ph: int      // paddle height
+    flex pw: int      // paddle width
+    flex bs: int      // ball size
+    flex spx: int     // ball x speed
+    flex spy: int     // ball y speed
+    flex psp: int     // paddle speed
+    flex lx: int      // side margin
+}
+
+// Ball position (pixels) + DIRECTION (±1, not velocity), paddle y's, scores, sound flag.
+drip Game {
+    flex bx: int
+    flex by: int
+    flex dirx: int
+    flex diry: int
+    flex p1: int
+    flex p2: int
+    flex s1: int
+    flex s2: int
+    flex beep: int
+}
+
+finna maxi(a: int, b: int) -> int {
+    fr a > b {
+        bet a
+    }
+    bet b
+}
+
+// Compute the geometry for a window of size (w, h). Ball/paddle/speed are all proportional, so
+// the whole board scales with the window; `maxi(..)` floors keep tiny windows playable.
+finna dimsFor(w: int, h: int) -> Dims {
+    lowkey mn = h
+    fr w < h {
+        mn = w
+    }
+    bet Dims{
+        w: w,
+        h: h,
+        ph: maxi(8, h / 5),
+        pw: maxi(4, w / 60),
+        bs: maxi(4, mn / 64),
+        spx: maxi(2, w / 128),
+        spy: maxi(2, h / 160),
+        psp: maxi(3, h / 100),
+        lx: maxi(4, w / 30)
+    }
+}
+
+finna clampPaddle(y: int, d: Dims) -> int {
+    fr y < 0 {
+        bet 0
+    }
+    fr y > d.h - d.ph {
+        bet d.h - d.ph
+    }
+    bet y
+}
+
+// Pure physics/AI step using the current `Dims`. `l*`/`r*` are the paddle key states (0/1).
+finna step(g: Game, d: Dims, lUp: int, lDn: int, rUp: int, rDn: int) -> Game {
+    g.beep = 0
+
+    // left paddle (W/S)
+    fr lUp != 0 {
+        g.p1 = clampPaddle(g.p1 - d.psp, d)
+    }
+    fr lDn != 0 {
+        g.p1 = clampPaddle(g.p1 + d.psp, d)
+    }
+
+    // right paddle: arrow keys if pressed, else drift toward the ball (simple AI)
+    fr rUp != 0 {
+        g.p2 = clampPaddle(g.p2 - d.psp, d)
+    } naw fr rDn != 0 {
+        g.p2 = clampPaddle(g.p2 + d.psp, d)
+    } naw {
+        lowkey bc = g.by + d.bs / 2
+        lowkey pc = g.p2 + d.ph / 2
+        fr bc < pc - d.psp {
+            g.p2 = clampPaddle(g.p2 - d.psp, d)
+        } naw fr bc > pc + d.psp {
+            g.p2 = clampPaddle(g.p2 + d.psp, d)
+        }
+    }
+
+    // advance ball: velocity = direction * speed (so it scales with resolution)
+    g.bx = g.bx + g.dirx * d.spx
+    g.by = g.by + g.diry * d.spy
+
+    // top / bottom walls
+    fr g.by <= 0 {
+        g.by = 0
+        g.diry = 0 - g.diry
+        g.beep = 1
+    } naw fr g.by + d.bs >= d.h {
+        g.by = d.h - d.bs
+        g.diry = 0 - g.diry
+        g.beep = 1
+    }
+
+    // left paddle collision
+    lowkey lxr = d.lx + d.pw
+    fr g.bx <= lxr && g.bx >= d.lx && g.by + d.bs >= g.p1 && g.by <= g.p1 + d.ph {
+        g.bx = lxr
+        g.dirx = 0 - g.dirx
+        g.beep = 1
+    }
+
+    // right paddle collision
+    lowkey rx = d.w - d.lx - d.pw
+    fr g.bx + d.bs >= rx && g.bx + d.bs <= rx + d.pw && g.by + d.bs >= g.p2 && g.by <= g.p2 + d.ph {
+        g.bx = rx - d.bs
+        g.dirx = 0 - g.dirx
+        g.beep = 1
+    }
+
+    // scoring: ball past an edge -> point + recenter
+    fr g.bx < 0 {
+        g.s2 = g.s2 + 1
+        g.bx = d.w / 2
+        g.by = d.h / 2
+        g.dirx = 1
+        g.diry = 1
+        g.beep = 2
+    } naw fr g.bx + d.bs > d.w {
+        g.s1 = g.s1 + 1
+        g.bx = d.w / 2
+        g.by = d.h / 2
+        g.dirx = 0 - 1
+        g.diry = 1
+        g.beep = 2
+    }
+
+    bet g
+}
+
+finna main() {
+    lowkey keydown = mem.slab[int](512)
+    lowkey beepbuf = mem.slab[i16](BEEP_FRAMES * 2)
+
+    // pre-render a 440Hz square-wave beep (stereo interleaved i16)
+    lowkey period = SR / 440
+    lowkey si = 0
+    vibin si < BEEP_FRAMES {
+        lowkey phase = si - (si / period) * period
+        lowkey amp = 0 - 7000
+        fr phase * 2 < period {
+            amp = 7000
+        }
+        beepbuf[si * 2] = amp
+        beepbuf[si * 2 + 1] = amp
+        si = si + 1
+    }
+
+    lowkey w, h = gg.size()
+    lowkey d = dimsFor(w, h)
+    lowkey fb = mem.slab[u32](w * h)
+    lowkey ow = w
+    lowkey oh = h
+
+    lowkey g = Game{
+        bx: w / 2,
+        by: h / 2,
+        dirx: 1,
+        diry: 1,
+        p1: (h - d.ph) / 2,
+        p2: (h - d.ph) / 2,
+        s1: 0,
+        s2: 0,
+        beep: 0
+    }
+
+    lowkey running = nocap
+    lowkey last = gg.ticks()
+    vibin running {
+        // ---- drain input ----
+        lowkey polling = nocap
+        vibin polling {
+            lowkey kind, code = gg.poll()
+            fr kind == EV_NONE {
+                polling = cap
+            } naw fr kind == EV_QUIT {
+                running = cap
+                polling = cap
+            } naw fr kind == EV_KEYDOWN {
+                fr code == KEY_ESC {
+                    running = cap
+                } naw fr code < 512 {
+                    keydown[code] = 1
+                }
+            } naw fr kind == EV_KEYUP {
+                fr code < 512 {
+                    keydown[code] = 0
+                }
+            }
+        }
+
+        // ---- dynamic resolution: match the framebuffer to the live window ----
+        lowkey nw, nh = gg.size()
+        fr nw != ow || nh != oh {
+            g.bx = g.bx * nw / ow
+            g.by = g.by * nh / oh
+            g.p1 = g.p1 * nh / oh
+            g.p2 = g.p2 * nh / oh
+            fb = mem.slab[u32](nw * nh)
+            ow = nw
+            oh = nh
+        }
+        w = nw
+        h = nh
+        d = dimsFor(w, h)
+
+        // ---- update ----
+        g = step(g, d, keydown[KEY_W], keydown[KEY_S], keydown[KEY_UP], keydown[KEY_DOWN])
+
+        // keep everything inside the (possibly just-resized) field, so draws never go OOB
+        g.p1 = clampPaddle(g.p1, d)
+        g.p2 = clampPaddle(g.p2, d)
+        fr g.bx < 0 {
+            g.bx = 0
+        }
+        fr g.bx > d.w - d.bs {
+            g.bx = d.w - d.bs
+        }
+        fr g.by < 0 {
+            g.by = 0
+        }
+        fr g.by > d.h - d.bs {
+            g.by = d.h - d.bs
+        }
+
+        // ---- draw (INLINE — fb is never passed to a mutating helper) ----
+        lowkey i = 0
+        vibin i < w * h {
+            fb[i] = BLACK
+            i = i + 1
+        }
+
+        // center net (dashed)
+        lowkey dash = d.bs * 2
+        lowkey ny = 0
+        vibin ny < h {
+            fr (ny / dash) - (ny / (dash * 2)) * 2 == 0 {
+                fb[ny * w + w / 2] = WHITE
+            }
+            ny = ny + 1
+        }
+
+        // left paddle
+        lowkey py = g.p1
+        vibin py < g.p1 + d.ph {
+            lowkey px = d.lx
+            vibin px < d.lx + d.pw {
+                fb[py * w + px] = WHITE
+                px = px + 1
+            }
+            py = py + 1
+        }
+
+        // right paddle
+        lowkey qy = g.p2
+        vibin qy < g.p2 + d.ph {
+            lowkey qx = d.w - d.lx - d.pw
+            vibin qx < d.w - d.lx {
+                fb[qy * w + qx] = WHITE
+                qx = qx + 1
+            }
+            qy = qy + 1
+        }
+
+        // ball
+        lowkey ry = g.by
+        vibin ry < g.by + d.bs {
+            lowkey rx = g.bx
+            vibin rx < g.bx + d.bs {
+                fb[ry * w + rx] = WHITE
+                rx = rx + 1
+            }
+            ry = ry + 1
+        }
+
+        // ---- present + audio ----
+        gg.blit(fb, w, h)
+        fr g.beep != 0 {
+            gg.audio(beepbuf, BEEP_FRAMES * 2)
+        }
+
+        // ---- pace to ~60fps (16.6ms) ----
+        lowkey target = last + 16600000
+        vibin gg.ticks() < target {
+        }
+        last = gg.ticks()
+    }
+
+    spill.f("final score {} - {}\n", g.s1, g.s2)
+}

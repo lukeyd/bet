@@ -55,6 +55,11 @@ pub unsafe extern "C" fn bet_alloc(size: usize, align: usize) -> *mut u8 {
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_alloc_zeroed(size: usize, align: usize) -> *mut u8 {
+    unsafe { alloc::alloc_zeroed(layout(size, align)) }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn bet_free(ptr: *mut u8, size: usize, align: usize) {
     if !ptr.is_null() {
         unsafe { alloc::dealloc(ptr, layout(size, align)) }
@@ -834,6 +839,14 @@ pub unsafe extern "C" fn bet_gg_poll(out: *mut Event) -> bool {
 pub unsafe extern "C" fn bet_gg_ticks() -> u64 {
     static START: OnceLock<Instant> = OnceLock::new();
     START.get_or_init(Instant::now).elapsed().as_nanos() as u64
+}
+
+/// `bet_gg_size` — the current window size, packed `w << 32 | h`. rt-stub is headless (no
+/// window), so it always reports the fixed default — kept equal to `gg-backend`'s `DEFAULT_W/H`
+/// (960×640) so the headless interp and a stub-linked program stay byte-identical.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_size() -> u64 {
+    (960u64 << 32) | 640
 }
 
 #[cfg(test)]

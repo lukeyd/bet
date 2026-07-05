@@ -1052,8 +1052,28 @@ impl<'p> Interp<'p> {
                         let id = self.new_arena(false);
                         return Ok(vec![Value::Crib(id)]);
                     }
+                    // `mem.slab[T](n)` — a zero-initialized `[]T` buffer of `n` elements. The
+                    // element type is erased in the interpreter (every scalar is a `Value::Int`),
+                    // so it's an `Array` of `n` zeros, matching the compiled `bet_alloc_zeroed`.
+                    "mem" if method == "slab" => {
+                        let vals = self.eval_args(env, args)?;
+                        let n = match vals.as_slice() {
+                            [Value::Int(n)] if *n >= 0 => *n as usize,
+                            _ => {
+                                return Err(RunError::Type(
+                                    "`mem.slab` takes a single non-negative length".into(),
+                                ));
+                            }
+                        };
+                        return Ok(vec![Value::Array(vec![Value::Int(0); n])]);
+                    }
                     "math" => return self.call_math(env, method, args).map(|v| vec![v]),
                     "sys" => return self.call_sys(env, method, args).map(|v| vec![v]),
+                    // `gg.*` — the platform layer (window/audio/input/timing). Returns a value
+                    // list directly (`gg.poll` is a 2-tuple, `gg.ticks` a 1-tuple), so it is
+                    // dispatched here rather than through the single-value `.map(|v| vec![v])`
+                    // wrappers above.
+                    "gg" => return self.call_gg(env, method, args),
                     _ => {}
                 }
             }
@@ -1651,6 +1671,72 @@ impl<'p> Interp<'p> {
         }
     }
 
+    /// The `gg` platform intrinsics — the interpreter half of the native `gg` backend, routed
+    /// through the shared `gg-backend` crate so `bet run` presents pixels, drains audio, and
+    /// reports input through the very same window/stream/queue a compiled binary uses. Headless
+    /// (present/audio no-op, poll ⇒ NONE) unless `interp` is built with `--features gg-desktop`;
+    /// the marshaling and the return-value shapes are identical either way.
+    fn call_gg(
+        &mut self,
+        env: &mut Env,
+        method: &str,
+        args: &[Arg],
+    ) -> Result<Vec<Value>, RunError> {
+        let vals = self.eval_args(env, args)?;
+        match (method, vals.as_slice()) {
+            // `gg.blit(pixels, w, h)` presents a tightly packed `w * h` framebuffer (stride == w).
+            ("blit", [pixels, Value::Int(w), Value::Int(h)]) if *w >= 0 && *h >= 0 => {
+                let (w, h) = (*w as u32, *h as u32);
+                let mut buf = marshal_ints(pixels, |i| i as u32).ok_or_else(|| {
+                    RunError::Type("`gg.blit` needs an array of pixel integers".into())
+                })?;
+                // Never let the backend read past the marshaled buffer: pad short frames to w*h.
+                buf.resize((w as usize) * (h as usize), 0);
+                gg_backend::present(buf.as_ptr(), w, h, w);
+                Ok(Vec::new())
+            }
+            ("blit", _) => Err(RunError::Type(
+                "`gg.blit(pixels, w, h)` takes a pixel array and two non-negative int dimensions"
+                    .into(),
+            )),
+            // `gg.audio(samples, count)` queues the first `count` interleaved i16 samples.
+            ("audio", [samples, Value::Int(count)]) if *count >= 0 => {
+                let buf = marshal_ints(samples, |i| i as i16).ok_or_else(|| {
+                    RunError::Type("`gg.audio` needs an array of sample integers".into())
+                })?;
+                let count = (*count as usize).min(buf.len());
+                gg_backend::audio(&buf[..count]);
+                Ok(Vec::new())
+            }
+            ("audio", _) => Err(RunError::Type(
+                "`gg.audio(samples, count)` takes a sample array and a non-negative int count"
+                    .into(),
+            )),
+            // `gg.poll()` returns a `(kind, code)` int pair; NONE (kind == 0) when the queue empty.
+            ("poll", []) => {
+                let e = gg_backend::poll();
+                Ok(vec![
+                    Value::Int(i64::from(e.kind)),
+                    Value::Int(i64::from(e.code)),
+                ])
+            }
+            ("poll", _) => Err(RunError::Type("`gg.poll` takes no arguments".into())),
+            // `gg.ticks()` returns a monotonic nanosecond counter.
+            ("ticks", []) => Ok(vec![Value::Int(gg_backend::ticks() as i64)]),
+            ("ticks", _) => Err(RunError::Type("`gg.ticks` takes no arguments".into())),
+            // `gg.size()` returns the live window `(width, height)`; the ABI packs `w << 32 | h`.
+            ("size", []) => {
+                let v = gg_backend::size();
+                Ok(vec![
+                    Value::Int((v >> 32) as i64),
+                    Value::Int((v & 0xFFFF_FFFF) as i64),
+                ])
+            }
+            ("size", _) => Err(RunError::Type("`gg.size` takes no arguments".into())),
+            (other, _) => Err(RunError::Unsupported(format!("gg.{other}"))),
+        }
+    }
+
     // ---- coercion -------------------------------------------------------------
 
     /// Apply a binding's declared type to a value where it is observable at runtime — namely,
@@ -1710,6 +1796,24 @@ fn bytes_of(vals: &[Value]) -> Result<Vec<u8>, RunError> {
             )),
         })
         .collect()
+}
+
+/// Marshal a `gg` pixel/sample array `Value` into a `Vec<T>` via `conv`. A fixed `[u32; N]` /
+/// `[i16; N]` array is a [`Value::Array`] whose elements are `Value::Int` (or a `Value::Byte`
+/// for a `[]u8`). Returns `None` if the value isn't an array of integers.
+fn marshal_ints<T>(v: &Value, conv: impl Fn(i64) -> T) -> Option<Vec<T>> {
+    let Value::Array(xs) = v else {
+        return None;
+    };
+    let mut out = Vec::with_capacity(xs.len());
+    for e in xs {
+        match e {
+            Value::Int(i) => out.push(conv(*i)),
+            Value::Byte(b) => out.push(conv(i64::from(*b))),
+            _ => return None,
+        }
+    }
+    Some(out)
 }
 
 fn exactly_one(mut vals: Vec<Value>) -> Result<Value, RunError> {

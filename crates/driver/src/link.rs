@@ -72,9 +72,31 @@ fn link_unix(obj: &Path, libdir: &Path, out: &Path, runtime: Runtime) -> Result<
     for lib in unix_sys_libs() {
         cmd.arg(lib);
     }
+    // The real runtime built with `gg-desktop` statically bundles minifb + cpal, whose macOS
+    // framework dependencies are recorded as cargo link directives that do NOT survive into the
+    // `.a` archive — so the final `cc` link must name them explicitly. Harmless when gg is
+    // headless (the linker drops unreferenced frameworks).
+    if cfg!(target_os = "macos") && runtime == Runtime::Real {
+        for fw in MACOS_GG_FRAMEWORKS {
+            cmd.arg("-framework").arg(fw);
+        }
+    }
     cmd.arg("-o").arg(out);
     run_linker(cmd, "cc")
 }
+
+/// macOS frameworks the `gg-desktop` runtime (minifb + cpal) references but a static archive does
+/// not carry: window/graphics/input (Cocoa/Carbon/Metal/MetalKit) + audio
+/// (AudioUnit/CoreAudio/CoreFoundation). `AudioUnit`'s dylib re-exports the AudioToolbox symbols.
+const MACOS_GG_FRAMEWORKS: &[&str] = &[
+    "Cocoa",
+    "Carbon",
+    "Metal",
+    "MetalKit",
+    "AudioUnit",
+    "CoreAudio",
+    "CoreFoundation",
+];
 
 fn link_msvc(obj: &Path, libdir: &Path, out: &Path, runtime: Runtime) -> Result<(), String> {
     // clang (from the LLVM toolchain) drives the link, pulling the MSVC CRT. The runtime archive
