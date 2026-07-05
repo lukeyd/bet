@@ -543,6 +543,8 @@ impl LowerCtx {
             "str" => TyKind::Str,
             "void" | "nada" => TyKind::Void,
             "rawptr" => TyKind::RawPtr,
+            // `rng` — an opaque seeded-PRNG handle (`math.cook`); no type arguments.
+            "rng" => TyKind::Rng,
             _ => {
                 if let Some(&s) = self.structs.get(name) {
                     return Ok(self.m.intern_ty(TyKind::Struct(s)));
@@ -2077,6 +2079,9 @@ impl LowerCtx {
         if let TyKind::Vec(e) = *self.m.ty(bty) {
             return self.lower_vec_method(bop, e, method, args);
         }
+        if matches!(*self.m.ty(bty), TyKind::Rng) {
+            return self.lower_rng_method(bop, method, args);
+        }
         if self.is_yikes(bty) {
             return self.lower_yikes_method(bop, method, args);
         }
@@ -2716,6 +2721,63 @@ impl LowerCtx {
         )
     }
 
+    /// Dispatch a method on an `rng` handle (`math.cook`): `roll` (raw 64-bit draw), `frac`
+    /// (a float in `[0, 1)`), or `upTo(n)` (an unbiased int in `[0, n)`). The runtime speaks
+    /// `u64`; the `int`-facing sides cross the signed/unsigned boundary via `coerce_int`.
+    fn lower_rng_method(
+        &mut self,
+        rng_op: Operand,
+        method: &str,
+        args: &[ast::Arg],
+    ) -> Result<(Operand, TyId), String> {
+        let rng_ty = self.m.intern_ty(TyKind::Rng);
+        let u64t = self.m.t_int(IntWidth::W64, false);
+        let i64t = self.m.t_i64();
+        let f64t = self.m.intern_ty(TyKind::F64);
+        match method {
+            // `g.roll()` → bet_rng_next(rng) -> u64, presented as an `int`.
+            "roll" => {
+                if !args.is_empty() {
+                    return Err("`rng.roll` takes no arguments".into());
+                }
+                let ext = self.get_extern("bet_rng_next", vec![rng_ty], vec![u64t]);
+                let raw = self.new_local(u64t);
+                self.fb().assign(
+                    Place::local(raw),
+                    Rvalue::Call(Callee::Extern(ext), vec![rng_op]),
+                );
+                let out = self.coerce_int(Operand::Copy(Place::local(raw)), u64t, i64t);
+                Ok((out, i64t))
+            }
+            // `g.frac()` → bet_rng_frac(rng) -> f64 in `[0, 1)`.
+            "frac" => {
+                if !args.is_empty() {
+                    return Err("`rng.frac` takes no arguments".into());
+                }
+                let ext = self.get_extern("bet_rng_frac", vec![rng_ty], vec![f64t]);
+                self.emit_extern_call(ext, &[f64t], vec![rng_op])
+            }
+            // `g.upTo(n)` → bet_rng_upto(rng, n) -> u64, unbiased in `[0, n)`. Both the bound
+            // and the result cross the `int`↔`u64` boundary.
+            "upTo" => {
+                if args.len() != 1 {
+                    return Err("`rng.upTo` takes a single bound".into());
+                }
+                let (n, nty) = self.lower_expr(&args[0].value, Some(i64t))?;
+                let nu = self.coerce_int(n, nty, u64t);
+                let ext = self.get_extern("bet_rng_upto", vec![rng_ty, u64t], vec![u64t]);
+                let raw = self.new_local(u64t);
+                self.fb().assign(
+                    Place::local(raw),
+                    Rvalue::Call(Callee::Extern(ext), vec![rng_op, nu]),
+                );
+                let out = self.coerce_int(Operand::Copy(Place::local(raw)), u64t, i64t);
+                Ok((out, i64t))
+            }
+            other => Err(format!("unknown `rng` method `{other}`")),
+        }
+    }
+
     fn lower_intrinsic(
         &mut self,
         module: &str,
@@ -2736,6 +2798,25 @@ impl LowerCtx {
                     Rvalue::BinOp(BinOp::Add, a, b, ArithMode::Wrap),
                 );
                 Ok((Operand::Copy(Place::local(tmp)), aty))
+            }
+            // `math.cook(seed)` — a seeded PRNG handle (`rng`). The `int` seed is reinterpreted
+            // as `u64` for the runtime constructor.
+            ("math", "cook") => {
+                if args.len() != 1 {
+                    return Err("`math.cook` takes a single int seed".into());
+                }
+                let u64t = self.m.t_int(IntWidth::W64, false);
+                let i64t = self.m.t_i64();
+                let rng_ty = self.m.intern_ty(TyKind::Rng);
+                let (seed, sty) = self.lower_expr(&args[0].value, Some(i64t))?;
+                let seedu = self.coerce_int(seed, sty, u64t);
+                let ext = self.get_extern("bet_rng_new", vec![u64t], vec![rng_ty]);
+                let tmp = self.new_local(rng_ty);
+                self.fb().assign(
+                    Place::local(tmp),
+                    Rvalue::Call(Callee::Extern(ext), vec![seedu]),
+                );
+                Ok((Operand::Copy(Place::local(tmp)), rng_ty))
             }
             // `bytes.readU32le(buf, off)` — a little-endian u32 from `buf[off..off+4]`.
             ("bytes", "readU32le") => {
@@ -2900,6 +2981,44 @@ impl LowerCtx {
                     Rvalue::Call(
                         Callee::Extern(ext),
                         vec![idxu, Operand::Copy(Place::local(out_ptr))],
+                    ),
+                );
+                let result = self.new_local(strt);
+                self.fb().assign(
+                    Place::local(result),
+                    Rvalue::MakeStr {
+                        data: Operand::Copy(Place::local(data)),
+                        len: Operand::Copy(Place::local(out_len)),
+                    },
+                );
+                Ok((Operand::Copy(Place::local(result)), strt))
+            }
+            // `sys.peep()` — read one stdin line (trailing newline stripped); `""` at EOF. The
+            // runtime returns an owned buffer + writes its byte length through the out pointer;
+            // a null/zero-length return builds the empty `str`.
+            ("sys", "peep") => {
+                if !args.is_empty() {
+                    return Err("`sys.peep` takes no arguments".into());
+                }
+                let rawptr = self.m.intern_ty(TyKind::RawPtr);
+                let usize_t = self.m.t_int(IntWidth::W64, false);
+                let strt = self.m.t_str();
+                // An out-parameter local for the line length; pass its address.
+                let out_len = self.new_local(usize_t);
+                self.fb().assign(
+                    Place::local(out_len),
+                    Rvalue::Use(Operand::Const(Const::Int(0, usize_t))),
+                );
+                let out_ptr = self.new_local(rawptr);
+                self.fb()
+                    .assign(Place::local(out_ptr), Rvalue::AddrOf(Place::local(out_len)));
+                let ext = self.get_extern("bet_read_line", vec![rawptr], vec![rawptr]);
+                let data = self.new_local(rawptr);
+                self.fb().assign(
+                    Place::local(data),
+                    Rvalue::Call(
+                        Callee::Extern(ext),
+                        vec![Operand::Copy(Place::local(out_ptr))],
                     ),
                 );
                 let result = self.new_local(strt);
