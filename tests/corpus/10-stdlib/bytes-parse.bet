@@ -1,11 +1,15 @@
-// bytes-parse — read little-endian u32s out of a byte slice (WAD-lump shaped).
+// bytes-parse — read little-endian u16/u32s out of a byte slice (WAD-lump shaped).
 pull "spill"
 pull "bytes"
 
 finna main() {
-    lowkey buf: []u8 = [0x2A, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00]
-    lowkey a = bytes.readU32le(buf, 0)   // 0x0000002A = 42
-    lowkey b = bytes.readU32le(buf, 4)   // 0x00000007 = 7
+    lowkey buf: []u8 = [0x2A, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x80]
+    lowkey a = bytes.readU32le(buf, 0)   // 42
+    lowkey b = bytes.readU32le(buf, 4)   // 7
     spill.it(a)
     spill.it(b)
+    spill.it(bytes.readU16le(buf, 8))    // 0xFFFF = 65535
+    spill.it(bytes.readI16le(buf, 8))    // 0xFFFF as i16 = -1
+    spill.it(bytes.readU16le(buf, 10))   // 0x8000 = 32768
+    spill.it(bytes.readI16le(buf, 10))   // 0x8000 as i16 = -32768
 }

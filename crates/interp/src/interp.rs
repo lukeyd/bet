@@ -1069,6 +1069,7 @@ impl<'p> Interp<'p> {
                     }
                     "math" => return self.call_math(env, method, args).map(|v| vec![v]),
                     "sys" => return self.call_sys(env, method, args).map(|v| vec![v]),
+                    "fs" => return self.call_fs(env, method, args).map(|v| vec![v]),
                     // `gg.*` — the platform layer (window/audio/input/timing). Returns a value
                     // list directly (`gg.poll` is a 2-tuple, `gg.ticks` a 1-tuple), so it is
                     // dispatched here rather than through the single-value `.map(|v| vec![v])`
@@ -1644,6 +1645,24 @@ impl<'p> Interp<'p> {
         }
     }
 
+    /// `fs` intrinsics. `fs.peep(path)` reads the whole file as `[]u8` (empty on any error),
+    /// mirroring the runtime `bet_fs_read` used by the compiled path.
+    fn call_fs(&mut self, env: &mut Env, method: &str, args: &[Arg]) -> Result<Value, RunError> {
+        let vals = self.eval_args(env, args)?;
+        match (method, vals.as_slice()) {
+            ("peep", [Value::Str(path)]) => match std::fs::read(path) {
+                Ok(bytes) => Ok(Value::Array(
+                    bytes.into_iter().map(|b| Value::Int(b as i64)).collect(),
+                )),
+                Err(_) => Ok(Value::Array(Vec::new())),
+            },
+            ("peep", _) => Err(RunError::Type(
+                "`fs.peep` takes a single path string".into(),
+            )),
+            (other, _) => Err(RunError::Unsupported(format!("fs.{other}"))),
+        }
+    }
+
     fn call_bytes(&mut self, env: &mut Env, method: &str, args: &[Arg]) -> Result<Value, RunError> {
         let vals = self.eval_args(env, args)?;
         match (method, vals.as_slice()) {
@@ -1664,6 +1683,46 @@ impl<'p> Interp<'p> {
                 }
                 Ok(Value::Int(acc as i64))
             }
+            ("readU16le", [Value::Array(bytes), Value::Int(off)]) if *off >= 0 => {
+                let off = *off as usize;
+                let mut acc: u16 = 0;
+                for k in 0..2 {
+                    let byte = match bytes.get(off + k) {
+                        Some(Value::Int(b)) => (*b as u32) & 0xFF,
+                        Some(Value::Byte(b)) => *b as u32,
+                        _ => {
+                            return Err(RunError::Type(
+                                "bytes.readU16le needs 2 in-range byte elements".into(),
+                            ));
+                        }
+                    };
+                    acc |= (byte as u16) << (8 * k as u32);
+                }
+                Ok(Value::Int(acc as i64))
+            }
+            ("readU16le", _) => Err(RunError::Type(
+                "bytes.readU16le(buf, off) called with the wrong argument shape".into(),
+            )),
+            ("readI16le", [Value::Array(bytes), Value::Int(off)]) if *off >= 0 => {
+                let off = *off as usize;
+                let mut acc: u16 = 0;
+                for k in 0..2 {
+                    let byte = match bytes.get(off + k) {
+                        Some(Value::Int(b)) => (*b as u32) & 0xFF,
+                        Some(Value::Byte(b)) => *b as u32,
+                        _ => {
+                            return Err(RunError::Type(
+                                "bytes.readI16le needs 2 in-range byte elements".into(),
+                            ));
+                        }
+                    };
+                    acc |= (byte as u16) << (8 * k as u32);
+                }
+                Ok(Value::Int(acc as i16 as i64))
+            }
+            ("readI16le", _) => Err(RunError::Type(
+                "bytes.readI16le(buf, off) called with the wrong argument shape".into(),
+            )),
             ("readU32le", _) => Err(RunError::Type(
                 "bytes.readU32le(buf, off) called with the wrong argument shape".into(),
             )),

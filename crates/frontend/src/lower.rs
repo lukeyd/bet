@@ -3100,6 +3100,152 @@ impl LowerCtx {
                 }
                 Ok((Operand::Copy(Place::local(acc)), u32t))
             }
+            // `bytes.readU16le(buf, off)` — a little-endian u16 from `buf[off..off+2]`,
+            // zero-extended (keeps the narrow unsigned width, like `readU32le`).
+            ("bytes", "readU16le") => {
+                if args.len() != 2 {
+                    return Err("`bytes.readU16le` takes a byte slice and an offset".into());
+                }
+                let i64t = self.m.t_i64();
+                let u16t = self.m.t_int(IntWidth::W16, false);
+                let (buf, bufty) = self.lower_expr(&args[0].value, None)?;
+                let elem = match self.m.ty(bufty) {
+                    TyKind::Slice(e) | TyKind::Array(e, _) => *e,
+                    other => {
+                        return Err(format!("`bytes.readU16le` needs a byte slice ({other:?})"));
+                    }
+                };
+                let buf_place = self
+                    .operand_place(buf)
+                    .ok_or_else(|| "`bytes.readU16le` buffer must be addressable".to_string())?;
+                let (off, _) = self.lower_expr(&args[1].value, Some(i64t))?;
+
+                let acc = self.new_local(u16t);
+                self.fb().assign(
+                    Place::local(acc),
+                    Rvalue::Use(Operand::Const(Const::Int(0, u16t))),
+                );
+                for k in 0..2u32 {
+                    let idx = self.new_local(i64t);
+                    self.fb().assign(
+                        Place::local(idx),
+                        Rvalue::BinOp(
+                            BinOp::Add,
+                            off.clone(),
+                            Operand::Const(Const::Int(k as i128, i64t)),
+                            ArithMode::Wrap,
+                        ),
+                    );
+                    let byte_place =
+                        extend(&buf_place, Proj::Index(Operand::Copy(Place::local(idx))));
+                    let widened = self.new_local(u16t);
+                    let kind = self.cast_kind(elem, u16t).unwrap_or(CastKind::IntZext);
+                    self.fb().assign(
+                        Place::local(widened),
+                        Rvalue::Cast(Operand::Copy(byte_place), u16t, kind),
+                    );
+                    let shifted = self.new_local(u16t);
+                    self.fb().assign(
+                        Place::local(shifted),
+                        Rvalue::BinOp(
+                            BinOp::Shl,
+                            Operand::Copy(Place::local(widened)),
+                            Operand::Const(Const::Int((8 * k) as i128, u16t)),
+                            ArithMode::Na,
+                        ),
+                    );
+                    let next = self.new_local(u16t);
+                    self.fb().assign(
+                        Place::local(next),
+                        Rvalue::BinOp(
+                            BinOp::BitOr,
+                            Operand::Copy(Place::local(acc)),
+                            Operand::Copy(Place::local(shifted)),
+                            ArithMode::Na,
+                        ),
+                    );
+                    self.fb().assign(
+                        Place::local(acc),
+                        Rvalue::Use(Operand::Copy(Place::local(next))),
+                    );
+                }
+                Ok((Operand::Copy(Place::local(acc)), u16t))
+            }
+            // `bytes.readI16le(buf, off)` — a little-endian i16 from `buf[off..off+2]`,
+            // sign-extended to `int` (i64).
+            ("bytes", "readI16le") => {
+                if args.len() != 2 {
+                    return Err("`bytes.readI16le` takes a byte slice and an offset".into());
+                }
+                let i64t = self.m.t_i64();
+                let u16t = self.m.t_int(IntWidth::W16, false);
+                let i16t = self.m.t_int(IntWidth::W16, true);
+                let (buf, bufty) = self.lower_expr(&args[0].value, None)?;
+                let elem = match self.m.ty(bufty) {
+                    TyKind::Slice(e) | TyKind::Array(e, _) => *e,
+                    other => {
+                        return Err(format!("`bytes.readI16le` needs a byte slice ({other:?})"));
+                    }
+                };
+                let buf_place = self
+                    .operand_place(buf)
+                    .ok_or_else(|| "`bytes.readI16le` buffer must be addressable".to_string())?;
+                let (off, _) = self.lower_expr(&args[1].value, Some(i64t))?;
+
+                let acc = self.new_local(u16t);
+                self.fb().assign(
+                    Place::local(acc),
+                    Rvalue::Use(Operand::Const(Const::Int(0, u16t))),
+                );
+                for k in 0..2u32 {
+                    let idx = self.new_local(i64t);
+                    self.fb().assign(
+                        Place::local(idx),
+                        Rvalue::BinOp(
+                            BinOp::Add,
+                            off.clone(),
+                            Operand::Const(Const::Int(k as i128, i64t)),
+                            ArithMode::Wrap,
+                        ),
+                    );
+                    let byte_place =
+                        extend(&buf_place, Proj::Index(Operand::Copy(Place::local(idx))));
+                    let widened = self.new_local(u16t);
+                    let kind = self.cast_kind(elem, u16t).unwrap_or(CastKind::IntZext);
+                    self.fb().assign(
+                        Place::local(widened),
+                        Rvalue::Cast(Operand::Copy(byte_place), u16t, kind),
+                    );
+                    let shifted = self.new_local(u16t);
+                    self.fb().assign(
+                        Place::local(shifted),
+                        Rvalue::BinOp(
+                            BinOp::Shl,
+                            Operand::Copy(Place::local(widened)),
+                            Operand::Const(Const::Int((8 * k) as i128, u16t)),
+                            ArithMode::Na,
+                        ),
+                    );
+                    let next = self.new_local(u16t);
+                    self.fb().assign(
+                        Place::local(next),
+                        Rvalue::BinOp(
+                            BinOp::BitOr,
+                            Operand::Copy(Place::local(acc)),
+                            Operand::Copy(Place::local(shifted)),
+                            ArithMode::Na,
+                        ),
+                    );
+                    self.fb().assign(
+                        Place::local(acc),
+                        Rvalue::Use(Operand::Copy(Place::local(next))),
+                    );
+                }
+                // Reinterpret the u16 pattern as i16 (same width => Bitcast), then sign-extend.
+                let signed = self.coerce_int(Operand::Copy(Place::local(acc)), u16t, i16t);
+                let wide = self.coerce_int(signed, i16t, i64t);
+                Ok((wide, i64t))
+            }
             // `fs.peepText(path)` — the whole file at `path` as a `str` (empty on any error).
             // (A future `(str, yikes)` form can layer the error channel on top.)
             ("fs", "peepText") => {
@@ -3147,6 +3293,58 @@ impl LowerCtx {
                     },
                 );
                 Ok((Operand::Copy(Place::local(result)), strt))
+            }
+            // `fs.peep(path)` — the whole file at `path` as a `[]u8` (empty on any error).
+            // A byte-slice sibling of `fs.peepText`; both call `bet_fs_read`, which returns raw
+            // bytes, so the slice view is byte-identical to the interpreter's `[]u8`.
+            ("fs", "peep") => {
+                if args.len() != 1 {
+                    return Err("`fs.peep` takes a single path string".into());
+                }
+                let rawptr = self.m.intern_ty(TyKind::RawPtr);
+                let usize_t = self.m.t_int(IntWidth::W64, false);
+                let u8t = self.m.t_int(IntWidth::W8, false);
+                let slice_ty = self.m.intern_ty(TyKind::Slice(u8t));
+                let strt = self.m.t_str();
+                let (path, _) = self.lower_expr(&args[0].value, Some(strt))?;
+                let pp = self.new_local(rawptr);
+                self.fb()
+                    .assign(Place::local(pp), Rvalue::StrPtr(path.clone()));
+                let pl = self.new_local(usize_t);
+                self.fb().assign(Place::local(pl), Rvalue::StrLen(path));
+                // An out-parameter local for the read length; pass its address.
+                let out_len = self.new_local(usize_t);
+                self.fb().assign(
+                    Place::local(out_len),
+                    Rvalue::Use(Operand::Const(Const::Int(0, usize_t))),
+                );
+                let out_ptr = self.new_local(rawptr);
+                self.fb()
+                    .assign(Place::local(out_ptr), Rvalue::AddrOf(Place::local(out_len)));
+                let ext =
+                    self.get_extern("bet_fs_read", vec![rawptr, usize_t, rawptr], vec![rawptr]);
+                let data = self.new_local(rawptr);
+                self.fb().assign(
+                    Place::local(data),
+                    Rvalue::Call(
+                        Callee::Extern(ext),
+                        vec![
+                            Operand::Copy(Place::local(pp)),
+                            Operand::Copy(Place::local(pl)),
+                            Operand::Copy(Place::local(out_ptr)),
+                        ],
+                    ),
+                );
+                let result = self.new_local(slice_ty);
+                self.fb().assign(
+                    Place::local(result),
+                    Rvalue::MakeSlice {
+                        data: Operand::Copy(Place::local(data)),
+                        len: Operand::Copy(Place::local(out_len)),
+                        elem: u8t,
+                    },
+                );
+                Ok((Operand::Copy(Place::local(result)), slice_ty))
             }
             // `sys.argc()` — the process argument count, as an `int`.
             ("sys", "argc") => {

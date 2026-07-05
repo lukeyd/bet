@@ -59,7 +59,7 @@ all = [
   "bits.operators", "bits.bam-angles", "bits.wrapping", "bits.fixed-point",
   # 10 stdlib
   "stdlib.stash", "stdlib.bytes", "stdlib.squadops", "stdlib.vec", "stdlib.str", "stdlib.sys",
-  "stdlib.rng", "stdlib.input",
+  "stdlib.rng", "stdlib.input", "stdlib.fs",
   # 11 reference oracles
   "reference.compiler", "reference.doom",
   # 12 ffi
@@ -413,6 +413,14 @@ path = "10-stdlib/read-line-eof"
 covers = ["stdlib.input"]
 interp = "pass"
 # The corpus runner closes stdin, so sys.peep() hits EOF -> "" identically on both paths.
+compiled = "pass"
+
+[[program]]
+path = "10-stdlib/fs-peep"
+covers = ["stdlib.fs"]
+interp = "pass"
+# bet_fs_read returns raw bytes; the []u8 view is byte-identical to the compiled MakeSlice,
+# and the fixture is repo-root-relative so the path resolves on both paths.
 compiled = "pass"
 
 # --- 11 reference oracles ---------------------------------------------------
