@@ -500,20 +500,25 @@ status = "todo"
 slug = "stdlib-rng"
 name = "A6: math.cook seedable RNG (xoshiro256** stream, SplitMix64 seed, Lemire bound, 53-bit frac) across rt-abi/runtime/backend/frontend/interp + corpus"
 size = 8
-# Phase 0 landed: the algorithm is a single source of truth in rt-abi (RngState) that rt-stub,
-# runtime, and interp all call, so interp and compiled streams are byte-identical by construction.
-# rt-abi: RngHandle + bet_rng_{new,next,frac,upto,free}; midir TyKind::Rng + text; backend ptr/1-word
-# arms; 6 rt-abi unit tests (determinism + known-value regression for seed 0). Remaining: frontend
-# lowering (math.cook/rng methods) + interp dispatch (Value::Rng) + corpus rng-seeded test.
-status = "doing"
+# DONE. The algorithm is a single source of truth in rt-abi (RngState) that rt-stub, runtime, and
+# interp all call, so interp and compiled streams are byte-identical BY CONSTRUCTION (no 3-way
+# drift risk). rt-abi: RngHandle + bet_rng_{new,next,frac,upto,free} + 6 unit tests (determinism +
+# a known-value regression for seed 0). midir TyKind::Rng + text; backend ptr/1-word arms. interp:
+# Value::Rng(Rc<RefCell<rt_abi::RngState>>) + math.cook + roll/upTo/frac. frontend: lower_rng_new
+# + lower_rng_method + `rng` named type. Corpus 10-stdlib/rng-seeded is interp+compiled pass
+# (byte-identical differential). Surface: math.cook(seed) -> rng; rng.roll()/upTo(n)/frac().
+status = "done"
 
 [[task]]
 slug = "sys-stdin"
 name = "A7: sys.peep stdin read-line (mirrors A5 argv) — bet_read_line across rt-abi/runtime + frontend/interp + a piped-stdin integration test"
 size = 5
-# Phase 0 landed: bet_read_line in rt-abi + both runtimes (line read, newline stripped, EOF -> null).
-# Remaining: frontend lowering (sys.peep -> bet_read_line + MakeStr) + interp call_sys arm + tests.
-status = "doing"
+# DONE. bet_read_line in rt-abi + both runtimes (line read, trailing \n/\r stripped, EOF -> null).
+# frontend: ("sys","peep") -> bet_read_line + MakeStr (modeled on sys.arg). interp: call_sys "peep"
+# reads std::io::stdin directly, same semantics. Corpus 10-stdlib/read-line-eof pins the EOF path
+# (interp+compiled pass — the corpus runner closes stdin). Real interactive input is covered by
+# crates/driver/tests/stdin_read_line.rs (pipes "hello trail\n"). Surface: sys.peep() -> str.
+status = "done"
 
 [[task]]
 slug = "port-oregon-trail"

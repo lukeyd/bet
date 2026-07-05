@@ -397,17 +397,16 @@ compiled = "pass"
 path = "10-stdlib/rng-seeded"
 covers = ["stdlib.rng"]
 interp = "pass"
-# Seeded RNG (math.cook) is deterministic on the interpreter today; the compiled path lands with
-# the frontend-lowering workstream. Root should flip this to "pass" and verify once that merges.
-compiled = "skip"
+# Seeded RNG (math.cook) is deterministic and byte-identical across interp and native — the whole
+# point of sharing rt_abi::RngState between the interpreter and the runtime.
+compiled = "pass"
 
 [[program]]
 path = "10-stdlib/read-line-eof"
 covers = ["stdlib.input"]
 interp = "pass"
-# sys.peep() EOF path runs on the interpreter today; compiled codegen for it lands with the
-# frontend-lowering workstream. Root should flip this to "pass" and verify once that merges.
-compiled = "skip"
+# The corpus runner closes stdin, so sys.peep() hits EOF -> "" identically on both paths.
+compiled = "pass"
 
 # --- 11 reference oracles ---------------------------------------------------
 [[program]]
