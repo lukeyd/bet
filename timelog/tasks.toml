@@ -524,4 +524,15 @@ status = "done"
 slug = "port-oregon-trail"
 name = "Ports: full faithful Oregon Trail port under ports/oregon-trail (sibling of doom) — runs on interp + compiles native"
 size = 13
-status = "todo"
+# DONE. ports/oregon-trail/oregon.bet — the 1978 MECC listing restructured from GOTO/GOSUB onto a
+# value-threaded Trip struct (bet structs are value-copy: s = phase(s, g); a `done` field signals
+# death/arrival). All mechanics: $700 outfitting w/ re-buy, two-week dates, fort/hunt/continue,
+# fort shopping, hunting, 3 eating levels, rider combat (4 tactics + hostility flip), the full
+# 15-event table, South/Blue passes, blizzards, illness, and every ending incl. the Polk victory.
+# RND(-1) -> math.cook(1847)+upTo/frac (A6); INPUT -> sys.peep()+parseInt (A7); timed shoot ->
+# skill+luck draw. Integer arithmetic throughout. Verified: full win + multiple deaths on interp;
+# native `bet build` -> Mach-O arm64 plays BYTE-IDENTICAL to the interpreter. Not a corpus entry
+# (stdout depends on input). NOTE: mutable module-level `lowkey` globals do NOT lower to native
+# ("module-level lowkey is not yet lowered"), and nested `holla` on one crib slot DIVERGES
+# interp(snapshot) vs compiled(live-ptr) — hence value-struct threading, which is path-identical.
+status = "done"
