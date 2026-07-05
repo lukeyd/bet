@@ -109,6 +109,9 @@ pub enum TyKind {
     Map(TyId, TyId),
     /// `vec[T]` — an opaque, runtime-backed growable-array handle.
     Vec(TyId),
+    /// `rng` — an opaque, runtime-backed seedable PRNG handle (`math.cook`). Carries no element
+    /// type; the generator state lives behind the handle.
+    Rng,
     /// A function-pointer value; the pointee signature is interned.
     FnPtr(SigId),
     /// An anonymous tuple, used to carry multi-value returns as one value.

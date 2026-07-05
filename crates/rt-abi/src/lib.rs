@@ -67,6 +67,85 @@ pub struct MapHandle(pub *mut c_void);
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct VecHandle(pub *mut c_void);
 
+/// An opaque handle to a seedable PRNG (`math.cook`). Created by [`bet_rng_new`]; its state is
+/// an [`RngState`]. The generator itself lives in this crate (see [`RngState`]) so the runtime
+/// and the interpreter share one implementation and produce byte-identical streams.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RngHandle(pub *mut c_void);
+
+/// The canonical seedable PRNG backing `math.cook` — **xoshiro256\*\*** seeded by **SplitMix64**.
+///
+/// This is the *single source of truth* for the algorithm. Both runtimes (`rt-stub`, `runtime`)
+/// and the tree-walking interpreter (`interp`) all depend on `rt-abi` and call these methods, so
+/// a program's random stream is identical whether run via `bet run` or a compiled binary — which
+/// the corpus differential-tests byte-for-byte. Uses only fixed-width `u64` wrapping ops, so it
+/// is portable across targets. **Non-cryptographic**: reproducible pseudo-randomness, never a
+/// CSPRNG.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RngState {
+    s: [u64; 4],
+}
+
+impl RngState {
+    /// Seed with a single `u64` (C#-`new Random(seed)` style). SplitMix64 expands the seed into
+    /// the four 64-bit state words; an all-zero state (which xoshiro cannot escape) is nudged off.
+    #[must_use]
+    pub fn new(seed: u64) -> Self {
+        let mut z = seed;
+        let mut s = [0u64; 4];
+        for slot in &mut s {
+            z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut x = z;
+            x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            *slot = x ^ (x >> 31);
+        }
+        if s == [0, 0, 0, 0] {
+            s[0] = 1;
+        }
+        RngState { s }
+    }
+
+    /// The raw next 64-bit draw (xoshiro256\*\*). Backs `rng.roll`.
+    pub fn next_u64(&mut self) -> u64 {
+        let result = self.s[1].wrapping_mul(5).rotate_left(7).wrapping_mul(9);
+        let t = self.s[1] << 17;
+        self.s[2] ^= self.s[0];
+        self.s[3] ^= self.s[1];
+        self.s[1] ^= self.s[2];
+        self.s[0] ^= self.s[3];
+        self.s[2] ^= t;
+        self.s[3] = self.s[3].rotate_left(45);
+        result
+    }
+
+    /// A uniform `f64` in `[0.0, 1.0)` from the top 53 bits — the BASIC `RND(-1)` analog. Backs
+    /// `rng.frac`.
+    pub fn frac(&mut self) -> f64 {
+        // 2^-53 is exact in f64; the product is a uniform dyadic rational in [0, 1).
+        (self.next_u64() >> 11) as f64 * (1.0 / ((1u64 << 53) as f64))
+    }
+
+    /// A uniform integer in `[0, n)`, unbiased via Lemire's multiply-high method. `n == 0` → 0.
+    /// Backs `rng.upTo`.
+    pub fn up_to(&mut self, n: u64) -> u64 {
+        if n == 0 {
+            return 0;
+        }
+        let mut m = (self.next_u64() as u128).wrapping_mul(n as u128);
+        let mut low = m as u64;
+        if low < n {
+            let threshold = n.wrapping_neg() % n; // 2^64 mod n
+            while low < threshold {
+                m = (self.next_u64() as u128).wrapping_mul(n as u128);
+                low = m as u64;
+            }
+        }
+        (m >> 64) as u64
+    }
+}
+
 /// An opaque allocator-context handle (the Odin-style "current allocator"). The stub's
 /// current allocator is always the system heap; the handle exists so the contract is stable.
 #[repr(transparent)]
@@ -204,6 +283,14 @@ unsafe extern "C" {
     /// rest of the process; the caller must not free them. Backs `sys.arg`.
     pub fn bet_arg_get(i: usize, out_len: *mut usize) -> *const u8;
 
+    // --- stdin ---
+
+    /// Read one line from stdin into a freshly allocated buffer, writing its length to `out_len`
+    /// and returning the buffer. The trailing newline (`\n`, and a preceding `\r`) is stripped.
+    /// Returns null (and leaves `out_len` = 0) at end-of-input or on error, so a caller reading
+    /// past EOF sees an empty string. The caller owns the buffer. Backs `sys.peep`.
+    pub fn bet_read_line(out_len: *mut usize) -> *mut u8;
+
     // --- stash (hash maps) ---
 
     /// Create an empty hash map whose values are `val_size`-byte blobs. Keys are arbitrary
@@ -254,6 +341,20 @@ unsafe extern "C" {
     pub fn bet_vec_extend(vec: VecHandle, ptr: *const u8, len: usize);
     /// Destroy a vec and release its backing memory.
     pub fn bet_vec_free(vec: VecHandle);
+
+    // --- rng (seedable prng: math.cook) ---
+
+    /// Create a PRNG seeded with `seed` (xoshiro256\*\*/SplitMix64; see [`RngState`]). Backs
+    /// `math.cook`.
+    pub fn bet_rng_new(seed: u64) -> RngHandle;
+    /// The raw next 64-bit draw. Backs `rng.roll`.
+    pub fn bet_rng_next(rng: RngHandle) -> u64;
+    /// A uniform `f64` in `[0.0, 1.0)`. Backs `rng.frac`.
+    pub fn bet_rng_frac(rng: RngHandle) -> f64;
+    /// A uniform integer in `[0, n)` (unbiased). Backs `rng.upTo`.
+    pub fn bet_rng_upto(rng: RngHandle, n: u64) -> u64;
+    /// Destroy a PRNG and release its state.
+    pub fn bet_rng_free(rng: RngHandle);
 
     // --- concurrency (slide) ---
 
@@ -317,5 +418,57 @@ mod tests {
             core::mem::size_of::<CribHandle>(),
             core::mem::size_of::<*mut c_void>()
         );
+    }
+
+    #[test]
+    fn rng_is_deterministic_for_a_seed() {
+        // Same seed → identical stream. This is the property the corpus differential relies on.
+        let mut a = RngState::new(1847);
+        let mut b = RngState::new(1847);
+        for _ in 0..1000 {
+            assert_eq!(a.next_u64(), b.next_u64());
+        }
+    }
+
+    #[test]
+    fn rng_seeds_diverge() {
+        let mut a = RngState::new(1);
+        let mut b = RngState::new(2);
+        assert_ne!(a.next_u64(), b.next_u64());
+    }
+
+    #[test]
+    fn rng_known_values_do_not_drift() {
+        // A regression guard: the exact first draws for seed 0. If the algorithm/constants ever
+        // change, this fails loudly rather than silently altering every seeded program's output.
+        let mut r = RngState::new(0);
+        let got = [r.next_u64(), r.next_u64(), r.next_u64()];
+        assert_eq!(
+            got,
+            [
+                0x99EC_5F36_CB75_F2B4,
+                0xBF6E_1F78_4956_452A,
+                0x1A5F_849D_4933_E6E0
+            ]
+        );
+    }
+
+    #[test]
+    fn rng_frac_is_in_unit_interval() {
+        let mut r = RngState::new(42);
+        for _ in 0..10_000 {
+            let f = r.frac();
+            assert!((0.0..1.0).contains(&f), "frac out of range: {f}");
+        }
+    }
+
+    #[test]
+    fn rng_up_to_is_in_range_and_handles_zero() {
+        let mut r = RngState::new(7);
+        assert_eq!(r.up_to(0), 0);
+        assert_eq!(r.up_to(1), 0);
+        for _ in 0..10_000 {
+            assert!(r.up_to(6) < 6);
+        }
     }
 }

@@ -490,3 +490,33 @@ slug = "doom"
 name = "Milestone 7.2: Doom port targeting gg — BLOCKED ON GATE; out of scope for the 'Open Doom's Gate' plan (do not start until gate is green)"
 size = 34
 status = "todo"
+
+# ─────────────────────── Oregon Trail port + the language features it needs ───────────────────────
+# A faithful port of the 1978 MECC Oregon Trail BASIC listing (ports/oregon-trail/). It needs two
+# stdlib intrinsics the language lacked: a seedable RNG and interactive stdin. betfe is intentionally
+# NOT updated (language still moving). Both features target `bet run` AND native `bet build`.
+
+[[task]]
+slug = "stdlib-rng"
+name = "A6: math.cook seedable RNG (xoshiro256** stream, SplitMix64 seed, Lemire bound, 53-bit frac) across rt-abi/runtime/backend/frontend/interp + corpus"
+size = 8
+# Phase 0 landed: the algorithm is a single source of truth in rt-abi (RngState) that rt-stub,
+# runtime, and interp all call, so interp and compiled streams are byte-identical by construction.
+# rt-abi: RngHandle + bet_rng_{new,next,frac,upto,free}; midir TyKind::Rng + text; backend ptr/1-word
+# arms; 6 rt-abi unit tests (determinism + known-value regression for seed 0). Remaining: frontend
+# lowering (math.cook/rng methods) + interp dispatch (Value::Rng) + corpus rng-seeded test.
+status = "doing"
+
+[[task]]
+slug = "sys-stdin"
+name = "A7: sys.peep stdin read-line (mirrors A5 argv) — bet_read_line across rt-abi/runtime + frontend/interp + a piped-stdin integration test"
+size = 5
+# Phase 0 landed: bet_read_line in rt-abi + both runtimes (line read, newline stripped, EOF -> null).
+# Remaining: frontend lowering (sys.peep -> bet_read_line + MakeStr) + interp call_sys arm + tests.
+status = "doing"
+
+[[task]]
+slug = "port-oregon-trail"
+name = "Ports: full faithful Oregon Trail port under ports/oregon-trail (sibling of doom) — runs on interp + compiles native"
+size = 13
+status = "todo"

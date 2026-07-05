@@ -166,6 +166,7 @@ impl Printer<'_> {
             TyKind::Ref(e) => format!("ref {}", self.ty(*e)),
             TyKind::Map(k, v) => format!("map[{}, {}]", self.ty(*k), self.ty(*v)),
             TyKind::Vec(e) => format!("vec[{}]", self.ty(*e)),
+            TyKind::Rng => "rng".into(),
             TyKind::FnPtr(sig) => {
                 let s = self.m.sig(*sig);
                 let ps: Vec<String> = s.params.iter().map(|&t| self.ty(t)).collect();
@@ -1805,6 +1806,7 @@ impl Parser {
                 self.expect(&Tok::RBracket)?;
                 Ok(self.m.intern_ty(TyKind::Vec(e)))
             }
+            "rng" => Ok(self.m.intern_ty(TyKind::Rng)),
             "fn" => {
                 let params = self.param_types()?;
                 self.expect(&Tok::Arrow)?;

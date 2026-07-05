@@ -37,7 +37,8 @@ pub fn staticlib_link_name() -> &'static str {
 // Only the *types* are re-exported; the entry-point declarations in `rt-abi` are not (they
 // would collide with the definitions below).
 pub use rt_abi::{
-    AllocCtx, CribHandle, Event, FrameBuffer, MapHandle, Tag, TaskHandle, VecHandle, event_kind,
+    AllocCtx, CribHandle, Event, FrameBuffer, MapHandle, RngHandle, RngState, Tag, TaskHandle,
+    VecHandle, event_kind,
 };
 
 // ---------------------------------------------------------------------------
@@ -430,6 +431,30 @@ pub unsafe extern "C" fn bet_arg_get(i: usize, out_len: *mut usize) -> *const u8
 }
 
 // ---------------------------------------------------------------------------
+// Stdin (line reader). Backs `sys.peep`.
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_read_line(out_len: *mut usize) -> *mut u8 {
+    use std::io::BufRead as _;
+    let mut line = String::new();
+    match std::io::stdin().lock().read_line(&mut line) {
+        Ok(0) | Err(_) => {
+            unsafe { *out_len = 0 };
+            std::ptr::null_mut()
+        }
+        Ok(_) => {
+            while line.ends_with('\n') || line.ends_with('\r') {
+                line.pop();
+            }
+            let bytes = line.into_bytes().into_boxed_slice();
+            unsafe { *out_len = bytes.len() };
+            Box::into_raw(bytes) as *mut u8
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Stash (hash maps).
 // ---------------------------------------------------------------------------
 
@@ -597,6 +622,42 @@ pub unsafe extern "C" fn bet_vec_extend(vec: VecHandle, ptr: *const u8, len: usi
 pub unsafe extern "C" fn bet_vec_free(vec: VecHandle) {
     if !vec.0.is_null() {
         drop(unsafe { Box::from_raw(vec.0 as *mut DynVec) });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rng (seedable PRNG). The algorithm lives in `rt-abi` ([`RngState`]); these entry points just
+// box the state and delegate, so the interpreter and compiled code share one implementation.
+// ---------------------------------------------------------------------------
+
+unsafe fn rng_ref<'a>(rng: RngHandle) -> &'a mut RngState {
+    unsafe { &mut *(rng.0 as *mut RngState) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_rng_new(seed: u64) -> RngHandle {
+    RngHandle(Box::into_raw(Box::new(RngState::new(seed))) as *mut c_void)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_rng_next(rng: RngHandle) -> u64 {
+    unsafe { rng_ref(rng) }.next_u64()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_rng_frac(rng: RngHandle) -> f64 {
+    unsafe { rng_ref(rng) }.frac()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_rng_upto(rng: RngHandle, n: u64) -> u64 {
+    unsafe { rng_ref(rng) }.up_to(n)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_rng_free(rng: RngHandle) {
+    if !rng.0.is_null() {
+        drop(unsafe { Box::from_raw(rng.0 as *mut RngState) });
     }
 }
 
