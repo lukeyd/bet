@@ -68,6 +68,11 @@ pub enum Value {
     /// matching the compiled path's runtime-backed `VecHandle`. Distinct from `Array`, which is a
     /// fixed value-semantics literal (`[a, b, c]`) copied on assignment.
     Vec(Rc<RefCell<Vec<Value>>>),
+    /// A seedable PRNG (`math.cook`). Reference-counted so a generator passed to a function or
+    /// stored in a struct is a single shared, mutating stream — matching the compiled path's
+    /// `RngHandle`. The state and algorithm are `rt_abi::RngState`, the *same* generator the
+    /// runtime uses, so `bet run` and a compiled binary draw the identical sequence.
+    Rng(Rc<RefCell<rt_abi::RngState>>),
 }
 
 /// The default display of a value (corpus "Display rules"): the text `spill.it` prints before
@@ -119,6 +124,8 @@ pub fn display(v: &Value) -> String {
                 .join(", ");
             format!("[{inner}]")
         }
+        // A generator is never `spill`'d in a corpus program; this is diagnostic.
+        Value::Rng(_) => "<rng>".to_string(),
     }
 }
 
@@ -152,6 +159,7 @@ impl Value {
             Value::Crib(_) => "crib",
             Value::Stash(_) => "stash",
             Value::Vec(_) => "vec",
+            Value::Rng(_) => "rng",
         }
     }
 }

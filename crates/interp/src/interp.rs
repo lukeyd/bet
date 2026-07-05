@@ -1052,6 +1052,7 @@ impl<'p> Interp<'p> {
                         let id = self.new_arena(false);
                         return Ok(vec![Value::Crib(id)]);
                     }
+                    "math" => return self.call_math(env, method, args).map(|v| vec![v]),
                     "sys" => return self.call_sys(env, method, args).map(|v| vec![v]),
                     _ => {}
                 }
@@ -1307,6 +1308,38 @@ impl<'p> Interp<'p> {
                 }
             };
         }
+        // `rng` methods dispatch on the shared generator: each draw mutates its state, visible to
+        // every holder — matching the compiled path's `RngHandle`. The state is `rt_abi::RngState`,
+        // the same generator the runtime uses, so the stream is identical across `bet run` and a
+        // compiled binary.
+        if let Value::Rng(rc) = &recv {
+            let rc = rc.clone();
+            let arg_vals = self.eval_args(env, args)?;
+            return match method {
+                // `rng.roll()` — the raw next 64-bit draw, as `int`.
+                "roll" => {
+                    if !arg_vals.is_empty() {
+                        return Err(RunError::Type("`rng.roll` takes no arguments".into()));
+                    }
+                    Ok(vec![Value::Int(rc.borrow_mut().next_u64() as i64)])
+                }
+                // `rng.frac()` — a float in `[0.0, 1.0)` (the BASIC `RND(-1)` analog).
+                "frac" => {
+                    if !arg_vals.is_empty() {
+                        return Err(RunError::Type("`rng.frac` takes no arguments".into()));
+                    }
+                    Ok(vec![Value::Float(rc.borrow_mut().frac())])
+                }
+                // `rng.upTo(n)` — an unbiased int in `[0, n)`.
+                "upTo" => match arg_vals.as_slice() {
+                    [Value::Int(n)] => {
+                        Ok(vec![Value::Int(rc.borrow_mut().up_to(*n as u64) as i64)])
+                    }
+                    _ => Err(RunError::Type("`rng.upTo` takes a single int".into())),
+                },
+                _ => Err(RunError::Undefined(format!("rng.{method}"))),
+            };
+        }
         // Pure collection methods on an array (squadops): `gang`, `vibeCheck`, `glowUp`. The
         // mutating `stack`/`pop` are handled earlier in `eval_method_call` (they need a place).
         if let Value::Array(xs) = &recv {
@@ -1554,9 +1587,40 @@ impl<'p> Interp<'p> {
                 Ok(Value::Str(arg))
             }
             ("arg", [Value::Int(_)]) => Ok(Value::Str(String::new())),
+            // `sys.peep()` reads one line from stdin, the trailing newline stripped; empty string
+            // at EOF. Reads stdin directly (as `sys.arg` reads the process env directly); the
+            // semantics match the runtime's `bet_read_line`, so the two paths agree.
+            ("peep", []) => {
+                use std::io::BufRead as _;
+                let mut line = String::new();
+                match std::io::stdin().lock().read_line(&mut line) {
+                    Ok(0) | Err(_) => Ok(Value::Str(String::new())),
+                    Ok(_) => {
+                        while line.ends_with('\n') || line.ends_with('\r') {
+                            line.pop();
+                        }
+                        Ok(Value::Str(line))
+                    }
+                }
+            }
             ("argc", _) => Err(RunError::Type("`sys.argc` takes no arguments".into())),
             ("arg", _) => Err(RunError::Type("`sys.arg` takes a single index".into())),
+            ("peep", _) => Err(RunError::Type("`sys.peep` takes no arguments".into())),
             (other, _) => Err(RunError::Unsupported(format!("sys.{other}"))),
+        }
+    }
+
+    /// `math` intrinsics. Only `cook` — the seedable PRNG constructor (`math.cook(seed)`) — is
+    /// implemented in the interpreter; the generator is `rt_abi::RngState`, the same algorithm the
+    /// runtime uses, so a seeded stream is identical whether run via `bet run` or compiled.
+    fn call_math(&mut self, env: &mut Env, method: &str, args: &[Arg]) -> Result<Value, RunError> {
+        let vals = self.eval_args(env, args)?;
+        match (method, vals.as_slice()) {
+            ("cook", [Value::Int(seed)]) => Ok(Value::Rng(Rc::new(RefCell::new(
+                rt_abi::RngState::new(*seed as u64),
+            )))),
+            ("cook", _) => Err(RunError::Type("`math.cook` takes a single int seed".into())),
+            (other, _) => Err(RunError::Unsupported(format!("math.{other}"))),
         }
     }
 
