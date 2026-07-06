@@ -1,0 +1,280 @@
+// p/p_sight.bet — line-of-sight / visibility checks using the REJECT table + a BSP descent
+// (linuxdoom-1.10 p_sight.c). Signature FROZEN in ports/doom/p-sigs.md ("p/p_map": checkSight).
+//
+// PORTED: P_CheckSight, P_CrossBSPNode, P_CrossSubsector, P_DivlineSide, P_InterceptVector2.
+//
+// MODEL NOTES:
+//   * The per-check registers (id's file-static strace / sightzstart / topslope / bottomslope /
+//     t2x / t2y) are threaded WITHOUT new gs fields: `strace` reuses g.tick.trace, topslope /
+//     bottomslope reuse g.tick.topslope / g.tick.bottomslope (all scratch; sight never overlaps
+//     path traversal or aim), and sightzstart / t2x / t2y are passed down the recursion as params.
+//   * P_DivlineSide is p_sight's own 3-way (0 front / 1 back / 2 on) side test with id's PLAIN
+//     integer products `(dy>>FRACBITS)*(dx>>FRACBITS)` (i32, wrapping — NOT FixedMul) and its
+//     verbatim `if (x==node->y)` quirk in the horizontal branch (a known id typo, reproduced for
+//     demo-sync fidelity).
+//   * The reject matrix is read in place from g.wad.buf at g.level.rejectOfs (CONTRACTS).
+//   * node/subsector children carry the NF_SUBSECTOR (0x8000) flag in the value; bspnum == -1
+//     (a nodeless single-subsector map, numnodes-1) crosses subsector 0, exactly as id.
+//
+// NATIVE is the correctness target. First exercised on real geometry at P2.5 / the W3 demo oracle
+// (needs loaded nodes/segs/reject); compiles standalone now.
+pull "../defs/gs" as gs
+pull "../defs/think" as think
+pull "../defs/fixed" as fixed
+pull "../defs/doomdef" as doomdef
+
+// pDivlineSide — P_DivlineSide: 0 (front), 1 (back), or 2 (on the line). gs-free.
+flex finna pDivlineSide(x: i32, y: i32, node: gs.Divline) -> int {
+    fr node.dx == 0 {
+        fr x == node.x {
+            bet 2
+        }
+        fr x <= node.x {
+            fr node.dy > 0 {
+                bet 1
+            }
+            bet 0
+        }
+        fr node.dy < 0 {
+            bet 1
+        }
+        bet 0
+    }
+    fr node.dy == 0 {
+        // NOTE: id compares x (not y) to node->y here — a verbatim bug, kept for demo fidelity.
+        fr x == node.y {
+            bet 2
+        }
+        fr y <= node.y {
+            fr node.dx < 0 {
+                bet 1
+            }
+            bet 0
+        }
+        fr node.dx > 0 {
+            bet 1
+        }
+        bet 0
+    }
+    lowkey dx: i32 = x - node.x
+    lowkey dy: i32 = y - node.y
+    lowkey left: i32 = (node.dy >> 16) * (dx >> 16)
+    lowkey right: i32 = (dy >> 16) * (node.dx >> 16)
+    fr right < left {
+        bet 0
+    }
+    fr left == right {
+        bet 2
+    }
+    bet 1
+}
+
+// pInterceptVector2 — P_InterceptVector2 (identical to P_InterceptVector; kept local to avoid a
+// p_maputl dependency). gs-free.
+flex finna pInterceptVector2(v2: gs.Divline, v1: gs.Divline) -> i32 {
+    lowkey den: i32 = fixed.fixedMul(v1.dy >> 8, v2.dx) - fixed.fixedMul(v1.dx >> 8, v2.dy)
+    fr den == 0 {
+        bet 0
+    }
+    lowkey na: i32 = fixed.fixedMul((v1.x - v2.x) >> 8, v1.dy)
+    lowkey nb: i32 = fixed.fixedMul((v2.y - v1.y) >> 8, v1.dx)
+    lowkey num: i32 = na + nb
+    bet fixed.fixedDiv(num, den)
+}
+
+// crossSubsector — P_CrossSubsector: true if strace crosses subsector `num` unobstructed. Mutates
+// g.tick.topslope / g.tick.bottomslope as it narrows the visible window; false stops the whole
+// check. All helpers here are gs-free, so the whole body runs under one holla.
+flex finna crossSubsector(gt: tag gs.GameState, num: int, sightzstart: i32, t2x: i32, t2y: i32) -> bool {
+    lowkey result = nocap
+    holla g = gt in gs.gsc {
+        lowkey strace = gs.Divline{ x: g.tick.trace.x, y: g.tick.trace.y, dx: g.tick.trace.dx, dy: g.tick.trace.dy }
+        lowkey vc: int = g.tick.validcount as int
+        lowkey count: int = g.level.ssNumLines[num] as int
+        lowkey first: int = g.level.ssFirstLine[num] as int
+        lowkey i: int = 0
+        vibin i < count {
+            lowkey seg: int = first + i
+            i = i + 1
+            lowkey line: int = g.level.segLine[seg] as int
+            fr g.level.lineValid[line] as int == vc {
+                skip
+            }
+            g.level.lineValid[line] = vc as i32
+            lowkey av1: int = g.level.lineV1[line] as int
+            lowkey av2: int = g.level.lineV2[line] as int
+            lowkey v1x: i32 = g.level.vtxX[av1]
+            lowkey v1y: i32 = g.level.vtxY[av1]
+            lowkey v2x: i32 = g.level.vtxX[av2]
+            lowkey v2y: i32 = g.level.vtxY[av2]
+            lowkey s1: int = pDivlineSide(v1x, v1y, strace)
+            lowkey s2: int = pDivlineSide(v2x, v2y, strace)
+            fr s1 == s2 {
+                skip
+            }
+            lowkey divl = gs.Divline{ x: v1x, y: v1y, dx: v2x - v1x, dy: v2y - v1y }
+            s1 = pDivlineSide(strace.x, strace.y, divl)
+            s2 = pDivlineSide(t2x, t2y, divl)
+            fr s1 == s2 {
+                skip
+            }
+            fr ((g.level.lineFlags[line] as int) & doomdef.ML_TWOSIDED) == 0 {
+                result = cap
+                dip
+            }
+            lowkey front: int = g.level.segFront[seg] as int
+            lowkey back: int = g.level.segBack[seg] as int
+            lowkey fFloor: i32 = g.level.secFloorH[front]
+            lowkey bFloor: i32 = g.level.secFloorH[back]
+            lowkey fCeil: i32 = g.level.secCeilH[front]
+            lowkey bCeil: i32 = g.level.secCeilH[back]
+            fr fFloor == bFloor && fCeil == bCeil {
+                skip
+            }
+            lowkey opentop: i32 = fCeil
+            fr bCeil < fCeil {
+                opentop = bCeil
+            }
+            lowkey openbottom: i32 = fFloor
+            fr bFloor > fFloor {
+                openbottom = bFloor
+            }
+            fr openbottom >= opentop {
+                result = cap
+                dip
+            }
+            lowkey frac: i32 = pInterceptVector2(strace, divl)
+            fr fFloor != bFloor {
+                lowkey slope: i32 = fixed.fixedDiv(openbottom - sightzstart, frac)
+                fr slope > g.tick.bottomslope {
+                    g.tick.bottomslope = slope
+                }
+            }
+            fr fCeil != bCeil {
+                lowkey slope2: i32 = fixed.fixedDiv(opentop - sightzstart, frac)
+                fr slope2 < g.tick.topslope {
+                    g.tick.topslope = slope2
+                }
+            }
+            fr g.tick.topslope <= g.tick.bottomslope {
+                result = cap
+                dip
+            }
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    bet result
+}
+
+// crossBSPNode — P_CrossBSPNode: true if strace crosses BSP node `bspnum` unobstructed.
+flex finna crossBSPNode(gt: tag gs.GameState, bspnum: int, sightzstart: i32, t2x: i32, t2y: i32) -> bool {
+    fr bspnum == -1 {
+        bet crossSubsector(gt, 0, sightzstart, t2x, t2y)
+    }
+    fr (bspnum & doomdef.NF_SUBSECTOR) != 0 {
+        bet crossSubsector(gt, bspnum & 32767, sightzstart, t2x, t2y)
+    }
+    lowkey nodeDL = gs.Divline{ x: 0, y: 0, dx: 0, dy: 0 }
+    lowkey child0: int = 0
+    lowkey child1: int = 0
+    lowkey sx: i32 = 0
+    lowkey sy: i32 = 0
+    holla g = gt in gs.gsc {
+        nodeDL = gs.Divline{ x: g.level.nodeX[bspnum], y: g.level.nodeY[bspnum], dx: g.level.nodeDx[bspnum], dy: g.level.nodeDy[bspnum] }
+        child0 = g.level.nodeChild0[bspnum] as int
+        child1 = g.level.nodeChild1[bspnum] as int
+        sx = g.tick.trace.x
+        sy = g.tick.trace.y
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey side: int = pDivlineSide(sx, sy, nodeDL)
+    fr side == 2 {
+        side = 0
+    }
+    lowkey nearChild: int = child0
+    fr side == 1 {
+        nearChild = child1
+    }
+    fr !crossBSPNode(gt, nearChild, sightzstart, t2x, t2y) {
+        bet cap
+    }
+    lowkey side2: int = pDivlineSide(t2x, t2y, nodeDL)
+    fr side == side2 {
+        bet nocap
+    }
+    lowkey farChild: int = child0
+    fr (side ^ 1) == 1 {
+        farChild = child1
+    }
+    bet crossBSPNode(gt, farChild, sightzstart, t2x, t2y)
+}
+
+// checkSight — P_CheckSight: true if a straight line between t1 and t2 is unobstructed. Trivially
+// rejects via the REJECT matrix first, then descends the BSP from the head node.
+flex finna checkSight(gt: tag gs.GameState, t1: tag think.Thinker, t2: tag think.Thinker) -> bool {
+    lowkey t1x: i32 = 0
+    lowkey t1y: i32 = 0
+    lowkey t1z: i32 = 0
+    lowkey t1h: i32 = 0
+    lowkey t1sub: int = 0
+    holla m = t1 in gs.thinkers {
+        t1x = m.mobj.x
+        t1y = m.mobj.y
+        t1z = m.mobj.z
+        t1h = m.mobj.height
+        t1sub = m.mobj.subsector as int
+    } ghosted {
+        yeet("t1")
+    }
+    lowkey t2x: i32 = 0
+    lowkey t2y: i32 = 0
+    lowkey t2z: i32 = 0
+    lowkey t2h: i32 = 0
+    lowkey t2sub: int = 0
+    holla m = t2 in gs.thinkers {
+        t2x = m.mobj.x
+        t2y = m.mobj.y
+        t2z = m.mobj.z
+        t2h = m.mobj.height
+        t2sub = m.mobj.subsector as int
+    } ghosted {
+        yeet("t2")
+    }
+    // trivial REJECT rejection
+    lowkey rejected = cap
+    lowkey numnodes: int = 0
+    holla g = gt in gs.gsc {
+        lowkey ns: int = g.level.numsectors as int
+        lowkey s1: int = g.level.ssSector[t1sub] as int
+        lowkey s2: int = g.level.ssSector[t2sub] as int
+        lowkey pnum: int = s1 * ns + s2
+        lowkey bytenum: int = pnum >> 3
+        lowkey bitnum: int = 1 << (pnum & 7)
+        lowkey rb: int = g.wad.buf[g.level.rejectOfs + bytenum] as int
+        fr (rb & bitnum) != 0 {
+            rejected = nocap
+        }
+        numnodes = g.level.numnodes as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr rejected {
+        bet cap
+    }
+    // set up the sight registers (strace -> g.tick.trace; slopes -> g.tick.*) and descend.
+    lowkey sightzstart: i32 = t1z + t1h - (t1h >> 2)
+    holla g = gt in gs.gsc {
+        g.tick.validcount = g.tick.validcount + 1
+        g.tick.topslope = (t2z + t2h) - sightzstart
+        g.tick.bottomslope = t2z - sightzstart
+        g.tick.trace.x = t1x
+        g.tick.trace.y = t1y
+        g.tick.trace.dx = t2x - t1x
+        g.tick.trace.dy = t2y - t1y
+    } ghosted {
+        yeet("gs")
+    }
+    bet crossBSPNode(gt, numnodes - 1, sightzstart, t2x, t2y)
+}

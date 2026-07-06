@@ -1,0 +1,413 @@
+// p/p_think.bet — the thinker list + state-action dispatch (linuxdoom-1.10 p_tick.c thinker
+// half: P_InitThinkers / P_AddThinker / P_RemoveThinker / P_RunThinkers, plus the action-fn
+// dispatch that p_mobj.setMobjState and p_pspr call). Signatures are FROZEN in
+// ports/doom/p-sigs.md ("p/p_think"). Every stateful fn takes `gt: tag gs.GameState` first.
+//
+// PORTED: P_InitThinkers, P_AddThinker, P_RemoveThinker, P_RunThinkers, plus runAction /
+//   runPsprAction (id inlines `st->action.acp1(mobj)` / `psp->state->action.acp2(...)`; here the
+//   fn pointer became info.State.actionId + the gs.Actions.a* fn-value fields, so dispatch is an
+//   explicit if-chain on the AID_* ordinal — bet has no integer switch).
+//
+// MODEL NOTES:
+//   * The thinker list is a doubly-linked ring of `tag think.Thinker` handles through the
+//     Thinker.prev/next fields, with a copped sentinel (funcId FUNC_CAP) at g.tick.thinkercap —
+//     mirroring id's static `thinkercap` whose &thinkercap is both head and tail.
+//   * P_RemoveThinker is lazy: it only stamps funcId = FUNC_REMOVED. The next P_RunThinkers pass
+//     unlinks the node and `evict`s its slot (gen bump -> any stale tag to it ghosts), replacing
+//     id's Z_Free.
+//   * runThinkers dispatches a FUNC_MOBJ node through the `g.hooks.mobjThink` forward slot
+//     (p_mobj.mobjThinker), NOT a direct call: the bet module loader rejects the p_think<->p_mobj
+//     import cycle, so the mobj thinker is wired in like the 7 movement hooks. See the gs.bet
+//     Hooks amendment. FUNC_DOOR/CEILING/FLOOR/PLAT/FLICKER/FLASH/STROBE/GLOW are P2.3's
+//     sector-effect thinkers — their dispatch arms are left as a documented slot below.
+//
+// SEAM: g.hooks.mobjThink       wired by the tick init (P2.4) / the smoke harness -> p_mobj.mobjThinker.
+// SEAM: g.actions.a*            wired by p_action (P2.4); runAction/runPsprAction call them. AID_NONE
+//                               is a no-op; a non-zero AID assumes its field is wired (the harness
+//                               installs no-op stubs). Native can't null-compare a fn-value, so the
+//                               dispatch calls the selected field unconditionally once matched.
+//
+// NATIVE is the correctness target. This module pulls only gs/think/info (no p_mobj), so it sits
+// UNDER p_mobj in the DAG; p_mobj pulls p_think for addThinker/removeThinker/runAction.
+pull "../defs/gs" as gs
+pull "../defs/think" as think
+pull "../defs/info" as info
+
+// ===========================================================================================
+// thinker list (p_tick.c)
+// ===========================================================================================
+
+// initThinkers — P_InitThinkers: cop the FUNC_CAP sentinel and point its prev/next at itself
+// (empty ring), storing it at g.tick.thinkercap.
+flex finna initThinkers(gt: tag gs.GameState) {
+    lowkey capT = cop think.Thinker{ funcId: think.FUNC_CAP as i32 } in gs.thinkers
+    holla c = capT in gs.thinkers {
+        c.prev = capT
+        c.next = capT
+    } ghosted {
+        yeet("cap")
+    }
+    holla g = gt in gs.gsc {
+        g.tick.thinkercap = capT
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// addThinker — P_AddThinker: append `th` just before the sentinel (list tail).
+//   thinkercap.prev->next = th ; th->next = thinkercap ; th->prev = thinkercap.prev ; thinkercap.prev = th
+flex finna addThinker(gt: tag gs.GameState, th: tag think.Thinker) {
+    lowkey capT: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        capT = g.tick.thinkercap
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey oldprev: tag think.Thinker = ghosted
+    holla c = capT in gs.thinkers {
+        oldprev = c.prev
+    } ghosted {
+        yeet("cap")
+    }
+    holla p = oldprev in gs.thinkers {
+        p.next = th
+    } ghosted {
+        yeet("oldprev")
+    }
+    holla t = th in gs.thinkers {
+        t.next = capT
+        t.prev = oldprev
+    } ghosted {
+        yeet("th")
+    }
+    holla c2 = capT in gs.thinkers {
+        c2.prev = th
+    } ghosted {
+        yeet("cap")
+    }
+}
+
+// removeThinker — P_RemoveThinker: lazy free. Just stamp FUNC_REMOVED; runThinkers unlinks+evicts.
+flex finna removeThinker(gt: tag gs.GameState, th: tag think.Thinker) {
+    holla t = th in gs.thinkers {
+        t.funcId = think.FUNC_REMOVED as i32
+    } ghosted {
+        yeet("th")
+    }
+}
+
+// runThinkers — P_RunThinkers: walk the ring from thinkercap.next; for each node either
+//   (FUNC_REMOVED) unlink it from its neighbours and evict its slot, or dispatch its think fn.
+// The walk reads `next` BEFORE any evict, so eviction of the current node is safe.
+flex finna runThinkers(gt: tag gs.GameState) {
+    lowkey capT: tag think.Thinker = ghosted
+    lowkey mobjFn: finna(tag gs.GameState, tag think.Thinker) -> void = ghosted
+    holla g = gt in gs.gsc {
+        capT = g.tick.thinkercap
+        mobjFn = g.hooks.mobjThink
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey cur: tag think.Thinker = ghosted
+    holla c = capT in gs.thinkers {
+        cur = c.next
+    } ghosted {
+        yeet("cap")
+    }
+    vibin !(cur == capT) {
+        lowkey fid = 0
+        lowkey nxt: tag think.Thinker = ghosted
+        lowkey prv: tag think.Thinker = ghosted
+        holla n = cur in gs.thinkers {
+            fid = n.funcId as int
+            nxt = n.next
+            prv = n.prev
+        } ghosted {
+            yeet("cur")
+        }
+        fr fid == think.FUNC_REMOVED {
+            // time to remove it: next->prev = prev ; prev->next = next ; free the slot
+            holla nn = nxt in gs.thinkers {
+                nn.prev = prv
+            } ghosted {
+            }
+            holla pp = prv in gs.thinkers {
+                pp.next = nxt
+            } ghosted {
+            }
+            evict cur in gs.thinkers
+        } naw fr fid == think.FUNC_MOBJ {
+            // P_MobjThinker, via the forward slot (see header). Assumed wired.
+            mobjFn(gt, cur)
+        } naw {
+            // SEAM: FUNC_DOOR / FUNC_CEILING / FUNC_FLOOR / FUNC_PLAT / FUNC_FLICKER /
+            // FUNC_FLASH / FUNC_STROBE / FUNC_GLOW — P2.3's sector-effect thinkers. Their
+            // dispatch arms slot in here (each via its own forward fn-value, mirroring
+            // mobjThink) once p_spec lands. Until then such nodes never exist.
+        }
+        cur = nxt
+    }
+}
+
+// ===========================================================================================
+// action-fn dispatch (replaces id's `st->action.acp1(mobj)` / `psp->state->action.acp2(...)`)
+// ===========================================================================================
+
+// runAction — dispatch a MOBJ-signature action (info AID_*, the 52 fns taking mobj_t*). Reads
+// the matching gs.Actions field out of the crib, then calls it AFTER closing the holla (so the
+// action opens its own gs holla with no parent open). AID_NONE is a no-op.
+flex finna runAction(gt: tag gs.GameState, aid: int, actor: tag think.Thinker) {
+    fr aid == info.AID_NONE {
+        bet
+    }
+    lowkey found = cap
+    lowkey fn: finna(tag gs.GameState, tag think.Thinker) -> void = ghosted
+    holla g = gt in gs.gsc {
+        fr aid == info.AID_BFGSPRAY {
+            fn = g.actions.aBFGSpray
+            found = nocap
+        } naw fr aid == info.AID_BABYMETAL {
+            fn = g.actions.aBabyMetal
+            found = nocap
+        } naw fr aid == info.AID_BOSSDEATH {
+            fn = g.actions.aBossDeath
+            found = nocap
+        } naw fr aid == info.AID_BRAINAWAKE {
+            fn = g.actions.aBrainAwake
+            found = nocap
+        } naw fr aid == info.AID_BRAINDIE {
+            fn = g.actions.aBrainDie
+            found = nocap
+        } naw fr aid == info.AID_BRAINEXPLODE {
+            fn = g.actions.aBrainExplode
+            found = nocap
+        } naw fr aid == info.AID_BRAINPAIN {
+            fn = g.actions.aBrainPain
+            found = nocap
+        } naw fr aid == info.AID_BRAINSCREAM {
+            fn = g.actions.aBrainScream
+            found = nocap
+        } naw fr aid == info.AID_BRAINSPIT {
+            fn = g.actions.aBrainSpit
+            found = nocap
+        } naw fr aid == info.AID_BRUISATTACK {
+            fn = g.actions.aBruisAttack
+            found = nocap
+        } naw fr aid == info.AID_BSPIATTACK {
+            fn = g.actions.aBspiAttack
+            found = nocap
+        } naw fr aid == info.AID_CPOSATTACK {
+            fn = g.actions.aCPosAttack
+            found = nocap
+        } naw fr aid == info.AID_CPOSREFIRE {
+            fn = g.actions.aCPosRefire
+            found = nocap
+        } naw fr aid == info.AID_CHASE {
+            fn = g.actions.aChase
+            found = nocap
+        } naw fr aid == info.AID_CYBERATTACK {
+            fn = g.actions.aCyberAttack
+            found = nocap
+        } naw fr aid == info.AID_EXPLODE {
+            fn = g.actions.aExplode
+            found = nocap
+        } naw fr aid == info.AID_FACETARGET {
+            fn = g.actions.aFaceTarget
+            found = nocap
+        } naw fr aid == info.AID_FALL {
+            fn = g.actions.aFall
+            found = nocap
+        } naw fr aid == info.AID_FATATTACK1 {
+            fn = g.actions.aFatAttack1
+            found = nocap
+        } naw fr aid == info.AID_FATATTACK2 {
+            fn = g.actions.aFatAttack2
+            found = nocap
+        } naw fr aid == info.AID_FATATTACK3 {
+            fn = g.actions.aFatAttack3
+            found = nocap
+        } naw fr aid == info.AID_FATRAISE {
+            fn = g.actions.aFatRaise
+            found = nocap
+        } naw fr aid == info.AID_FIRE {
+            fn = g.actions.aFire
+            found = nocap
+        } naw fr aid == info.AID_FIRECRACKLE {
+            fn = g.actions.aFireCrackle
+            found = nocap
+        } naw fr aid == info.AID_HEADATTACK {
+            fn = g.actions.aHeadAttack
+            found = nocap
+        } naw fr aid == info.AID_HOOF {
+            fn = g.actions.aHoof
+            found = nocap
+        } naw fr aid == info.AID_KEENDIE {
+            fn = g.actions.aKeenDie
+            found = nocap
+        } naw fr aid == info.AID_LOOK {
+            fn = g.actions.aLook
+            found = nocap
+        } naw fr aid == info.AID_METAL {
+            fn = g.actions.aMetal
+            found = nocap
+        } naw fr aid == info.AID_PAIN {
+            fn = g.actions.aPain
+            found = nocap
+        } naw fr aid == info.AID_PAINATTACK {
+            fn = g.actions.aPainAttack
+            found = nocap
+        } naw fr aid == info.AID_PAINDIE {
+            fn = g.actions.aPainDie
+            found = nocap
+        } naw fr aid == info.AID_PLAYERSCREAM {
+            fn = g.actions.aPlayerScream
+            found = nocap
+        } naw fr aid == info.AID_POSATTACK {
+            fn = g.actions.aPosAttack
+            found = nocap
+        } naw fr aid == info.AID_SPOSATTACK {
+            fn = g.actions.aSPosAttack
+            found = nocap
+        } naw fr aid == info.AID_SARGATTACK {
+            fn = g.actions.aSargAttack
+            found = nocap
+        } naw fr aid == info.AID_SCREAM {
+            fn = g.actions.aScream
+            found = nocap
+        } naw fr aid == info.AID_SKELFIST {
+            fn = g.actions.aSkelFist
+            found = nocap
+        } naw fr aid == info.AID_SKELMISSILE {
+            fn = g.actions.aSkelMissile
+            found = nocap
+        } naw fr aid == info.AID_SKELWHOOSH {
+            fn = g.actions.aSkelWhoosh
+            found = nocap
+        } naw fr aid == info.AID_SKULLATTACK {
+            fn = g.actions.aSkullAttack
+            found = nocap
+        } naw fr aid == info.AID_SPAWNFLY {
+            fn = g.actions.aSpawnFly
+            found = nocap
+        } naw fr aid == info.AID_SPAWNSOUND {
+            fn = g.actions.aSpawnSound
+            found = nocap
+        } naw fr aid == info.AID_SPIDREFIRE {
+            fn = g.actions.aSpidRefire
+            found = nocap
+        } naw fr aid == info.AID_STARTFIRE {
+            fn = g.actions.aStartFire
+            found = nocap
+        } naw fr aid == info.AID_TRACER {
+            fn = g.actions.aTracer
+            found = nocap
+        } naw fr aid == info.AID_TROOPATTACK {
+            fn = g.actions.aTroopAttack
+            found = nocap
+        } naw fr aid == info.AID_VILEATTACK {
+            fn = g.actions.aVileAttack
+            found = nocap
+        } naw fr aid == info.AID_VILECHASE {
+            fn = g.actions.aVileChase
+            found = nocap
+        } naw fr aid == info.AID_VILESTART {
+            fn = g.actions.aVileStart
+            found = nocap
+        } naw fr aid == info.AID_VILETARGET {
+            fn = g.actions.aVileTarget
+            found = nocap
+        } naw fr aid == info.AID_XSCREAM {
+            fn = g.actions.aXScream
+            found = nocap
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    fr found {
+        fn(gt, actor)
+    }
+}
+
+// runPsprAction — dispatch a WEAPON/PSPRITE-signature action (the 22 fns taking
+// (player_t*, pspdef_t*)); playerIdx/pspIdx replace those pointers.
+flex finna runPsprAction(gt: tag gs.GameState, aid: int, playerIdx: int, pspIdx: int) {
+    fr aid == info.AID_NONE {
+        bet
+    }
+    lowkey found = cap
+    lowkey fn: finna(tag gs.GameState, int, int) -> void = ghosted
+    holla g = gt in gs.gsc {
+        fr aid == info.AID_BFGSOUND {
+            fn = g.actions.aBFGsound
+            found = nocap
+        } naw fr aid == info.AID_CHECKRELOAD {
+            fn = g.actions.aCheckReload
+            found = nocap
+        } naw fr aid == info.AID_CLOSESHOTGUN2 {
+            fn = g.actions.aCloseShotgun2
+            found = nocap
+        } naw fr aid == info.AID_FIREBFG {
+            fn = g.actions.aFireBFG
+            found = nocap
+        } naw fr aid == info.AID_FIRECGUN {
+            fn = g.actions.aFireCGun
+            found = nocap
+        } naw fr aid == info.AID_FIREMISSILE {
+            fn = g.actions.aFireMissile
+            found = nocap
+        } naw fr aid == info.AID_FIREPISTOL {
+            fn = g.actions.aFirePistol
+            found = nocap
+        } naw fr aid == info.AID_FIREPLASMA {
+            fn = g.actions.aFirePlasma
+            found = nocap
+        } naw fr aid == info.AID_FIRESHOTGUN {
+            fn = g.actions.aFireShotgun
+            found = nocap
+        } naw fr aid == info.AID_FIRESHOTGUN2 {
+            fn = g.actions.aFireShotgun2
+            found = nocap
+        } naw fr aid == info.AID_GUNFLASH {
+            fn = g.actions.aGunFlash
+            found = nocap
+        } naw fr aid == info.AID_LIGHT0 {
+            fn = g.actions.aLight0
+            found = nocap
+        } naw fr aid == info.AID_LIGHT1 {
+            fn = g.actions.aLight1
+            found = nocap
+        } naw fr aid == info.AID_LIGHT2 {
+            fn = g.actions.aLight2
+            found = nocap
+        } naw fr aid == info.AID_LOADSHOTGUN2 {
+            fn = g.actions.aLoadShotgun2
+            found = nocap
+        } naw fr aid == info.AID_LOWER {
+            fn = g.actions.aLower
+            found = nocap
+        } naw fr aid == info.AID_OPENSHOTGUN2 {
+            fn = g.actions.aOpenShotgun2
+            found = nocap
+        } naw fr aid == info.AID_PUNCH {
+            fn = g.actions.aPunch
+            found = nocap
+        } naw fr aid == info.AID_RAISE {
+            fn = g.actions.aRaise
+            found = nocap
+        } naw fr aid == info.AID_REFIRE {
+            fn = g.actions.aReFire
+            found = nocap
+        } naw fr aid == info.AID_SAW {
+            fn = g.actions.aSaw
+            found = nocap
+        } naw fr aid == info.AID_WEAPONREADY {
+            fn = g.actions.aWeaponReady
+            found = nocap
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    fr found {
+        fn(gt, playerIdx, pspIdx)
+    }
+}

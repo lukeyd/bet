@@ -401,6 +401,12 @@ flex drip RenderState {
 // ---- Hooks: the 7 upward calls that break the p_mobj/p_map/p_spec cycle. Wired at init by
 // p/p_action. Signatures are FROZEN (p-sigs.md). Mobjs are `tag think.Thinker`, lines/sides
 // are indices, angles u32, fixed i32. -----------------------------------------------------
+// P2.1 CONTRACTS amendment (additive, non-structural): `mobjThink` is a forward-dispatch
+// slot for P_MobjThinker so p/p_think.runThinkers can dispatch a FUNC_MOBJ node WITHOUT
+// pulling p/p_mobj (the bet loader rejects the p_think<->p_mobj import cycle). It is wired at
+// tick init (the smoke harness / P2.4's tick) to p_mobj.mobjThinker, exactly as the 7 hooks
+// are wired by p_action. Native can't null-compare fn-values, so runThinkers CALLS it
+// unconditionally on a FUNC_MOBJ node — it MUST be wired before any mobj thinker runs.
 flex drip Hooks {
     flex tryMove: finna(tag GameState, tag think.Thinker, i32, i32) -> bool
     flex slideMove: finna(tag GameState, tag think.Thinker) -> void
@@ -409,6 +415,7 @@ flex drip Hooks {
     flex crossSpecialLine: finna(tag GameState, i32, i32, tag think.Thinker) -> void
     flex shootSpecialLine: finna(tag GameState, tag think.Thinker, i32) -> void
     flex useSpecialLine: finna(tag GameState, tag think.Thinker, i32, i32) -> bool
+    flex mobjThink: finna(tag GameState, tag think.Thinker) -> void
 }
 
 // ---- Actions: one fn-value field per A_* action id (info.bet AID_*). Naming: `a` + the

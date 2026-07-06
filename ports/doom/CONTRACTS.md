@@ -311,3 +311,21 @@ Six mutated-in-place `vec` fields were therefore converted to fixed arrays + an 
 - Build-once-read vecs are UNCHANGED (still `vec`): `Wad.lumpName`, `TickState.anims`,
   `InfoTables.states/mobjinfo/sfx`, `GameShell.savegameStrings`, `AmState.marks`. Never
   element-mutate these — only `.stack` (append) then read `v[i]`.
+
+## P2.1 amendment (additive `Hooks.mobjThink` — thinker forward-dispatch)
+
+One field added to the **existing `Hooks` drip** (no TickState/Level/RenderState change):
+
+    flex mobjThink: finna(tag GameState, tag think.Thinker) -> void   // P_MobjThinker forward-dispatch
+
+Why: the bet module loader rejects import cycles, and `p/p_mobj` must pull `p/p_think`
+(addThinker/removeThinker/runAction), so `p/p_think.runThinkers` cannot pull `p/p_mobj` to call
+`mobjThinker` directly. `mobjThink` is a pre-wired fn-value — exactly the pattern the 7 `Hooks`
+already use to break the p_mobj⇄p_map⇄p_spec cycle — dispatched by `runThinkers` for a FUNC_MOBJ
+node. **Wire it at tick init** (alongside the 7 movement hooks that p_action wires) to
+`p_mobj.mobjThinker`. Native cannot null-compare a fn-value, so `runThinkers` calls it
+unconditionally on a FUNC_MOBJ node: it MUST be wired before any mobj thinker runs. Additive —
+`cop` zero-inits it; existing goldens (gs_selftest = 14187, sound/rdata) are unaffected.
+
+P2.3's sector-effect thinkers (FUNC_DOOR/CEILING/FLOOR/PLAT/FLICKER/FLASH/STROBE/GLOW) slot into
+`runThinkers`'s documented dispatch arm the same way (their own forward fn-values, their amendment).
