@@ -1,0 +1,76 @@
+// defs/fixed.bet — 16.16 fixed-point (m_fixed.c) + P_AproxDistance (moved here from
+// p_maputl.c so s_sound and the low sim/render layers can depend on distance without pulling
+// the map utilities). Leaf module: no pulls. Ported from linuxdoom-1.10 m_fixed.c / m_fixed.h
+// and doomtype.h. See ports/doom/CONTRACTS.md.
+//
+// TYPES: fixed_t -> i32. Multiply/divide go through i64 intermediates. angle math lives in
+// defs/tables + r/r_geom (P1.4). C `int` in sim/render math -> i32.
+//
+// FixedDiv2 uses the reference's *double* path verbatim (linuxdoom m_fixed.c: the i64
+// `#if 0` branch is disabled; the shipped/oracle build divides in double). It matches the
+// committed ports/doom/goldens/fixed.golden bit-for-bit AND matches the doomgeneric/linuxdoom
+// demo-sync oracle. Native lowers this as sitofp/fdiv/fmul/fcmp/fptosi; the interpreter
+// evaluates it in f64 too, so goldens.bet reproduces the golden under `bet run`.
+
+// int/fixed limits (doomtype.h). MININT/MAXINT are the FixedDiv overflow clamps.
+flex facts MININT: i32 = -2147483648   // 0x80000000
+flex facts MAXINT: i32 = 2147483647    // 0x7fffffff
+
+flex facts FRACBITS: int = 16
+flex facts FRACUNIT: i32 = 65536       // 1 << FRACBITS
+
+// FixedMul: ((long long)a * (long long)b) >> FRACBITS
+flex finna fixedMul(a: i32, b: i32) -> i32 {
+    bet (((a as i64) * (b as i64)) >> 16) as i32
+}
+
+// FixedDiv: the overflow guard, then FixedDiv2. Reproduces m_fixed.c bit-for-bit including
+// the INT_MIN edge: abs() is taken in i64 (a is widened first), so abs(INT_MIN) is +2^31
+// rather than the C `abs(int)` UB — and that is exactly what the committed golden encodes
+// (FixedDiv(INT_MIN, INT_MIN) -> FRACUNIT, i.e. the clamp is NOT taken).
+flex finna fixedDiv(a: i32, b: i32) -> i32 {
+    lowkey aa: i64 = a as i64
+    fr aa < 0 {
+        aa = 0 - aa
+    }
+    lowkey bb: i64 = b as i64
+    fr bb < 0 {
+        bb = 0 - bb
+    }
+    fr (aa >> 14) >= bb {
+        fr (a ^ b) < 0 {
+            bet MININT
+        }
+        bet MAXINT
+    }
+    bet fixedDiv2(a, b)
+}
+
+// FixedDiv2: the double path. c = ((double)a)/((double)b)*FRACUNIT; overflow -> I_Error (yeet).
+flex finna fixedDiv2(a: i32, b: i32) -> i32 {
+    lowkey c: f64 = (a as f64) / (b as f64) * 65536.0
+    fr c >= 2147483648.0 {
+        yeet("FixedDiv: divide by zero")
+    }
+    fr c < -2147483648.0 {
+        yeet("FixedDiv: divide by zero")
+    }
+    bet c as i32
+}
+
+// P_AproxDistance (p_maputl.c): cheap octagonal distance estimate. abs() here matches the C
+// int abs — the sim never passes INT_MIN coordinates.
+flex finna aproxDistance(dx: i32, dy: i32) -> i32 {
+    lowkey ax: i32 = dx
+    fr ax < 0 {
+        ax = 0 - ax
+    }
+    lowkey ay: i32 = dy
+    fr ay < 0 {
+        ay = 0 - ay
+    }
+    fr ax < ay {
+        bet ax + ay - (ax >> 1)
+    }
+    bet ax + ay - (ay >> 1)
+}

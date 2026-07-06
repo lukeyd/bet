@@ -1,0 +1,44 @@
+// defs/event.bet — input events + per-tic commands. Leaf module: no pulls.
+// Ported from linuxdoom-1.10 d_event.h and d_ticcmd.h.
+
+// evtype_t
+flex facts EV_KEYDOWN: int = 0
+flex facts EV_KEYUP: int = 1
+flex facts EV_MOUSE: int = 2
+flex facts EV_JOYSTICK: int = 3
+
+// event_t. `typ` is the evtype_t; data1/2/3 are keys / mouse-x / mouse-y (or joystick).
+flex drip Event {
+    flex typ: i32
+    flex data1: i32
+    flex data2: i32
+    flex data3: i32
+}
+
+flex facts MAXEVENTS: int = 64   // event ring size (d_event.h)
+
+// ticcmd_t. In id's struct these are char/short/byte at the wire; widened to i32 here.
+// The wire widths still matter for demo compat: forwardmove/sidemove are signed 8-bit,
+// angleturn/consistancy signed 16-bit, chatchar/buttons unsigned 8-bit — d_net / g_game
+// mask on encode/decode (see CONTRACTS.md).
+flex drip Ticcmd {
+    flex forwardmove: i32   // *2048 for move (signed char)
+    flex sidemove: i32      // *2048 for move (signed char)
+    flex angleturn: i32     // <<16 for angle delta (signed short)
+    flex consistancy: i32   // net-game consistency check (signed short)
+    flex chatchar: i32      // unsigned char
+    flex buttons: i32       // unsigned char, BT_* bits
+}
+
+// buttoncode_t — ticcmd.buttons bits, plus the BTS_* special-command byte encoding.
+flex facts BT_ATTACK: int = 1
+flex facts BT_USE: int = 2
+flex facts BT_SPECIAL: int = 128       // flag: game event, not a button
+flex facts BT_SPECIALMASK: int = 3
+flex facts BT_CHANGE: int = 4          // weapon change pending; next 3 bits = weapon
+flex facts BT_WEAPONMASK: int = 56     // 8 + 16 + 32
+flex facts BT_WEAPONSHIFT: int = 3
+flex facts BTS_PAUSE: int = 1
+flex facts BTS_SAVEGAME: int = 2
+flex facts BTS_SAVEMASK: int = 28      // 4 + 8 + 16
+flex facts BTS_SAVESHIFT: int = 2

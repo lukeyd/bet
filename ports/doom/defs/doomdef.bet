@@ -1,0 +1,167 @@
+// defs/doomdef.bet — global constants and the small "enum" facts from doomdef.h.
+// Leaf module: no pulls. Ported from linuxdoom-1.10 doomdef.h (+ the ML_* linedef/lump facts
+// from doomdata.h, kept here so map code has one place for them). C enums become `facts`
+// (bet has no enums); dense ordinals preserved exactly.
+
+flex facts VERSION: int = 110
+
+flex facts SCREENWIDTH: int = 320
+flex facts SCREENHEIGHT: int = 200
+flex facts TICRATE: int = 35
+flex facts MAXPLAYERS: int = 4
+
+// gamestate_t
+flex facts GS_LEVEL: int = 0
+flex facts GS_INTERMISSION: int = 1
+flex facts GS_FINALE: int = 2
+flex facts GS_DEMOSCREEN: int = 3
+
+// gameaction_t (d_event.h — kept here with the other shell enums)
+flex facts GA_NOTHING: int = 0
+flex facts GA_LOADLEVEL: int = 1
+flex facts GA_NEWGAME: int = 2
+flex facts GA_LOADGAME: int = 3
+flex facts GA_SAVEGAME: int = 4
+flex facts GA_PLAYDEMO: int = 5
+flex facts GA_COMPLETED: int = 6
+flex facts GA_VICTORY: int = 7
+flex facts GA_WORLDDONE: int = 8
+flex facts GA_SCREENSHOT: int = 9
+
+// GameMode_t
+flex facts GM_SHAREWARE: int = 0
+flex facts GM_REGISTERED: int = 1
+flex facts GM_COMMERCIAL: int = 2
+flex facts GM_RETAIL: int = 3
+flex facts GM_INDETERMINED: int = 4
+
+// GameMission_t
+flex facts GMIS_DOOM: int = 0
+flex facts GMIS_DOOM2: int = 1
+flex facts GMIS_PACK_TNT: int = 2
+flex facts GMIS_PACK_PLUT: int = 3
+flex facts GMIS_NONE: int = 4
+
+// Language_t
+flex facts LANG_ENGLISH: int = 0
+flex facts LANG_FRENCH: int = 1
+flex facts LANG_GERMAN: int = 2
+flex facts LANG_UNKNOWN: int = 3
+
+// skill_t
+flex facts SK_BABY: int = 0
+flex facts SK_EASY: int = 1
+flex facts SK_MEDIUM: int = 2
+flex facts SK_HARD: int = 3
+flex facts SK_NIGHTMARE: int = 4
+
+// mapthing options / skill filter flags (MTF_*)
+flex facts MTF_EASY: int = 1
+flex facts MTF_NORMAL: int = 2
+flex facts MTF_HARD: int = 4
+flex facts MTF_AMBUSH: int = 8
+
+// card_t (key cards) — it_*
+flex facts IT_BLUECARD: int = 0
+flex facts IT_YELLOWCARD: int = 1
+flex facts IT_REDCARD: int = 2
+flex facts IT_BLUESKULL: int = 3
+flex facts IT_YELLOWSKULL: int = 4
+flex facts IT_REDSKULL: int = 5
+flex facts NUMCARDS: int = 6
+
+// weapontype_t — wp_*
+flex facts WP_FIST: int = 0
+flex facts WP_PISTOL: int = 1
+flex facts WP_SHOTGUN: int = 2
+flex facts WP_CHAINGUN: int = 3
+flex facts WP_MISSILE: int = 4
+flex facts WP_PLASMA: int = 5
+flex facts WP_BFG: int = 6
+flex facts WP_CHAINSAW: int = 7
+flex facts WP_SUPERSHOTGUN: int = 8
+flex facts NUMWEAPONS: int = 9
+flex facts WP_NOCHANGE: int = 10   // sentinel: no pending weapon change
+
+// ammotype_t — am_*
+flex facts AM_CLIP: int = 0
+flex facts AM_SHELL: int = 1
+flex facts AM_CELL: int = 2
+flex facts AM_MISL: int = 3
+flex facts NUMAMMO: int = 4
+flex facts AM_NOAMMO: int = 5      // fist / chainsaw: unlimited
+
+// powertype_t — pw_*
+flex facts PW_INVULNERABILITY: int = 0
+flex facts PW_STRENGTH: int = 1
+flex facts PW_INVISIBILITY: int = 2
+flex facts PW_IRONFEET: int = 3
+flex facts PW_ALLMAP: int = 4
+flex facts PW_INFRARED: int = 5
+flex facts NUMPOWERS: int = 6
+
+// powerduration_t (tics)
+flex facts INVULNTICS: int = 1050    // 30 * TICRATE
+flex facts INVISTICS: int = 2100     // 60 * TICRATE
+flex facts INFRATICS: int = 4200     // 120 * TICRATE
+flex facts IRONTICS: int = 2100      // 60 * TICRATE
+
+// -----------------------------------------------------------------------------
+// Map lump order in a map WAD (doomdata.h ML_* enum).
+flex facts ML_LABEL: int = 0
+flex facts ML_THINGS: int = 1
+flex facts ML_LINEDEFS: int = 2
+flex facts ML_SIDEDEFS: int = 3
+flex facts ML_VERTEXES: int = 4
+flex facts ML_SEGS: int = 5
+flex facts ML_SSECTORS: int = 6
+flex facts ML_NODES: int = 7
+flex facts ML_SECTORS: int = 8
+flex facts ML_REJECT: int = 9
+flex facts ML_BLOCKMAP: int = 10
+
+// LineDef flag bits (doomdata.h). NB same ML_ prefix as the lump order in id's headers;
+// these are the `flags` field bits, distinct value space.
+flex facts ML_BLOCKING: int = 1
+flex facts ML_BLOCKMONSTERS: int = 2
+flex facts ML_TWOSIDED: int = 4
+flex facts ML_DONTPEGTOP: int = 8
+flex facts ML_DONTPEGBOTTOM: int = 16
+flex facts ML_SECRET: int = 32
+flex facts ML_SOUNDBLOCK: int = 64
+flex facts ML_DONTDRAW: int = 128
+flex facts ML_MAPPED: int = 256
+
+// BSP node child flag: leaf marker (doomdata.h / r_defs.h).
+flex facts NF_SUBSECTOR: int = 0x8000
+
+// -----------------------------------------------------------------------------
+// DOOM internal keycodes (doomdef.h KEY_*). These are DOOM's own codes, distinct from the
+// gg platform keycodes — i/i_video (P1.2) translates gg -> DOOM before postEvent.
+flex facts KEY_RIGHTARROW: int = 0xae
+flex facts KEY_LEFTARROW: int = 0xac
+flex facts KEY_UPARROW: int = 0xad
+flex facts KEY_DOWNARROW: int = 0xaf
+flex facts KEY_ESCAPE: int = 27
+flex facts KEY_ENTER: int = 13
+flex facts KEY_TAB: int = 9
+flex facts KEY_F1: int = 0xbb    // 0x80 + 0x3b
+flex facts KEY_F2: int = 0xbc
+flex facts KEY_F3: int = 0xbd
+flex facts KEY_F4: int = 0xbe
+flex facts KEY_F5: int = 0xbf
+flex facts KEY_F6: int = 0xc0
+flex facts KEY_F7: int = 0xc1
+flex facts KEY_F8: int = 0xc2
+flex facts KEY_F9: int = 0xc3
+flex facts KEY_F10: int = 0xc4
+flex facts KEY_F11: int = 0xd7   // 0x80 + 0x57
+flex facts KEY_F12: int = 0xd8   // 0x80 + 0x58
+flex facts KEY_BACKSPACE: int = 127
+flex facts KEY_PAUSE: int = 0xff
+flex facts KEY_EQUALS: int = 0x3d
+flex facts KEY_MINUS: int = 0x2d
+flex facts KEY_RSHIFT: int = 0xb6   // 0x80 + 0x36
+flex facts KEY_RCTRL: int = 0x9d    // 0x80 + 0x1d
+flex facts KEY_RALT: int = 0xb8     // 0x80 + 0x38
+flex facts KEY_LALT: int = 0xb8     // == KEY_RALT

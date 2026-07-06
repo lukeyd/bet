@@ -1,0 +1,91 @@
+// defs/player.bet — player_t and the intermission structs (L2). Ported from d_player.h.
+// mo/attacker are tags into the thinkers crib; cmd is an embedded Ticcmd; the fixed-size
+// inventory arrays keep their NUM* lengths. See ports/doom/CONTRACTS.md.
+pull "think"
+pull "doomdef"
+pull "event"
+
+// playerstate_t
+flex facts PST_LIVE: int = 0
+flex facts PST_DEAD: int = 1
+flex facts PST_REBORN: int = 2
+
+// cheat_t (player.cheats bits)
+flex facts CF_NOCLIP: int = 1
+flex facts CF_GODMODE: int = 2
+flex facts CF_NOMOMENTUM: int = 4
+
+flex drip Player {
+    flex mo: tag think.Thinker     // the player's mobj (mobj_t*)
+    flex playerstate: i32          // PST_*
+    flex cmd: event.Ticcmd         // buffered input for this tic
+    // view (fixed)
+    flex viewz: i32
+    flex viewheight: i32
+    flex deltaviewheight: i32
+    flex bob: i32
+    // between-level health/armor (mo->health used during a level)
+    flex health: i32
+    flex armorpoints: i32
+    flex armortype: i32            // 0-2
+    // powerup tic counters (pw_*)
+    flex powers: i32[6]
+    flex cards: bool[6]            // key cards held (it_*)
+    flex backpack: bool
+    // frags against other players
+    flex frags: i32[4]
+    flex readyweapon: i32          // weapontype_t
+    flex pendingweapon: i32        // WP_NOCHANGE if not changing
+    flex weaponowned: bool[9]
+    flex ammo: i32[4]
+    flex maxammo: i32[4]
+    // button-held-last-tic (C ints, used as bools)
+    flex attackdown: bool
+    flex usedown: bool
+    flex cheats: i32               // CF_* bits
+    flex refire: i32               // refired shots are less accurate
+    // intermission stats
+    flex killcount: i32
+    flex itemcount: i32
+    flex secretcount: i32
+    flex message: str              // hint message (or "")
+    // screen flash counters
+    flex damagecount: i32
+    flex bonuscount: i32
+    flex attacker: tag think.Thinker  // who did damage (null for floors/ceilings)
+    // lighting
+    flex extralight: i32           // gun flashes
+    flex fixedcolormap: i32        // REDCOLORMAP for pain, etc.
+    flex colormap: i32             // player skin colorshift 0-3
+    // gun / flash overlay sprites
+    flex psprites: think.Psp[2]
+    flex didsecret: bool
+}
+
+// -----------------------------------------------------------------------------
+// wbplayerstruct_t (d_player.h). `in` is a bet keyword (holla ... in crib), so the
+// "player is in game" flag is renamed `inGame` — see CONTRACTS.md.
+flex drip WbPlayer {
+    flex inGame: bool
+    flex skills: i32
+    flex sitems: i32
+    flex ssecret: i32
+    flex stime: i32
+    flex frags: i32[4]
+    flex score: i32                // score on entry, modified on return
+}
+
+// wbstartstruct_t (d_player.h) — passed to WI_Start for the intermission.
+flex drip WbStart {
+    flex epsd: i32                 // episode # (0-2)
+    flex didsecret: bool
+    flex last: i32                 // previous level, origin 0
+    flex next: i32                 // next level, origin 0
+    flex maxkills: i32
+    flex maxitems: i32
+    flex maxsecret: i32
+    flex maxfrags: i32
+    flex partime: i32
+    flex pnum: i32                 // this player's index
+    flex plyr: WbPlayer[4]
+}

@@ -1,0 +1,188 @@
+// defs/think.bet — the mobj / thinker / sector-action layer (L1). Collapses the mutually
+// recursive p_mobj.h / d_think.h / p_spec.h structs into one module so the bottom stack is a
+// DAG. Ported from p_mobj.h (mobj_t, mobjflag_t), d_think.h (thinker_t), p_pspr.h (pspdef_t,
+// FF_*), doomdata.h (mapthing_t) and p_spec.h (the door/ceiling/floor/plat/light payloads,
+// unioned into SectorAction). See ports/doom/CONTRACTS.md.
+pull "fixed"
+pull "doomdef"
+pull "event"
+pull "info"
+
+// -----------------------------------------------------------------------------
+// mobjflag_t — mobj_t.flags bits. id's field is a C `int`; all bits (max MF_TRANSLATION =
+// 0x0c000000) fit in a positive i32, so flags stays i32 and these are int facts used with &.
+flex facts MF_SPECIAL: int = 1
+flex facts MF_SOLID: int = 2
+flex facts MF_SHOOTABLE: int = 4
+flex facts MF_NOSECTOR: int = 8
+flex facts MF_NOBLOCKMAP: int = 16
+flex facts MF_AMBUSH: int = 32
+flex facts MF_JUSTHIT: int = 64
+flex facts MF_JUSTATTACKED: int = 128
+flex facts MF_SPAWNCEILING: int = 256
+flex facts MF_NOGRAVITY: int = 512
+flex facts MF_DROPOFF: int = 0x400
+flex facts MF_PICKUP: int = 0x800
+flex facts MF_NOCLIP: int = 0x1000
+flex facts MF_SLIDE: int = 0x2000
+flex facts MF_FLOAT: int = 0x4000
+flex facts MF_TELEPORT: int = 0x8000
+flex facts MF_MISSILE: int = 0x10000
+flex facts MF_DROPPED: int = 0x20000
+flex facts MF_SHADOW: int = 0x40000
+flex facts MF_NOBLOOD: int = 0x80000
+flex facts MF_CORPSE: int = 0x100000
+flex facts MF_INFLOAT: int = 0x200000
+flex facts MF_COUNTKILL: int = 0x400000
+flex facts MF_COUNTITEM: int = 0x800000
+flex facts MF_SKULLFLY: int = 0x1000000
+flex facts MF_NOTDMATCH: int = 0x2000000
+flex facts MF_TRANSLATION: int = 0xc000000
+flex facts MF_TRANSSHIFT: int = 26
+
+// Frame flags (p_pspr.h): FF_FULLBRIGHT is ORed into mobj/psp frame; FF_FRAMEMASK strips it.
+flex facts FF_FULLBRIGHT: int = 0x8000
+flex facts FF_FRAMEMASK: int = 0x7fff
+
+// z sentinels for P_SpawnMobj (p_local.h ONFLOORZ/ONCEILINGZ == MININT/MAXINT).
+flex facts ONFLOORZ: i32 = -2147483648
+flex facts ONCEILINGZ: i32 = 2147483647
+
+// psprnum_t (p_pspr.h) — psprites[] indices.
+flex facts PS_WEAPON: int = 0
+flex facts PS_FLASH: int = 1
+flex facts NUMPSPRITES: int = 2
+
+// -----------------------------------------------------------------------------
+// mapthing_t (doomdata.h): a THINGS-lump entry. All shorts, widened to i32.
+flex drip MapThing {
+    flex x: i32
+    flex y: i32
+    flex angle: i32
+    flex typ: i32       // doomednum
+    flex options: i32   // MTF_* skill/ambush flags
+}
+
+// pspdef_t (p_pspr.h): a player sprite overlay. state pointer -> stateIdx (-1 == not active).
+flex drip Psp {
+    flex stateIdx: i32
+    flex tics: i32
+    flex sx: i32        // fixed
+    flex sy: i32        // fixed
+}
+
+// -----------------------------------------------------------------------------
+// mobj_t (p_mobj.h). Cross-refs: sector via `subsector` index; player via `player` index
+// (-1 = none); other mobjs via `tag Thinker` (snext/sprev/bnext/bprev/target/tracer). The C
+// mobj->info / mobj->state pointers are recomputed from typeIdx / stateIdx on demand.
+flex drip Mobj {
+    // position (fixed)
+    flex x: i32
+    flex y: i32
+    flex z: i32
+    // momentum (fixed)
+    flex momx: i32
+    flex momy: i32
+    flex momz: i32
+    // contacted floor/ceiling interval (fixed)
+    flex floorz: i32
+    flex ceilingz: i32
+    // movement box (fixed)
+    flex radius: i32
+    flex height: i32
+    // orientation
+    flex angle: u32
+    // drawing
+    flex spriteIdx: i32   // spritenum_t
+    flex frame: i32       // may be ORed with FF_FULLBRIGHT
+    // identity / state
+    flex typeIdx: i32     // mobjtype_t (index into mobjinfo[])
+    flex stateIdx: i32    // statenum_t (index into states[])
+    flex tics: i32        // state tic counter
+    flex flags: i32       // MF_* bits
+    flex health: i32
+    // AI
+    flex movedir: i32     // 0-7
+    flex movecount: i32   // when 0, pick a new dir
+    flex reactiontime: i32
+    flex threshold: i32
+    flex lastlook: i32    // player number last looked for
+    flex validcount: i32
+    // geometry links (indices)
+    flex subsector: i32   // R_PointInSubsector index, -1 none
+    flex player: i32      // index into players[], -1 none
+    // intrusive mobj links (tags into the thinkers crib)
+    flex snext: tag Thinker
+    flex sprev: tag Thinker
+    flex bnext: tag Thinker
+    flex bprev: tag Thinker
+    flex target: tag Thinker
+    flex tracer: tag Thinker
+    // nightmare respawn point
+    flex spawnpoint: MapThing
+}
+
+// -----------------------------------------------------------------------------
+// SectorAction — the manual union of every sector-effect thinker payload (vldoor_t,
+// ceiling_t, floormove_t, plat_t, lightflash_t, strobe_t, glow_t, fireflicker_t from
+// p_spec.h). One flat drip: the C thinker_t becomes the enclosing Thinker, sector_t* becomes
+// `secnum`, and `kind` holds the effect's *_e sub-type ordinal (vldoor_e / ceiling_e /
+// floor_e / plattype_e — those enums are defined by p/p_spec, P2.3). The active thinker is
+// distinguished by Thinker.funcId (FUNC_*). CONTRACTS.md maps each C field to its slot.
+flex drip SectorAction {
+    flex kind: i32            // C `type` field (*_e ordinal)
+    flex secnum: i32          // sector index (was sector_t*)
+    // heights / speeds (fixed)
+    flex speed: i32
+    flex topheight: i32       // door/ceiling
+    flex bottomheight: i32    // ceiling
+    flex floordestheight: i32 // floor
+    flex low: i32             // plat
+    flex high: i32            // plat
+    // direction / counters
+    flex direction: i32       // door/ceiling/floor/glow (1 up, 0 wait, -1 down)
+    flex olddirection: i32    // ceiling
+    flex topwait: i32         // door
+    flex topcountdown: i32    // door
+    flex wait: i32            // plat
+    flex count: i32           // plat / lights
+    flex secTag: i32          // ceiling / plat (C `tag`; `tag` is a bet keyword)
+    flex newspecial: i32      // floor
+    flex texture: i32         // floor (short)
+    flex status: i32          // plat_e
+    flex oldstatus: i32       // plat_e
+    flex crush: bool          // ceiling / floor / plat
+    // lights
+    flex maxlight: i32
+    flex minlight: i32
+    flex maxtime: i32         // lightflash
+    flex mintime: i32         // lightflash
+    flex darktime: i32        // strobe
+    flex brighttime: i32      // strobe
+}
+
+// -----------------------------------------------------------------------------
+// thinker_t (d_think.h), with the mobj and sector-action payloads embedded. Exactly one of
+// mobj / sa is meaningful per node, selected by funcId. prev/next form the doubly-linked
+// thinker list (a copped sentinel with funcId FUNC_CAP is head and tail).
+flex drip Thinker {
+    flex prev: tag Thinker
+    flex next: tag Thinker
+    flex funcId: i32
+    flex mobj: Mobj
+    flex sa: SectorAction
+}
+
+// funcId values — which think function runs on this node (P_RunThinkers dispatches on it).
+flex facts FUNC_NONE: int = 0        // inert (no think function)
+flex facts FUNC_REMOVED: int = 1     // unlinked + evict on next pass (P_RemoveThinker)
+flex facts FUNC_CAP: int = 2         // the list sentinel (thinkercap)
+flex facts FUNC_MOBJ: int = 3        // P_MobjThinker
+flex facts FUNC_DOOR: int = 4        // T_VerticalDoor
+flex facts FUNC_CEILING: int = 5     // T_MoveCeiling
+flex facts FUNC_FLOOR: int = 6       // T_MoveFloor
+flex facts FUNC_PLAT: int = 7        // T_PlatRaise
+flex facts FUNC_FLICKER: int = 8     // T_FireFlicker
+flex facts FUNC_FLASH: int = 9       // T_LightFlash
+flex facts FUNC_STROBE: int = 10     // T_StrobeFlash
+flex facts FUNC_GLOW: int = 11       // T_Glow
