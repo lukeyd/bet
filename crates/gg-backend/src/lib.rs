@@ -1246,6 +1246,7 @@ mod imp {
     ///   * even channels (left)  get gain `vol * (255 - pan) / 255`,
     ///   * odd  channels (right) get gain `vol * pan / 255`,
     ///   * a mono device applies the plain unpanned `vol`.
+    ///
     /// Center is therefore ~half gain per side (127/255 and 128/255), the standard linear
     /// halving that keeps a hard-panned voice at unity on its side.
     fn mix_sample(ring: &mut VecDeque<i16>, mixer: &mut Mixer, chan: usize) -> i16 {
@@ -1266,7 +1267,7 @@ mod imp {
             let vol = v.vol_q8 as i32;
             let gain = if mono {
                 vol
-            } else if chan % 2 == 0 {
+            } else if chan.is_multiple_of(2) {
                 vol * (255 - v.pan_q8 as i32) / 255
             } else {
                 vol * v.pan_q8 as i32 / 255
