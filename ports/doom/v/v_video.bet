@@ -1428,6 +1428,97 @@ flex finna drawRawScreen(gt: tag gs.GameState, screen: int, rawLumpOfs: int) {
     }
 }
 
+// copyRect — V_CopyRect: copy a width×height rect from screen `srcscrn` at (srcx,srcy) to
+// screen `destscrn` at (destx,desty). Used to restore backgrounds (e.g. scr1 → scr0). Both
+// screens are picked once; the copy is row-major. Distinct screens (id's only usage) copy
+// cleanly on both backends; an in-place same-screen overlap is UB, as it is in id's memcpy.
+flex finna copyRect(gt: tag gs.GameState, srcx: int, srcy: int, srcscrn: int, width: int, height: int, destx: int, desty: int, destscrn: int) {
+    holla g = gt in gs.gsc {
+        lowkey src = g.vid.scr0
+        fr srcscrn == 1 {
+            src = g.vid.scr1
+        } naw fr srcscrn == 2 {
+            src = g.vid.scr2
+        } naw fr srcscrn == 3 {
+            src = g.vid.scr3
+        } naw fr srcscrn == 4 {
+            src = g.vid.scr4
+        }
+        lowkey dst = g.vid.scr0
+        fr destscrn == 1 {
+            dst = g.vid.scr1
+        } naw fr destscrn == 2 {
+            dst = g.vid.scr2
+        } naw fr destscrn == 3 {
+            dst = g.vid.scr3
+        } naw fr destscrn == 4 {
+            dst = g.vid.scr4
+        }
+        lowkey row = 0
+        vibin row < height {
+            lowkey col = 0
+            vibin col < width {
+                dst[(desty + row) * SCREENWIDTH + destx + col] = src[(srcy + row) * SCREENWIDTH + srcx + col]
+                col = col + 1
+            }
+            row = row + 1
+        }
+        fr destscrn == 0 {
+            g.vid.scr0 = dst
+        } naw fr destscrn == 1 {
+            g.vid.scr1 = dst
+        } naw fr destscrn == 2 {
+            g.vid.scr2 = dst
+        } naw fr destscrn == 3 {
+            g.vid.scr3 = dst
+        } naw fr destscrn == 4 {
+            g.vid.scr4 = dst
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// drawBlock — V_DrawBlock: copy a linear width×height block of pixels from an external `src`
+// (`[]u8`, row-major, tightly packed) into screen `screen` at (x,y). (V_GetBlock, the inverse,
+// is deferred until a caller needs it.)
+flex finna drawBlock(gt: tag gs.GameState, x: int, y: int, screen: int, width: int, height: int, src: []u8) {
+    holla g = gt in gs.gsc {
+        lowkey dst = g.vid.scr0
+        fr screen == 1 {
+            dst = g.vid.scr1
+        } naw fr screen == 2 {
+            dst = g.vid.scr2
+        } naw fr screen == 3 {
+            dst = g.vid.scr3
+        } naw fr screen == 4 {
+            dst = g.vid.scr4
+        }
+        lowkey row = 0
+        vibin row < height {
+            lowkey col = 0
+            vibin col < width {
+                dst[(y + row) * SCREENWIDTH + x + col] = src[row * width + col]
+                col = col + 1
+            }
+            row = row + 1
+        }
+        fr screen == 0 {
+            g.vid.scr0 = dst
+        } naw fr screen == 1 {
+            g.vid.scr1 = dst
+        } naw fr screen == 2 {
+            g.vid.scr2 = dst
+        } naw fr screen == 3 {
+            g.vid.scr3 = dst
+        } naw fr screen == 4 {
+            g.vid.scr4 = dst
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
 // markRect — V_MarkRect. No-op: gg presents the whole framebuffer every finishUpdate, so id's
 // dirtybox dirty-rectangle bookkeeping (a blit optimization for partial X updates) is unneeded.
 flex finna markRect(gt: tag gs.GameState, x: int, y: int, width: int, height: int) {
