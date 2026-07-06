@@ -1,0 +1,868 @@
+// defs/gs.bet — THE FROZEN MODULE (L3). All DOOM engine state lives in one crib-resident
+// GameState drip (`gsc`), and all mobjs/thinkers in the `thinkers` crib. Every stateful
+// engine function takes `gt: tag GameState` as its first parameter and opens exactly one
+//     holla g = gt in gsc { ... } ghosted { yeet("gs") }
+// to reach the state. Cross-module refs are indices into SoA slabs (map geometry) or
+// `tag think.Thinker` handles (mobjs). Ported/rehomed from doomstat.h, r_state.h, r_defs.h,
+// p_local.h, p_spec.h, d_net.h. The full C-global -> field-path map is ports/doom/CONTRACTS.md;
+// the frozen play-sim signatures are ports/doom/p-sigs.md. DO NOT edit field names/shapes
+// without a CONTRACTS.md amendment (W1.1-owned) — 11 downstream packages depend on them.
+pull "fixed"
+pull "tables"
+pull "doomdef"
+pull "event"
+pull "info"
+pull "sounds"
+pull "think"
+pull "player"
+pull "mem"
+pull "vec"
+pull "stash"
+
+// ---- sizes (vanilla static limits kept) --------------------------------------------------
+flex facts NUMTHINKERS: int = 4096
+flex facts MAXVISPLANES: int = 128
+flex facts VPSTRIDE: int = 322          // SCREENWIDTH + 2 ([minx-1]/[maxx+1] pads)
+flex facts MAXOPENINGS: int = 20480     // SCREENWIDTH * 64
+flex facts MAXDRAWSEGS: int = 256
+flex facts MAXVISSPRITES: int = 128
+flex facts LIGHTLEVELS: int = 16
+flex facts MAXLIGHTSCALE: int = 48
+flex facts MAXLIGHTZ: int = 128
+flex facts NUMCOLORMAPS: int = 34       // 32 light + invuln + all-black
+flex facts SCREENAREA: int = 64000      // SCREENWIDTH * SCREENHEIGHT
+flex facts MAXCHANNELS: int = 8
+flex facts BACKUPTICS: int = 12
+flex facts MAXNETNODES: int = 8
+flex facts MAX_DM_STARTS: int = 10
+flex facts BODYQUESIZE: int = 32
+flex facts ITEMQUESIZE: int = 128
+flex facts MAXSPECIALCROSS: int = 8
+
+// =========================================================================================
+// Small helper drips
+// =========================================================================================
+
+// A sound channel (s_sound). originKind: 0 none, 1 mobj, 2 sector origin. originT is the
+// mobj tag (kind 1); originSec the sector index (kind 2). voice is the gg mixer voice.
+flex drip Channel {
+    flex sfxId: i32
+    flex originKind: i32
+    flex originSec: i32
+    flex voice: i32
+    flex priority: i32
+    flex originT: tag think.Thinker
+    flex endTick: i64
+}
+
+// Sector tag-valued refs (sector_t soundtarget/thinglist/specialdata), written back per
+// sector into Level.secLinks (one entry per sector, index-parallel to the SoA slabs).
+flex drip SecLinks {
+    flex soundtarget: tag think.Thinker
+    flex thinglist: tag think.Thinker
+    flex specialT: tag think.Thinker
+}
+
+// Line tag-valued ref (line_t specialdata: the thinker of a reversible action on the line).
+flex drip LineLinks {
+    flex specialT: tag think.Thinker
+}
+
+// A single thinker handle, wrapped in a drip so fixed/growable arrays of tags are legal
+// (`tag T[N]` parses as `tag (T[N])`). Used for blockLinks, activeceilings/plats, bodyque,
+// braintargets.
+flex drip TagBox {
+    flex t: tag think.Thinker
+}
+
+// drawseg_t (r_defs.h). Pointers become indices/offsets: curline -> seg index; the three
+// clip pointers -> offsets into RenderState.openings.
+flex drip DrawSeg {
+    flex curline: i32
+    flex x1: i32
+    flex x2: i32
+    flex scale1: i32
+    flex scale2: i32
+    flex scalestep: i32
+    flex silhouette: i32
+    flex bsilheight: i32
+    flex tsilheight: i32
+    flex sprtopclipOfs: i32
+    flex sprbottomclipOfs: i32
+    flex maskedtexturecolOfs: i32
+}
+
+// vissprite_t (r_defs.h). prev/next are intra-array indices (the sorted list), colormap a
+// byte offset into RenderState.colormaps, patch a sprite-lump index.
+flex drip VisSprite {
+    flex prev: i32
+    flex next: i32
+    flex x1: i32
+    flex x2: i32
+    flex gx: i32
+    flex gy: i32
+    flex gz: i32
+    flex gzt: i32
+    flex startfrac: i32
+    flex scale: i32
+    flex xiscale: i32
+    flex texturemid: i32
+    flex patch: i32
+    flex colormapOfs: i32
+    flex mobjflags: i32
+}
+
+// intercept_t (p_local.h): a union of thing/line. isaline picks; thingT is the mobj tag,
+// lineIdx the line index.
+flex drip Intercept {
+    flex frac: i32
+    flex isaline: bool
+    flex thingT: tag think.Thinker
+    flex lineIdx: i32
+}
+
+// divline_t (p_local.h).
+flex drip Divline {
+    flex x: i32
+    flex y: i32
+    flex dx: i32
+    flex dy: i32
+}
+
+// button_t (p_spec.h): a wall switch mid-toggle. line -> lineIdx; soundorg -> sector index.
+flex drip Button {
+    flex lineIdx: i32
+    flex where: i32
+    flex btexture: i32
+    flex btimer: i32
+    flex soundorgSec: i32
+}
+
+// anim_t (p_spec.c P_InitPicAnims): a flat/texture animation range.
+flex drip AnimDef {
+    flex istexture: bool
+    flex picnum: i32
+    flex basepic: i32
+    flex numpics: i32
+    flex speed: i32
+}
+
+// automap mark (am_map.c markpoints).
+flex drip MapMark {
+    flex x: i32
+    flex y: i32
+}
+
+// =========================================================================================
+// State groups
+// =========================================================================================
+
+// ---- Wad: whole IWAD in memory (w_wad). No purgeable cache; readers index `buf`. --------
+flex drip Wad {
+    flex buf: []u8
+    flex bufLen: int
+    flex numLumps: i32
+    flex lumpOfs: []i32
+    flex lumpLen: []i32
+    flex lumpName: vec[str]
+    flex nameToLump: stash[str, int]
+}
+
+// ---- Level: per-level map geometry as Structure-of-Arrays slabs (p_setup). Sized from
+// lump counts at P_SetupLevel; tag-valued refs live in the *Links vecs. -------------------
+flex drip Level {
+    flex numvertexes: i32
+    flex numsectors: i32
+    flex numsides: i32
+    flex numlines: i32
+    flex numsubsectors: i32
+    flex numsegs: i32
+    flex numnodes: i32
+    flex numthings: i32
+    // vertexes (fixed)
+    flex vtxX: []i32
+    flex vtxY: []i32
+    // sectors
+    flex secFloorH: []i32
+    flex secCeilH: []i32
+    flex secFloorPic: []i32
+    flex secCeilPic: []i32
+    flex secLight: []i32
+    flex secSpecial: []i32
+    flex secTag: []i32
+    flex secSoundTrav: []i32
+    flex secValid: []i32
+    flex secSoundOrgX: []i32
+    flex secSoundOrgY: []i32
+    flex secSoundOrgZ: []i32
+    flex secBlockBox: []i32       // 4 per sector
+    flex secLineOfs: []i32        // start index into secLinesList
+    flex secLineCount: []i32
+    flex secLinesList: []i32      // flattened sector->line index lists
+    flex secLinks: vec[SecLinks]  // soundtarget / thinglist / specialdata (1 per sector)
+    // sides
+    flex sdTexOfs: []i32
+    flex sdRowOfs: []i32
+    flex sdTopTex: []i32
+    flex sdBotTex: []i32
+    flex sdMidTex: []i32
+    flex sdSector: []i32
+    // lines
+    flex lineV1: []i32
+    flex lineV2: []i32
+    flex lineDx: []i32
+    flex lineDy: []i32
+    flex lineFlags: []i32
+    flex lineSpecial: []i32
+    flex lineTag: []i32
+    flex lineSide0: []i32         // sidenum[0]
+    flex lineSide1: []i32         // sidenum[1], -1 if one-sided
+    flex lineBBox: []i32          // 4 per line
+    flex lineSlopetype: []i32
+    flex lineFront: []i32         // frontsector index
+    flex lineBack: []i32          // backsector index, -1 none
+    flex lineValid: []i32
+    flex lineLinks: vec[LineLinks]
+    // segs
+    flex segV1: []i32
+    flex segV2: []i32
+    flex segOffset: []i32
+    flex segAngle: []u32
+    flex segSide: []i32           // sidedef index
+    flex segLine: []i32           // linedef index
+    flex segFront: []i32
+    flex segBack: []i32           // -1 for one-sided
+    // subsectors
+    flex ssSector: []i32
+    flex ssNumLines: []i32
+    flex ssFirstLine: []i32
+    // nodes
+    flex nodeX: []i32
+    flex nodeY: []i32
+    flex nodeDx: []i32
+    flex nodeDy: []i32
+    flex nodeBBox: []i32          // 8 per node (2 children * 4)
+    flex nodeChild0: []i32        // NF_SUBSECTOR bit kept in the value
+    flex nodeChild1: []i32
+    // blockmap
+    flex bmapWidth: i32
+    flex bmapHeight: i32
+    flex bmapOrgX: i32
+    flex bmapOrgY: i32
+    flex blockmap: []i32          // decoded blockmap (offsets + line lists)
+    flex blockLinks: vec[TagBox]  // per-block thing-chain head (bmapWidth*bmapHeight)
+    // reject matrix: read in place from wad.buf
+    flex rejectOfs: int
+    flex rejectLen: int
+}
+
+// ---- RenderState: refresh globals (r_state.h, r_main/r_plane/r_things/r_draw statics).
+// Vanilla static limits kept. Colormaps/light LUTs are byte offsets into `colormaps`. -----
+flex drip RenderState {
+    // POV
+    flex viewx: i32
+    flex viewy: i32
+    flex viewz: i32
+    flex viewangle: u32
+    flex viewplayer: i32          // player index (-1 none)
+    flex viewangleoffset: i32
+    flex clipangle: u32
+    flex extralight: i32
+    flex fixedcolormapOfs: i32    // byte offset into colormaps, -1 == none
+    // view window
+    flex viewwindowx: i32
+    flex viewwindowy: i32
+    flex viewwidth: i32
+    flex viewheight: i32
+    flex scaledviewwidth: i32
+    flex centerx: i32
+    flex centery: i32
+    flex centerxfrac: i32
+    flex centeryfrac: i32
+    flex projection: i32
+    flex detailshift: i32
+    flex setblocks: i32
+    flex setdetail: i32
+    // colormap arena + light LUTs (byte offsets into colormaps)
+    flex colormaps: []u8
+    flex colormapsLen: int
+    flex scalelight: []i32        // LIGHTLEVELS*MAXLIGHTSCALE
+    flex zlight: []i32            // LIGHTLEVELS*MAXLIGHTZ
+    flex fixedcolormap: i32       // current colormap byte offset
+    // angle tables
+    flex xtoviewangle: []u32      // SCREENWIDTH+1
+    flex viewangletox: []i32      // FINEANGLES/2
+    // drawsegs
+    flex drawsegs: vec[DrawSeg]
+    flex dsP: i32
+    // visplanes SoA
+    flex vpHeight: []i32
+    flex vpPicnum: []i32
+    flex vpLight: []i32
+    flex vpMinX: []i32
+    flex vpMaxX: []i32
+    flex vpTop: []u8              // MAXVISPLANES*VPSTRIDE
+    flex vpBottom: []u8           // MAXVISPLANES*VPSTRIDE
+    flex lastvisplane: i32
+    flex floorplane: i32          // visplane index
+    flex ceilingplane: i32
+    // openings (sprite clip storage)
+    flex openings: []i16
+    flex lastopening: i32
+    // vissprites
+    flex vissprites: vec[VisSprite]
+    flex visspriteP: i32
+    flex vsprSortedHead: i32
+    // per-column clip
+    flex floorclip: []i16
+    flex ceilingclip: []i16
+    // column draw registers (dc_*)
+    flex dc_x: i32
+    flex dc_yl: i32
+    flex dc_yh: i32
+    flex dc_iscale: i32
+    flex dc_texturemid: i32
+    flex dc_sourceOfs: i32
+    flex dc_colormapOfs: i32
+    flex dc_texheight: i32
+    // span draw registers (ds_*)
+    flex ds_x1: i32
+    flex ds_x2: i32
+    flex ds_y: i32
+    flex ds_xfrac: i32
+    flex ds_yfrac: i32
+    flex ds_xstep: i32
+    flex ds_ystep: i32
+    flex ds_sourceOfs: i32
+    flex ds_colormapOfs: i32
+    // seg render registers (r_segs)
+    flex rw_distance: i32
+    flex rw_normalangle: u32
+    flex rw_angle1: i32
+    flex sscount: i32
+    flex skyflatnum: i32
+    // draw-function vtable
+    flex colfunc: finna(tag GameState) -> void
+    flex basecolfunc: finna(tag GameState) -> void
+    flex fuzzcolfunc: finna(tag GameState) -> void
+    flex transcolfunc: finna(tag GameState) -> void
+    flex spanfunc: finna(tag GameState) -> void
+}
+
+// ---- Hooks: the 7 upward calls that break the p_mobj/p_map/p_spec cycle. Wired at init by
+// p/p_action. Signatures are FROZEN (p-sigs.md). Mobjs are `tag think.Thinker`, lines/sides
+// are indices, angles u32, fixed i32. -----------------------------------------------------
+flex drip Hooks {
+    flex tryMove: finna(tag GameState, tag think.Thinker, i32, i32) -> bool
+    flex slideMove: finna(tag GameState, tag think.Thinker) -> void
+    flex checkPosition: finna(tag GameState, tag think.Thinker, i32, i32) -> bool
+    flex aimLineAttack: finna(tag GameState, tag think.Thinker, u32, i32) -> i32
+    flex crossSpecialLine: finna(tag GameState, i32, i32, tag think.Thinker) -> void
+    flex shootSpecialLine: finna(tag GameState, tag think.Thinker, i32) -> void
+    flex useSpecialLine: finna(tag GameState, tag think.Thinker, i32, i32) -> bool
+}
+
+// ---- Actions: one fn-value field per A_* action id (info.bet AID_*). Naming: `a` + the
+// A_* name with its exact casing (A_Chase -> aChase, A_BFGsound -> aBFGsound). Two groups by
+// C signature: mobj actions take (gt, actor: tag Thinker); the 22 weapon/psprite actions
+// take (gt, playerIdx: int, pspIdx: int) per p_pspr.c. runPsprAction/runAction (p_think,
+// p-sigs.md) dispatch on actionId to the matching field. Wired at init by p/p_action. ------
+flex drip Actions {
+    flex aBFGSpray: finna(tag GameState, tag think.Thinker) -> void   // A_BFGSpray (AID 1)
+    flex aBFGsound: finna(tag GameState, int, int) -> void   // A_BFGsound (AID 2)
+    flex aBabyMetal: finna(tag GameState, tag think.Thinker) -> void   // A_BabyMetal (AID 3)
+    flex aBossDeath: finna(tag GameState, tag think.Thinker) -> void   // A_BossDeath (AID 4)
+    flex aBrainAwake: finna(tag GameState, tag think.Thinker) -> void   // A_BrainAwake (AID 5)
+    flex aBrainDie: finna(tag GameState, tag think.Thinker) -> void   // A_BrainDie (AID 6)
+    flex aBrainExplode: finna(tag GameState, tag think.Thinker) -> void   // A_BrainExplode (AID 7)
+    flex aBrainPain: finna(tag GameState, tag think.Thinker) -> void   // A_BrainPain (AID 8)
+    flex aBrainScream: finna(tag GameState, tag think.Thinker) -> void   // A_BrainScream (AID 9)
+    flex aBrainSpit: finna(tag GameState, tag think.Thinker) -> void   // A_BrainSpit (AID 10)
+    flex aBruisAttack: finna(tag GameState, tag think.Thinker) -> void   // A_BruisAttack (AID 11)
+    flex aBspiAttack: finna(tag GameState, tag think.Thinker) -> void   // A_BspiAttack (AID 12)
+    flex aCPosAttack: finna(tag GameState, tag think.Thinker) -> void   // A_CPosAttack (AID 13)
+    flex aCPosRefire: finna(tag GameState, tag think.Thinker) -> void   // A_CPosRefire (AID 14)
+    flex aChase: finna(tag GameState, tag think.Thinker) -> void   // A_Chase (AID 15)
+    flex aCheckReload: finna(tag GameState, int, int) -> void   // A_CheckReload (AID 16)
+    flex aCloseShotgun2: finna(tag GameState, int, int) -> void   // A_CloseShotgun2 (AID 17)
+    flex aCyberAttack: finna(tag GameState, tag think.Thinker) -> void   // A_CyberAttack (AID 18)
+    flex aExplode: finna(tag GameState, tag think.Thinker) -> void   // A_Explode (AID 19)
+    flex aFaceTarget: finna(tag GameState, tag think.Thinker) -> void   // A_FaceTarget (AID 20)
+    flex aFall: finna(tag GameState, tag think.Thinker) -> void   // A_Fall (AID 21)
+    flex aFatAttack1: finna(tag GameState, tag think.Thinker) -> void   // A_FatAttack1 (AID 22)
+    flex aFatAttack2: finna(tag GameState, tag think.Thinker) -> void   // A_FatAttack2 (AID 23)
+    flex aFatAttack3: finna(tag GameState, tag think.Thinker) -> void   // A_FatAttack3 (AID 24)
+    flex aFatRaise: finna(tag GameState, tag think.Thinker) -> void   // A_FatRaise (AID 25)
+    flex aFire: finna(tag GameState, tag think.Thinker) -> void   // A_Fire (AID 26)
+    flex aFireBFG: finna(tag GameState, int, int) -> void   // A_FireBFG (AID 27)
+    flex aFireCGun: finna(tag GameState, int, int) -> void   // A_FireCGun (AID 28)
+    flex aFireCrackle: finna(tag GameState, tag think.Thinker) -> void   // A_FireCrackle (AID 29)
+    flex aFireMissile: finna(tag GameState, int, int) -> void   // A_FireMissile (AID 30)
+    flex aFirePistol: finna(tag GameState, int, int) -> void   // A_FirePistol (AID 31)
+    flex aFirePlasma: finna(tag GameState, int, int) -> void   // A_FirePlasma (AID 32)
+    flex aFireShotgun: finna(tag GameState, int, int) -> void   // A_FireShotgun (AID 33)
+    flex aFireShotgun2: finna(tag GameState, int, int) -> void   // A_FireShotgun2 (AID 34)
+    flex aGunFlash: finna(tag GameState, int, int) -> void   // A_GunFlash (AID 35)
+    flex aHeadAttack: finna(tag GameState, tag think.Thinker) -> void   // A_HeadAttack (AID 36)
+    flex aHoof: finna(tag GameState, tag think.Thinker) -> void   // A_Hoof (AID 37)
+    flex aKeenDie: finna(tag GameState, tag think.Thinker) -> void   // A_KeenDie (AID 38)
+    flex aLight0: finna(tag GameState, int, int) -> void   // A_Light0 (AID 39)
+    flex aLight1: finna(tag GameState, int, int) -> void   // A_Light1 (AID 40)
+    flex aLight2: finna(tag GameState, int, int) -> void   // A_Light2 (AID 41)
+    flex aLoadShotgun2: finna(tag GameState, int, int) -> void   // A_LoadShotgun2 (AID 42)
+    flex aLook: finna(tag GameState, tag think.Thinker) -> void   // A_Look (AID 43)
+    flex aLower: finna(tag GameState, int, int) -> void   // A_Lower (AID 44)
+    flex aMetal: finna(tag GameState, tag think.Thinker) -> void   // A_Metal (AID 45)
+    flex aOpenShotgun2: finna(tag GameState, int, int) -> void   // A_OpenShotgun2 (AID 46)
+    flex aPain: finna(tag GameState, tag think.Thinker) -> void   // A_Pain (AID 47)
+    flex aPainAttack: finna(tag GameState, tag think.Thinker) -> void   // A_PainAttack (AID 48)
+    flex aPainDie: finna(tag GameState, tag think.Thinker) -> void   // A_PainDie (AID 49)
+    flex aPlayerScream: finna(tag GameState, tag think.Thinker) -> void   // A_PlayerScream (AID 50)
+    flex aPosAttack: finna(tag GameState, tag think.Thinker) -> void   // A_PosAttack (AID 51)
+    flex aPunch: finna(tag GameState, int, int) -> void   // A_Punch (AID 52)
+    flex aRaise: finna(tag GameState, int, int) -> void   // A_Raise (AID 53)
+    flex aReFire: finna(tag GameState, int, int) -> void   // A_ReFire (AID 54)
+    flex aSPosAttack: finna(tag GameState, tag think.Thinker) -> void   // A_SPosAttack (AID 55)
+    flex aSargAttack: finna(tag GameState, tag think.Thinker) -> void   // A_SargAttack (AID 56)
+    flex aSaw: finna(tag GameState, int, int) -> void   // A_Saw (AID 57)
+    flex aScream: finna(tag GameState, tag think.Thinker) -> void   // A_Scream (AID 58)
+    flex aSkelFist: finna(tag GameState, tag think.Thinker) -> void   // A_SkelFist (AID 59)
+    flex aSkelMissile: finna(tag GameState, tag think.Thinker) -> void   // A_SkelMissile (AID 60)
+    flex aSkelWhoosh: finna(tag GameState, tag think.Thinker) -> void   // A_SkelWhoosh (AID 61)
+    flex aSkullAttack: finna(tag GameState, tag think.Thinker) -> void   // A_SkullAttack (AID 62)
+    flex aSpawnFly: finna(tag GameState, tag think.Thinker) -> void   // A_SpawnFly (AID 63)
+    flex aSpawnSound: finna(tag GameState, tag think.Thinker) -> void   // A_SpawnSound (AID 64)
+    flex aSpidRefire: finna(tag GameState, tag think.Thinker) -> void   // A_SpidRefire (AID 65)
+    flex aStartFire: finna(tag GameState, tag think.Thinker) -> void   // A_StartFire (AID 66)
+    flex aTracer: finna(tag GameState, tag think.Thinker) -> void   // A_Tracer (AID 67)
+    flex aTroopAttack: finna(tag GameState, tag think.Thinker) -> void   // A_TroopAttack (AID 68)
+    flex aVileAttack: finna(tag GameState, tag think.Thinker) -> void   // A_VileAttack (AID 69)
+    flex aVileChase: finna(tag GameState, tag think.Thinker) -> void   // A_VileChase (AID 70)
+    flex aVileStart: finna(tag GameState, tag think.Thinker) -> void   // A_VileStart (AID 71)
+    flex aVileTarget: finna(tag GameState, tag think.Thinker) -> void   // A_VileTarget (AID 72)
+    flex aWeaponReady: finna(tag GameState, int, int) -> void   // A_WeaponReady (AID 73)
+    flex aXScream: finna(tag GameState, tag think.Thinker) -> void   // A_XScream (AID 74)
+}
+
+// ---- TickState: the play-sim clock + scratch. RNG (m_random), thinker list sentinel,
+// intercepts/spechit, p_map collision registers (tm*), p_maputl opening registers, the
+// active-effect thinker arrays, item respawn queue, texture anims. --------------------------
+flex drip TickState {
+    flex leveltime: i32
+    flex prndindex: i32
+    flex rndindex: i32
+    flex validcount: i32
+    flex rndtable: []u8               // 256-entry m_random LUT (filled by m_random.initRndtable)
+    flex thinkercap: tag think.Thinker // doubly-linked list sentinel (funcId FUNC_CAP)
+    // intercepts / path traversal
+    flex intercepts: vec[Intercept]
+    flex interceptP: i32
+    flex trace: Divline
+    // special-line crossing accumulator (p_map)
+    flex spechit: i32[8]             // MAXSPECIALCROSS line indices
+    flex numspechit: i32
+    // p_map collision registers (tm*)
+    flex tmx: i32
+    flex tmy: i32
+    flex tmbbox: i32[4]
+    flex tmflags: i32
+    flex tmfloorz: i32
+    flex tmceilingz: i32
+    flex tmdropoffz: i32
+    flex floatok: bool
+    flex ceilingline: i32            // line index (or -1)
+    flex crushchange: bool
+    flex nofit: bool
+    flex linetarget: tag think.Thinker
+    flex shootthing: tag think.Thinker
+    flex bombsource: tag think.Thinker
+    flex bombspot: tag think.Thinker
+    flex bombdamage: i32
+    flex attackrange: i32
+    flex aimslope: i32
+    flex shootz: i32
+    flex la_damage: i32
+    flex topslope: i32
+    flex bottomslope: i32
+    // p_maputl line-opening registers
+    flex opentop: i32
+    flex openbottom: i32
+    flex openrange: i32
+    flex lowfloor: i32
+    // active effect thinkers (drip-wrapped tag arrays)
+    flex activeceilings: TagBox[30]  // MAXCEILINGS
+    flex activeplats: TagBox[30]     // MAXPLATS
+    flex buttonlist: Button[16]      // MAXBUTTONS
+    flex bodyque: TagBox[32]         // BODYQUESIZE
+    flex bodyqueslot: i32
+    flex braintargets: TagBox[32]
+    flex numbraintargets: i32
+    flex brainTargetOn: i32
+    flex brainEasy: i32
+    // texture animation
+    flex anims: vec[AnimDef]
+    // item respawn queue (nightmare)
+    flex itemrespawnque: think.MapThing[128]
+    flex itemrespawntime: i32[128]
+    flex iquehead: i32
+    flex iquetail: i32
+}
+
+// ---- GameShell: the D_DoomMain/G_Game/doomstat.h globals — game/level flags, players. -----
+flex drip GameShell {
+    flex gamestate: i32          // GS_*
+    flex gameaction: i32         // GA_*
+    flex gametic: i32            // canonical game tic counter
+    flex gameepisode: i32
+    flex gamemap: i32
+    flex gameskill: i32          // SK_*
+    flex startskill: i32
+    flex startepisode: i32
+    flex startmap: i32
+    flex respawnmonsters: bool
+    flex paused: bool
+    flex sendpause: bool
+    flex sendsave: bool
+    flex usergame: bool
+    flex netgame: bool
+    flex deathmatch: i32         // 0 none, 1 dm, 2 altdeath
+    flex demoplayback: bool
+    flex demorecording: bool
+    flex singledemo: bool
+    flex netdemo: bool
+    flex demobuffer: []u8
+    flex demoOfs: int            // read/write cursor
+    flex demoLen: int
+    flex demoend: int
+    flex consoleplayer: i32
+    flex displayplayer: i32
+    flex viewactive: bool
+    flex nodrawers: bool
+    flex noblit: bool
+    flex automapactive: bool
+    flex menuactive: bool
+    flex statusbaractive: bool
+    flex wipegamestate: i32      // -1 forces a wipe
+    flex nomonsters: bool
+    flex respawnparm: bool
+    flex fastparm: bool
+    flex devparm: bool
+    flex precache: bool
+    flex singletics: bool
+    flex gamemode: i32           // GM_*
+    flex gamemission: i32
+    flex language: i32
+    flex modifiedgame: bool
+    flex autostart: bool
+    flex totalkills: i32
+    flex totalitems: i32
+    flex totalsecret: i32
+    flex levelstarttic: i32
+    flex mouseSensitivity: i32
+    // players
+    flex players: player.Player[4]
+    flex playeringame: bool[4]
+    flex playerstarts: think.MapThing[4]
+    flex deathmatchstarts: think.MapThing[10]  // MAX_DM_STARTS
+    flex deathmatchP: i32
+    flex wminfo: player.WbStart
+    flex maxammo: i32[4]         // ammo caps (backpack doubles)
+    flex clipammo: i32[4]        // per-pickup ammo counts
+}
+
+// ---- Events: the input event ring (d_event.h). -------------------------------------------
+flex drip Events {
+    flex ring: event.Event[64]   // MAXEVENTS
+    flex head: i32
+    flex tail: i32
+}
+
+// ---- SoundState: s_sound channel allocation + volumes. -----------------------------------
+flex drip SoundState {
+    flex channels: Channel[8]
+    flex numChannels: i32
+    flex sfxVolume: i32
+    flex musicVolume: i32
+    flex sfxHandle: []i32        // per-sfx cached lump handle
+    flex sfxLenTics: []i32       // per-sfx duration in tics
+    flex nextcleanup: i32
+}
+
+// ---- MusicState: MUS sequencer + OPL synth placeholders (P2.10 fills the synth). ----------
+flex drip MusicState {
+    flex musId: i32
+    flex musicPlaying: bool
+    flex musicPaused: bool
+    flex musLumpOfs: int
+    flex musLumpLen: int
+    flex musTick: i32
+    flex musDelay: i32
+    flex oplRegOfs: []i32        // OPL register scratch
+    flex genmidiOfs: int        // GENMIDI lump byte offset in wad.buf
+}
+
+// ---- VidState: 8-bit screens + present buffer + palette (i_video/v_video). ---------------
+flex drip VidState {
+    flex scr0: []u8             // primary draw screen
+    flex scr1: []u8
+    flex scr2: []u8
+    flex scr3: []u8
+    flex scr4: []u8
+    flex fb: []u32             // XRGB present buffer
+    flex pal: []u32           // 256 XRGB entries (PLAYPAL*gamma)
+    flex gammaIndex: i32
+    flex paletteIndex: i32
+}
+
+// ---- InfoTables: the generated data tables, held as shared handles. ----------------------
+flex drip InfoTables {
+    flex states: vec[info.State]
+    flex mobjinfo: vec[info.MobjInfo]
+    flex sfx: vec[sounds.SfxInfo]
+    flex finesine: []i32
+    flex finetangent: []i32
+    flex tantoangle: []u32
+}
+
+// ---- MenuState (m_menu). ------------------------------------------------------------------
+flex drip MenuState {
+    flex menuactive: bool
+    flex itemOn: i32
+    flex currentMenu: i32
+    flex lastMenu: i32
+    flex skullAnimCounter: i32
+    flex whichSkull: i32
+    flex messageToPrint: bool
+    flex messageString: str
+    flex messageNeedsInput: bool
+    flex saveStringEnter: bool
+    flex saveSlot: i32
+    flex saveCharIndex: i32
+    flex quickSaveSlot: i32
+    flex screenSize: i32
+    flex detailLevel: i32
+    flex showMessages: i32
+    flex savegameStrings: vec[str]
+}
+
+// ---- HudState (hu_stuff). -----------------------------------------------------------------
+flex drip HudState {
+    flex messageOn: bool
+    flex message: str
+    flex messageCounter: i32
+    flex chatOn: bool
+    flex chatString: str
+}
+
+// ---- StBarState (st_stuff). ---------------------------------------------------------------
+flex drip StBarState {
+    flex faceIndex: i32
+    flex faceCount: i32
+    flex oldHealth: i32
+    flex priority: i32
+    flex randomNumber: i32
+    flex currentState: i32
+    flex firsttime: bool
+    flex keyboxes: i32[3]
+    flex oldweaponsowned: bool[9]
+}
+
+// ---- AmState (am_map). --------------------------------------------------------------------
+flex drip AmState {
+    flex active: bool
+    flex mx: i32
+    flex my: i32
+    flex mw: i32
+    flex mh: i32
+    flex mScale: i32
+    flex ftom: i32
+    flex mtof: i32
+    flex followplayer: bool
+    flex grid: bool
+    flex leaveletter: i32
+    flex marks: vec[MapMark]
+}
+
+// ---- WiState (wi_stuff intermission). -----------------------------------------------------
+flex drip WiState {
+    flex state: i32
+    flex acceleratestage: i32
+    flex cnt: i32
+    flex bcnt: i32
+    flex cntTime: i32
+    flex cntPar: i32
+    flex cntTotal: i32
+    flex spstate: i32
+    flex cntKills: i32[4]
+    flex cntItems: i32[4]
+    flex cntSecret: i32[4]
+}
+
+// ---- FinaleState (f_finale). --------------------------------------------------------------
+flex drip FinaleState {
+    flex stage: i32
+    flex count: i32
+    flex text: str
+    flex textIndex: i32
+}
+
+// ---- WipeState (f_wipe melt). -------------------------------------------------------------
+flex drip WipeState {
+    flex active: bool
+    flex y: []i32               // per-column melt offset
+    flex scrStart: []u8
+    flex scrEnd: []u8
+}
+
+// ---- NetState: FULL d_net tic-sync machinery (single-player-loopback-ready). doomcom /
+// netbuffer become flat fields; netcmds is the flattened MAXPLAYERS x BACKUPTICS table. -----
+flex drip NetState {
+    // doomcom_t
+    flex dcId: i32
+    flex dcNumnodes: i32
+    flex dcNumplayers: i32
+    flex dcConsoleplayer: i32
+    flex dcTicdup: i32
+    flex dcExtratics: i32
+    flex dcCommand: i32
+    flex dcRemotenode: i32
+    flex dcDatalength: i32
+    flex dcDeathmatch: i32
+    flex dcSavegame: i32
+    flex dcEpisode: i32
+    flex dcMap: i32
+    flex dcSkill: i32
+    // netbuffer (doomdata_t) header of the current packet
+    flex nbChecksum: i32
+    flex nbRetransmitfrom: i32
+    flex nbStarttic: i32
+    flex nbPlayer: i32
+    flex nbNumtics: i32
+    // tic sync
+    flex maketic: i32
+    flex ticdup: i32
+    flex skiptics: i32
+    flex nettics: i32[8]         // MAXNETNODES
+    flex nodeingame: bool[8]
+    flex remoteresend: bool[8]
+    flex resendto: i32[8]
+    flex resendcount: i32[8]
+    flex localcmds: event.Ticcmd[12]     // BACKUPTICS
+    flex netcmds: event.Ticcmd[48]       // MAXPLAYERS*BACKUPTICS: [player*BACKUPTICS + (tic%BACKUPTICS)]
+    flex reboundpacket: bool
+    flex frametics: i32[35]
+    flex frameon: i32
+    flex oldnettics: i32
+    flex lasttime: i32
+    flex gametime: i32          // last gametic run by TryRunTics
+}
+
+// =========================================================================================
+// GameState — the composition of every state group.
+// =========================================================================================
+flex drip GameState {
+    flex wad: Wad
+    flex level: Level
+    flex render: RenderState
+    flex hooks: Hooks
+    flex actions: Actions
+    flex tick: TickState
+    flex shell: GameShell
+    flex events: Events
+    flex sound: SoundState
+    flex music: MusicState
+    flex vid: VidState
+    flex info: InfoTables
+    flex menu: MenuState
+    flex hud: HudState
+    flex stbar: StBarState
+    flex am: AmState
+    flex wi: WiState
+    flex finale: FinaleState
+    flex wipe: WipeState
+    flex net: NetState
+}
+
+// The two module-level cribs: the single GameState slot and the thinker/mobj arena.
+flex crib gsc: GameState[1]
+flex crib thinkers: think.Thinker[4096]
+
+// =========================================================================================
+// gsInit — allocate every handle-shaped field (slabs/vecs/stashes) to a valid startup state
+// and set the few non-zero defaults. Per-level SoA slabs (Level.*) stay null here; p/p_setup
+// sizes them at level load. Call once from the bootstrap after `cop GameState{} in gsc`.
+// =========================================================================================
+flex finna gsInit(gt: tag GameState) {
+    holla g = gt in gsc {
+        // video
+        g.vid.scr0 = mem.slab[u8](64000)
+        g.vid.scr1 = mem.slab[u8](64000)
+        g.vid.scr2 = mem.slab[u8](64000)
+        g.vid.scr3 = mem.slab[u8](64000)
+        g.vid.scr4 = mem.slab[u8](64000)
+        g.vid.fb = mem.slab[u32](64000)
+        g.vid.pal = mem.slab[u32](256)
+        // info tables (empty vecs; the info/tables fillers populate them)
+        g.info.states = vec.new[info.State]()
+        g.info.mobjinfo = vec.new[info.MobjInfo]()
+        g.info.sfx = vec.new[sounds.SfxInfo]()
+        g.info.finesine = mem.slab[i32](10240)
+        g.info.finetangent = mem.slab[i32](4096)
+        g.info.tantoangle = mem.slab[u32](2049)
+        // render angle tables + framebuffers
+        g.render.xtoviewangle = mem.slab[u32](321)
+        g.render.viewangletox = mem.slab[i32](4096)
+        g.render.vpTop = mem.slab[u8](41216)      // MAXVISPLANES*VPSTRIDE = 128*322
+        g.render.vpBottom = mem.slab[u8](41216)
+        g.render.vpHeight = mem.slab[i32](128)
+        g.render.vpPicnum = mem.slab[i32](128)
+        g.render.vpLight = mem.slab[i32](128)
+        g.render.vpMinX = mem.slab[i32](128)
+        g.render.vpMaxX = mem.slab[i32](128)
+        g.render.openings = mem.slab[i16](20480)
+        g.render.floorclip = mem.slab[i16](320)
+        g.render.ceilingclip = mem.slab[i16](320)
+        g.render.scalelight = mem.slab[i32](768)  // LIGHTLEVELS*MAXLIGHTSCALE
+        g.render.zlight = mem.slab[i32](2048)     // LIGHTLEVELS*MAXLIGHTZ
+        g.render.colormaps = mem.slab[u8](8704)   // NUMCOLORMAPS*256 = 34*256
+        g.render.colormapsLen = 8704
+        g.render.drawsegs = vec.new[DrawSeg]()
+        g.render.vissprites = vec.new[VisSprite]()
+        g.render.fixedcolormapOfs = -1
+        g.render.viewplayer = -1
+        // tick
+        g.tick.rndtable = mem.slab[u8](256)
+        g.tick.intercepts = vec.new[Intercept]()
+        g.tick.anims = vec.new[AnimDef]()
+        g.tick.ceilingline = -1
+        // wad
+        g.wad.nameToLump = stash.new[str, int]()
+        g.wad.lumpName = vec.new[str]()
+        // level link vecs (slabs are sized at level load)
+        g.level.secLinks = vec.new[SecLinks]()
+        g.level.lineLinks = vec.new[LineLinks]()
+        g.level.blockLinks = vec.new[TagBox]()
+        // sound
+        g.sound.sfxHandle = mem.slab[i32](256)
+        g.sound.sfxLenTics = mem.slab[i32](256)
+        g.sound.numChannels = 8
+        // music
+        g.music.oplRegOfs = mem.slab[i32](512)
+        // menu / automap
+        g.menu.savegameStrings = vec.new[str]()
+        g.am.marks = vec.new[MapMark]()
+        // wipe
+        g.wipe.y = mem.slab[i32](320)
+        g.wipe.scrStart = mem.slab[u8](64000)
+        g.wipe.scrEnd = mem.slab[u8](64000)
+        // shell defaults
+        g.shell.wipegamestate = -1
+        g.shell.gamestate = doomdef.GS_DEMOSCREEN
+        g.shell.consoleplayer = 0
+        g.shell.displayplayer = 0
+        g.net.dcNumplayers = 1
+        g.net.dcNumnodes = 1
+    } ghosted {
+        yeet("gs")
+    }
+}
