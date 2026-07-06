@@ -768,6 +768,11 @@ flex finna spawnMobj(gt: tag gs.GameState, x: i32, y: i32, z: i32, typ: int) -> 
         t.mobj.health = spawnhealth as i32
         t.mobj.reactiontime = rt as i32
         t.mobj.lastlook = lastlook as i32
+        // `player` is a -1==none index (mobj_t.player is a pointer, NULL for non-players); cop
+        // zero-inits it to 0, a VALID player index, so it must be reset to -1 here. P_SpawnPlayer
+        // (p_setup, P2.5) sets the real index for the player's mobj afterward. (Required by
+        // p_inter.damageMobj / p_map, which branch on `player != -1`.)
+        t.mobj.player = -1
         t.mobj.stateIdx = spawnstate as i32
         t.mobj.tics = stTics as i32
         t.mobj.spriteIdx = stSprite as i32

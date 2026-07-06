@@ -1,0 +1,565 @@
+// tools/simmove_smoke.bet — the P2.2 SIM-MOVE proof (p/p_inter + p/p_map). Cops a GameState,
+// fills the generated tables, wires NO-OP action/special stubs, then wires the 4 movement hooks
+// to the REAL p_map versions (tryMove/slideMove/checkPosition/aimLineAttack) so the collision
+// engine drives itself. Builds a MINIMAL synthetic level in-harness (no p_setup yet): one square
+// sector, 4 one-sided wall lines, one subsector (numnodes=0 -> R_PointInSubsector returns 0), and
+// a tiny 3x3 blockmap that lists all 4 walls in every cell. Then:
+//   (A) P_DamageMobj ARITHMETIC unit tests (no geometry needed) with a seeded RNG:
+//        a1 monster damage (null inflictor/source): stepped damage -> health/state/pain/kill.
+//        a2 player damage: armor absorption + health mirror (mobj + Player.health).
+//        a3 monster damage with a source: target-acquire (target/threshold/seestate).
+//   (B) P_TouchSpecialThing pickups: touch a clip / stimpack / shotgun -> ammo/health/weapon.
+//   (C) checkPosition / tryMove: move a thing in open space, into a wall, into another thing;
+//        assert the boolean result + the resulting (x,y).
+// A DETERMINISTIC trace is dumped and committed as goldens/simmove.golden (self-consistency
+// baseline; the definitive check is the W3 demo oracle once a real map lands at P2.5).
+//
+// Build+run NATIVE headless:
+//   cargo build -p driver --features llvm ; cargo build -p runtime --features gg-desktop
+//   bet build ports/doom/tools/simmove_smoke.bet --runtime real -o /tmp/simmove_smoke
+//   BET_GG_HEADLESS=1 /tmp/simmove_smoke
+pull "spill"
+pull "mem"
+pull "../defs/gs" as gs
+pull "../defs/think" as think
+pull "../defs/info" as info
+pull "../defs/sounds" as sounds
+pull "../defs/doomdef" as doomdef
+pull "../defs/fixed" as fixed
+pull "../defs/tables" as tables
+pull "../util/m_random" as rnd
+pull "../p/p_think" as pthink
+pull "../p/p_mobj" as pmobj
+pull "../p/p_inter" as pinter
+pull "../p/p_map" as pmap
+
+// ---- no-op stubs (actions + the 3 special-line hooks P2.3 will replace) --------------------
+flex finna noopMobj(gt: tag gs.GameState, actor: tag think.Thinker) {
+}
+flex finna noopPspr(gt: tag gs.GameState, playerIdx: int, pspIdx: int) {
+}
+flex finna noopCrossSpecial(gt: tag gs.GameState, linenum: i32, side: i32, thing: tag think.Thinker) {
+}
+flex finna noopShootSpecial(gt: tag gs.GameState, thing: tag think.Thinker, line: i32) {
+}
+flex finna noopUseSpecial(gt: tag gs.GameState, thing: tag think.Thinker, line: i32, side: i32) -> bool {
+    bet cap
+}
+
+// F — map units -> 16.16 fixed.
+flex finna F(u: int) -> i32 {
+    bet (u << 16) as i32
+}
+
+// wireStubs — install no-op actions + special hooks, the 4 movement hooks (REAL p_map), and the
+// mobj-thinker forward slot. Mirrors simcore_smoke's wiring but points the movement hooks at p_map.
+flex finna wireStubs(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        // the 4 movement hooks -> the real p_map engine (P2.4 does this at tick init).
+        g.hooks.tryMove = pmap.tryMove
+        g.hooks.slideMove = pmap.slideMove
+        g.hooks.checkPosition = pmap.checkPosition
+        g.hooks.aimLineAttack = pmap.aimLineAttack
+        // the 3 special-line hooks -> no-ops (P2.3 wires the real p_spec versions).
+        g.hooks.crossSpecialLine = noopCrossSpecial
+        g.hooks.shootSpecialLine = noopShootSpecial
+        g.hooks.useSpecialLine = noopUseSpecial
+        // mobj thinker forward-dispatch.
+        g.hooks.mobjThink = pmobj.mobjThinker
+        // all 52 mobj-signature actions -> noopMobj
+        g.actions.aBFGSpray = noopMobj
+        g.actions.aBabyMetal = noopMobj
+        g.actions.aBossDeath = noopMobj
+        g.actions.aBrainAwake = noopMobj
+        g.actions.aBrainDie = noopMobj
+        g.actions.aBrainExplode = noopMobj
+        g.actions.aBrainPain = noopMobj
+        g.actions.aBrainScream = noopMobj
+        g.actions.aBrainSpit = noopMobj
+        g.actions.aBruisAttack = noopMobj
+        g.actions.aBspiAttack = noopMobj
+        g.actions.aCPosAttack = noopMobj
+        g.actions.aCPosRefire = noopMobj
+        g.actions.aChase = noopMobj
+        g.actions.aCyberAttack = noopMobj
+        g.actions.aExplode = noopMobj
+        g.actions.aFaceTarget = noopMobj
+        g.actions.aFall = noopMobj
+        g.actions.aFatAttack1 = noopMobj
+        g.actions.aFatAttack2 = noopMobj
+        g.actions.aFatAttack3 = noopMobj
+        g.actions.aFatRaise = noopMobj
+        g.actions.aFire = noopMobj
+        g.actions.aFireCrackle = noopMobj
+        g.actions.aHeadAttack = noopMobj
+        g.actions.aHoof = noopMobj
+        g.actions.aKeenDie = noopMobj
+        g.actions.aLook = noopMobj
+        g.actions.aMetal = noopMobj
+        g.actions.aPain = noopMobj
+        g.actions.aPainAttack = noopMobj
+        g.actions.aPainDie = noopMobj
+        g.actions.aPlayerScream = noopMobj
+        g.actions.aPosAttack = noopMobj
+        g.actions.aSPosAttack = noopMobj
+        g.actions.aSargAttack = noopMobj
+        g.actions.aScream = noopMobj
+        g.actions.aSkelFist = noopMobj
+        g.actions.aSkelMissile = noopMobj
+        g.actions.aSkelWhoosh = noopMobj
+        g.actions.aSkullAttack = noopMobj
+        g.actions.aSpawnFly = noopMobj
+        g.actions.aSpawnSound = noopMobj
+        g.actions.aSpidRefire = noopMobj
+        g.actions.aStartFire = noopMobj
+        g.actions.aTracer = noopMobj
+        g.actions.aTroopAttack = noopMobj
+        g.actions.aVileAttack = noopMobj
+        g.actions.aVileChase = noopMobj
+        g.actions.aVileStart = noopMobj
+        g.actions.aVileTarget = noopMobj
+        g.actions.aXScream = noopMobj
+        // all 22 weapon/psprite-signature actions -> noopPspr
+        g.actions.aBFGsound = noopPspr
+        g.actions.aCheckReload = noopPspr
+        g.actions.aCloseShotgun2 = noopPspr
+        g.actions.aFireBFG = noopPspr
+        g.actions.aFireCGun = noopPspr
+        g.actions.aFireMissile = noopPspr
+        g.actions.aFirePistol = noopPspr
+        g.actions.aFirePlasma = noopPspr
+        g.actions.aFireShotgun = noopPspr
+        g.actions.aFireShotgun2 = noopPspr
+        g.actions.aGunFlash = noopPspr
+        g.actions.aLight0 = noopPspr
+        g.actions.aLight1 = noopPspr
+        g.actions.aLight2 = noopPspr
+        g.actions.aLoadShotgun2 = noopPspr
+        g.actions.aLower = noopPspr
+        g.actions.aOpenShotgun2 = noopPspr
+        g.actions.aPunch = noopPspr
+        g.actions.aRaise = noopPspr
+        g.actions.aReFire = noopPspr
+        g.actions.aSaw = noopPspr
+        g.actions.aWeaponReady = noopPspr
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// buildLevel — a square room [0..384]x[0..384] map units: 4 vertices, 4 one-sided walls, sector 0
+// (floor 0, ceiling 128), one subsector, and a 3x3 blockmap (org 0,0) whose every cell lists all
+// 4 walls. numnodes=0 so R_PointInSubsector returns subsector 0.
+flex finna buildLevel(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.level.numnodes = 0
+        g.level.numsubsectors = 1
+        g.level.numsectors = 1
+        g.level.numvertexes = 4
+        g.level.numlines = 4
+        g.level.numsides = 0
+        // subsector / sector
+        g.level.ssSector = mem.slab[i32](1)
+        g.level.ssNumLines = mem.slab[i32](1)
+        g.level.ssFirstLine = mem.slab[i32](1)
+        g.level.secFloorH = mem.slab[i32](1)
+        g.level.secCeilH = mem.slab[i32](1)
+        g.level.secSpecial = mem.slab[i32](1)
+        g.level.secFloorH[0] = 0
+        g.level.secCeilH[0] = F(128)
+        g.level.secSpecial[0] = 0
+        // vertices (fixed): (0,0) (384,0) (384,384) (0,384)
+        g.level.vtxX = mem.slab[i32](4)
+        g.level.vtxY = mem.slab[i32](4)
+        g.level.vtxX[0] = F(0)
+        g.level.vtxY[0] = F(0)
+        g.level.vtxX[1] = F(384)
+        g.level.vtxY[1] = F(0)
+        g.level.vtxX[2] = F(384)
+        g.level.vtxY[2] = F(384)
+        g.level.vtxX[3] = F(0)
+        g.level.vtxY[3] = F(384)
+        // lines
+        g.level.lineV1 = mem.slab[i32](4)
+        g.level.lineV2 = mem.slab[i32](4)
+        g.level.lineDx = mem.slab[i32](4)
+        g.level.lineDy = mem.slab[i32](4)
+        g.level.lineFlags = mem.slab[i32](4)
+        g.level.lineSpecial = mem.slab[i32](4)
+        g.level.lineTag = mem.slab[i32](4)
+        g.level.lineSide0 = mem.slab[i32](4)
+        g.level.lineSide1 = mem.slab[i32](4)
+        g.level.lineBBox = mem.slab[i32](16)
+        g.level.lineSlopetype = mem.slab[i32](4)
+        g.level.lineFront = mem.slab[i32](4)
+        g.level.lineBack = mem.slab[i32](4)
+        g.level.lineValid = mem.slab[i32](4)
+        // blockmap 3x3, org (0,0). offsets 0..8 -> list at index 9 = [0,1,2,3,-1].
+        g.level.bmapWidth = 3
+        g.level.bmapHeight = 3
+        g.level.bmapOrgX = 0
+        g.level.bmapOrgY = 0
+        g.level.blockmap = mem.slab[i32](14)
+        lowkey c: int = 0
+        vibin c < 9 {
+            g.level.blockmap[c] = 9
+            c = c + 1
+        }
+        g.level.blockmap[9] = 0
+        g.level.blockmap[10] = 1
+        g.level.blockmap[11] = 2
+        g.level.blockmap[12] = 3
+        g.level.blockmap[13] = -1
+    } ghosted {
+        yeet("gs")
+    }
+    // L0 bottom v0->v1 (horizontal, y=0); L1 right (vertical); L2 top (horizontal); L3 left.
+    setLine(gt, 0, 0, 1, F(384), 0, 0)
+    setLine(gt, 1, 1, 2, 0, F(384), 1)
+    setLine(gt, 2, 2, 3, F(-384), 0, 0)
+    setLine(gt, 3, 3, 0, 0, F(-384), 1)
+}
+
+// setLine — fill line `i` (v1->v2), computing dx/dy, slopetype, and the m_bbox from the verts.
+// One-sided wall: side1=-1, front sector 0, back -1. slope: 0=horizontal, 1=vertical.
+flex finna setLine(gt: tag gs.GameState, i: int, v1: int, v2: int, dx: i32, dy: i32, slope: int) {
+    holla g = gt in gs.gsc {
+        g.level.lineV1[i] = v1 as i32
+        g.level.lineV2[i] = v2 as i32
+        g.level.lineDx[i] = dx
+        g.level.lineDy[i] = dy
+        g.level.lineFlags[i] = 0
+        g.level.lineSpecial[i] = 0
+        g.level.lineTag[i] = 0
+        g.level.lineSide0[i] = 0
+        g.level.lineSide1[i] = -1
+        g.level.lineSlopetype[i] = slope as i32
+        g.level.lineFront[i] = 0
+        g.level.lineBack[i] = -1
+        g.level.lineValid[i] = 0
+        lowkey x1: i32 = g.level.vtxX[v1]
+        lowkey y1: i32 = g.level.vtxY[v1]
+        lowkey x2: i32 = g.level.vtxX[v2]
+        lowkey y2: i32 = g.level.vtxY[v2]
+        // BOXTOP/BOTTOM/LEFT/RIGHT = 0/1/2/3
+        fr y1 < y2 {
+            g.level.lineBBox[i * 4 + 0] = y2
+            g.level.lineBBox[i * 4 + 1] = y1
+        } naw {
+            g.level.lineBBox[i * 4 + 0] = y1
+            g.level.lineBBox[i * 4 + 1] = y2
+        }
+        fr x1 < x2 {
+            g.level.lineBBox[i * 4 + 2] = x1
+            g.level.lineBBox[i * 4 + 3] = x2
+        } naw {
+            g.level.lineBBox[i * 4 + 2] = x2
+            g.level.lineBBox[i * 4 + 3] = x1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+finna main() {
+    lowkey g0 = cop gs.GameState{} in gs.gsc
+    gs.gsInit(g0)
+    holla g = g0 in gs.gsc {
+        info.initStatesAll(g.info.states)
+        info.initMobjinfoAll(g.info.mobjinfo)
+        sounds.initSfxAll(g.info.sfx)
+        g.info.finesine = tables.initFinesineAll(g.info.finesine)
+        g.info.finetangent = tables.initFinetangentAll(g.info.finetangent)
+        g.info.tantoangle = tables.initTantoangleAll(g.info.tantoangle)
+        g.tick.rndtable = rnd.initRndtable(g.tick.rndtable)
+        g.shell.gameskill = doomdef.SK_MEDIUM as i32
+        g.shell.gametic = 0
+        g.shell.consoleplayer = 0
+    } ghosted {
+        yeet("gs")
+    }
+    wireStubs(g0)
+    buildLevel(g0)
+    pinter.initAmmoTables(g0)
+    rnd.clearRandom(g0)
+    pthink.initThinkers(g0)
+
+    spill.f("== SIM-MOVE smoke (p_inter + p_map) ==\n")
+
+    // ============================================================================
+    // (A) P_DamageMobj arithmetic
+    // ============================================================================
+    spill.f("-- A: P_DamageMobj --\n")
+    // a1: an imp (MT_TROOP, spawnhealth 60, painchance 200) taking null-inflictor damage.
+    lowkey imp = pmobj.spawnMobj(g0, F(60), F(60), think.ONFLOORZ, info.MT_TROOP)
+    printMobj(g0, "a1 imp spawned", imp)
+    damageStep(g0, imp, 15)
+    damageStep(g0, imp, 15)
+    damageStep(g0, imp, 20)
+    damageStep(g0, imp, 20)   // 70 total > 60 -> dead
+
+    // a2: a player mobj taking damage through armor (armortype 1: absorbs 1/3).
+    lowkey pmo = pmobj.spawnMobj(g0, F(300), F(60), think.ONFLOORZ, info.MT_PLAYER)
+    holla g = g0 in gs.gsc {
+        g.shell.players[0].health = 100
+        g.shell.players[0].armorpoints = 50
+        g.shell.players[0].armortype = 1
+        g.shell.players[0].mo = pmo
+    } ghosted {
+        yeet("gs")
+    }
+    holla m = pmo in gs.thinkers {
+        m.mobj.player = 0
+    } ghosted {
+        yeet("pmo")
+    }
+    playerStatLbl(g0, "a2 player pre")
+    pinter.damageMobj(g0, pmo, ghosted, ghosted, 30)
+    playerStatLbl(g0, "a2 dmg 30")
+    pinter.damageMobj(g0, pmo, ghosted, ghosted, 30)
+    playerStatLbl(g0, "a2 dmg 30")
+    // detach + remove the player mobj so it doesn't pollute the pickup/move tests
+    holla g = g0 in gs.gsc {
+        g.shell.players[0].mo = ghosted
+    } ghosted {
+        yeet("gs")
+    }
+    pmobj.removeMobj(g0, pmo)
+    pmobj.removeMobj(g0, imp)
+
+    // a3: an imp taking damage from a SOURCE (a barrel) -> should acquire the source as target.
+    lowkey imp3 = pmobj.spawnMobj(g0, F(300), F(300), think.ONFLOORZ, info.MT_TROOP)
+    lowkey src = pmobj.spawnMobj(g0, F(320), F(300), think.ONFLOORZ, info.MT_BARREL)
+    pinter.damageMobj(g0, imp3, ghosted, src, 10)
+    printTargetLink(g0, imp3)
+    pmobj.removeMobj(g0, imp3)
+    pmobj.removeMobj(g0, src)
+
+    // ============================================================================
+    // (B) P_TouchSpecialThing pickups
+    // ============================================================================
+    spill.f("-- B: P_TouchSpecialThing --\n")
+    // reset player ammo/health/weapons to a known state and re-link a live player mobj.
+    lowkey ptouch = pmobj.spawnMobj(g0, F(200), F(200), think.ONFLOORZ, info.MT_PLAYER)
+    holla g = g0 in gs.gsc {
+        g.shell.players[0].health = 100
+        g.shell.players[0].mo = ptouch
+        g.shell.players[0].maxammo[0] = 200
+        g.shell.players[0].maxammo[1] = 50
+        g.shell.players[0].maxammo[2] = 300
+        g.shell.players[0].maxammo[3] = 50
+        g.shell.players[0].ammo[0] = 0
+        g.shell.players[0].readyweapon = doomdef.WP_PISTOL as i32
+    } ghosted {
+        yeet("gs")
+    }
+    holla m = ptouch in gs.thinkers {
+        m.mobj.player = 0
+    } ghosted {
+        yeet("ptouch")
+    }
+    // a clip (MT_CLIP) placed at the player's feet.
+    lowkey clip = pmobj.spawnMobj(g0, F(200), F(200), think.ONFLOORZ, info.MT_CLIP)
+    pinter.touchSpecialThing(g0, clip, ptouch)
+    ammoStat(g0, "B clip picked up (expect am_clip 0->10)")
+    // a stimpack (MT_STIM) -> +10 health, but player is at 100 so it should be refused.
+    holla g = g0 in gs.gsc {
+        g.shell.players[0].health = 100
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey stim = pmobj.spawnMobj(g0, F(200), F(200), think.ONFLOORZ, info.MT_MISC10)
+    holla g = g0 in gs.gsc {
+        g.shell.players[0].health = 40
+    } ghosted {
+        yeet("gs")
+    }
+    pinter.touchSpecialThing(g0, stim, ptouch)
+    healthStat(g0, "B stimpack (expect 40->50)")
+    // a shotgun (MT_SHOTGUN) -> gives weapon + ammo.
+    lowkey sg = pmobj.spawnMobj(g0, F(200), F(200), think.ONFLOORZ, info.MT_SHOTGUN)
+    pinter.touchSpecialThing(g0, sg, ptouch)
+    weaponStat(g0, "B shotgun (expect owned + shells)")
+    // detach + free player mobj for the move tests
+    holla g = g0 in gs.gsc {
+        g.shell.players[0].mo = ghosted
+    } ghosted {
+        yeet("gs")
+    }
+    pmobj.removeMobj(g0, ptouch)
+
+    // ============================================================================
+    // (C) checkPosition / tryMove
+    // ============================================================================
+    spill.f("-- C: P_CheckPosition / P_TryMove --\n")
+    // Thing A (solid imp) fixed at (192,192); B (solid imp) at (240,192).
+    lowkey aMo = pmobj.spawnMobj(g0, F(192), F(192), think.ONFLOORZ, info.MT_TROOP)
+    lowkey bMo = pmobj.spawnMobj(g0, F(240), F(192), think.ONFLOORZ, info.MT_TROOP)
+    // C1: move B into open space (260,192) -> ok.
+    tryMoveTrace(g0, bMo, F(260), F(192), "C1 B->(260,192) open")
+    // C2: move B into thing A (208,192) -> blocked (solid thing), stays put.
+    tryMoveTrace(g0, bMo, F(208), F(192), "C2 B->(208,192) into thing A")
+    // C3: move B into the left wall (8,192) -> blocked (one-sided wall), stays put.
+    tryMoveTrace(g0, bMo, F(8), F(192), "C3 B->(8,192) into wall")
+    // C4: bare checkPosition test at an open spot -> true, tm regs sane.
+    checkPosTrace(g0, bMo, F(300), F(300), "C4 checkPosition (300,300) open")
+
+    spill.f("== done ==\n")
+}
+
+// ---- trace helpers -------------------------------------------------------------------------
+
+flex finna printMobj(gt: tag gs.GameState, label: str, mo: tag think.Thinker) {
+    lowkey hp: int = 0
+    lowkey st: int = 0
+    lowkey tics: int = 0
+    holla m = mo in gs.thinkers {
+        hp = m.mobj.health as int
+        st = m.mobj.stateIdx as int
+        tics = m.mobj.tics as int
+    } ghosted {
+        yeet("mo")
+    }
+    spill.f("{}: hp={} st={} tics={}\n", label, hp, st, tics)
+}
+
+// damageStep — damage `mo` by `d` (null inflictor/source), then print hp/state/tics + rndindex.
+flex finna damageStep(gt: tag gs.GameState, mo: tag think.Thinker, d: int) {
+    pinter.damageMobj(gt, mo, ghosted, ghosted, d)
+    lowkey hp: int = 0
+    lowkey st: int = 0
+    lowkey tics: int = 0
+    lowkey ri: int = 0
+    holla m = mo in gs.thinkers {
+        hp = m.mobj.health as int
+        st = m.mobj.stateIdx as int
+        tics = m.mobj.tics as int
+    } ghosted {
+        yeet("mo")
+    }
+    holla g = gt in gs.gsc {
+        ri = g.tick.prndindex as int
+    } ghosted {
+        yeet("gs")
+    }
+    spill.f("  dmg {} -> hp={} st={} tics={} rnd={}\n", d, hp, st, tics, ri)
+}
+
+flex finna playerStatLbl(gt: tag gs.GameState, label: str) {
+    lowkey hp: int = 0
+    lowkey ap: int = 0
+    lowkey at: int = 0
+    lowkey mohp: int = 0
+    lowkey st: int = 0
+    lowkey pmo: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        hp = g.shell.players[0].health as int
+        ap = g.shell.players[0].armorpoints as int
+        at = g.shell.players[0].armortype as int
+        pmo = g.shell.players[0].mo
+    } ghosted {
+        yeet("gs")
+    }
+    fr !(pmo == ghosted) {
+        holla m = pmo in gs.thinkers {
+            mohp = m.mobj.health as int
+            st = m.mobj.stateIdx as int
+        } ghosted {
+        }
+    }
+    spill.f("{}: hp={} armor={} type={} mohp={} st={}\n", label, hp, ap, at, mohp, st)
+}
+
+flex finna printTargetLink(gt: tag gs.GameState, mo: tag think.Thinker) {
+    lowkey thr: int = 0
+    lowkey st: int = 0
+    lowkey hasTarget = cap
+    holla m = mo in gs.thinkers {
+        thr = m.mobj.threshold as int
+        st = m.mobj.stateIdx as int
+        fr !(m.mobj.target == ghosted) {
+            hasTarget = nocap
+        }
+    } ghosted {
+        yeet("mo")
+    }
+    lowkey ht: int = 0
+    fr hasTarget {
+        ht = 1
+    }
+    spill.f("  a3 imp: threshold={} st={} hasTarget={}\n", thr, st, ht)
+}
+
+flex finna ammoStat(gt: tag gs.GameState, label: str) {
+    lowkey a0: int = 0
+    holla g = gt in gs.gsc {
+        a0 = g.shell.players[0].ammo[0] as int
+    } ghosted {
+        yeet("gs")
+    }
+    spill.f("{}: am_clip={}\n", label, a0)
+}
+
+flex finna healthStat(gt: tag gs.GameState, label: str) {
+    lowkey hp: int = 0
+    holla g = gt in gs.gsc {
+        hp = g.shell.players[0].health as int
+    } ghosted {
+        yeet("gs")
+    }
+    spill.f("{}: health={}\n", label, hp)
+}
+
+flex finna weaponStat(gt: tag gs.GameState, label: str) {
+    lowkey owned = cap
+    lowkey shells: int = 0
+    lowkey pend: int = 0
+    holla g = gt in gs.gsc {
+        owned = g.shell.players[0].weaponowned[doomdef.WP_SHOTGUN]
+        shells = g.shell.players[0].ammo[doomdef.AM_SHELL] as int
+        pend = g.shell.players[0].pendingweapon as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey ow: int = 0
+    fr owned {
+        ow = 1
+    }
+    spill.f("{}: shotgunOwned={} shells={} pending={}\n", label, ow, shells, pend)
+}
+
+// tryMoveTrace — call p_map.tryMove and print result + resulting (x,y) in map units.
+flex finna tryMoveTrace(gt: tag gs.GameState, mo: tag think.Thinker, x: i32, y: i32, label: str) {
+    lowkey ok = pmap.tryMove(gt, mo, x, y)
+    lowkey rx: int = 0
+    lowkey ry: int = 0
+    holla m = mo in gs.thinkers {
+        rx = (m.mobj.x >> 16) as int
+        ry = (m.mobj.y >> 16) as int
+    } ghosted {
+        yeet("mo")
+    }
+    lowkey r: int = 0
+    fr ok {
+        r = 1
+    }
+    spill.f("{}: ok={} x={} y={}\n", label, r, rx, ry)
+}
+
+// checkPosTrace — call p_map.checkPosition and print result + the tm floor/ceil registers.
+flex finna checkPosTrace(gt: tag gs.GameState, mo: tag think.Thinker, x: i32, y: i32, label: str) {
+    lowkey ok = pmap.checkPosition(gt, mo, x, y)
+    lowkey fz: int = 0
+    lowkey cz: int = 0
+    holla g = gt in gs.gsc {
+        fz = (g.tick.tmfloorz >> 16) as int
+        cz = (g.tick.tmceilingz >> 16) as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey r: int = 0
+    fr ok {
+        r = 1
+    }
+    spill.f("{}: ok={} tmfloorz={} tmceilingz={}\n", label, r, fz, cz)
+}

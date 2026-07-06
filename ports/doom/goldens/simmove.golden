@@ -1,0 +1,21 @@
+== SIM-MOVE smoke (p_inter + p_map) ==
+-- A: P_DamageMobj --
+a1 imp spawned: hp=60 st=442 tics=10
+  dmg 15 -> hp=45 st=455 tics=2 rnd=2
+  dmg 15 -> hp=30 st=455 tics=2 rnd=3
+  dmg 20 -> hp=10 st=455 tics=2 rnd=4
+  dmg 20 -> hp=-10 st=457 tics=7 rnd=5
+a2 player pre: hp=100 armor=50 type=1 mohp=100 st=149
+a2 dmg 30: hp=80 armor=40 type=1 mohp=80 st=156
+a2 dmg 30: hp=60 armor=30 type=1 mohp=60 st=156
+  a3 imp: threshold=100 st=455 hasTarget=1
+-- B: P_TouchSpecialThing --
+B clip picked up (expect am_clip 0->10): am_clip=10
+B stimpack (expect 40->50): health=50
+B shotgun (expect owned + shells): shotgunOwned=1 shells=8 pending=2
+-- C: P_CheckPosition / P_TryMove --
+C1 B->(260,192) open: ok=1 x=260 y=192
+C2 B->(208,192) into thing A: ok=0 x=260 y=192
+C3 B->(8,192) into wall: ok=0 x=260 y=192
+C4 checkPosition (300,300) open: ok=1 tmfloorz=0 tmceilingz=128
+== done ==

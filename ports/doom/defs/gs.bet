@@ -609,6 +609,7 @@ flex drip TickState {
     flex tmy: i32
     flex tmbbox: i32[4]
     flex tmflags: i32
+    flex tmthing: tag think.Thinker  // P2.2: the mobj being clip-tested (p_map file static `tmthing`)
     flex tmfloorz: i32
     flex tmceilingz: i32
     flex tmdropoffz: i32
@@ -616,6 +617,17 @@ flex drip TickState {
     flex ceilingline: i32            // line index (or -1)
     flex crushchange: bool
     flex nofit: bool
+    // P2.2 SIM-MOVE amendment (additive): p_map.c file statics that its fn-value iterator/
+    // traverser callbacks (PIT_*/PTR_*) must share through gs (bet callbacks take no closure).
+    // Scratch only; never overlap a live collision pass with a slide/use pass.
+    flex slidemo: tag think.Thinker  // P_SlideMove `slidemo`
+    flex bestslidefrac: i32          // P_SlideMove `bestslidefrac`
+    flex secondslidefrac: i32        // P_SlideMove `secondslidefrac`
+    flex bestslideline: i32          // P_SlideMove `bestslideline` (line index, -1 none)
+    flex secondslideline: i32        // P_SlideMove `secondslideline` (line index, -1 none)
+    flex tmxmove: i32                // P_SlideMove / P_HitSlideLine `tmxmove`
+    flex tmymove: i32                // P_SlideMove / P_HitSlideLine `tmymove`
+    flex usething: tag think.Thinker // P_UseLines `usething`
     flex linetarget: tag think.Thinker
     flex shootthing: tag think.Thinker
     flex bombsource: tag think.Thinker

@@ -1,0 +1,1801 @@
+// p/p_map.bet — movement clipping, thing/line collision, slide/use, line & radius attacks, and
+// sector-crush height re-clip (linuxdoom-1.10 p_map.c). Signatures FROZEN in ports/doom/p-sigs.md
+// ("p/p_map"): checkPosition, tryMove, teleportMove, slideMove, useLines, changeSector,
+// aimLineAttack, lineAttack, radiusAttack. (checkSight lives in p/p_sight.)
+//
+// PORTED: PIT_StompThing, P_TeleportMove, PIT_CheckLine, PIT_CheckThing, P_CheckPosition,
+//   P_TryMove, P_ThingHeightClip, P_HitSlideLine, PTR_SlideTraverse, P_SlideMove, PTR_AimTraverse,
+//   PTR_ShootTraverse, P_AimLineAttack, P_LineAttack, PTR_UseTraverse, P_UseLines,
+//   PIT_RadiusAttack, P_RadiusAttack, PIT_ChangeSector, P_ChangeSector.
+//
+// THE tm* REGISTER PROTOCOL (P2.4/P2.5 read these after a move test): checkPosition/tryMove SET
+//   g.tick.tmthing/tmflags/tmx/tmy/tmbbox (the query), then tmfloorz/tmceilingz/tmdropoffz (the
+//   contacted floor/ceiling interval), g.tick.ceilingline (line that lowered the ceiling, -1
+//   none), g.tick.floatok (would-fit-if-floated), and g.tick.spechit[0..numspechit-1] (special
+//   lines the move crossed, unsorted). Callers read tmfloorz/tmceilingz/floatok after
+//   checkPosition (e.g. floating monsters), and the aim/attack regs (linetarget/aimslope) after
+//   aimLineAttack. All live in TickState (CONTRACTS.md p_local.h map + the P2.2 amendment).
+//
+// SEAMS (the 3 special-line hooks — P2.3 wires the real p_spec impls; no-op until then). Native
+//   cannot null-compare a fn-value, so these are called unconditionally on the paths that reach
+//   them (the harness installs no-op stubs). Exact call sites:
+//     * g.hooks.crossSpecialLine(gt, line, oldside, thing)  — P_TryMove, per crossed spechit line.
+//     * g.hooks.shootSpecialLine(gt, shooter, line)         — PTR_ShootTraverse, on a special line.
+//     * g.hooks.useSpecialLine(gt, user, line, side) -> bool — PTR_UseTraverse, on a special line.
+//
+// The 4 movement hooks (tryMove/slideMove/checkPosition/aimLineAttack) declared by P2.1 are
+// IMPLEMENTED here; P2.4/p_action wires them into g.hooks.* at tick init (the smoke harness wires
+// them itself). p_mobj already calls them through g.hooks (callTryMove etc.), breaking the cycle.
+//
+// RNG / DEMO-SYNC: P_Random via m_random.pRandom. Order preserved: PIT_CheckThing draws one
+//   P_Random for a skull-slam or a missile hit (`(P_Random()%8)+1`) before P_DamageMobj;
+//   PIT_ChangeSector draws two per crushed body (momx then momy: `(P_Random()-P_Random())<<12`,
+//   left-to-right). spechit ordering is COLLECTION order (unsorted, per id's note) — the crossing
+//   effects in P_TryMove replay spechit from numspechit-1 DOWN to 0.
+//
+// NATIVE is the correctness target. First driven on a real map at P2.5 / W3 demo oracle.
+pull "mem"
+pull "../defs/gs" as gs
+pull "../defs/think" as think
+pull "../defs/fixed" as fixed
+pull "../defs/tables" as tables
+pull "../defs/doomdef" as doomdef
+pull "../defs/info" as info
+pull "../defs/sounds" as sounds
+pull "../util/m_bbox" as m_bbox
+pull "../util/m_random" as rnd
+pull "../r/r_geom" as rgeom
+pull "../s/s_sound" as ssnd
+pull "../p/p_maputl" as pmaputl
+pull "../p/p_mobj" as pmobj
+pull "../p/p_inter" as pinter
+pull "../p/p_sight" as psight
+
+// ---- constants (p_local.h) ----------------------------------------------------------------
+flex facts MAXRADIUS: i32 = 2097152      // 32*FRACUNIT (blockmap bbox slop)
+flex facts USERANGE: i32 = 4194304       // 64*FRACUNIT
+flex facts MELEERANGE: i32 = 4194304     // 64*FRACUNIT
+flex facts MISSILERANGE: i32 = 134217728 // 32*64*FRACUNIT
+
+// ===========================================================================================
+// TELEPORT MOVE
+// ===========================================================================================
+
+// pitStompThing — PIT_StompThing: telefrag anything shootable at the destination (monsters may
+// only stomp on the boss level, map 30).
+flex finna pitStompThing(gt: tag gs.GameState, thing: tag think.Thinker) -> bool {
+    lowkey flags: int = 0
+    lowkey radius: i32 = 0
+    lowkey x: i32 = 0
+    lowkey y: i32 = 0
+    holla t = thing in gs.thinkers {
+        flags = t.mobj.flags as int
+        radius = t.mobj.radius
+        x = t.mobj.x
+        y = t.mobj.y
+    } ghosted {
+        yeet("thing")
+    }
+    fr (flags & think.MF_SHOOTABLE) == 0 {
+        bet nocap
+    }
+    lowkey tmr: i32 = 0
+    lowkey tmx: i32 = 0
+    lowkey tmy: i32 = 0
+    lowkey tmthing: tag think.Thinker = ghosted
+    lowkey tmplayer: int = -1
+    lowkey gamemap: int = 0
+    holla g = gt in gs.gsc {
+        tmx = g.tick.tmx
+        tmy = g.tick.tmy
+        tmthing = g.tick.tmthing
+        gamemap = g.shell.gamemap as int
+    } ghosted {
+        yeet("gs")
+    }
+    holla tt = tmthing in gs.thinkers {
+        tmr = tt.mobj.radius
+        tmplayer = tt.mobj.player as int
+    } ghosted {
+        yeet("tmthing")
+    }
+    lowkey blockdist: i32 = radius + tmr
+    fr absI(x - tmx) >= blockdist || absI(y - tmy) >= blockdist {
+        bet nocap
+    }
+    fr thing == tmthing {
+        bet nocap
+    }
+    fr tmplayer == -1 && gamemap != 30 {
+        bet cap
+    }
+    pinter.damageMobj(gt, thing, tmthing, tmthing, 10000)
+    bet nocap
+}
+
+// teleportMove — P_TeleportMove: kill occupants of (x,y) then relink `thing` there.
+flex finna teleportMove(gt: tag gs.GameState, thing: tag think.Thinker, x: i32, y: i32) -> bool {
+    lowkey flags: int = 0
+    lowkey radius: i32 = 0
+    holla t = thing in gs.thinkers {
+        flags = t.mobj.flags as int
+        radius = t.mobj.radius
+    } ghosted {
+        yeet("thing")
+    }
+    lowkey ss: int = rgeom.pointInSubsector(gt, x, y)
+    lowkey floorz: i32 = 0
+    lowkey ceilingz: i32 = 0
+    lowkey orgx: i32 = 0
+    lowkey orgy: i32 = 0
+    holla g = gt in gs.gsc {
+        g.tick.tmthing = thing
+        g.tick.tmflags = flags as i32
+        g.tick.tmx = x
+        g.tick.tmy = y
+        g.tick.tmbbox[m_bbox.BOXTOP] = y + radius
+        g.tick.tmbbox[m_bbox.BOXBOTTOM] = y - radius
+        g.tick.tmbbox[m_bbox.BOXRIGHT] = x + radius
+        g.tick.tmbbox[m_bbox.BOXLEFT] = x - radius
+        g.tick.ceilingline = -1
+        lowkey sec: int = g.level.ssSector[ss] as int
+        floorz = g.level.secFloorH[sec]
+        ceilingz = g.level.secCeilH[sec]
+        g.tick.tmfloorz = floorz
+        g.tick.tmdropoffz = floorz
+        g.tick.tmceilingz = ceilingz
+        g.tick.validcount = g.tick.validcount + 1
+        g.tick.numspechit = 0
+        orgx = g.level.bmapOrgX
+        orgy = g.level.bmapOrgY
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey xl: int = ((x - radius - orgx - MAXRADIUS) >> pmaputl.MAPBLOCKSHIFT) as int
+    lowkey xh: int = ((x + radius - orgx + MAXRADIUS) >> pmaputl.MAPBLOCKSHIFT) as int
+    lowkey yl: int = ((y - radius - orgy - MAXRADIUS) >> pmaputl.MAPBLOCKSHIFT) as int
+    lowkey yh: int = ((y + radius - orgy + MAXRADIUS) >> pmaputl.MAPBLOCKSHIFT) as int
+    fr !blockThingsBox(gt, xl, xh, yl, yh, pitStompThing) {
+        bet cap
+    }
+    pmaputl.unsetThingPosition(gt, thing)
+    holla g = gt in gs.gsc {
+        lowkey tfz = g.tick.tmfloorz
+        lowkey tcz = g.tick.tmceilingz
+        holla t = thing in gs.thinkers {
+            t.mobj.floorz = tfz
+            t.mobj.ceilingz = tcz
+            t.mobj.x = x
+            t.mobj.y = y
+        } ghosted {
+            yeet("thing")
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    pmaputl.setThingPosition(gt, thing)
+    bet nocap
+}
+
+// ===========================================================================================
+// MOVEMENT ITERATOR FUNCTIONS
+// ===========================================================================================
+
+// pitCheckLine — PIT_CheckLine: contact a line; adjust the tm floor/ceiling interval, collect
+// specials, and return false (blocked) for a one-sided / explicitly-blocking crossing.
+flex finna pitCheckLine(gt: tag gs.GameState, ld: i32) -> bool {
+    // bbox reject
+    lowkey ldi: int = ld as int
+    lowkey reject = cap
+    lowkey tmR: i32 = 0
+    lowkey tmL: i32 = 0
+    lowkey tmT: i32 = 0
+    lowkey tmB: i32 = 0
+    lowkey lbL: i32 = 0
+    lowkey lbR: i32 = 0
+    lowkey lbB: i32 = 0
+    lowkey lbT: i32 = 0
+    holla g = gt in gs.gsc {
+        tmR = g.tick.tmbbox[m_bbox.BOXRIGHT]
+        tmL = g.tick.tmbbox[m_bbox.BOXLEFT]
+        tmT = g.tick.tmbbox[m_bbox.BOXTOP]
+        tmB = g.tick.tmbbox[m_bbox.BOXBOTTOM]
+        lbL = g.level.lineBBox[ldi * 4 + m_bbox.BOXLEFT]
+        lbR = g.level.lineBBox[ldi * 4 + m_bbox.BOXRIGHT]
+        lbB = g.level.lineBBox[ldi * 4 + m_bbox.BOXBOTTOM]
+        lbT = g.level.lineBBox[ldi * 4 + m_bbox.BOXTOP]
+    } ghosted {
+        yeet("gs")
+    }
+    fr tmR <= lbL || tmL >= lbR || tmT <= lbB || tmB >= lbT {
+        reject = nocap
+    }
+    fr reject {
+        bet nocap
+    }
+    // side test on the whole tmbbox
+    lowkey side: int = pmaputl.boxOnLineSide(gt, tmbboxSlab(gt), 0, ld)
+    fr side != -1 {
+        bet nocap
+    }
+    // a line has been hit
+    lowkey back: int = 0
+    lowkey lflags: int = 0
+    lowkey lspecial: int = 0
+    holla g = gt in gs.gsc {
+        back = g.level.lineBack[ld] as int
+        lflags = g.level.lineFlags[ld] as int
+        lspecial = g.level.lineSpecial[ld] as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr back == -1 {
+        bet cap
+    }
+    lowkey tmflags: int = 0
+    holla g = gt in gs.gsc {
+        tmflags = g.tick.tmflags as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr (tmflags & think.MF_MISSILE) == 0 {
+        fr (lflags & doomdef.ML_BLOCKING) != 0 {
+            bet cap
+        }
+        lowkey tmplayer: int = -1
+        holla g = gt in gs.gsc {
+            holla tt = g.tick.tmthing in gs.thinkers {
+                tmplayer = tt.mobj.player as int
+            } ghosted {
+            }
+        } ghosted {
+            yeet("gs")
+        }
+        fr tmplayer == -1 && (lflags & doomdef.ML_BLOCKMONSTERS) != 0 {
+            bet cap
+        }
+    }
+    // set openrange / opentop / openbottom
+    pmaputl.lineOpening(gt, ld)
+    holla g = gt in gs.gsc {
+        fr g.tick.opentop < g.tick.tmceilingz {
+            g.tick.tmceilingz = g.tick.opentop
+            g.tick.ceilingline = ld
+        }
+        fr g.tick.openbottom > g.tick.tmfloorz {
+            g.tick.tmfloorz = g.tick.openbottom
+        }
+        fr g.tick.lowfloor < g.tick.tmdropoffz {
+            g.tick.tmdropoffz = g.tick.lowfloor
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    fr lspecial != 0 {
+        holla g = gt in gs.gsc {
+            lowkey n: int = g.tick.numspechit as int
+            fr n < gs.MAXSPECIALCROSS {
+                g.tick.spechit[n] = ld
+                g.tick.numspechit = (n + 1) as i32
+            }
+        } ghosted {
+            yeet("gs")
+        }
+    }
+    bet nocap
+}
+
+// pitCheckThing — PIT_CheckThing: contact a thing; handle skull slams, missile impacts, pickups,
+// and solid blocking. Returns false to stop the move (blocked / consumed).
+flex finna pitCheckThing(gt: tag gs.GameState, thing: tag think.Thinker) -> bool {
+    lowkey flags: int = 0
+    lowkey radius: i32 = 0
+    lowkey x: i32 = 0
+    lowkey y: i32 = 0
+    lowkey z: i32 = 0
+    lowkey height: i32 = 0
+    lowkey typ: int = 0
+    holla t = thing in gs.thinkers {
+        flags = t.mobj.flags as int
+        radius = t.mobj.radius
+        x = t.mobj.x
+        y = t.mobj.y
+        z = t.mobj.z
+        height = t.mobj.height
+        typ = t.mobj.typeIdx as int
+    } ghosted {
+        yeet("thing")
+    }
+    fr (flags & (think.MF_SOLID | think.MF_SPECIAL | think.MF_SHOOTABLE)) == 0 {
+        bet nocap
+    }
+    lowkey tmthing: tag think.Thinker = ghosted
+    lowkey tmx: i32 = 0
+    lowkey tmy: i32 = 0
+    lowkey tmflags: int = 0
+    holla g = gt in gs.gsc {
+        tmthing = g.tick.tmthing
+        tmx = g.tick.tmx
+        tmy = g.tick.tmy
+        tmflags = g.tick.tmflags as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey tmr: i32 = 0
+    lowkey tmz: i32 = 0
+    lowkey tmheight: i32 = 0
+    lowkey tmmoflags: int = 0
+    lowkey tmtype: int = 0
+    lowkey tmtarget: tag think.Thinker = ghosted
+    holla tt = tmthing in gs.thinkers {
+        tmr = tt.mobj.radius
+        tmz = tt.mobj.z
+        tmheight = tt.mobj.height
+        tmmoflags = tt.mobj.flags as int
+        tmtype = tt.mobj.typeIdx as int
+        tmtarget = tt.mobj.target
+    } ghosted {
+        yeet("tmthing")
+    }
+    lowkey blockdist: i32 = radius + tmr
+    fr absI(x - tmx) >= blockdist || absI(y - tmy) >= blockdist {
+        bet nocap
+    }
+    fr thing == tmthing {
+        bet nocap
+    }
+    // check for skulls slamming into things
+    fr (tmmoflags & think.MF_SKULLFLY) != 0 {
+        lowkey tmdmg: int = 0
+        holla g = gt in gs.gsc {
+            tmdmg = g.info.mobjinfo[tmtype].damage as int
+        } ghosted {
+            yeet("gs")
+        }
+        lowkey damage: int = ((rnd.pRandom(gt) % 8) + 1) * tmdmg
+        pinter.damageMobj(gt, thing, tmthing, tmthing, damage)
+        lowkey spawnstate: int = 0
+        holla g = gt in gs.gsc {
+            spawnstate = g.info.mobjinfo[tmtype].spawnstate as int
+        } ghosted {
+            yeet("gs")
+        }
+        holla tt = tmthing in gs.thinkers {
+            tt.mobj.flags = (tt.mobj.flags as int & ~think.MF_SKULLFLY) as i32
+            tt.mobj.momx = 0
+            tt.mobj.momy = 0
+            tt.mobj.momz = 0
+        } ghosted {
+            yeet("tmthing")
+        }
+        pmobj.setMobjState(gt, tmthing, spawnstate)
+        bet cap
+    }
+    // missiles can hit other things
+    fr (tmmoflags & think.MF_MISSILE) != 0 {
+        // over / under
+        fr tmz > (z + height) {
+            bet nocap
+        }
+        fr (tmz + tmheight) < z {
+            bet nocap
+        }
+        // don't hit same species as the shooter
+        fr !(tmtarget == ghosted) {
+            lowkey targType: int = 0
+            holla tg = tmtarget in gs.thinkers {
+                targType = tg.mobj.typeIdx as int
+            } ghosted {
+            }
+            lowkey sameSpecies = cap
+            fr targType == typ || (targType == info.MT_KNIGHT && typ == info.MT_BRUISER) || (targType == info.MT_BRUISER && typ == info.MT_KNIGHT) {
+                sameSpecies = nocap
+            }
+            fr sameSpecies {
+                fr thing == tmtarget {
+                    bet nocap
+                }
+                fr typ != info.MT_PLAYER {
+                    // explode, but do no damage (let players missile players)
+                    bet cap
+                }
+            }
+        }
+        fr (flags & think.MF_SHOOTABLE) == 0 {
+            // no damage; pass through unless solid
+            fr (flags & think.MF_SOLID) != 0 {
+                bet cap
+            }
+            bet nocap
+        }
+        // damage / explode
+        lowkey tmdmg: int = 0
+        holla g = gt in gs.gsc {
+            tmdmg = g.info.mobjinfo[tmtype].damage as int
+        } ghosted {
+            yeet("gs")
+        }
+        lowkey damage: int = ((rnd.pRandom(gt) % 8) + 1) * tmdmg
+        pinter.damageMobj(gt, thing, tmthing, tmtarget, damage)
+        bet cap
+    }
+    // special pickup
+    fr (flags & think.MF_SPECIAL) != 0 {
+        lowkey solid = cap
+        fr (flags & think.MF_SOLID) != 0 {
+            solid = nocap
+        }
+        fr (tmflags & think.MF_PICKUP) != 0 {
+            pinter.touchSpecialThing(gt, thing, tmthing)
+        }
+        fr solid {
+            bet cap
+        }
+        bet nocap
+    }
+    fr (flags & think.MF_SOLID) != 0 {
+        bet cap
+    }
+    bet nocap
+}
+
+// ===========================================================================================
+// MOVEMENT CLIPPING
+// ===========================================================================================
+
+// checkPosition — P_CheckPosition: purely informative (except MF_PICKUP touches). Sets up the
+// tm* registers, then checks things (MAXRADIUS-slop bbox) then lines. FROZEN sig.
+flex finna checkPosition(gt: tag gs.GameState, thing: tag think.Thinker, x: i32, y: i32) -> bool {
+    lowkey flags: int = 0
+    lowkey radius: i32 = 0
+    holla t = thing in gs.thinkers {
+        flags = t.mobj.flags as int
+        radius = t.mobj.radius
+    } ghosted {
+        yeet("thing")
+    }
+    lowkey ss: int = rgeom.pointInSubsector(gt, x, y)
+    lowkey orgx: i32 = 0
+    lowkey orgy: i32 = 0
+    holla g = gt in gs.gsc {
+        g.tick.tmthing = thing
+        g.tick.tmflags = flags as i32
+        g.tick.tmx = x
+        g.tick.tmy = y
+        g.tick.tmbbox[m_bbox.BOXTOP] = y + radius
+        g.tick.tmbbox[m_bbox.BOXBOTTOM] = y - radius
+        g.tick.tmbbox[m_bbox.BOXRIGHT] = x + radius
+        g.tick.tmbbox[m_bbox.BOXLEFT] = x - radius
+        g.tick.ceilingline = -1
+        lowkey sec: int = g.level.ssSector[ss] as int
+        g.tick.tmfloorz = g.level.secFloorH[sec]
+        g.tick.tmdropoffz = g.level.secFloorH[sec]
+        g.tick.tmceilingz = g.level.secCeilH[sec]
+        g.tick.validcount = g.tick.validcount + 1
+        g.tick.numspechit = 0
+        orgx = g.level.bmapOrgX
+        orgy = g.level.bmapOrgY
+    } ghosted {
+        yeet("gs")
+    }
+    fr (flags & think.MF_NOCLIP) != 0 {
+        bet nocap
+    }
+    // things (bbox extended by MAXRADIUS — mobjs group by origin, overlapping adjacent blocks)
+    lowkey lx: i32 = 0
+    lowkey rx: i32 = 0
+    lowkey by0: i32 = 0
+    lowkey ty0: i32 = 0
+    holla g = gt in gs.gsc {
+        lx = g.tick.tmbbox[m_bbox.BOXLEFT]
+        rx = g.tick.tmbbox[m_bbox.BOXRIGHT]
+        by0 = g.tick.tmbbox[m_bbox.BOXBOTTOM]
+        ty0 = g.tick.tmbbox[m_bbox.BOXTOP]
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey xl: int = ((lx - orgx - MAXRADIUS) >> pmaputl.MAPBLOCKSHIFT) as int
+    lowkey xh: int = ((rx - orgx + MAXRADIUS) >> pmaputl.MAPBLOCKSHIFT) as int
+    lowkey yl: int = ((by0 - orgy - MAXRADIUS) >> pmaputl.MAPBLOCKSHIFT) as int
+    lowkey yh: int = ((ty0 - orgy + MAXRADIUS) >> pmaputl.MAPBLOCKSHIFT) as int
+    fr !blockThingsBox(gt, xl, xh, yl, yh, pitCheckThing) {
+        bet cap
+    }
+    // lines (no slop)
+    lowkey xl2: int = ((lx - orgx) >> pmaputl.MAPBLOCKSHIFT) as int
+    lowkey xh2: int = ((rx - orgx) >> pmaputl.MAPBLOCKSHIFT) as int
+    lowkey yl2: int = ((by0 - orgy) >> pmaputl.MAPBLOCKSHIFT) as int
+    lowkey yh2: int = ((ty0 - orgy) >> pmaputl.MAPBLOCKSHIFT) as int
+    fr !blockLinesBox(gt, xl2, xh2, yl2, yh2, pitCheckLine) {
+        bet cap
+    }
+    bet nocap
+}
+
+// tryMove — P_TryMove: attempt to move `thing` to (x,y), crossing special lines unless teleport.
+// FROZEN sig.
+flex finna tryMove(gt: tag gs.GameState, thing: tag think.Thinker, x: i32, y: i32) -> bool {
+    holla g = gt in gs.gsc {
+        g.tick.floatok = cap
+    } ghosted {
+        yeet("gs")
+    }
+    fr !checkPosition(gt, thing, x, y) {
+        bet cap
+    }
+    lowkey flags: int = 0
+    lowkey height: i32 = 0
+    lowkey z: i32 = 0
+    holla t = thing in gs.thinkers {
+        flags = t.mobj.flags as int
+        height = t.mobj.height
+        z = t.mobj.z
+    } ghosted {
+        yeet("thing")
+    }
+    fr (flags & think.MF_NOCLIP) == 0 {
+        lowkey tmfloorz: i32 = 0
+        lowkey tmceilingz: i32 = 0
+        lowkey tmdropoffz: i32 = 0
+        holla g = gt in gs.gsc {
+            tmfloorz = g.tick.tmfloorz
+            tmceilingz = g.tick.tmceilingz
+            tmdropoffz = g.tick.tmdropoffz
+        } ghosted {
+            yeet("gs")
+        }
+        fr (tmceilingz - tmfloorz) < height {
+            bet cap
+        }
+        holla g = gt in gs.gsc {
+            g.tick.floatok = nocap
+        } ghosted {
+            yeet("gs")
+        }
+        fr (flags & think.MF_TELEPORT) == 0 && (tmceilingz - z) < height {
+            bet cap
+        }
+        fr (flags & think.MF_TELEPORT) == 0 && (tmfloorz - z) > (24 * fixed.FRACUNIT) {
+            bet cap
+        }
+        fr (flags & (think.MF_DROPOFF | think.MF_FLOAT)) == 0 && (tmfloorz - tmdropoffz) > (24 * fixed.FRACUNIT) {
+            bet cap
+        }
+    }
+    // the move is ok — relink the thing into its new position.
+    pmaputl.unsetThingPosition(gt, thing)
+    lowkey oldx: i32 = 0
+    lowkey oldy: i32 = 0
+    holla g = gt in gs.gsc {
+        lowkey tmfloorz = g.tick.tmfloorz
+        lowkey tmceilingz = g.tick.tmceilingz
+        holla t = thing in gs.thinkers {
+            oldx = t.mobj.x
+            oldy = t.mobj.y
+            t.mobj.floorz = tmfloorz
+            t.mobj.ceilingz = tmceilingz
+            t.mobj.x = x
+            t.mobj.y = y
+        } ghosted {
+            yeet("thing")
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    pmaputl.setThingPosition(gt, thing)
+    // special-line crossings (skip if teleport / noclip)
+    fr (flags & (think.MF_TELEPORT | think.MF_NOCLIP)) == 0 {
+        lowkey n: int = 0
+        holla g = gt in gs.gsc {
+            n = g.tick.numspechit as int
+        } ghosted {
+            yeet("gs")
+        }
+        lowkey crossFn: finna(tag gs.GameState, i32, i32, tag think.Thinker) -> void = ghosted
+        holla g = gt in gs.gsc {
+            crossFn = g.hooks.crossSpecialLine
+        } ghosted {
+            yeet("gs")
+        }
+        vibin n > 0 {
+            n = n - 1
+            lowkey ld: int = 0
+            lowkey special: int = 0
+            holla g = gt in gs.gsc {
+                ld = g.tick.spechit[n] as int
+                special = g.level.lineSpecial[ld] as int
+            } ghosted {
+                yeet("gs")
+            }
+            lowkey side: int = pmaputl.pointOnLineSide(gt, x, y, ld as i32)
+            lowkey oldside: int = pmaputl.pointOnLineSide(gt, oldx, oldy, ld as i32)
+            fr side != oldside {
+                fr special != 0 {
+                    // SEAM: P2.3 wires g.hooks.crossSpecialLine to p_spec.P_CrossSpecialLine.
+                    crossFn(gt, ld as i32, oldside as i32, thing)
+                }
+            }
+        }
+    }
+    bet nocap
+}
+
+// thingHeightClip — P_ThingHeightClip: re-derive floorz/ceilingz for a settled thing (after a
+// sector height change) and drop/raise z; false if it no longer fits.
+flex finna thingHeightClip(gt: tag gs.GameState, thing: tag think.Thinker) -> bool {
+    lowkey z: i32 = 0
+    lowkey floorz: i32 = 0
+    lowkey ceilingz: i32 = 0
+    lowkey height: i32 = 0
+    holla t = thing in gs.thinkers {
+        z = t.mobj.z
+        floorz = t.mobj.floorz
+        ceilingz = t.mobj.ceilingz
+        height = t.mobj.height
+    } ghosted {
+        yeet("thing")
+    }
+    lowkey onfloor = cap
+    fr z == floorz {
+        onfloor = nocap
+    }
+    lowkey x: i32 = 0
+    lowkey y: i32 = 0
+    holla t = thing in gs.thinkers {
+        x = t.mobj.x
+        y = t.mobj.y
+    } ghosted {
+        yeet("thing")
+    }
+    checkPosition(gt, thing, x, y)
+    lowkey tmfloorz: i32 = 0
+    lowkey tmceilingz: i32 = 0
+    holla g = gt in gs.gsc {
+        tmfloorz = g.tick.tmfloorz
+        tmceilingz = g.tick.tmceilingz
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey nz: i32 = z
+    fr onfloor {
+        nz = tmfloorz
+    } naw {
+        fr (z + height) > tmceilingz {
+            nz = tmceilingz - height
+        }
+    }
+    holla t = thing in gs.thinkers {
+        t.mobj.floorz = tmfloorz
+        t.mobj.ceilingz = tmceilingz
+        t.mobj.z = nz
+    } ghosted {
+        yeet("thing")
+    }
+    fr (tmceilingz - tmfloorz) < height {
+        bet cap
+    }
+    bet nocap
+}
+
+// ===========================================================================================
+// SLIDE MOVE (players sliding along angled walls)
+// ===========================================================================================
+
+// hitSlideLine — P_HitSlideLine: clip tmxmove/tmymove so the next move slides along `ld`.
+flex finna hitSlideLine(gt: tag gs.GameState, ld: i32) {
+    lowkey slope: int = 0
+    lowkey ldx: i32 = 0
+    lowkey ldy: i32 = 0
+    holla g = gt in gs.gsc {
+        slope = g.level.lineSlopetype[ld] as int
+        ldx = g.level.lineDx[ld]
+        ldy = g.level.lineDy[ld]
+    } ghosted {
+        yeet("gs")
+    }
+    fr slope == pmaputl.ST_HORIZONTAL {
+        holla g = gt in gs.gsc {
+            g.tick.tmymove = 0
+        } ghosted {
+            yeet("gs")
+        }
+        bet
+    }
+    fr slope == pmaputl.ST_VERTICAL {
+        holla g = gt in gs.gsc {
+            g.tick.tmxmove = 0
+        } ghosted {
+            yeet("gs")
+        }
+        bet
+    }
+    lowkey slidex: i32 = 0
+    lowkey slidey: i32 = 0
+    lowkey tmxmove: i32 = 0
+    lowkey tmymove: i32 = 0
+    holla g = gt in gs.gsc {
+        holla sm = g.tick.slidemo in gs.thinkers {
+            slidex = sm.mobj.x
+            slidey = sm.mobj.y
+        } ghosted {
+        }
+        tmxmove = g.tick.tmxmove
+        tmymove = g.tick.tmymove
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey side: int = pmaputl.pointOnLineSide(gt, slidex, slidey, ld)
+    lowkey lineangle: u32 = 0
+    holla g = gt in gs.gsc {
+        lineangle = rgeom.pointToAngle2(g.info.tantoangle, 0, 0, ldx, ldy)
+    } ghosted {
+        yeet("gs")
+    }
+    fr side == 1 {
+        lineangle = lineangle + tables.ANG180
+    }
+    lowkey moveangle: u32 = 0
+    holla g = gt in gs.gsc {
+        moveangle = rgeom.pointToAngle2(g.info.tantoangle, 0, 0, tmxmove, tmymove)
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey deltaangle: u32 = moveangle - lineangle
+    fr deltaangle > tables.ANG180 {
+        deltaangle = deltaangle + tables.ANG180
+    }
+    lowkey lineFine: int = (lineangle >> 19) as int
+    lowkey deltaFine: int = (deltaangle >> 19) as int
+    lowkey movelen: i32 = fixed.aproxDistance(tmxmove, tmymove)
+    lowkey newlen: i32 = 0
+    lowkey nx: i32 = 0
+    lowkey ny: i32 = 0
+    holla g = gt in gs.gsc {
+        newlen = fixed.fixedMul(movelen, g.info.finesine[deltaFine + 2048])
+        nx = fixed.fixedMul(newlen, g.info.finesine[lineFine + 2048])
+        ny = fixed.fixedMul(newlen, g.info.finesine[lineFine])
+    } ghosted {
+        yeet("gs")
+    }
+    holla g = gt in gs.gsc {
+        g.tick.tmxmove = nx
+        g.tick.tmymove = ny
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// ptrSlideTraverse — PTR_SlideTraverse: pick the nearest blocking line into best/second slide.
+flex finna ptrSlideTraverse(gt: tag gs.GameState, inIdx: i32) -> bool {
+    lowkey isaline = cap
+    lowkey frac: i32 = 0
+    lowkey li: int = 0
+    holla g = gt in gs.gsc {
+        isaline = g.tick.intercepts[inIdx as int].isaline
+        frac = g.tick.intercepts[inIdx as int].frac
+        li = g.tick.intercepts[inIdx as int].lineIdx as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr !isaline {
+        yeet("PTR_SlideTraverse: not a line?")
+    }
+    lowkey lflags: int = 0
+    holla g = gt in gs.gsc {
+        lflags = g.level.lineFlags[li] as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey blocking = cap
+    fr (lflags & doomdef.ML_TWOSIDED) == 0 {
+        lowkey slidex: i32 = 0
+        lowkey slidey: i32 = 0
+        holla g = gt in gs.gsc {
+            holla sm = g.tick.slidemo in gs.thinkers {
+                slidex = sm.mobj.x
+                slidey = sm.mobj.y
+            } ghosted {
+            }
+        } ghosted {
+            yeet("gs")
+        }
+        fr pmaputl.pointOnLineSide(gt, slidex, slidey, li as i32) != 0 {
+            // don't hit the back side
+            bet nocap
+        }
+        blocking = nocap
+    } naw {
+        pmaputl.lineOpening(gt, li as i32)
+        lowkey slideheight: i32 = 0
+        lowkey slidez: i32 = 0
+        holla g = gt in gs.gsc {
+            holla sm = g.tick.slidemo in gs.thinkers {
+                slideheight = sm.mobj.height
+                slidez = sm.mobj.z
+            } ghosted {
+            }
+        } ghosted {
+            yeet("gs")
+        }
+        lowkey openrange: i32 = 0
+        lowkey opentop: i32 = 0
+        lowkey openbottom: i32 = 0
+        holla g = gt in gs.gsc {
+            openrange = g.tick.openrange
+            opentop = g.tick.opentop
+            openbottom = g.tick.openbottom
+        } ghosted {
+            yeet("gs")
+        }
+        fr openrange < slideheight {
+            blocking = nocap
+        } naw fr (opentop - slidez) < slideheight {
+            blocking = nocap
+        } naw fr (openbottom - slidez) > (24 * fixed.FRACUNIT) {
+            blocking = nocap
+        }
+    }
+    fr !blocking {
+        // this line doesn't block movement
+        bet nocap
+    }
+    // the line blocks — record if closer than best so far
+    holla g = gt in gs.gsc {
+        fr frac < g.tick.bestslidefrac {
+            g.tick.secondslidefrac = g.tick.bestslidefrac
+            g.tick.secondslideline = g.tick.bestslideline
+            g.tick.bestslidefrac = frac
+            g.tick.bestslideline = li as i32
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    bet cap
+}
+
+// slideMove — P_SlideMove: the momx/momy move is bad; slide flush along the first wall hit. FROZEN.
+flex finna slideMove(gt: tag gs.GameState, mo: tag think.Thinker) {
+    holla g = gt in gs.gsc {
+        g.tick.slidemo = mo
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey hitcount: int = 0
+    lowkey running = nocap
+    vibin running {
+        hitcount = hitcount + 1
+        fr hitcount == 3 {
+            stairStep(gt, mo)
+            bet
+        }
+        lowkey momx: i32 = 0
+        lowkey momy: i32 = 0
+        lowkey mx: i32 = 0
+        lowkey my: i32 = 0
+        lowkey radius: i32 = 0
+        holla t = mo in gs.thinkers {
+            momx = t.mobj.momx
+            momy = t.mobj.momy
+            mx = t.mobj.x
+            my = t.mobj.y
+            radius = t.mobj.radius
+        } ghosted {
+            yeet("mo")
+        }
+        lowkey leadx: i32 = 0
+        lowkey trailx: i32 = 0
+        lowkey leady: i32 = 0
+        lowkey traily: i32 = 0
+        fr momx > 0 {
+            leadx = mx + radius
+            trailx = mx - radius
+        } naw {
+            leadx = mx - radius
+            trailx = mx + radius
+        }
+        fr momy > 0 {
+            leady = my + radius
+            traily = my - radius
+        } naw {
+            leady = my - radius
+            traily = my + radius
+        }
+        holla g = gt in gs.gsc {
+            g.tick.bestslidefrac = (fixed.FRACUNIT + 1) as i32
+        } ghosted {
+            yeet("gs")
+        }
+        pmaputl.pathTraverse(gt, leadx, leady, leadx + momx, leady + momy, pmaputl.PT_ADDLINES, ptrSlideTraverse)
+        pmaputl.pathTraverse(gt, trailx, leady, trailx + momx, leady + momy, pmaputl.PT_ADDLINES, ptrSlideTraverse)
+        pmaputl.pathTraverse(gt, leadx, traily, leadx + momx, traily + momy, pmaputl.PT_ADDLINES, ptrSlideTraverse)
+        lowkey bestfrac: i32 = 0
+        holla g = gt in gs.gsc {
+            bestfrac = g.tick.bestslidefrac
+        } ghosted {
+            yeet("gs")
+        }
+        // move up to the wall
+        fr bestfrac == (fixed.FRACUNIT + 1) as i32 {
+            // hit the middle — stairstep
+            stairStep(gt, mo)
+            bet
+        }
+        // fudge a bit so it doesn't quite hit
+        bestfrac = bestfrac - 0x800
+        fr bestfrac > 0 {
+            lowkey newx: i32 = fixed.fixedMul(momx, bestfrac)
+            lowkey newy: i32 = fixed.fixedMul(momy, bestfrac)
+            fr !tryMove(gt, mo, mx + newx, my + newy) {
+                stairStep(gt, mo)
+                bet
+            }
+        }
+        // continue along the wall — the remaining fraction
+        lowkey rem: i32 = (fixed.FRACUNIT - (bestfrac + 0x800)) as i32
+        fr rem > fixed.FRACUNIT {
+            rem = fixed.FRACUNIT
+        }
+        fr rem <= 0 {
+            bet
+        }
+        holla g = gt in gs.gsc {
+            g.tick.tmxmove = fixed.fixedMul(momx, rem)
+            g.tick.tmymove = fixed.fixedMul(momy, rem)
+        } ghosted {
+            yeet("gs")
+        }
+        lowkey bestline: int = 0
+        holla g = gt in gs.gsc {
+            bestline = g.tick.bestslideline as int
+        } ghosted {
+            yeet("gs")
+        }
+        hitSlideLine(gt, bestline as i32)
+        lowkey nmx: i32 = 0
+        lowkey nmy: i32 = 0
+        holla g = gt in gs.gsc {
+            nmx = g.tick.tmxmove
+            nmy = g.tick.tmymove
+        } ghosted {
+            yeet("gs")
+        }
+        holla t = mo in gs.thinkers {
+            t.mobj.momx = nmx
+            t.mobj.momy = nmy
+        } ghosted {
+            yeet("mo")
+        }
+        fr tryMove(gt, mo, mx + nmx, my + nmy) {
+            bet
+        }
+        // blocked again -> retry
+    }
+}
+
+// stairStep — the P_SlideMove `stairstep:` fallback: try the pure-y then pure-x move.
+flex finna stairStep(gt: tag gs.GameState, mo: tag think.Thinker) {
+    lowkey mx: i32 = 0
+    lowkey my: i32 = 0
+    lowkey momx: i32 = 0
+    lowkey momy: i32 = 0
+    holla t = mo in gs.thinkers {
+        mx = t.mobj.x
+        my = t.mobj.y
+        momx = t.mobj.momx
+        momy = t.mobj.momy
+    } ghosted {
+        yeet("mo")
+    }
+    fr !tryMove(gt, mo, mx, my + momy) {
+        tryMove(gt, mo, mx + momx, my)
+    }
+}
+
+// ===========================================================================================
+// LINE / AIM ATTACK
+// ===========================================================================================
+
+// ptrAimTraverse — PTR_AimTraverse: narrow the aim slope through two-sided lines; lock onto the
+// first shootable thing in the vertical aim window (sets g.tick.linetarget + aimslope).
+flex finna ptrAimTraverse(gt: tag gs.GameState, inIdx: i32) -> bool {
+    lowkey isaline = cap
+    lowkey frac: i32 = 0
+    lowkey li: int = 0
+    lowkey thingT: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        isaline = g.tick.intercepts[inIdx as int].isaline
+        frac = g.tick.intercepts[inIdx as int].frac
+        li = g.tick.intercepts[inIdx as int].lineIdx as int
+        thingT = g.tick.intercepts[inIdx as int].thingT
+    } ghosted {
+        yeet("gs")
+    }
+    fr isaline {
+        lowkey lflags: int = 0
+        holla g = gt in gs.gsc {
+            lflags = g.level.lineFlags[li] as int
+        } ghosted {
+            yeet("gs")
+        }
+        fr (lflags & doomdef.ML_TWOSIDED) == 0 {
+            bet cap
+        }
+        pmaputl.lineOpening(gt, li as i32)
+        lowkey opentop: i32 = 0
+        lowkey openbottom: i32 = 0
+        holla g = gt in gs.gsc {
+            opentop = g.tick.opentop
+            openbottom = g.tick.openbottom
+        } ghosted {
+            yeet("gs")
+        }
+        fr openbottom >= opentop {
+            bet cap
+        }
+        lowkey attackrange: i32 = 0
+        lowkey shootz: i32 = 0
+        holla g = gt in gs.gsc {
+            attackrange = g.tick.attackrange
+            shootz = g.tick.shootz
+        } ghosted {
+            yeet("gs")
+        }
+        lowkey dist: i32 = fixed.fixedMul(attackrange, frac)
+        lowkey frontf: i32 = 0
+        lowkey backf: i32 = 0
+        lowkey frontc: i32 = 0
+        lowkey backc: i32 = 0
+        holla g = gt in gs.gsc {
+            lowkey fs = g.level.lineFront[li] as int
+            lowkey bs = g.level.lineBack[li] as int
+            frontf = g.level.secFloorH[fs]
+            backf = g.level.secFloorH[bs]
+            frontc = g.level.secCeilH[fs]
+            backc = g.level.secCeilH[bs]
+        } ghosted {
+            yeet("gs")
+        }
+        fr frontf != backf {
+            lowkey slope: i32 = fixed.fixedDiv(openbottom - shootz, dist)
+            holla g = gt in gs.gsc {
+                fr slope > g.tick.bottomslope {
+                    g.tick.bottomslope = slope
+                }
+            } ghosted {
+                yeet("gs")
+            }
+        }
+        fr frontc != backc {
+            lowkey slope: i32 = fixed.fixedDiv(opentop - shootz, dist)
+            holla g = gt in gs.gsc {
+                fr slope < g.tick.topslope {
+                    g.tick.topslope = slope
+                }
+            } ghosted {
+                yeet("gs")
+            }
+        }
+        lowkey stop = cap
+        holla g = gt in gs.gsc {
+            fr g.tick.topslope <= g.tick.bottomslope {
+                stop = nocap
+            }
+        } ghosted {
+            yeet("gs")
+        }
+        fr stop {
+            bet cap
+        }
+        bet nocap
+    }
+    // shoot a thing
+    lowkey shootthing: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        shootthing = g.tick.shootthing
+    } ghosted {
+        yeet("gs")
+    }
+    fr thingT == shootthing {
+        bet nocap
+    }
+    lowkey tflags: int = 0
+    lowkey tz: i32 = 0
+    lowkey theight: i32 = 0
+    holla th = thingT in gs.thinkers {
+        tflags = th.mobj.flags as int
+        tz = th.mobj.z
+        theight = th.mobj.height
+    } ghosted {
+        yeet("thingT")
+    }
+    fr (tflags & think.MF_SHOOTABLE) == 0 {
+        bet nocap
+    }
+    lowkey attackrange: i32 = 0
+    lowkey shootz: i32 = 0
+    holla g = gt in gs.gsc {
+        attackrange = g.tick.attackrange
+        shootz = g.tick.shootz
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey dist: i32 = fixed.fixedMul(attackrange, frac)
+    lowkey thingtop: i32 = fixed.fixedDiv((tz + theight) - shootz, dist)
+    lowkey bottomslope: i32 = 0
+    lowkey topslope: i32 = 0
+    holla g = gt in gs.gsc {
+        bottomslope = g.tick.bottomslope
+        topslope = g.tick.topslope
+    } ghosted {
+        yeet("gs")
+    }
+    fr thingtop < bottomslope {
+        bet nocap
+    }
+    lowkey thingbottom: i32 = fixed.fixedDiv(tz - shootz, dist)
+    fr thingbottom > topslope {
+        bet nocap
+    }
+    fr thingtop > topslope {
+        thingtop = topslope
+    }
+    fr thingbottom < bottomslope {
+        thingbottom = bottomslope
+    }
+    holla g = gt in gs.gsc {
+        g.tick.aimslope = (thingtop + thingbottom) / 2
+        g.tick.linetarget = thingT
+    } ghosted {
+        yeet("gs")
+    }
+    bet cap
+}
+
+// ptrShootTraverse — PTR_ShootTraverse: trigger shootable specials, then place a puff/blood and
+// (if la_damage) damage the first thing/line the shot reaches.
+flex finna ptrShootTraverse(gt: tag gs.GameState, inIdx: i32) -> bool {
+    lowkey isaline = cap
+    lowkey frac: i32 = 0
+    lowkey li: int = 0
+    lowkey thingT: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        isaline = g.tick.intercepts[inIdx as int].isaline
+        frac = g.tick.intercepts[inIdx as int].frac
+        li = g.tick.intercepts[inIdx as int].lineIdx as int
+        thingT = g.tick.intercepts[inIdx as int].thingT
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey attackrange: i32 = 0
+    lowkey shootz: i32 = 0
+    lowkey aimslope: i32 = 0
+    lowkey shootthing: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        attackrange = g.tick.attackrange
+        shootz = g.tick.shootz
+        aimslope = g.tick.aimslope
+        shootthing = g.tick.shootthing
+    } ghosted {
+        yeet("gs")
+    }
+    fr isaline {
+        lowkey lspecial: int = 0
+        lowkey lflags: int = 0
+        holla g = gt in gs.gsc {
+            lspecial = g.level.lineSpecial[li] as int
+            lflags = g.level.lineFlags[li] as int
+        } ghosted {
+            yeet("gs")
+        }
+        fr lspecial != 0 {
+            // SEAM: P2.3 wires g.hooks.shootSpecialLine to p_spec.P_ShootSpecialLine.
+            lowkey shootFn: finna(tag gs.GameState, tag think.Thinker, i32) -> void = ghosted
+            holla g = gt in gs.gsc {
+                shootFn = g.hooks.shootSpecialLine
+            } ghosted {
+                yeet("gs")
+            }
+            shootFn(gt, shootthing, li as i32)
+        }
+        lowkey hitwall = cap
+        fr (lflags & doomdef.ML_TWOSIDED) == 0 {
+            hitwall = nocap
+        } naw {
+            pmaputl.lineOpening(gt, li as i32)
+            lowkey dist: i32 = fixed.fixedMul(attackrange, frac)
+            lowkey frontf: i32 = 0
+            lowkey backf: i32 = 0
+            lowkey frontc: i32 = 0
+            lowkey backc: i32 = 0
+            lowkey opentop: i32 = 0
+            lowkey openbottom: i32 = 0
+            holla g = gt in gs.gsc {
+                lowkey fs = g.level.lineFront[li] as int
+                lowkey bs = g.level.lineBack[li] as int
+                frontf = g.level.secFloorH[fs]
+                backf = g.level.secFloorH[bs]
+                frontc = g.level.secCeilH[fs]
+                backc = g.level.secCeilH[bs]
+                opentop = g.tick.opentop
+                openbottom = g.tick.openbottom
+            } ghosted {
+                yeet("gs")
+            }
+            fr frontf != backf {
+                lowkey slope: i32 = fixed.fixedDiv(openbottom - shootz, dist)
+                fr slope > aimslope {
+                    hitwall = nocap
+                }
+            }
+            fr !hitwall && frontc != backc {
+                lowkey slope: i32 = fixed.fixedDiv(opentop - shootz, dist)
+                fr slope < aimslope {
+                    hitwall = nocap
+                }
+            }
+        }
+        fr !hitwall {
+            // shot continues
+            bet nocap
+        }
+        // hit line — position a bit closer
+        lowkey fr2: i32 = frac - fixed.fixedDiv(4 * fixed.FRACUNIT, attackrange)
+        lowkey tracex: i32 = 0
+        lowkey tracey: i32 = 0
+        lowkey tracedx: i32 = 0
+        lowkey tracedy: i32 = 0
+        holla g = gt in gs.gsc {
+            tracex = g.tick.trace.x
+            tracey = g.tick.trace.y
+            tracedx = g.tick.trace.dx
+            tracedy = g.tick.trace.dy
+        } ghosted {
+            yeet("gs")
+        }
+        lowkey px: i32 = tracex + fixed.fixedMul(tracedx, fr2)
+        lowkey py: i32 = tracey + fixed.fixedMul(tracedy, fr2)
+        lowkey pz: i32 = shootz + fixed.fixedMul(aimslope, fixed.fixedMul(fr2, attackrange))
+        // don't shoot the sky
+        lowkey isSky = cap
+        holla g = gt in gs.gsc {
+            lowkey fs = g.level.lineFront[li] as int
+            fr g.level.secCeilPic[fs] == g.render.skyflatnum {
+                fr pz > g.level.secCeilH[fs] {
+                    isSky = nocap
+                }
+                lowkey bs = g.level.lineBack[li] as int
+                fr bs != -1 {
+                    fr g.level.secCeilPic[bs] == g.render.skyflatnum {
+                        isSky = nocap
+                    }
+                }
+            }
+        } ghosted {
+            yeet("gs")
+        }
+        fr isSky {
+            bet cap
+        }
+        pmobj.spawnPuff(gt, px, py, pz)
+        bet cap
+    }
+    // shoot a thing
+    fr thingT == shootthing {
+        bet nocap
+    }
+    lowkey tflags: int = 0
+    lowkey tz: i32 = 0
+    lowkey theight: i32 = 0
+    holla th = thingT in gs.thinkers {
+        tflags = th.mobj.flags as int
+        tz = th.mobj.z
+        theight = th.mobj.height
+    } ghosted {
+        yeet("thingT")
+    }
+    fr (tflags & think.MF_SHOOTABLE) == 0 {
+        bet nocap
+    }
+    lowkey dist: i32 = fixed.fixedMul(attackrange, frac)
+    lowkey thingtop: i32 = fixed.fixedDiv((tz + theight) - shootz, dist)
+    fr thingtop < aimslope {
+        bet nocap
+    }
+    lowkey thingbottom: i32 = fixed.fixedDiv(tz - shootz, dist)
+    fr thingbottom > aimslope {
+        bet nocap
+    }
+    // hit thing — position a bit closer
+    lowkey fr2: i32 = frac - fixed.fixedDiv(10 * fixed.FRACUNIT, attackrange)
+    lowkey tracex: i32 = 0
+    lowkey tracey: i32 = 0
+    lowkey tracedx: i32 = 0
+    lowkey tracedy: i32 = 0
+    holla g = gt in gs.gsc {
+        tracex = g.tick.trace.x
+        tracey = g.tick.trace.y
+        tracedx = g.tick.trace.dx
+        tracedy = g.tick.trace.dy
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey px: i32 = tracex + fixed.fixedMul(tracedx, fr2)
+    lowkey py: i32 = tracey + fixed.fixedMul(tracedy, fr2)
+    lowkey pz: i32 = shootz + fixed.fixedMul(aimslope, fixed.fixedMul(fr2, attackrange))
+    lowkey la_damage: int = 0
+    holla g = gt in gs.gsc {
+        la_damage = g.tick.la_damage as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr (tflags & think.MF_NOBLOOD) != 0 {
+        pmobj.spawnPuff(gt, px, py, pz)
+    } naw {
+        pmobj.spawnBlood(gt, px, py, pz, la_damage)
+    }
+    fr la_damage != 0 {
+        pinter.damageMobj(gt, thingT, shootthing, shootthing, la_damage)
+    }
+    bet cap
+}
+
+// aimLineAttack — P_AimLineAttack: trace out `angle` looking for a target; returns the aim slope
+// (0 if none) and leaves g.tick.linetarget set. FROZEN sig.
+flex finna aimLineAttack(gt: tag gs.GameState, t1: tag think.Thinker, angle: u32, distance: i32) -> i32 {
+    lowkey fine: int = (angle >> 19) as int
+    lowkey x1: i32 = 0
+    lowkey y1: i32 = 0
+    lowkey z1: i32 = 0
+    lowkey height: i32 = 0
+    holla t = t1 in gs.thinkers {
+        x1 = t.mobj.x
+        y1 = t.mobj.y
+        z1 = t.mobj.z
+        height = t.mobj.height
+    } ghosted {
+        yeet("t1")
+    }
+    lowkey x2: i32 = 0
+    lowkey y2: i32 = 0
+    holla g = gt in gs.gsc {
+        x2 = x1 + (distance >> 16) * g.info.finesine[fine + 2048]
+        y2 = y1 + (distance >> 16) * g.info.finesine[fine]
+    } ghosted {
+        yeet("gs")
+    }
+    holla g = gt in gs.gsc {
+        g.tick.shootthing = t1
+        g.tick.shootz = z1 + (height >> 1) + (8 * fixed.FRACUNIT)
+        g.tick.topslope = (100 * fixed.FRACUNIT) / 160
+        g.tick.bottomslope = (0 - (100 * fixed.FRACUNIT)) / 160
+        g.tick.attackrange = distance
+        g.tick.linetarget = ghosted
+    } ghosted {
+        yeet("gs")
+    }
+    pmaputl.pathTraverse(gt, x1, y1, x2, y2, pmaputl.PT_ADDLINES + pmaputl.PT_ADDTHINGS, ptrAimTraverse)
+    lowkey hit = cap
+    lowkey slope: i32 = 0
+    holla g = gt in gs.gsc {
+        fr !(g.tick.linetarget == ghosted) {
+            hit = nocap
+            slope = g.tick.aimslope
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    fr hit {
+        bet slope
+    }
+    bet 0
+}
+
+// lineAttack — P_LineAttack: fire a hitscan of `damage` along `angle`/`slope` (damage 0 = a pure
+// test trace that only leaves linetarget). FROZEN sig.
+flex finna lineAttack(gt: tag gs.GameState, t1: tag think.Thinker, angle: u32, distance: i32, slope: i32, damage: int) {
+    lowkey fine: int = (angle >> 19) as int
+    lowkey x1: i32 = 0
+    lowkey y1: i32 = 0
+    lowkey z1: i32 = 0
+    lowkey height: i32 = 0
+    holla t = t1 in gs.thinkers {
+        x1 = t.mobj.x
+        y1 = t.mobj.y
+        z1 = t.mobj.z
+        height = t.mobj.height
+    } ghosted {
+        yeet("t1")
+    }
+    lowkey x2: i32 = 0
+    lowkey y2: i32 = 0
+    holla g = gt in gs.gsc {
+        x2 = x1 + (distance >> 16) * g.info.finesine[fine + 2048]
+        y2 = y1 + (distance >> 16) * g.info.finesine[fine]
+    } ghosted {
+        yeet("gs")
+    }
+    holla g = gt in gs.gsc {
+        g.tick.shootthing = t1
+        g.tick.la_damage = damage as i32
+        g.tick.shootz = z1 + (height >> 1) + (8 * fixed.FRACUNIT)
+        g.tick.attackrange = distance
+        g.tick.aimslope = slope
+    } ghosted {
+        yeet("gs")
+    }
+    pmaputl.pathTraverse(gt, x1, y1, x2, y2, pmaputl.PT_ADDLINES + pmaputl.PT_ADDTHINGS, ptrShootTraverse)
+}
+
+// ===========================================================================================
+// USE LINES
+// ===========================================================================================
+
+// ptrUseTraverse — PTR_UseTraverse: activate the first usable special line; stop at a blank wall.
+flex finna ptrUseTraverse(gt: tag gs.GameState, inIdx: i32) -> bool {
+    lowkey li: int = 0
+    holla g = gt in gs.gsc {
+        li = g.tick.intercepts[inIdx as int].lineIdx as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey lspecial: int = 0
+    holla g = gt in gs.gsc {
+        lspecial = g.level.lineSpecial[li] as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey usething: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        usething = g.tick.usething
+    } ghosted {
+        yeet("gs")
+    }
+    fr lspecial == 0 {
+        pmaputl.lineOpening(gt, li as i32)
+        lowkey openrange: i32 = 0
+        holla g = gt in gs.gsc {
+            openrange = g.tick.openrange
+        } ghosted {
+            yeet("gs")
+        }
+        fr openrange <= 0 {
+            ssnd.startSound(gt, usething, sounds.SFX_NOWAY)
+            // can't use through a wall
+            bet cap
+        }
+        // not a special line, keep checking
+        bet nocap
+    }
+    lowkey ux: i32 = 0
+    lowkey uy: i32 = 0
+    holla u = usething in gs.thinkers {
+        ux = u.mobj.x
+        uy = u.mobj.y
+    } ghosted {
+        yeet("usething")
+    }
+    lowkey side: int = 0
+    fr pmaputl.pointOnLineSide(gt, ux, uy, li as i32) == 1 {
+        side = 1
+    }
+    // SEAM: P2.3 wires g.hooks.useSpecialLine to p_spec.P_UseSpecialLine.
+    lowkey useFn: finna(tag gs.GameState, tag think.Thinker, i32, i32) -> bool = ghosted
+    holla g = gt in gs.gsc {
+        useFn = g.hooks.useSpecialLine
+    } ghosted {
+        yeet("gs")
+    }
+    useFn(gt, usething, li as i32, side as i32)
+    // can't use more than one special line in a row
+    bet cap
+}
+
+// useLines — P_UseLines: look for a usable special line in front of the player. FROZEN sig.
+flex finna useLines(gt: tag gs.GameState, playerIdx: int) {
+    lowkey pmo: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        pmo = g.shell.players[playerIdx].mo
+    } ghosted {
+        yeet("gs")
+    }
+    holla g = gt in gs.gsc {
+        g.tick.usething = pmo
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey angle: u32 = 0
+    lowkey x1: i32 = 0
+    lowkey y1: i32 = 0
+    holla u = pmo in gs.thinkers {
+        angle = u.mobj.angle
+        x1 = u.mobj.x
+        y1 = u.mobj.y
+    } ghosted {
+        yeet("pmo")
+    }
+    lowkey fine: int = (angle >> 19) as int
+    lowkey x2: i32 = 0
+    lowkey y2: i32 = 0
+    holla g = gt in gs.gsc {
+        x2 = x1 + (USERANGE >> 16) * g.info.finesine[fine + 2048]
+        y2 = y1 + (USERANGE >> 16) * g.info.finesine[fine]
+    } ghosted {
+        yeet("gs")
+    }
+    pmaputl.pathTraverse(gt, x1, y1, x2, y2, pmaputl.PT_ADDLINES, ptrUseTraverse)
+}
+
+// ===========================================================================================
+// RADIUS ATTACK
+// ===========================================================================================
+
+// pitRadiusAttack — PIT_RadiusAttack: concussion-damage a thing within range if it is in sight.
+flex finna pitRadiusAttack(gt: tag gs.GameState, thing: tag think.Thinker) -> bool {
+    lowkey flags: int = 0
+    lowkey typ: int = 0
+    lowkey x: i32 = 0
+    lowkey y: i32 = 0
+    lowkey radius: i32 = 0
+    holla t = thing in gs.thinkers {
+        flags = t.mobj.flags as int
+        typ = t.mobj.typeIdx as int
+        x = t.mobj.x
+        y = t.mobj.y
+        radius = t.mobj.radius
+    } ghosted {
+        yeet("thing")
+    }
+    fr (flags & think.MF_SHOOTABLE) == 0 {
+        bet nocap
+    }
+    // Cyborg and Spider Mastermind take no concussion damage.
+    fr typ == info.MT_CYBORG || typ == info.MT_SPIDER {
+        bet nocap
+    }
+    lowkey bspot: tag think.Thinker = ghosted
+    lowkey bsource: tag think.Thinker = ghosted
+    lowkey bdamage: i32 = 0
+    lowkey bx: i32 = 0
+    lowkey by: i32 = 0
+    holla g = gt in gs.gsc {
+        bspot = g.tick.bombspot
+        bsource = g.tick.bombsource
+        bdamage = g.tick.bombdamage
+    } ghosted {
+        yeet("gs")
+    }
+    holla b = bspot in gs.thinkers {
+        bx = b.mobj.x
+        by = b.mobj.y
+    } ghosted {
+        yeet("bombspot")
+    }
+    lowkey dx: i32 = absI(x - bx)
+    lowkey dy: i32 = absI(y - by)
+    lowkey dist: i32 = dx
+    fr dy > dx {
+        dist = dy
+    }
+    dist = (dist - radius) >> 16
+    fr dist < 0 {
+        dist = 0
+    }
+    fr dist >= bdamage {
+        // out of range
+        bet nocap
+    }
+    fr psight.checkSight(gt, thing, bspot) {
+        pinter.damageMobj(gt, thing, bspot, bsource, (bdamage - dist) as int)
+    }
+    bet nocap
+}
+
+// radiusAttack — P_RadiusAttack: explosion of `damage` at `spot`, credited to `source`. FROZEN.
+flex finna radiusAttack(gt: tag gs.GameState, spot: tag think.Thinker, source: tag think.Thinker, damage: int) {
+    lowkey sx: i32 = 0
+    lowkey sy: i32 = 0
+    holla s = spot in gs.thinkers {
+        sx = s.mobj.x
+        sy = s.mobj.y
+    } ghosted {
+        yeet("spot")
+    }
+    lowkey dist: i32 = ((damage + 32) << 16) as i32   // (damage + MAXRADIUS_units) << FRACBITS
+    lowkey orgx: i32 = 0
+    lowkey orgy: i32 = 0
+    holla g = gt in gs.gsc {
+        orgx = g.level.bmapOrgX
+        orgy = g.level.bmapOrgY
+        g.tick.bombspot = spot
+        g.tick.bombsource = source
+        g.tick.bombdamage = damage as i32
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey xl: int = ((sx - dist - orgx) >> pmaputl.MAPBLOCKSHIFT) as int
+    lowkey xh: int = ((sx + dist - orgx) >> pmaputl.MAPBLOCKSHIFT) as int
+    lowkey yl: int = ((sy - dist - orgy) >> pmaputl.MAPBLOCKSHIFT) as int
+    lowkey yh: int = ((sy + dist - orgy) >> pmaputl.MAPBLOCKSHIFT) as int
+    // note: id ignores the iterator return here (no early-out).
+    blockThingsBox(gt, xl, xh, yl, yh, pitRadiusAttack)
+}
+
+// ===========================================================================================
+// SECTOR HEIGHT CHANGE (crush)
+// ===========================================================================================
+
+// pitChangeSector — PIT_ChangeSector: re-clip a thing after its sector moved; gib corpses, drop
+// dropped items, mark nofit, and crush live things (spraying blood) when crushchange is set.
+flex finna pitChangeSector(gt: tag gs.GameState, thing: tag think.Thinker) -> bool {
+    fr thingHeightClip(gt, thing) {
+        bet nocap
+    }
+    lowkey health: int = 0
+    lowkey flags: int = 0
+    holla t = thing in gs.thinkers {
+        health = t.mobj.health as int
+        flags = t.mobj.flags as int
+    } ghosted {
+        yeet("thing")
+    }
+    // crunch a corpse to giblets
+    fr health <= 0 {
+        pmobj.setMobjState(gt, thing, info.S_GIBS)
+        holla t = thing in gs.thinkers {
+            t.mobj.flags = (t.mobj.flags as int & ~think.MF_SOLID) as i32
+            t.mobj.height = 0
+            t.mobj.radius = 0
+        } ghosted {
+            yeet("thing")
+        }
+        bet nocap
+    }
+    // crunch a dropped item
+    fr (flags & think.MF_DROPPED) != 0 {
+        pmobj.removeMobj(gt, thing)
+        bet nocap
+    }
+    fr (flags & think.MF_SHOOTABLE) == 0 {
+        // bloody gibs or similar — ignore
+        bet nocap
+    }
+    holla g = gt in gs.gsc {
+        g.tick.nofit = nocap
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey crush = cap
+    lowkey leveltime: int = 0
+    holla g = gt in gs.gsc {
+        crush = g.tick.crushchange
+        leveltime = g.tick.leveltime as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr crush && (leveltime & 3) == 0 {
+        pinter.damageMobj(gt, thing, ghosted, ghosted, 10)
+        // spray blood in a random direction (P_Random order: momx pair then momy pair)
+        lowkey tx: i32 = 0
+        lowkey ty: i32 = 0
+        lowkey tz: i32 = 0
+        lowkey theight: i32 = 0
+        holla t = thing in gs.thinkers {
+            tx = t.mobj.x
+            ty = t.mobj.y
+            tz = t.mobj.z
+            theight = t.mobj.height
+        } ghosted {
+            yeet("thing")
+        }
+        lowkey mo = pmobj.spawnMobj(gt, tx, ty, tz + (theight / 2), info.MT_BLOOD)
+        lowkey r1: int = rnd.pRandom(gt)
+        lowkey r2: int = rnd.pRandom(gt)
+        lowkey r3: int = rnd.pRandom(gt)
+        lowkey r4: int = rnd.pRandom(gt)
+        holla m = mo in gs.thinkers {
+            m.mobj.momx = ((r1 - r2) << 12) as i32
+            m.mobj.momy = ((r3 - r4) << 12) as i32
+        } ghosted {
+            yeet("mo")
+        }
+    }
+    bet nocap
+}
+
+// changeSector — P_ChangeSector: re-clip every thing near `secnum` after its height changed;
+// returns true if anything no longer fits (nofit). FROZEN sig.
+flex finna changeSector(gt: tag gs.GameState, secnum: int, crunch: bool) -> bool {
+    lowkey bl: int = 0
+    lowkey br: int = 0
+    lowkey bb: int = 0
+    lowkey bt: int = 0
+    holla g = gt in gs.gsc {
+        g.tick.nofit = cap
+        g.tick.crushchange = crunch
+        bl = g.level.secBlockBox[secnum * 4 + m_bbox.BOXLEFT] as int
+        br = g.level.secBlockBox[secnum * 4 + m_bbox.BOXRIGHT] as int
+        bb = g.level.secBlockBox[secnum * 4 + m_bbox.BOXBOTTOM] as int
+        bt = g.level.secBlockBox[secnum * 4 + m_bbox.BOXTOP] as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey x: int = bl
+    vibin x <= br {
+        lowkey y: int = bb
+        vibin y <= bt {
+            pmaputl.blockThingsIterator(gt, x, y, pitChangeSector)
+            y = y + 1
+        }
+        x = x + 1
+    }
+    lowkey nofit = cap
+    holla g = gt in gs.gsc {
+        nofit = g.tick.nofit
+    } ghosted {
+        yeet("gs")
+    }
+    bet nofit
+}
+
+// ===========================================================================================
+// local helpers
+// ===========================================================================================
+
+// absI — |x| for i32 (the sim never passes INT_MIN here; matches id's C abs()).
+flex finna absI(x: i32) -> i32 {
+    fr x < 0 {
+        bet 0 - x
+    }
+    bet x
+}
+
+// tmbboxSlab — hand boxOnLineSide a []i32 view of g.tick.tmbbox. bet fixed-array drip fields are
+// not directly sliceable, so copy the 4 entries into a fresh slab (base 0). Cheap; per-line call.
+flex finna tmbboxSlab(gt: tag gs.GameState) -> []i32 {
+    lowkey b = mem.slab[i32](4)
+    holla g = gt in gs.gsc {
+        b[0] = g.tick.tmbbox[0]
+        b[1] = g.tick.tmbbox[1]
+        b[2] = g.tick.tmbbox[2]
+        b[3] = g.tick.tmbbox[3]
+    } ghosted {
+        yeet("gs")
+    }
+    bet b
+}
+
+// blockThingsBox — run `func` over the blockmap cells [xl..xh]x[yl..yh]; false if any cell's
+// P_BlockThingsIterator returns false (id's double for-loop early-out).
+flex finna blockThingsBox(gt: tag gs.GameState, xl: int, xh: int, yl: int, yh: int, func: finna(tag gs.GameState, tag think.Thinker) -> bool) -> bool {
+    lowkey ok = nocap
+    lowkey bx: int = xl
+    vibin bx <= xh && ok {
+        lowkey by: int = yl
+        vibin by <= yh && ok {
+            fr !pmaputl.blockThingsIterator(gt, bx, by, func) {
+                ok = cap
+            }
+            by = by + 1
+        }
+        bx = bx + 1
+    }
+    bet ok
+}
+
+// blockLinesBox — run `func` over the blockmap cells [xl..xh]x[yl..yh]; false if any cell's
+// P_BlockLinesIterator returns false.
+flex finna blockLinesBox(gt: tag gs.GameState, xl: int, xh: int, yl: int, yh: int, func: finna(tag gs.GameState, i32) -> bool) -> bool {
+    lowkey ok = nocap
+    lowkey bx: int = xl
+    vibin bx <= xh && ok {
+        lowkey by: int = yl
+        vibin by <= yh && ok {
+            fr !pmaputl.blockLinesIterator(gt, bx, by, func) {
+                ok = cap
+            }
+            by = by + 1
+        }
+        bx = bx + 1
+    }
+    bet ok
+}
