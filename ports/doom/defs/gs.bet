@@ -702,25 +702,60 @@ flex drip MenuState {
 }
 
 // ---- HudState (hu_stuff). -----------------------------------------------------------------
+// P2.9a amendment (additive): huFontOfs holds the 63 HU_FONT patch byte-offsets (STCFN033..
+// STCFN095), loaded by HU_Init. The existing message/messageOn/messageCounter fields carry the
+// single-player message-line state (id's w_message SText + message_counter); chatOn/chatString
+// carry the minimal chat widget (id's chat_on + w_chat.l.l).
 flex drip HudState {
     flex messageOn: bool
     flex message: str
     flex messageCounter: i32
     flex chatOn: bool
     flex chatString: str
+    flex huFontOfs: []i32         // HU_FONTSIZE=63 HU_FONT patch byte-offsets; allocated by HU_Init
 }
 
 // ---- StBarState (st_stuff). ---------------------------------------------------------------
+// P2.9a amendment (additive): the leading fields are id's face/palette state machine statics
+// (st_faceindex, st_facecount, st_oldhealth, ST_updateFaceWidget's static priority, st_random-
+// number, st_gamestate, st_firsttime, keyboxes[3], oldweaponsowned[NUMWEAPONS]). The lower
+// block adds the remaining statics + the loaded status-bar graphics (byte offsets into
+// g.wad.buf), set once by ST_Init.
 flex drip StBarState {
     flex faceIndex: i32
     flex faceCount: i32
     flex oldHealth: i32
     flex priority: i32
     flex randomNumber: i32
-    flex currentState: i32
+    flex currentState: i32          // st_gamestate: 0 AutomapState / 1 FirstPersonState
     flex firsttime: bool
     flex keyboxes: i32[3]
     flex oldweaponsowned: bool[9]
+    // face/palette statics
+    flex lastAttackDown: i32        // ST_updateFaceWidget static lastattackdown (-1 sentinel)
+    flex statusBarOn: bool          // st_statusbaron
+    flex stPalette: i32             // last palette index handed to I_SetPalette
+    flex painOldHealth: i32         // ST_calcPainOffset static oldhealth (-1 sentinel)
+    flex painLastCalc: i32          // ST_calcPainOffset static lastcalc
+    flex luPalette: i32             // PLAYPAL lump number
+    flex started: bool              // ST_Start has been called at least once (!st_stopped)
+    // loaded graphics (byte offsets into g.wad.buf; the []i32 tables are allocated by ST_Init)
+    flex sbarOfs: i32               // STBAR
+    flex armsbgOfs: i32             // STARMS
+    flex facebackOfs: i32           // STFB<consoleplayer>
+    flex tallpercentOfs: i32        // STTPRCNT
+    flex sttminusOfs: i32           // STTMINUS
+    flex tallnumOfs: []i32          // STTNUM0..9 (10)
+    flex shortnumOfs: []i32         // STYSNUM0..9 (10)
+    flex keysOfs: []i32             // STKEYS0..5 (NUMCARDS=6)
+    flex facesOfs: []i32            // ST_NUMFACES=42
+    flex armsOfs: []i32             // arms[6][2] as [i*2 + j] (12): [i][0] gray STGNUM, [i][1] yellow
+    // cheat matcher state (m_cheat): per-cheat match position + the two mutable param sequences
+    // (idmus / idclev) whose 0-slots capture digits across keypresses. Non-param sequences are
+    // rebuilt per keypress (they never mutate), so only their position persists here.
+    flex cheatPos: []i32            // 16 slots (see st_stuff cheat ordinals)
+    flex cMus: []u8                 // idmus scrambled sequence (mutable param slots)
+    flex cClev: []u8                // idclev scrambled sequence (mutable param slots)
 }
 
 // ---- AmState (am_map). --------------------------------------------------------------------

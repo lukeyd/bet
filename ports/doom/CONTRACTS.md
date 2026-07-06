@@ -311,3 +311,29 @@ Six mutated-in-place `vec` fields were therefore converted to fixed arrays + an 
 - Build-once-read vecs are UNCHANGED (still `vec`): `Wad.lumpName`, `TickState.anims`,
   `InfoTables.states/mobjinfo/sfx`, `GameShell.savegameStrings`, `AmState.marks`. Never
   element-mutate these — only `.stack` (append) then read `v[i]`.
+
+## P2.9a amendment (status bar + HUD — additive to StBarState / HudState ONLY)
+
+`st/st_stuff` + `st/st_lib` + `hu/hu_stuff` + `hu/hu_lib` added fields to two drips only (no
+sibling drip touched). All are populated by `ST_Init` / `HU_Init`; the `[]i32`/`[]u8` handle
+fields are `mem.slab`-allocated there (NOT in `gsInit`, so they are null until init — matching
+id, where the bar graphics are only cached at `ST_Init`).
+
+- **`HudState`** += `huFontOfs: []i32` (63 STCFN font-patch byte offsets). The existing
+  `message`/`messageOn`/`messageCounter` carry the single-player message line; `chatOn`/
+  `chatString` the minimal chat widget.
+- **`StBarState`** += face/palette statics `lastAttackDown`,`statusBarOn`,`stPalette`,
+  `painOldHealth`,`painLastCalc`,`luPalette`,`started`; graphic byte offsets `sbarOfs`,
+  `armsbgOfs`,`facebackOfs`,`tallpercentOfs`,`sttminusOfs`, and the `[]i32` tables
+  `tallnumOfs`/`shortnumOfs`/`keysOfs`/`facesOfs`/`armsOfs`; cheat-matcher state `cheatPos: []i32`
+  (16 slots) + the two mutable param sequences `cMus`/`cClev: []u8`. (The pre-existing
+  `faceIndex`/`faceCount`/`oldHealth`/`priority`/`randomNumber`/`currentState`/`firsttime`/
+  `keyboxes[3]`/`oldweaponsowned[9]` are id's `st_faceindex` … statics.)
+
+**Flex API for d_main/g_game (P2.8) to drive per frame/tic:** `st_stuff.stInit(gt)` /
+`stStart(gt)` / `stTicker(gt)` / `stDrawer(gt, fullscreen: bool, refresh: bool)` /
+`stResponder(gt, evType: int, key: int) -> bool`; `hu_stuff.huInit(gt)` / `huStart(gt)` /
+`huTicker(gt)` / `huDrawer(gt)` / `huResponder(gt, evType: int, key: int) -> bool`. Player state
+is read from `g.shell.players[g.shell.consoleplayer]`; the message path is
+`players[cp].message` → `HudState.message` (promoted by `huTicker`, drawn by `huDrawer`).
+Baseline: `tools/statusbar_smoke.bet` → `goldens/statusbar.golden` (native-only, WAD-scale).
