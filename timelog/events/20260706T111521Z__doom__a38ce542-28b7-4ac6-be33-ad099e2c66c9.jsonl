@@ -1,0 +1,5 @@
+{"ts":"2026-07-06T11:15:21Z","agent":"agent","task":"doom","event":"in","activity":"research","note":""}
+{"ts":"2026-07-06T11:27:42Z","agent":"agent","event":"switch","activity":"writing","note":""}
+{"ts":"2026-07-06T12:08:57Z","agent":"agent","event":"switch","activity":"docs","note":""}
+{"ts":"2026-07-06T12:12:18Z","agent":"agent","event":"switch","activity":"ci","note":""}
+{"ts":"2026-07-06T12:14:09Z","agent":"agent","event":"out","activity":"","note":""}
