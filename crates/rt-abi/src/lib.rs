@@ -180,6 +180,8 @@ pub mod event_kind {
     pub const KEY_DOWN: u32 = 1;
     pub const KEY_UP: u32 = 2;
     pub const MOUSE_MOVE: u32 = 3;
+    /// The window was closed. Esc is NOT a QUIT — it arrives as a normal
+    /// [`KEY_DOWN`]/[`KEY_UP`] (code 27) so games can drive menus with it.
     pub const QUIT: u32 = 4;
     /// A mouse button was pressed. [`Event::code`] is the button (`0` = left, `1` = right).
     pub const MOUSE_DOWN: u32 = 5;

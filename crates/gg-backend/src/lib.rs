@@ -88,7 +88,8 @@ pub mod key {
     pub const SPACE: u32 = b' ' as u32;
     /// Enter / Return. `10` (`\n`), matching the ASCII line feed.
     pub const ENTER: u32 = 10;
-    /// Escape (ASCII 27). The `desktop` backend also treats this as a QUIT request.
+    /// Escape (ASCII 27). Delivered as a normal KEY_DOWN/KEY_UP like every other key — games
+    /// with menus need to see Esc presses. QUIT (kind 4) is reserved for actual window close.
     pub const ESC: u32 = 27;
     /// Backspace (ASCII 8).
     pub const BACKSPACE: u32 = 8;
@@ -410,8 +411,8 @@ mod imp {
     /// Cap the audio ring so a program that outruns the audio callback can't grow it forever.
     const RING_CAP: usize = 1 << 20;
 
-    /// `minifb::Key` → keycode pairs used to diff the down-key set each frame. `Escape` is
-    /// handled separately (it maps to QUIT), so it is intentionally absent here.
+    /// `minifb::Key` → keycode pairs used to diff the down-key set each frame. `Escape` is a
+    /// normal key here (KEY_DOWN/KEY_UP code 27); QUIT is emitted only for window close.
     const KEY_TABLE: &[(minifb::Key, u32)] = &[
         (minifb::Key::A, key::A),
         (minifb::Key::B, key::B),
@@ -451,6 +452,7 @@ mod imp {
         (minifb::Key::Key9, key::D9),
         (minifb::Key::Space, key::SPACE),
         (minifb::Key::Enter, key::ENTER),
+        (minifb::Key::Escape, key::ESC),
         (minifb::Key::Backspace, key::BACKSPACE),
         (minifb::Key::Tab, key::TAB),
         (minifb::Key::Apostrophe, key::APOSTROPHE),
@@ -639,13 +641,15 @@ mod imp {
         }
 
         /// Diff the current key state against the previous frame, enqueueing KEY_DOWN/KEY_UP
-        /// edges, and enqueue a single QUIT when the window is closed or Esc is pressed.
+        /// edges, and enqueue a single QUIT when the window is CLOSED. Esc is deliberately NOT
+        /// a quit: it arrives as a normal key event (code 27, via `KEY_TABLE`) so games can
+        /// drive pause/settings menus with it — only window close means "the player left".
         fn pump_input(&mut self) {
             let Some(window) = self.window.as_ref() else {
                 return;
             };
 
-            if !self.quit_sent && (!window.is_open() || window.is_key_down(minifb::Key::Escape)) {
+            if !self.quit_sent && !window.is_open() {
                 self.events.push_back(Event {
                     kind: event_kind::QUIT,
                     code: 0,
