@@ -1069,6 +1069,7 @@ impl<'p> Interp<'p> {
                     }
                     "math" => return self.call_math(env, method, args).map(|v| vec![v]),
                     "sys" => return self.call_sys(env, method, args).map(|v| vec![v]),
+                    "fs" => return self.call_fs(env, method, args).map(|v| vec![v]),
                     // `gg.*` — the platform layer (window/audio/input/timing). Returns a value
                     // list directly (`gg.poll` is a 2-tuple, `gg.ticks` a 1-tuple), so it is
                     // dispatched here rather than through the single-value `.map(|v| vec![v])`
@@ -1644,6 +1645,24 @@ impl<'p> Interp<'p> {
         }
     }
 
+    /// `fs` intrinsics. `fs.peep(path)` reads the whole file as `[]u8` (empty on any error),
+    /// mirroring the runtime `bet_fs_read` used by the compiled path.
+    fn call_fs(&mut self, env: &mut Env, method: &str, args: &[Arg]) -> Result<Value, RunError> {
+        let vals = self.eval_args(env, args)?;
+        match (method, vals.as_slice()) {
+            ("peep", [Value::Str(path)]) => match std::fs::read(path) {
+                Ok(bytes) => Ok(Value::Array(
+                    bytes.into_iter().map(|b| Value::Int(b as i64)).collect(),
+                )),
+                Err(_) => Ok(Value::Array(Vec::new())),
+            },
+            ("peep", _) => Err(RunError::Type(
+                "`fs.peep` takes a single path string".into(),
+            )),
+            (other, _) => Err(RunError::Unsupported(format!("fs.{other}"))),
+        }
+    }
+
     fn call_bytes(&mut self, env: &mut Env, method: &str, args: &[Arg]) -> Result<Value, RunError> {
         let vals = self.eval_args(env, args)?;
         match (method, vals.as_slice()) {
@@ -1664,6 +1683,46 @@ impl<'p> Interp<'p> {
                 }
                 Ok(Value::Int(acc as i64))
             }
+            ("readU16le", [Value::Array(bytes), Value::Int(off)]) if *off >= 0 => {
+                let off = *off as usize;
+                let mut acc: u16 = 0;
+                for k in 0..2 {
+                    let byte = match bytes.get(off + k) {
+                        Some(Value::Int(b)) => (*b as u32) & 0xFF,
+                        Some(Value::Byte(b)) => *b as u32,
+                        _ => {
+                            return Err(RunError::Type(
+                                "bytes.readU16le needs 2 in-range byte elements".into(),
+                            ));
+                        }
+                    };
+                    acc |= (byte as u16) << (8 * k as u32);
+                }
+                Ok(Value::Int(acc as i64))
+            }
+            ("readU16le", _) => Err(RunError::Type(
+                "bytes.readU16le(buf, off) called with the wrong argument shape".into(),
+            )),
+            ("readI16le", [Value::Array(bytes), Value::Int(off)]) if *off >= 0 => {
+                let off = *off as usize;
+                let mut acc: u16 = 0;
+                for k in 0..2 {
+                    let byte = match bytes.get(off + k) {
+                        Some(Value::Int(b)) => (*b as u32) & 0xFF,
+                        Some(Value::Byte(b)) => *b as u32,
+                        _ => {
+                            return Err(RunError::Type(
+                                "bytes.readI16le needs 2 in-range byte elements".into(),
+                            ));
+                        }
+                    };
+                    acc |= (byte as u16) << (8 * k as u32);
+                }
+                Ok(Value::Int(acc as i16 as i64))
+            }
+            ("readI16le", _) => Err(RunError::Type(
+                "bytes.readI16le(buf, off) called with the wrong argument shape".into(),
+            )),
             ("readU32le", _) => Err(RunError::Type(
                 "bytes.readU32le(buf, off) called with the wrong argument shape".into(),
             )),
@@ -1733,6 +1792,143 @@ impl<'p> Interp<'p> {
                 ])
             }
             ("size", _) => Err(RunError::Type("`gg.size` takes no arguments".into())),
+            // `gg.tex(buf, byteOff, w, h)` uploads a `w * h` RGBA8 texture from a byte view of the
+            // buffer; returns its 1-based id.
+            ("tex", [pixels, Value::Int(off), Value::Int(w), Value::Int(h)])
+                if *off >= 0 && *w >= 0 && *h >= 0 =>
+            {
+                let (w, h) = (*w as u32, *h as u32);
+                let off = *off as usize;
+                let need = (w as usize) * (h as usize) * 4;
+                // Marshal ONLY the `need`-byte window at `off`, never the whole buffer: an asset
+                // pack can be hundreds of MB while the backend reads just `w * h * 4` bytes, and
+                // the compiled path likewise reads only `[off, off + w*h*4)` (a `base + off`
+                // pointer). `marshal_ints_window` clamps to the array bounds, so an out-of-range
+                // window yields the in-range part (empty past the end) instead of panicking.
+                let window = marshal_ints_window(pixels, off, need, |i| i as u8).ok_or_else(|| {
+                    RunError::Type("`gg.tex` needs an array of pixel bytes".into())
+                })?;
+                let id = gg_backend::tex(&window, w, h);
+                Ok(vec![Value::Int(i64::from(id))])
+            }
+            ("tex", _) => Err(RunError::Type(
+                "`gg.tex(buf, byteOff, w, h)` takes a buffer and three non-negative ints".into(),
+            )),
+            // `gg.frame(w, h, color)` begins a frame and clears the canvas to `color` (0x00RRGGBB).
+            ("frame", [Value::Int(w), Value::Int(h), Value::Int(c)]) if *w >= 0 && *h >= 0 => {
+                gg_backend::frame(*w as u32, *h as u32, *c as u32);
+                Ok(Vec::new())
+            }
+            ("frame", _) => Err(RunError::Type(
+                "`gg.frame(w, h, color)` takes two non-negative dimensions and a color".into(),
+            )),
+            // `gg.sprite(tex, x, y)` blits texture `tex` at `(x, y)`.
+            ("sprite", [Value::Int(t), Value::Int(x), Value::Int(y)]) => {
+                gg_backend::sprite(*t as u32, *x as i32, *y as i32);
+                Ok(Vec::new())
+            }
+            ("sprite", _) => Err(RunError::Type(
+                "`gg.sprite(tex, x, y)` takes a texture id and an x, y position".into(),
+            )),
+            // `gg.spriteSub(tex, sx, sy, sw, sh, dx, dy)` blits `tex`'s source sub-rectangle.
+            (
+                "spriteSub",
+                [
+                    Value::Int(t),
+                    Value::Int(sx),
+                    Value::Int(sy),
+                    Value::Int(sw),
+                    Value::Int(sh),
+                    Value::Int(dx),
+                    Value::Int(dy),
+                ],
+            ) => {
+                gg_backend::sprite_sub(
+                    *t as u32, *sx as i32, *sy as i32, *sw as u32, *sh as u32, *dx as i32,
+                    *dy as i32,
+                );
+                Ok(Vec::new())
+            }
+            ("spriteSub", _) => Err(RunError::Type(
+                "`gg.spriteSub(tex, sx, sy, sw, sh, dx, dy)` takes a texture id and source/dest                  rects"
+                    .into(),
+            )),
+            // `gg.rect(x, y, w, h, color)` fills a rectangle with `color` (0xAARRGGBB).
+            (
+                "rect",
+                [
+                    Value::Int(x),
+                    Value::Int(y),
+                    Value::Int(w),
+                    Value::Int(h),
+                    Value::Int(c),
+                ],
+            ) => {
+                gg_backend::rect(*x as i32, *y as i32, *w as u32, *h as u32, *c as u32);
+                Ok(Vec::new())
+            }
+            ("rect", _) => Err(RunError::Type(
+                "`gg.rect(x, y, w, h, color)` takes four ints and a color".into(),
+            )),
+            // `gg.flush()` presents the composited canvas and pumps input.
+            ("flush", []) => {
+                gg_backend::flush();
+                Ok(Vec::new())
+            }
+            ("flush", _) => Err(RunError::Type("`gg.flush` takes no arguments".into())),
+            // `gg.sound(buf, byteOff, byteLen, channels, rate)` registers a PCM sound; returns its
+            // 1-based id. The interp buffer is a `[]i16`; serialize it to interleaved LE bytes to
+            // mirror the compiled path's raw byte view (documented convention — not corpus-tested,
+            // since a live window is non-deterministic).
+            (
+                "sound",
+                [
+                    samples,
+                    Value::Int(off),
+                    Value::Int(len),
+                    Value::Int(ch),
+                    Value::Int(rate),
+                ],
+            ) if *off >= 0 && *len >= 0 && *ch >= 0 && *rate >= 0 => {
+                // Serialize ONLY the samples spanning the `[off, off + len)` byte window instead
+                // of the whole (possibly hundreds-of-MB) buffer; `sound_le_window` produces bytes
+                // identical to marshalling everything and slicing, but touches just the window.
+                let win = sound_le_window(samples, *off as usize, *len as usize).ok_or_else(|| {
+                    RunError::Type("`gg.sound` needs an array of sample integers".into())
+                })?;
+                let id = gg_backend::sound(&win, *ch as u32, *rate as u32);
+                Ok(vec![Value::Int(i64::from(id))])
+            }
+            ("sound", _) => Err(RunError::Type(
+                "`gg.sound(buf, byteOff, byteLen, channels, rate)` takes a buffer and four \
+                 non-negative ints"
+                    .into(),
+            )),
+            // `gg.play(soundId, loop, volume)` starts a voice; returns its 1-based id.
+            ("play", [Value::Int(s), Value::Int(lp), Value::Int(vol)]) if *s >= 0 && *vol >= 0 => {
+                let id = gg_backend::play(*s as u32, *lp as u32, *vol as u32);
+                Ok(vec![Value::Int(i64::from(id))])
+            }
+            ("play", _) => Err(RunError::Type(
+                "`gg.play(soundId, loop, volume)` takes a sound id, a loop flag, and a volume"
+                    .into(),
+            )),
+            // `gg.stop(voiceId)` stops a voice.
+            ("stop", [Value::Int(v)]) if *v >= 0 => {
+                gg_backend::stop(*v as u32);
+                Ok(Vec::new())
+            }
+            ("stop", _) => Err(RunError::Type("`gg.stop` takes a single voice id".into())),
+            // `gg.mouse()` returns the mouse `(x, y)` in logical-canvas coords; the ABI packs
+            // `x << 32 | y`.
+            ("mouse", []) => {
+                let v = gg_backend::mouse();
+                Ok(vec![
+                    Value::Int((v >> 32) as i64),
+                    Value::Int((v & 0xFFFF_FFFF) as i64),
+                ])
+            }
+            ("mouse", _) => Err(RunError::Type("`gg.mouse` takes no arguments".into())),
             (other, _) => Err(RunError::Unsupported(format!("gg.{other}"))),
         }
     }
@@ -1814,6 +2010,58 @@ fn marshal_ints<T>(v: &Value, conv: impl Fn(i64) -> T) -> Option<Vec<T>> {
         }
     }
     Some(out)
+}
+
+/// Marshal a contiguous element window `[start, start + count)` of a `gg` pixel/sample array
+/// `Value` into a `Vec<T>` via `conv`, clamping the range to the array's bounds (an out-of-range
+/// window yields only the in-range part, empty when `start` is past the end). Unlike
+/// [`marshal_ints`], it walks ONLY the requested window — never the whole array — so a
+/// hundreds-of-MB asset buffer is not copied end-to-end on every `gg.tex` / `gg.sound` call.
+/// Returns `None` if the value is not an array of integers (only the windowed elements are
+/// inspected).
+fn marshal_ints_window<T>(
+    v: &Value,
+    start: usize,
+    count: usize,
+    conv: impl Fn(i64) -> T,
+) -> Option<Vec<T>> {
+    let Value::Array(xs) = v else {
+        return None;
+    };
+    let start = start.min(xs.len());
+    let end = start.saturating_add(count).min(xs.len());
+    let mut out = Vec::with_capacity(end - start);
+    for e in &xs[start..end] {
+        match e {
+            Value::Int(i) => out.push(conv(*i)),
+            Value::Byte(b) => out.push(conv(i64::from(*b))),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Serialize the `[off, off + len)` BYTE window of a `[]i16` sample array — viewed as interleaved
+/// little-endian bytes, mirroring the compiled path's raw byte view — WITHOUT serializing the
+/// whole buffer. Only the samples spanning the window (`off / 2 ..= (off + len - 1) / 2`) are
+/// marshaled, so an asset-pack-sized buffer is not walked end-to-end. The result is byte-for-byte
+/// identical to marshalling every sample and slicing `[off, off + len)`. Returns `None` if
+/// `samples` is not an integer array.
+fn sound_le_window(samples: &Value, off: usize, len: usize) -> Option<Vec<u8>> {
+    let first = off / 2; // first sample whose bytes fall in the window
+    let byte_end = off.saturating_add(len); // exclusive byte bound
+    let count = byte_end.div_ceil(2).saturating_sub(first); // samples spanning the window
+    let pcm = marshal_ints_window(samples, first, count, |i| i as i16)?;
+    let mut bytes = Vec::with_capacity(pcm.len() * 2);
+    for s in &pcm {
+        bytes.extend_from_slice(&s.to_le_bytes());
+    }
+    // `bytes` starts at byte `2 * first`; carve out the requested `[off, byte_end)` sub-range,
+    // clamped to what the array actually provided (an out-of-range window yields fewer bytes).
+    let base = 2 * first;
+    let lo = off.saturating_sub(base).min(bytes.len());
+    let hi = byte_end.saturating_sub(base).min(bytes.len());
+    Some(bytes[lo..hi].to_vec())
 }
 
 fn exactly_one(mut vals: Vec<Value>) -> Result<Value, RunError> {
@@ -2072,4 +2320,123 @@ fn format_str(fmt: &str, args: &[Value]) -> Result<String, RunError> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod gg_marshal_tests {
+    use super::*;
+
+    fn ints(xs: &[i64]) -> Value {
+        Value::Array(xs.iter().map(|&i| Value::Int(i)).collect())
+    }
+
+    // Oracles: the OLD whole-buffer behavior, kept verbatim to prove the windowed fix is
+    // byte-identical to marshalling everything and slicing.
+    fn old_tex_window(pixels: &Value, off: usize, need: usize) -> Vec<u8> {
+        let bytes = marshal_ints(pixels, |i| i as u8).unwrap();
+        if off <= bytes.len() {
+            bytes[off..off.saturating_add(need).min(bytes.len())].to_vec()
+        } else {
+            Vec::new()
+        }
+    }
+    fn old_sound_window(samples: &Value, off: usize, len: usize) -> Vec<u8> {
+        let pcm = marshal_ints(samples, |i| i as i16).unwrap();
+        let mut all = Vec::with_capacity(pcm.len() * 2);
+        for s in &pcm {
+            all.extend_from_slice(&s.to_le_bytes());
+        }
+        if off <= all.len() {
+            all[off..off.saturating_add(len).min(all.len())].to_vec()
+        } else {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn window_marshal_clamps_and_slices() {
+        let v = ints(&[10, 20, 30, 40, 50]);
+        assert_eq!(
+            marshal_ints_window(&v, 1, 3, |i| i as u8),
+            Some(vec![20u8, 30, 40])
+        );
+        // window running past the end clamps to what exists
+        assert_eq!(
+            marshal_ints_window(&v, 3, 10, |i| i as u8),
+            Some(vec![40u8, 50])
+        );
+        // start past the end -> empty
+        assert_eq!(
+            marshal_ints_window(&v, 9, 4, |i| i as u8),
+            Some(Vec::<u8>::new())
+        );
+        // count 0 -> empty
+        assert_eq!(
+            marshal_ints_window(&v, 2, 0, |i| i as u8),
+            Some(Vec::<u8>::new())
+        );
+    }
+
+    #[test]
+    fn window_marshal_accepts_bytes_and_rejects_others() {
+        let bytes = Value::Array(vec![Value::Byte(1), Value::Byte(2), Value::Byte(3)]);
+        assert_eq!(
+            marshal_ints_window(&bytes, 0, 2, |i| i as u8),
+            Some(vec![1u8, 2])
+        );
+        // not an array
+        assert_eq!(marshal_ints_window(&Value::Int(5), 0, 1, |i| i as u8), None);
+        // a non-int element INSIDE the window rejects
+        let mixed = Value::Array(vec![Value::Int(1), Value::Str("x".into())]);
+        assert_eq!(marshal_ints_window(&mixed, 0, 2, |i| i as u8), None);
+        // ... but a bad element OUTSIDE the window is never inspected
+        assert_eq!(
+            marshal_ints_window(&mixed, 0, 1, |i| i as u8),
+            Some(vec![1u8])
+        );
+    }
+
+    #[test]
+    fn tex_window_matches_full_marshal() {
+        // a []u8-style buffer (each element is one byte 0..64)
+        let v = ints(&(0..64).collect::<Vec<_>>());
+        for &(off, need) in &[
+            (0usize, 16usize),
+            (4, 16),
+            (8, 40),
+            (60, 16),
+            (70, 8),
+            (0, 64),
+            (64, 4),
+        ] {
+            assert_eq!(
+                marshal_ints_window(&v, off, need, |i| i as u8).unwrap(),
+                old_tex_window(&v, off, need),
+                "tex off={off} need={need}"
+            );
+        }
+    }
+
+    #[test]
+    fn sound_window_matches_full_marshal() {
+        let v = ints(&[0x1234, -1, 0x0055, 32767, -32768, 100, 200, 300]);
+        // even/odd offsets, out-of-range window, zero length
+        for &(off, len) in &[
+            (0usize, 4usize),
+            (2, 6),
+            (1, 3),
+            (3, 5),
+            (0, 16),
+            (10, 6),
+            (14, 10),
+            (30, 4),
+            (6, 0),
+        ] {
+            assert_eq!(
+                sound_le_window(&v, off, len).unwrap(),
+                old_sound_window(&v, off, len),
+                "sound off={off} len={len}"
+            );
+        }
+    }
 }

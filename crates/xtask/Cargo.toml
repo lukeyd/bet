@@ -13,5 +13,15 @@ serde          = { workspace = true }
 serde_json     = { workspace = true }
 toml           = { workspace = true }
 
+# Media decoding for `bake-frozen-bubble` is kept entirely inside xtask, out of the bet
+# toolchain. `image` is format-agnostic (real Frozen Bubble gfx mixes .png/.gif + `-mini`
+# variants) and yields RGBA8888 uniformly; `default-features = false` keeps it lean — only the
+# formats FB actually ships — and the `png` feature also provides the PNG *encoder* the inline
+# round-trip self-test uses. `lewton` is a pure-Rust Ogg Vorbis decoder (no C/system deps) for
+# the .ogg sound effects. Both are external crates, so they are invisible to
+# `cargo xtask graph-check` (no allowlist change needed).
+image  = { version = "0.25", default-features = false, features = ["png", "gif", "bmp"] }
+lewton = "0.10"
+
 [lints]
 workspace = true

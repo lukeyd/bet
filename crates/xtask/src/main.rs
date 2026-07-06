@@ -10,12 +10,16 @@
 //!   corpus --compiled   compiled differential column: `bet build` + run each program and
 //!                       assert its stdout == .expected == the interpreter's stdout
 //!   dist                stub (lands with release work)
+//!   bake-frozen-bubble  bake a local Frozen Bubble (GPL-2) share/ checkout into a packed
+//!                       assets.dat + a generated assets_gen.bet index
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
+
+mod bake_fb;
 
 const USAGE: &str = "\
 usage: cargo xtask <command>
@@ -31,6 +35,9 @@ usage: cargo xtask <command>
   selfhost                    self-hosted-frontend tracer: build selfhost/betfe.bet, run it to
                                           emit .mir, compile+run that, assert the hello oracle
                                           (needs an LLVM codegen driver; skipped cleanly without one)
+  bake-frozen-bubble --src <fb-checkout> --out <path/assets.dat>
+                              decode a local Frozen Bubble (GPL-2) share/ tree into one packed
+                              .dat + a generated assets_gen.bet index (FB assets are not shipped)
   dist                        (stub — release packaging)";
 
 fn main() -> ExitCode {
@@ -44,6 +51,7 @@ fn main() -> ExitCode {
         "setup-llvm" => setup_llvm(),
         "corpus" => corpus(rest),
         "selfhost" => selfhost(&workspace_root()),
+        "bake-frozen-bubble" => bake_fb::run(rest),
         "dist" => stub_cmd("dist", "release-artifact packaging for the 6 targets"),
         "" => {
             eprintln!("{USAGE}");

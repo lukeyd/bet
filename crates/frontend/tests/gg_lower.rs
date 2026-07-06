@@ -68,3 +68,53 @@ fn gg_full_snippet_lowers() {
     // Uncomment / run with `--nocapture` to inspect the lowered IR.
     println!("=== gg full snippet .mir ===\n{text}");
 }
+
+#[test]
+fn gg_tex_uploads_texture() {
+    let src = "finna main() {\n lowkey px = mem.slab[u8](64)\n \
+               lowkey id = gg.tex(px, 0, 4, 4)\n spill.it(id) }";
+    let text = mir(src);
+    assert!(text.contains("bet_gg_tex"), "tex extern missing:\n{text}");
+}
+
+#[test]
+fn gg_frame_sprite_rect_flush_lower() {
+    let src = "finna main() {\n lowkey px = mem.slab[u8](64)\n \
+               lowkey id = gg.tex(px, 0, 4, 4)\n gg.frame(320, 240, 0)\n \
+               gg.sprite(id, 10, 20)\n gg.spriteSub(id, 0, 0, 2, 2, 30, 40)\n                gg.rect(0, 0, 8, 8, 0)\n gg.flush() }";
+    let text = mir(src);
+    for sym in [
+        "bet_gg_frame",
+        "bet_gg_sprite",
+        "bet_gg_sprite_sub",
+        "bet_gg_rect",
+        "bet_gg_flush",
+    ] {
+        assert!(text.contains(sym), "{sym} missing:\n{text}");
+    }
+}
+
+#[test]
+fn gg_sound_play_stop_lower() {
+    let src = "finna main() {\n lowkey buf = mem.slab[i16](128)\n \
+               lowkey s = gg.sound(buf, 0, 256, 1, 44100)\n \
+               lowkey v = gg.play(s, 0, 256)\n gg.stop(v) }";
+    let text = mir(src);
+    for sym in ["bet_gg_sound", "bet_gg_play", "bet_gg_stop"] {
+        assert!(text.contains(sym), "{sym} missing:\n{text}");
+    }
+}
+
+#[test]
+fn gg_mouse_returns_xy_tuple() {
+    let src = "finna main() { lowkey mx, my = gg.mouse()\n spill.it(mx)\n spill.it(my) }";
+    let text = mir(src);
+    assert!(
+        text.contains("bet_gg_mouse"),
+        "mouse extern missing:\n{text}"
+    );
+    assert!(
+        text.contains("tuple("),
+        "mouse should build a tuple:\n{text}"
+    );
+}

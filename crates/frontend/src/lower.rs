@@ -2986,6 +2986,48 @@ impl LowerCtx {
         Ok(Operand::Copy(Place::local(ptr)))
     }
 
+    /// Like [`Self::buffer_base_ptr`], but returns a raw pointer `byteOff` BYTES into the buffer.
+    /// The `gg.tex` / `gg.sound` ABI counts the offset in bytes, but midir has no pointer+int
+    /// arithmetic — only element-granular indexing — so the byte offset is converted to an element
+    /// index by dividing by the element's size (`byteOff / sizeof(T)`). Exact for `byteOff == 0`
+    /// (the demo) and any offset that is a whole multiple of the element size; for a `[]u8` buffer
+    /// `sizeof == 1`, so it matches `bytes.readU32le`'s plain `Index(byteOff)`.
+    fn buffer_byte_ptr(&mut self, buf_arg: &Expr, off_arg: &Expr) -> Result<Operand, String> {
+        let rawptr = self.m.intern_ty(TyKind::RawPtr);
+        let usize_t = self.m.t_int(IntWidth::W64, false);
+        let i64t = self.m.t_i64();
+        let (buf, bufty) = self.lower_expr(buf_arg, None)?;
+        let place = self
+            .operand_place(buf)
+            .ok_or_else(|| "`gg` buffer argument must be addressable".to_string())?;
+        let elem = match self.m.ty(bufty) {
+            TyKind::Array(elem, _) => *elem,
+            TyKind::Slice(elem) => *elem,
+            other => {
+                return Err(format!(
+                    "`gg` buffer argument must be an array or slice ({other:?})"
+                ));
+            }
+        };
+        let (off, offty) = self.lower_expr(off_arg, Some(i64t))?;
+        let off = self.coerce_int(off, offty, i64t);
+        // elem_idx = byteOff / sizeof(T): element-granular GEP (midir has no ptr+int arithmetic).
+        let esize_us = self.new_local(usize_t);
+        self.fb()
+            .assign(Place::local(esize_us), Rvalue::SizeOf(elem));
+        let esize = self.coerce_int(Operand::Copy(Place::local(esize_us)), usize_t, i64t);
+        let idx = self.new_local(i64t);
+        self.fb().assign(
+            Place::local(idx),
+            Rvalue::BinOp(BinOp::Div, off, esize, ArithMode::Trap),
+        );
+        let elem_place = extend(&place, Proj::Index(Operand::Copy(Place::local(idx))));
+        let ptr = self.new_local(rawptr);
+        self.fb()
+            .assign(Place::local(ptr), Rvalue::AddrOf(elem_place));
+        Ok(Operand::Copy(Place::local(ptr)))
+    }
+
     fn lower_intrinsic(
         &mut self,
         module: &str,
@@ -3100,6 +3142,152 @@ impl LowerCtx {
                 }
                 Ok((Operand::Copy(Place::local(acc)), u32t))
             }
+            // `bytes.readU16le(buf, off)` — a little-endian u16 from `buf[off..off+2]`,
+            // zero-extended (keeps the narrow unsigned width, like `readU32le`).
+            ("bytes", "readU16le") => {
+                if args.len() != 2 {
+                    return Err("`bytes.readU16le` takes a byte slice and an offset".into());
+                }
+                let i64t = self.m.t_i64();
+                let u16t = self.m.t_int(IntWidth::W16, false);
+                let (buf, bufty) = self.lower_expr(&args[0].value, None)?;
+                let elem = match self.m.ty(bufty) {
+                    TyKind::Slice(e) | TyKind::Array(e, _) => *e,
+                    other => {
+                        return Err(format!("`bytes.readU16le` needs a byte slice ({other:?})"));
+                    }
+                };
+                let buf_place = self
+                    .operand_place(buf)
+                    .ok_or_else(|| "`bytes.readU16le` buffer must be addressable".to_string())?;
+                let (off, _) = self.lower_expr(&args[1].value, Some(i64t))?;
+
+                let acc = self.new_local(u16t);
+                self.fb().assign(
+                    Place::local(acc),
+                    Rvalue::Use(Operand::Const(Const::Int(0, u16t))),
+                );
+                for k in 0..2u32 {
+                    let idx = self.new_local(i64t);
+                    self.fb().assign(
+                        Place::local(idx),
+                        Rvalue::BinOp(
+                            BinOp::Add,
+                            off.clone(),
+                            Operand::Const(Const::Int(k as i128, i64t)),
+                            ArithMode::Wrap,
+                        ),
+                    );
+                    let byte_place =
+                        extend(&buf_place, Proj::Index(Operand::Copy(Place::local(idx))));
+                    let widened = self.new_local(u16t);
+                    let kind = self.cast_kind(elem, u16t).unwrap_or(CastKind::IntZext);
+                    self.fb().assign(
+                        Place::local(widened),
+                        Rvalue::Cast(Operand::Copy(byte_place), u16t, kind),
+                    );
+                    let shifted = self.new_local(u16t);
+                    self.fb().assign(
+                        Place::local(shifted),
+                        Rvalue::BinOp(
+                            BinOp::Shl,
+                            Operand::Copy(Place::local(widened)),
+                            Operand::Const(Const::Int((8 * k) as i128, u16t)),
+                            ArithMode::Na,
+                        ),
+                    );
+                    let next = self.new_local(u16t);
+                    self.fb().assign(
+                        Place::local(next),
+                        Rvalue::BinOp(
+                            BinOp::BitOr,
+                            Operand::Copy(Place::local(acc)),
+                            Operand::Copy(Place::local(shifted)),
+                            ArithMode::Na,
+                        ),
+                    );
+                    self.fb().assign(
+                        Place::local(acc),
+                        Rvalue::Use(Operand::Copy(Place::local(next))),
+                    );
+                }
+                Ok((Operand::Copy(Place::local(acc)), u16t))
+            }
+            // `bytes.readI16le(buf, off)` — a little-endian i16 from `buf[off..off+2]`,
+            // sign-extended to `int` (i64).
+            ("bytes", "readI16le") => {
+                if args.len() != 2 {
+                    return Err("`bytes.readI16le` takes a byte slice and an offset".into());
+                }
+                let i64t = self.m.t_i64();
+                let u16t = self.m.t_int(IntWidth::W16, false);
+                let i16t = self.m.t_int(IntWidth::W16, true);
+                let (buf, bufty) = self.lower_expr(&args[0].value, None)?;
+                let elem = match self.m.ty(bufty) {
+                    TyKind::Slice(e) | TyKind::Array(e, _) => *e,
+                    other => {
+                        return Err(format!("`bytes.readI16le` needs a byte slice ({other:?})"));
+                    }
+                };
+                let buf_place = self
+                    .operand_place(buf)
+                    .ok_or_else(|| "`bytes.readI16le` buffer must be addressable".to_string())?;
+                let (off, _) = self.lower_expr(&args[1].value, Some(i64t))?;
+
+                let acc = self.new_local(u16t);
+                self.fb().assign(
+                    Place::local(acc),
+                    Rvalue::Use(Operand::Const(Const::Int(0, u16t))),
+                );
+                for k in 0..2u32 {
+                    let idx = self.new_local(i64t);
+                    self.fb().assign(
+                        Place::local(idx),
+                        Rvalue::BinOp(
+                            BinOp::Add,
+                            off.clone(),
+                            Operand::Const(Const::Int(k as i128, i64t)),
+                            ArithMode::Wrap,
+                        ),
+                    );
+                    let byte_place =
+                        extend(&buf_place, Proj::Index(Operand::Copy(Place::local(idx))));
+                    let widened = self.new_local(u16t);
+                    let kind = self.cast_kind(elem, u16t).unwrap_or(CastKind::IntZext);
+                    self.fb().assign(
+                        Place::local(widened),
+                        Rvalue::Cast(Operand::Copy(byte_place), u16t, kind),
+                    );
+                    let shifted = self.new_local(u16t);
+                    self.fb().assign(
+                        Place::local(shifted),
+                        Rvalue::BinOp(
+                            BinOp::Shl,
+                            Operand::Copy(Place::local(widened)),
+                            Operand::Const(Const::Int((8 * k) as i128, u16t)),
+                            ArithMode::Na,
+                        ),
+                    );
+                    let next = self.new_local(u16t);
+                    self.fb().assign(
+                        Place::local(next),
+                        Rvalue::BinOp(
+                            BinOp::BitOr,
+                            Operand::Copy(Place::local(acc)),
+                            Operand::Copy(Place::local(shifted)),
+                            ArithMode::Na,
+                        ),
+                    );
+                    self.fb().assign(
+                        Place::local(acc),
+                        Rvalue::Use(Operand::Copy(Place::local(next))),
+                    );
+                }
+                // Reinterpret the u16 pattern as i16 (same width => Bitcast), then sign-extend.
+                let signed = self.coerce_int(Operand::Copy(Place::local(acc)), u16t, i16t);
+                let wide = self.coerce_int(signed, i16t, i64t);
+                Ok((wide, i64t))
+            }
             // `fs.peepText(path)` — the whole file at `path` as a `str` (empty on any error).
             // (A future `(str, yikes)` form can layer the error channel on top.)
             ("fs", "peepText") => {
@@ -3147,6 +3335,58 @@ impl LowerCtx {
                     },
                 );
                 Ok((Operand::Copy(Place::local(result)), strt))
+            }
+            // `fs.peep(path)` — the whole file at `path` as a `[]u8` (empty on any error).
+            // A byte-slice sibling of `fs.peepText`; both call `bet_fs_read`, which returns raw
+            // bytes, so the slice view is byte-identical to the interpreter's `[]u8`.
+            ("fs", "peep") => {
+                if args.len() != 1 {
+                    return Err("`fs.peep` takes a single path string".into());
+                }
+                let rawptr = self.m.intern_ty(TyKind::RawPtr);
+                let usize_t = self.m.t_int(IntWidth::W64, false);
+                let u8t = self.m.t_int(IntWidth::W8, false);
+                let slice_ty = self.m.intern_ty(TyKind::Slice(u8t));
+                let strt = self.m.t_str();
+                let (path, _) = self.lower_expr(&args[0].value, Some(strt))?;
+                let pp = self.new_local(rawptr);
+                self.fb()
+                    .assign(Place::local(pp), Rvalue::StrPtr(path.clone()));
+                let pl = self.new_local(usize_t);
+                self.fb().assign(Place::local(pl), Rvalue::StrLen(path));
+                // An out-parameter local for the read length; pass its address.
+                let out_len = self.new_local(usize_t);
+                self.fb().assign(
+                    Place::local(out_len),
+                    Rvalue::Use(Operand::Const(Const::Int(0, usize_t))),
+                );
+                let out_ptr = self.new_local(rawptr);
+                self.fb()
+                    .assign(Place::local(out_ptr), Rvalue::AddrOf(Place::local(out_len)));
+                let ext =
+                    self.get_extern("bet_fs_read", vec![rawptr, usize_t, rawptr], vec![rawptr]);
+                let data = self.new_local(rawptr);
+                self.fb().assign(
+                    Place::local(data),
+                    Rvalue::Call(
+                        Callee::Extern(ext),
+                        vec![
+                            Operand::Copy(Place::local(pp)),
+                            Operand::Copy(Place::local(pl)),
+                            Operand::Copy(Place::local(out_ptr)),
+                        ],
+                    ),
+                );
+                let result = self.new_local(slice_ty);
+                self.fb().assign(
+                    Place::local(result),
+                    Rvalue::MakeSlice {
+                        data: Operand::Copy(Place::local(data)),
+                        len: Operand::Copy(Place::local(out_len)),
+                        elem: u8t,
+                    },
+                );
+                Ok((Operand::Copy(Place::local(result)), slice_ty))
             }
             // `sys.argc()` — the process argument count, as an `int`.
             ("sys", "argc") => {
@@ -3635,6 +3875,227 @@ impl LowerCtx {
                 self.fb().assign(
                     Place::local(tup),
                     Rvalue::Aggregate(AggKind::Tuple, vec![w, h]),
+                );
+                Ok((Operand::Copy(Place::local(tup)), tuple_ty))
+            }
+            // `gg.tex(buf, byteOff, w, h) -> int` — upload an RGBA8 texture (4 bytes/pixel) from a
+            // byte-offset view of `buf`; returns its 1-based id (u32 -> int, like `gg.ticks`).
+            ("gg", "tex") => {
+                if args.len() != 4 {
+                    return Err(
+                        "`gg.tex` takes a pixel buffer, a byte offset, a width, and a height"
+                            .into(),
+                    );
+                }
+                let rawptr = self.m.intern_ty(TyKind::RawPtr);
+                let u32t = self.m.t_u32();
+                let i64t = self.m.t_i64();
+                let ptr = self.buffer_byte_ptr(&args[0].value, &args[1].value)?;
+                let (w, wty) = self.lower_expr(&args[2].value, Some(u32t))?;
+                let w = self.coerce_int(w, wty, u32t);
+                let (h, hty) = self.lower_expr(&args[3].value, Some(u32t))?;
+                let h = self.coerce_int(h, hty, u32t);
+                let ext = self.get_extern("bet_gg_tex", vec![rawptr, u32t, u32t], vec![u32t]);
+                let id = self.new_local(u32t);
+                self.fb().assign(
+                    Place::local(id),
+                    Rvalue::Call(Callee::Extern(ext), vec![ptr, w, h]),
+                );
+                let v = self.coerce_int(Operand::Copy(Place::local(id)), u32t, i64t);
+                Ok((v, i64t))
+            }
+            // `gg.frame(w, h, color)` — begin a frame: (re)size the canvas and clear to `color`
+            // (`0x00RRGGBB`). Void statement.
+            ("gg", "frame") => {
+                if args.len() != 3 {
+                    return Err("`gg.frame` takes a width, a height, and a clear color".into());
+                }
+                let u32t = self.m.t_u32();
+                let (w, wty) = self.lower_expr(&args[0].value, Some(u32t))?;
+                let w = self.coerce_int(w, wty, u32t);
+                let (h, hty) = self.lower_expr(&args[1].value, Some(u32t))?;
+                let h = self.coerce_int(h, hty, u32t);
+                let (c, cty) = self.lower_expr(&args[2].value, Some(u32t))?;
+                let c = self.coerce_int(c, cty, u32t);
+                let ext = self.get_extern("bet_gg_frame", vec![u32t, u32t, u32t], vec![]);
+                self.emit_extern_call(ext, &[], vec![w, h, c])
+            }
+            // `gg.sprite(tex, x, y)` — src-over blit of texture `tex` at `(x, y)`. Void statement.
+            ("gg", "sprite") => {
+                if args.len() != 3 {
+                    return Err("`gg.sprite` takes a texture id and an x, y position".into());
+                }
+                let u32t = self.m.t_u32();
+                let i32t = self.m.t_int(IntWidth::W32, true);
+                let (t, tty) = self.lower_expr(&args[0].value, Some(u32t))?;
+                let t = self.coerce_int(t, tty, u32t);
+                let (x, xty) = self.lower_expr(&args[1].value, Some(i32t))?;
+                let x = self.coerce_int(x, xty, i32t);
+                let (y, yty) = self.lower_expr(&args[2].value, Some(i32t))?;
+                let y = self.coerce_int(y, yty, i32t);
+                let ext = self.get_extern("bet_gg_sprite", vec![u32t, i32t, i32t], vec![]);
+                self.emit_extern_call(ext, &[], vec![t, x, y])
+            }
+            // `gg.spriteSub(tex, sx, sy, sw, sh, dx, dy)` — src-over blit of a texture's source
+            // sub-rectangle to `(dx, dy)`. The glyph-blit primitive behind bitmap text. Void.
+            ("gg", "spriteSub") => {
+                if args.len() != 7 {
+                    return Err(
+                        "`gg.spriteSub` takes a texture id, a source x, y, w, h, and a dest x, y"
+                            .into(),
+                    );
+                }
+                let u32t = self.m.t_u32();
+                let i32t = self.m.t_int(IntWidth::W32, true);
+                let (t, tty) = self.lower_expr(&args[0].value, Some(u32t))?;
+                let t = self.coerce_int(t, tty, u32t);
+                let (sx, sxty) = self.lower_expr(&args[1].value, Some(i32t))?;
+                let sx = self.coerce_int(sx, sxty, i32t);
+                let (sy, syty) = self.lower_expr(&args[2].value, Some(i32t))?;
+                let sy = self.coerce_int(sy, syty, i32t);
+                let (sw, swty) = self.lower_expr(&args[3].value, Some(u32t))?;
+                let sw = self.coerce_int(sw, swty, u32t);
+                let (sh, shty) = self.lower_expr(&args[4].value, Some(u32t))?;
+                let sh = self.coerce_int(sh, shty, u32t);
+                let (dx, dxty) = self.lower_expr(&args[5].value, Some(i32t))?;
+                let dx = self.coerce_int(dx, dxty, i32t);
+                let (dy, dyty) = self.lower_expr(&args[6].value, Some(i32t))?;
+                let dy = self.coerce_int(dy, dyty, i32t);
+                let ext = self.get_extern(
+                    "bet_gg_sprite_sub",
+                    vec![u32t, i32t, i32t, u32t, u32t, i32t, i32t],
+                    vec![],
+                );
+                self.emit_extern_call(ext, &[], vec![t, sx, sy, sw, sh, dx, dy])
+            }
+            // `gg.rect(x, y, w, h, color)` — src-over fill with `color` (`0xAARRGGBB`). Void.
+            ("gg", "rect") => {
+                if args.len() != 5 {
+                    return Err("`gg.rect` takes x, y, w, h, and a color".into());
+                }
+                let u32t = self.m.t_u32();
+                let i32t = self.m.t_int(IntWidth::W32, true);
+                let (x, xty) = self.lower_expr(&args[0].value, Some(i32t))?;
+                let x = self.coerce_int(x, xty, i32t);
+                let (y, yty) = self.lower_expr(&args[1].value, Some(i32t))?;
+                let y = self.coerce_int(y, yty, i32t);
+                let (w, wty) = self.lower_expr(&args[2].value, Some(u32t))?;
+                let w = self.coerce_int(w, wty, u32t);
+                let (h, hty) = self.lower_expr(&args[3].value, Some(u32t))?;
+                let h = self.coerce_int(h, hty, u32t);
+                let (c, cty) = self.lower_expr(&args[4].value, Some(u32t))?;
+                let c = self.coerce_int(c, cty, u32t);
+                let ext =
+                    self.get_extern("bet_gg_rect", vec![i32t, i32t, u32t, u32t, u32t], vec![]);
+                self.emit_extern_call(ext, &[], vec![x, y, w, h, c])
+            }
+            // `gg.flush()` — present the composited canvas and pump input. Void statement.
+            ("gg", "flush") => {
+                if !args.is_empty() {
+                    return Err("`gg.flush` takes no arguments".into());
+                }
+                let ext = self.get_extern("bet_gg_flush", vec![], vec![]);
+                self.emit_extern_call(ext, &[], vec![])
+            }
+            // `gg.sound(buf, byteOff, byteLen, channels, rate) -> int` — register a PCM sound from a
+            // byte view of `buf`; returns its 1-based id.
+            ("gg", "sound") => {
+                if args.len() != 5 {
+                    return Err(
+                        "`gg.sound` takes a sample buffer, a byte offset, a byte length, a channel \
+                         count, and a sample rate"
+                            .into(),
+                    );
+                }
+                let rawptr = self.m.intern_ty(TyKind::RawPtr);
+                let usize_t = self.m.t_int(IntWidth::W64, false);
+                let u32t = self.m.t_u32();
+                let i64t = self.m.t_i64();
+                let ptr = self.buffer_byte_ptr(&args[0].value, &args[1].value)?;
+                let (len, lty) = self.lower_expr(&args[2].value, Some(usize_t))?;
+                let len = self.coerce_int(len, lty, usize_t);
+                let (ch, chty) = self.lower_expr(&args[3].value, Some(u32t))?;
+                let ch = self.coerce_int(ch, chty, u32t);
+                let (rate, rty) = self.lower_expr(&args[4].value, Some(u32t))?;
+                let rate = self.coerce_int(rate, rty, u32t);
+                let ext = self.get_extern(
+                    "bet_gg_sound",
+                    vec![rawptr, usize_t, u32t, u32t],
+                    vec![u32t],
+                );
+                let id = self.new_local(u32t);
+                self.fb().assign(
+                    Place::local(id),
+                    Rvalue::Call(Callee::Extern(ext), vec![ptr, len, ch, rate]),
+                );
+                let v = self.coerce_int(Operand::Copy(Place::local(id)), u32t, i64t);
+                Ok((v, i64t))
+            }
+            // `gg.play(soundId, loop, volume) -> int` — start a voice; returns its 1-based id.
+            ("gg", "play") => {
+                if args.len() != 3 {
+                    return Err("`gg.play` takes a sound id, a loop flag, and a volume".into());
+                }
+                let u32t = self.m.t_u32();
+                let i64t = self.m.t_i64();
+                let (s, sty) = self.lower_expr(&args[0].value, Some(u32t))?;
+                let s = self.coerce_int(s, sty, u32t);
+                let (lp, lty) = self.lower_expr(&args[1].value, Some(u32t))?;
+                let lp = self.coerce_int(lp, lty, u32t);
+                let (vol, vty) = self.lower_expr(&args[2].value, Some(u32t))?;
+                let vol = self.coerce_int(vol, vty, u32t);
+                let ext = self.get_extern("bet_gg_play", vec![u32t, u32t, u32t], vec![u32t]);
+                let id = self.new_local(u32t);
+                self.fb().assign(
+                    Place::local(id),
+                    Rvalue::Call(Callee::Extern(ext), vec![s, lp, vol]),
+                );
+                let v = self.coerce_int(Operand::Copy(Place::local(id)), u32t, i64t);
+                Ok((v, i64t))
+            }
+            // `gg.stop(voiceId)` — stop a voice. Void statement.
+            ("gg", "stop") => {
+                if args.len() != 1 {
+                    return Err("`gg.stop` takes a single voice id".into());
+                }
+                let u32t = self.m.t_u32();
+                let (v, vty) = self.lower_expr(&args[0].value, Some(u32t))?;
+                let v = self.coerce_int(v, vty, u32t);
+                let ext = self.get_extern("bet_gg_stop", vec![u32t], vec![]);
+                self.emit_extern_call(ext, &[], vec![v])
+            }
+            // `gg.mouse()` -> (int, int) — the mouse position in logical-canvas coordinates. The ABI
+            // packs it `x << 32 | y`; unpack `x` by a right shift and `y` by truncation (like
+            // `gg.size`), presenting both as `int`.
+            ("gg", "mouse") => {
+                if !args.is_empty() {
+                    return Err("`gg.mouse` takes no arguments".into());
+                }
+                let u64t = self.m.t_int(IntWidth::W64, false);
+                let u32t = self.m.t_u32();
+                let i64t = self.m.t_i64();
+                let ext = self.get_extern("bet_gg_mouse", vec![], vec![u64t]);
+                let raw = self.new_local(u64t);
+                self.fb()
+                    .assign(Place::local(raw), Rvalue::Call(Callee::Extern(ext), vec![]));
+                let xsh = self.new_local(u64t);
+                self.fb().assign(
+                    Place::local(xsh),
+                    Rvalue::BinOp(
+                        BinOp::Shr,
+                        Operand::Copy(Place::local(raw)),
+                        Operand::Const(Const::Int(32, u64t)),
+                        ArithMode::Na,
+                    ),
+                );
+                let x = self.coerce_int(Operand::Copy(Place::local(xsh)), u64t, i64t);
+                let y_u32 = self.coerce_int(Operand::Copy(Place::local(raw)), u64t, u32t);
+                let y = self.coerce_int(y_u32, u32t, i64t);
+                let tuple_ty = self.m.intern_ty(TyKind::Tuple(vec![i64t, i64t]));
+                let tup = self.new_local(tuple_ty);
+                self.fb().assign(
+                    Place::local(tup),
+                    Rvalue::Aggregate(AggKind::Tuple, vec![x, y]),
                 );
                 Ok((Operand::Copy(Place::local(tup)), tuple_ty))
             }

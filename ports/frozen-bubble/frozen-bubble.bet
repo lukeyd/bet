@@ -1,0 +1,960 @@
+// frozen-bubble.bet — a `bet` port of Frozen Bubble's playable core (P4), driving the amendment-03
+// `gg` platform: a textured alpha compositor + voice mixer + keyboard input. Where Pong/gg-demo
+// shake out the primitives, this is a real sprite game: a hex bubble grid, an aimed launcher,
+// fixed-point flight with wall bounces, snap-to-grid collision, same-color flood-fill pops, and
+// ceiling-connectivity drops — all integer / Q16 fixed-point, no floats, no sqrt.
+//
+// Assets come from the baked `assets.dat` (FBD1 format — see crates/xtask/src/bake_fb.rs). Frozen
+// Bubble's media is GPL-2 and is NOT committed; run `cargo xtask bake-frozen-bubble` to produce
+// the .dat locally. The trig table is a baked Q16 (cos, sin) ring (there is no sin/cos intrinsic);
+// the levels blob is a `count x max_rows x cols` cube (255 = empty).
+//
+// Design notes (bet's memory/value model — mirrors Pong/gg-demo):
+//   * Scalar game state is value-struct-threaded: `g = stepFlight(g, board, gen)`.
+//   * The board (cellId -> color 1..8), flood worklists, and the trig/tex lookup tables are `stash`
+//     / `vec` SHARED HANDLES, so helpers mutate them identically on the interpreter and native
+//     paths (a `mem.slab` would deep-copy in interp and diverge — so none is used for game state).
+//   * `yeet` is a reserved statement keyword, so a stash entry cannot be `.yeet()`-ed from source;
+//     removed cells are tombstoned to color 0 (empty), read back through `cellColor`.
+//   * The 170 MB `dat` slice is READ ONLY IN `main` (never passed to a helper — that would deep-copy
+//     it in the interpreter). Everything a helper needs is extracted once into small handles.
+//   * One statement per line; integer math only; unary minus is `0 - x`; modulo is `a-(a/b)*b`.
+//
+// Geometry from the Frozen Bubble source (lib/Games/FrozenBubble/Stuff.pm): BUBBLE_SIZE = 32,
+// ROW_SIZE = 32*7/8 = 28, playfield left_limit = 190, top_limit = 44, 8 columns (odd rows offset
+// by half a bubble and hold 7). The launcher sits at board-center x = 318.
+pull "spill"
+pull "fs"
+pull "bytes"
+pull "stash"
+pull "vec"
+pull "math"
+
+// ---- asset indices (inlined from the generated assets_gen.bet; `pull` of it is unneeded) ----
+facts TEX_BACKGRND: int = 13
+facts TEX_BUBBLE_1: int = 15        // colored bubbles live at 15,17,19,... (mini variants between)
+facts TEX_FONT_HI: int = 124        // highlighted bitmap-font atlas (968x39, ASCII 33..90)
+facts TEX_FONT: int = 125           // normal bitmap-font atlas (same layout)
+facts TEX_BACK_START: int = 690     // title / main-menu background (640x480)
+facts SND_MUSIC: int = 3198         // SND_FROZEN_MAINZIK_1P — looping 1P soundtrack (stereo)
+facts SND_LAUNCH: int = 3202
+facts SND_MENU_CHANGE: int = 3205   // menu cursor move SFX
+facts SND_MENU_SEL: int = 3206      // menu select SFX
+facts LEVELS_BLOB: int = 3215
+facts TRIG_BLOB: int = 3216
+
+// ---- .dat (FBD1) layout ----
+facts HDR: int = 20                 // header size / start of the 32-byte entry table
+facts ENT: int = 32                 // entry stride
+facts E_OFF: int = 8                // per-entry field byte offsets
+facts E_LEN: int = 12
+facts E_A: int = 16
+facts E_B: int = 20
+facts E_C: int = 24
+
+// ---- hex-grid geometry ----
+facts COLS: int = 8
+facts MAXROWS: int = 14
+facts RADIUS: int = 16
+facts BUB: int = 32
+facts GLYPH_H: int = 39            // font atlas cell height (px)
+facts ROWH: int = 28                // ROW_SIZE (vertical row stride; rows nestle 4px)
+facts CX0: int = 206                // cell-center x for col 0 of a non-offset row (190 + 16)
+facts CY0: int = 60                 // cell-center y for row 0 at descent 0 (44 + 16)
+facts WALL_MIN: int = 206           // min flight center x (left wall 190 + radius)
+facts WALL_MAX: int = 430           // max flight center x (right wall 446 - radius)
+facts LAUNCH_X: int = 318           // launcher bubble center x (board center)
+facts LAUNCH_Y: int = 406           // launcher bubble center y
+facts NEXT_X: int = 386             // next-bubble preview top-left
+facts NEXT_Y: int = 412
+facts LOSE_CY: int = 374            // a settled bubble whose center reaches here = game over
+
+// ---- flight (Q16 fixed-point) ----
+facts Q16: int = 65536
+facts SPEED: int = 6                // px/frame flight speed
+facts COLLIDE2: int = 1024          // (2*RADIUS)^2 — squared touch distance (no sqrt)
+
+// ---- aiming (trig-table index units; full turn = 1024) ----
+facts AIM_UP: int = 256             // straight up (90 deg)
+facts AIM_MIN: int = 48             // ~17 deg (aimed hard right)
+facts AIM_MAX: int = 464            // ~163 deg (aimed hard left)
+facts AIM_STEP: int = 3
+
+facts DESCENT_SHOTS: int = 8        // push the grid down one row every N shots
+facts SEED: int = 20260705
+
+// ---- phases ----
+facts P_AIM: int = 0
+facts P_FLY: int = 1
+facts P_WIN: int = 2
+facts P_LOSE: int = 3
+
+// ---- top-level screens (a state machine wrapping the P_* play sub-phases) ----
+facts S_MENU: int = 0               // title / main menu
+facts S_PLAY: int = 1               // the playable core (Win/Lose show as banners within Play)
+
+// ---- event kinds (rt-abi event_kind) ----
+facts EV_NONE: int = 0
+facts EV_KEYDOWN: int = 1
+facts EV_KEYUP: int = 2
+facts EV_QUIT: int = 4
+
+// ---- keycodes (gg-backend `key` mapping) ----
+facts KEY_ESC: int = 27
+facts KEY_SPACE: int = 32
+facts KEY_A: int = 65
+facts KEY_D: int = 68
+facts KEY_ENTER: int = 10
+facts KEY_UP: int = 256
+facts KEY_DOWN: int = 257
+facts KEY_LEFT: int = 258
+facts KEY_RIGHT: int = 259
+
+// ---- UI colors ----
+facts CLEAR: u32 = 0x00000000
+facts DOT: u32 = 0x80FFFFFF
+facts WIN_COL: u32 = 0xA020C040
+facts LOSE_COL: u32 = 0xA0C03020
+facts TEXT_BG: u32 = 0xC0000000    // dark translucent panel behind text — readability over pale art
+
+// Scalar/struct game state — value-threaded (the board/worklists are shared handles, kept out).
+drip Game {
+    flex phase: int
+    flex ang: int          // aim angle, trig-table index
+    flex cur: int          // launcher color (1..8)
+    flex next: int         // on-deck color (1..8)
+    flex fx: int           // flight position x (Q16)
+    flex fy: int           // flight position y (Q16)
+    flex vx: int           // flight velocity x (Q16/frame)
+    flex vy: int           // flight velocity y (Q16/frame)
+    flex shots: int        // shots fired (drives descent)
+    flex descent: int      // rows the field has descended
+    flex score: int
+}
+
+// 1 if `row` is an offset (odd) row, else 0. Odd rows shift +RADIUS and hold COLS-1 bubbles.
+finna oddRow(row: int) -> int {
+    bet row - (row / 2) * 2
+}
+
+// Usable columns in `row` (8 on even rows, 7 on the half-offset odd rows).
+finna colsInRow(row: int) -> int {
+    fr oddRow(row) == 1 {
+        bet COLS - 1
+    }
+    bet COLS
+}
+
+// Cell-center x for (row, col). X depends only on the row's fixed parity, never on descent.
+finna cellCX(row: int, col: int) -> int {
+    lowkey x = CX0 + col * BUB
+    fr oddRow(row) == 1 {
+        x = x + RADIUS
+    }
+    bet x
+}
+
+// Cell-center y for (row) at a given descent (the whole field slides down by descent rows).
+finna cellCY(row: int, descent: int) -> int {
+    bet CY0 + (row + descent) * ROWH
+}
+
+// Color at `id` — 1..8 if occupied, 0 if empty/absent/tombstoned. (`yeet` is a keyword, so removed
+// bubbles are stored as color 0 rather than deleted.)
+finna cellColor(board: stash[int, int], id: int) -> int {
+    lowkey v, ok = board.peep(id)
+    fr ok {
+        bet v
+    }
+    bet 0
+}
+
+// Append (row, col)'s cellId to `out` if it is a valid on-board cell.
+finna tryPush(out: vec[int], row: int, col: int) {
+    fr row >= 0 && row < MAXROWS && col >= 0 && col < colsInRow(row) {
+        out.stack(row * COLS + col)
+    }
+}
+
+// Append the up-to-6 hex neighbors of (row, col) to `out`. The offset pattern flips with the
+// row's parity (odd rows lean right), matching the +RADIUS x-shift.
+finna pushNeighbors(out: vec[int], row: int, col: int) {
+    tryPush(out, row, col - 1)
+    tryPush(out, row, col + 1)
+    fr oddRow(row) == 1 {
+        tryPush(out, row - 1, col)
+        tryPush(out, row - 1, col + 1)
+        tryPush(out, row + 1, col)
+        tryPush(out, row + 1, col + 1)
+    } naw {
+        tryPush(out, row - 1, col - 1)
+        tryPush(out, row - 1, col)
+        tryPush(out, row + 1, col - 1)
+        tryPush(out, row + 1, col)
+    }
+}
+
+// 1 if no bubble remains on the board (win).
+finna boardEmpty(board: stash[int, int]) -> int {
+    lowkey r = 0
+    vibin r < MAXROWS {
+        lowkey cc = 0
+        vibin cc < colsInRow(r) {
+            fr cellColor(board, r * COLS + cc) >= 1 {
+                bet 0
+            }
+            cc = cc + 1
+        }
+        r = r + 1
+    }
+    bet 1
+}
+
+// Flood-fill the same-color component touching `startId`; if it is 3+ bubbles, tombstone them all
+// and return the count popped, else return 0. `board`/worklists are shared handles.
+finna popCluster(board: stash[int, int], startId: int, color: int) -> int {
+    lowkey visited = stash.new[int, int]()
+    lowkey work = vec.new[int]()
+    lowkey comp = vec.new[int]()
+    work.stack(startId)
+    visited.put(startId, 1)
+    vibin work.gang() > 0 {
+        lowkey id = work.pop()
+        comp.stack(id)
+        lowkey row = id / COLS
+        lowkey col = id - row * COLS
+        lowkey nbrs = vec.new[int]()
+        pushNeighbors(nbrs, row, col)
+        lowkey k = 0
+        vibin k < nbrs.gang() {
+            lowkey nid = nbrs[k]
+            fr cellColor(board, nid) == color {
+                lowkey sv, sok = visited.peep(nid)
+                fr sok {
+                } naw {
+                    visited.put(nid, 1)
+                    work.stack(nid)
+                }
+            }
+            k = k + 1
+        }
+    }
+    fr comp.gang() >= 3 {
+        lowkey j = 0
+        vibin j < comp.gang() {
+            board.put(comp[j], 0)
+            j = j + 1
+        }
+        bet comp.gang() as int
+    }
+    bet 0
+}
+
+// Drop every bubble no longer connected (through any color) to the ceiling row. Returns the count
+// dropped. Seeds a flood from the occupied row-0 cells, then tombstones whatever it never reached.
+finna dropFloating(board: stash[int, int]) -> int {
+    lowkey visited = stash.new[int, int]()
+    lowkey work = vec.new[int]()
+    lowkey c = 0
+    vibin c < COLS {
+        fr cellColor(board, c) >= 1 {
+            visited.put(c, 1)
+            work.stack(c)
+        }
+        c = c + 1
+    }
+    vibin work.gang() > 0 {
+        lowkey id = work.pop()
+        lowkey row = id / COLS
+        lowkey col = id - row * COLS
+        lowkey nbrs = vec.new[int]()
+        pushNeighbors(nbrs, row, col)
+        lowkey k = 0
+        vibin k < nbrs.gang() {
+            lowkey nid = nbrs[k]
+            fr cellColor(board, nid) >= 1 {
+                lowkey sv, sok = visited.peep(nid)
+                fr sok {
+                } naw {
+                    visited.put(nid, 1)
+                    work.stack(nid)
+                }
+            }
+            k = k + 1
+        }
+    }
+    lowkey dropped = 0
+    lowkey r = 0
+    vibin r < MAXROWS {
+        lowkey cc = 0
+        vibin cc < colsInRow(r) {
+            lowkey id = r * COLS + cc
+            fr cellColor(board, id) >= 1 {
+                lowkey sv, sok = visited.peep(id)
+                fr sok {
+                } naw {
+                    board.put(id, 0)
+                    dropped = dropped + 1
+                }
+            }
+            cc = cc + 1
+        }
+        r = r + 1
+    }
+    bet dropped
+}
+
+// 1 if a flying bubble centered at (cx, cy) touches any settled bubble (squared distance).
+finna collides(board: stash[int, int], cx: int, cy: int, descent: int) -> int {
+    lowkey r = 0
+    vibin r < MAXROWS {
+        lowkey cc = 0
+        vibin cc < colsInRow(r) {
+            fr cellColor(board, r * COLS + cc) >= 1 {
+                lowkey dx = cx - cellCX(r, cc)
+                lowkey dy = cy - cellCY(r, descent)
+                fr dx * dx + dy * dy <= COLLIDE2 {
+                    bet 1
+                }
+            }
+            cc = cc + 1
+        }
+        r = r + 1
+    }
+    bet 0
+}
+
+// Nearest EMPTY on-board cell to (cx, cy) by squared distance; -1 if the board is full.
+finna snapCell(board: stash[int, int], cx: int, cy: int, descent: int) -> int {
+    lowkey best = 0 - 1
+    lowkey bestD = 0
+    lowkey r = 0
+    vibin r < MAXROWS {
+        lowkey cc = 0
+        vibin cc < colsInRow(r) {
+            lowkey id = r * COLS + cc
+            fr cellColor(board, id) >= 1 {
+            } naw {
+                lowkey dx = cx - cellCX(r, cc)
+                lowkey dy = cy - cellCY(r, descent)
+                lowkey d2 = dx * dx + dy * dy
+                fr best < 0 || d2 < bestD {
+                    best = id
+                    bestD = d2
+                }
+            }
+            cc = cc + 1
+        }
+        r = r + 1
+    }
+    bet best
+}
+
+// 1 if any settled bubble has reached the bottom lose line.
+finna anyBelow(board: stash[int, int], descent: int) -> int {
+    lowkey r = 0
+    vibin r < MAXROWS {
+        lowkey cc = 0
+        vibin cc < colsInRow(r) {
+            fr cellColor(board, r * COLS + cc) >= 1 {
+                fr cellCY(r, descent) >= LOSE_CY {
+                    bet 1
+                }
+            }
+            cc = cc + 1
+        }
+        r = r + 1
+    }
+    bet 0
+}
+
+// Pick a launcher color: prefer one still present on the board (keeps the game winnable), drawing
+// from the shared `gen` handle for a byte-identical stream on both paths. Any color if board empty.
+finna pickColor(board: stash[int, int], gen: rng) -> int {
+    lowkey present = vec.new[int]()
+    lowkey col = 1
+    vibin col <= 8 {
+        lowkey found = 0
+        lowkey r = 0
+        vibin r < MAXROWS {
+            lowkey cc = 0
+            vibin cc < colsInRow(r) {
+                fr cellColor(board, r * COLS + cc) == col {
+                    found = 1
+                }
+                cc = cc + 1
+            }
+            r = r + 1
+        }
+        fr found == 1 {
+            present.stack(col)
+        }
+        col = col + 1
+    }
+    fr present.gang() == 0 {
+        bet (gen.upTo(8) as int) + 1
+    }
+    lowkey idx = gen.upTo(present.gang()) as int
+    bet present[idx]
+}
+
+// Advance the in-flight bubble one frame: integrate Q16 motion, bounce off the side walls, and on
+// a ceiling/bubble hit snap-to-grid, pop same-color clusters, drop floaters, maybe descend, and
+// hand the next bubble to the launcher. `board` mutates in place (shared handle); `g` threads back.
+finna stepFlight(g: Game, board: stash[int, int], gen: rng) -> Game {
+    g.fx = g.fx + g.vx
+    g.fy = g.fy + g.vy
+    lowkey cx = g.fx / Q16
+    lowkey cy = g.fy / Q16
+
+    fr cx <= WALL_MIN {
+        cx = WALL_MIN
+        g.fx = cx * Q16
+        g.vx = 0 - g.vx
+    }
+    fr cx >= WALL_MAX {
+        cx = WALL_MAX
+        g.fx = cx * Q16
+        g.vx = 0 - g.vx
+    }
+
+    lowkey ceil = cellCY(0, g.descent)
+    lowkey land = 0
+    fr cy <= ceil {
+        land = 1
+    } naw fr collides(board, cx, cy, g.descent) == 1 {
+        land = 1
+    }
+
+    fr land == 1 {
+        lowkey id = snapCell(board, cx, cy, g.descent)
+        fr id < 0 {
+            g.phase = P_LOSE
+        } naw {
+            board.put(id, g.cur)
+            lowkey popped = popCluster(board, id, g.cur)
+            fr popped >= 3 {
+                g.score = g.score + popped
+                lowkey fell = dropFloating(board)
+                g.score = g.score + fell * 2
+            }
+            fr boardEmpty(board) == 1 {
+                g.phase = P_WIN
+            } naw fr anyBelow(board, g.descent) == 1 {
+                g.phase = P_LOSE
+            } naw {
+                fr g.shots - (g.shots / DESCENT_SHOTS) * DESCENT_SHOTS == 0 {
+                    g.descent = g.descent + 1
+                }
+                fr anyBelow(board, g.descent) == 1 {
+                    g.phase = P_LOSE
+                } naw {
+                    g.phase = P_AIM
+                    g.cur = g.next
+                    g.next = pickColor(board, gen)
+                    g.ang = AIM_UP
+                }
+            }
+        }
+    }
+    bet g
+}
+
+// Draw the dotted aim guide from the launcher along the current angle, reflecting off side walls,
+// until it reaches the (possibly-descended) ceiling. Cosmetic — pure gg.rect dots.
+finna drawAim(coss: vec[int], sins: vec[int], ang: int, descent: int) {
+    lowkey px = LAUNCH_X * Q16
+    lowkey py = LAUNCH_Y * Q16
+    lowkey dvx = coss[ang]
+    lowkey dvy = 0 - sins[ang]
+    lowkey ceil = cellCY(0, descent)
+    lowkey n = 0
+    vibin n < 48 {
+        px = px + dvx * 4
+        py = py + dvy * 4
+        lowkey sx = px / Q16
+        lowkey sy = py / Q16
+        fr sx <= WALL_MIN {
+            sx = WALL_MIN
+            px = sx * Q16
+            dvx = 0 - dvx
+        }
+        fr sx >= WALL_MAX {
+            sx = WALL_MAX
+            px = sx * Q16
+            dvx = 0 - dvx
+        }
+        fr sy <= ceil {
+            n = 48
+        } naw {
+            fr n - (n / 3) * 3 == 0 {
+                gg.rect(sx - 2, sy - 2, 4, 4, DOT)
+            }
+        }
+        n = n + 1
+    }
+}
+
+// Draw a string of uppercase ASCII (letters/digits/space) as bitmap glyphs, blitting each glyph's
+// source sub-rectangle out of the font atlas `fontTex` with gg.spriteSub. Proportional advance from
+// the per-glyph width table `fontW`. `fontX`/`fontW` are shared vec handles (indexed by char code);
+// `fontTex` is an already-uploaded texture id, so — unlike the `dat` slab — nothing here reads the
+// 170 MB pack, and the whole thing lives safely in a helper. Unknown glyphs advance without drawing.
+finna drawText(fontTex: int, fontX: vec[int], fontW: vec[int], s: str, x: int, y: int) {
+    lowkey n = str.len(s)
+    // measure the run's advance so we can lay a dark backing panel for contrast
+    lowkey bw = 0
+    lowkey bi = 0
+    vibin bi < n {
+        lowkey bc = str.at(s, bi)
+        fr bc == 32 {
+            bw = bw + 12
+        } naw {
+            lowkey bwid = fontW[bc]
+            fr bwid > 0 {
+                bw = bw + bwid + 3
+            } naw {
+                bw = bw + 9
+            }
+        }
+        bi = bi + 1
+    }
+    gg.rect(x - 5, y - 4, bw + 10, GLYPH_H + 8, TEXT_BG)
+    lowkey px = x
+    lowkey i = 0
+    vibin i < n {
+        lowkey c = str.at(s, i)
+        fr c == 32 {
+            px = px + 12
+        } naw {
+            lowkey w = fontW[c]
+            fr w > 0 {
+                gg.spriteSub(fontTex, fontX[c], 1, w, GLYPH_H - 1, px, y)
+                px = px + w + 3
+            } naw {
+                px = px + 9
+            }
+        }
+        i = i + 1
+    }
+}
+
+// Draw a non-negative integer as bitmap digits (left to right) via drawText's glyph blitter.
+finna drawInt(fontTex: int, fontX: vec[int], fontW: vec[int], val: int, x: int, y: int) {
+    lowkey v = val
+    fr v < 0 {
+        v = 0
+    }
+    lowkey digs = vec.new[int]()
+    fr v == 0 {
+        digs.stack(0)
+    } naw {
+        vibin v > 0 {
+            digs.stack(v - (v / 10) * 10)
+            v = v / 10
+        }
+    }
+    lowkey bw = 0
+    lowkey bj = digs.gang() as int - 1
+    vibin bj >= 0 {
+        lowkey bcode = 48 + digs[bj]
+        bw = bw + fontW[bcode] + 3
+        bj = bj - 1
+    }
+    gg.rect(x - 5, y - 4, bw + 10, GLYPH_H + 8, TEXT_BG)
+    lowkey px = x
+    lowkey i = digs.gang() as int - 1
+    vibin i >= 0 {
+        lowkey d = digs[i]
+        lowkey code = 48 + d
+        gg.spriteSub(fontTex, fontX[code], 1, fontW[code], GLYPH_H - 1, px, y)
+        px = px + fontW[code] + 3
+        i = i - 1
+    }
+}
+
+// Reset the board to a level layout given as parallel (cellId, color) vecs — shared handles, so no
+// `dat` is passed to this helper (which would deep-copy the pack in the interpreter). Every cell is
+// first tombstoned to empty, then the layout is re-applied. Lets Play be re-entered from the menu.
+finna resetGame(board: stash[int, int], ids: vec[int], colors: vec[int]) {
+    lowkey id = 0
+    vibin id < MAXROWS * COLS {
+        board.put(id, 0)
+        id = id + 1
+    }
+    lowkey i = 0
+    vibin i < ids.gang() {
+        board.put(ids[i], colors[i])
+        i = i + 1
+    }
+}
+
+finna main() {
+    // ---- load the baked asset pack (READ ONLY in main; never handed to a helper) ----
+    lowkey dat = fs.peep("ports/frozen-bubble/assets.dat")
+    lowkey blobOff = bytes.readU32le(dat, 16) as int
+
+    // background (full 640x480)
+    lowkey bgBase = HDR + TEX_BACKGRND * ENT
+    lowkey bgOff = bytes.readU32le(dat, bgBase + E_OFF) as int
+    lowkey bgW = bytes.readU32le(dat, bgBase + E_A) as int
+    lowkey bgH = bytes.readU32le(dat, bgBase + E_B) as int
+    lowkey bgTex = gg.tex(dat, blobOff + bgOff, bgW, bgH)
+
+    // title / main-menu background (full 640x480)
+    lowkey mbBase = HDR + TEX_BACK_START * ENT
+    lowkey mbOff = bytes.readU32le(dat, mbBase + E_OFF) as int
+    lowkey mbW = bytes.readU32le(dat, mbBase + E_A) as int
+    lowkey mbH = bytes.readU32le(dat, mbBase + E_B) as int
+    lowkey menuTex = gg.tex(dat, blobOff + mbOff, mbW, mbH)
+
+    // bitmap-font atlases: normal (fontTex) + highlighted (fontHiTex); identical 968x39 layout
+    lowkey fnBase = HDR + TEX_FONT * ENT
+    lowkey fnOff = bytes.readU32le(dat, fnBase + E_OFF) as int
+    lowkey fnW = bytes.readU32le(dat, fnBase + E_A) as int
+    lowkey fnH = bytes.readU32le(dat, fnBase + E_B) as int
+    lowkey fontTex = gg.tex(dat, blobOff + fnOff, fnW, fnH)
+    lowkey fhBase = HDR + TEX_FONT_HI * ENT
+    lowkey fhOff = bytes.readU32le(dat, fhBase + E_OFF) as int
+    lowkey fhW = bytes.readU32le(dat, fhBase + E_A) as int
+    lowkey fhH = bytes.readU32le(dat, fhBase + E_B) as int
+    lowkey fontHiTex = gg.tex(dat, blobOff + fhOff, fhW, fhH)
+
+    // 8 colored bubbles -> bubTex[color] (index 0 unused; colors are 1..8)
+    lowkey bubTex = vec.new[int]()
+    bubTex.stack(0)
+    lowkey bi = 0
+    vibin bi < 8 {
+        lowkey base = HDR + (TEX_BUBBLE_1 + bi * 2) * ENT
+        lowkey off = bytes.readU32le(dat, base + E_OFF) as int
+        lowkey w = bytes.readU32le(dat, base + E_A) as int
+        lowkey h = bytes.readU32le(dat, base + E_B) as int
+        bubTex.stack(gg.tex(dat, blobOff + off, w, h))
+        bi = bi + 1
+    }
+
+    // launch sound (one-shot)
+    lowkey sndBase = HDR + SND_LAUNCH * ENT
+    lowkey sOff = bytes.readU32le(dat, sndBase + E_OFF) as int
+    lowkey sLen = bytes.readU32le(dat, sndBase + E_LEN) as int
+    lowkey sRate = bytes.readU32le(dat, sndBase + E_A) as int
+    lowkey sChan = bytes.readU32le(dat, sndBase + E_B) as int
+    lowkey launchSnd = gg.sound(dat, blobOff + sOff, sLen, sChan, sRate)
+
+    // looping background music (stereo) — exercises the mixer's looping-voice path
+    lowkey muBase = HDR + SND_MUSIC * ENT
+    lowkey muOff = bytes.readU32le(dat, muBase + E_OFF) as int
+    lowkey muLen = bytes.readU32le(dat, muBase + E_LEN) as int
+    lowkey muRate = bytes.readU32le(dat, muBase + E_A) as int
+    lowkey muChan = bytes.readU32le(dat, muBase + E_B) as int
+    lowkey musicSnd = gg.sound(dat, blobOff + muOff, muLen, muChan, muRate)
+
+    // menu SFX (one-shots)
+    lowkey mcBase = HDR + SND_MENU_CHANGE * ENT
+    lowkey mcOff = bytes.readU32le(dat, mcBase + E_OFF) as int
+    lowkey mcLen = bytes.readU32le(dat, mcBase + E_LEN) as int
+    lowkey mcRate = bytes.readU32le(dat, mcBase + E_A) as int
+    lowkey mcChan = bytes.readU32le(dat, mcBase + E_B) as int
+    lowkey menuChangeSnd = gg.sound(dat, blobOff + mcOff, mcLen, mcChan, mcRate)
+    lowkey msBase = HDR + SND_MENU_SEL * ENT
+    lowkey msOff = bytes.readU32le(dat, msBase + E_OFF) as int
+    lowkey msLen = bytes.readU32le(dat, msBase + E_LEN) as int
+    lowkey msRate = bytes.readU32le(dat, msBase + E_A) as int
+    lowkey msChan = bytes.readU32le(dat, msBase + E_B) as int
+    lowkey menuSelSnd = gg.sound(dat, blobOff + msOff, msLen, msChan, msRate)
+
+    // trig ring -> Q16 cos/sin vecs (shared handles). Stored as i32; sign-convert from u32.
+    lowkey coss = vec.new[int]()
+    lowkey sins = vec.new[int]()
+    lowkey trigBase = HDR + TRIG_BLOB * ENT
+    lowkey trigOff = bytes.readU32le(dat, trigBase + E_OFF) as int
+    lowkey trigN = bytes.readU32le(dat, trigBase + E_A) as int
+    lowkey trigPay = blobOff + trigOff
+    lowkey ti = 0
+    vibin ti < trigN {
+        lowkey cu = bytes.readU32le(dat, trigPay + ti * 8) as int
+        fr cu >= 2147483648 {
+            cu = cu - 4294967296
+        }
+        lowkey su = bytes.readU32le(dat, trigPay + ti * 8 + 4) as int
+        fr su >= 2147483648 {
+            su = su - 4294967296
+        }
+        coss.stack(cu)
+        sins.stack(su)
+        ti = ti + 1
+    }
+
+    // ---- bitmap-font metrics via SFont (SDLx::SFont): font.png is an SFont atlas. Row 0 is a marker
+    // row; the separator color is pixel (0,0). Each contiguous run of row-0 columns differing from the
+    // separator is one glyph, mapped to ASCII 33,34,... in order. Glyph pixels live in rows 1..fnH-1,
+    // so drawText/drawInt blit from srcY=1. Parsed here in main from `dat` (never handed to a helper).
+    lowkey fontX = vec.new[int]()
+    lowkey fontW = vec.new[int]()
+    lowkey cp = 0
+    vibin cp < 33 {
+        fontX.stack(0)
+        fontW.stack(0)
+        cp = cp + 1
+    }
+    lowkey fpx = blobOff + fnOff
+    lowkey sepR = dat[fpx] as int
+    lowkey sepG = dat[fpx + 1] as int
+    lowkey sepB = dat[fpx + 2] as int
+    lowkey sepA = dat[fpx + 3] as int
+    lowkey sx = 0
+    vibin sx < fnW {
+        lowkey pidx = fpx + sx * 4
+        fr dat[pidx] as int == sepR && dat[pidx + 1] as int == sepG && dat[pidx + 2] as int == sepB && dat[pidx + 3] as int == sepA {
+            sx = sx + 1
+        } naw {
+            lowkey gstart = sx
+            lowkey run = 1
+            vibin run == 1 {
+                fr sx >= fnW {
+                    run = 0
+                } naw {
+                    lowkey qidx = fpx + sx * 4
+                    fr dat[qidx] as int == sepR && dat[qidx + 1] as int == sepG && dat[qidx + 2] as int == sepB && dat[qidx + 3] as int == sepA {
+                        run = 0
+                    } naw {
+                        sx = sx + 1
+                    }
+                }
+            }
+            fontX.stack(gstart)
+            fontW.stack(sx - gstart)
+        }
+    }
+    vibin fontX.gang() as int < 128 {
+        fontX.stack(0)
+        fontW.stack(0)
+    }
+
+    // ---- level 0 -> parallel (cellId, color) vecs (shared handles), so the board can be reset on a
+    // new game without re-reading `dat` in a helper. Seed the initial board from them too. ----
+    lowkey lvlIds = vec.new[int]()
+    lowkey lvlColors = vec.new[int]()
+    lowkey lvlBase = HDR + LEVELS_BLOB * ENT
+    lowkey lvlOff = bytes.readU32le(dat, lvlBase + E_OFF) as int
+    lowkey lvlCols = bytes.readU32le(dat, lvlBase + E_B) as int
+    lowkey lvlRows = bytes.readU32le(dat, lvlBase + E_C) as int
+    lowkey lvlPay = blobOff + lvlOff
+    lowkey lr = 0
+    vibin lr < lvlRows {
+        lowkey lc = 0
+        vibin lc < lvlCols {
+            lowkey cell = dat[lvlPay + lr * lvlCols + lc] as int
+            fr cell != 255 {
+                lvlIds.stack(lr * COLS + lc)
+                lvlColors.stack(cell + 1)
+            }
+            lc = lc + 1
+        }
+        lr = lr + 1
+    }
+
+    // ---- initial game state ----
+    lowkey board = stash.new[int, int]()
+    resetGame(board, lvlIds, lvlColors)
+    lowkey gen = math.cook(SEED)
+    lowkey g = Game{
+        phase: P_AIM,
+        ang: AIM_UP,
+        cur: 0,
+        next: 0,
+        fx: 0,
+        fy: 0,
+        vx: 0,
+        vy: 0,
+        shots: 0,
+        descent: 0,
+        score: 0
+    }
+    g.cur = pickColor(board, gen)
+    g.next = pickColor(board, gen)
+
+    lowkey screen = S_MENU
+    lowkey menuSel = 0             // 0 = Play, 1 = Quit
+    lowkey gameVoice = 0          // the looping-music voice id while in Play (0 = none)
+
+    lowkey leftHeld = 0
+    lowkey rightHeld = 0
+    lowkey voice = 0
+    lowkey running = nocap
+    lowkey last = gg.ticks()
+    vibin running {
+        // ---- drain input (interpreted per active screen) ----
+        lowkey polling = nocap
+        vibin polling {
+            lowkey kind, code = gg.poll()
+            fr kind == EV_NONE {
+                polling = cap
+            } naw fr kind == EV_QUIT {
+                // Esc / window-close: from Play it drops back to the menu (stopping the music);
+                // from the menu it exits the program.
+                fr screen == S_PLAY {
+                    screen = S_MENU
+                    fr gameVoice != 0 {
+                        gg.stop(gameVoice)
+                        gameVoice = 0
+                    }
+                } naw {
+                    running = cap
+                }
+                polling = cap
+            } naw fr kind == EV_KEYDOWN {
+                fr screen == S_MENU {
+                    fr code == KEY_UP || code == KEY_DOWN {
+                        menuSel = 1 - menuSel
+                        voice = gg.play(menuChangeSnd, 0, 256)
+                    } naw fr code == KEY_ENTER || code == KEY_SPACE {
+                        voice = gg.play(menuSelSnd, 0, 256)
+                        fr menuSel == 0 {
+                            // start a fresh game
+                            gen = math.cook(SEED)
+                            resetGame(board, lvlIds, lvlColors)
+                            g.phase = P_AIM
+                            g.ang = AIM_UP
+                            g.fx = 0
+                            g.fy = 0
+                            g.vx = 0
+                            g.vy = 0
+                            g.shots = 0
+                            g.descent = 0
+                            g.score = 0
+                            g.cur = pickColor(board, gen)
+                            g.next = pickColor(board, gen)
+                            leftHeld = 0
+                            rightHeld = 0
+                            screen = S_PLAY
+                            fr gameVoice == 0 {
+                                gameVoice = gg.play(musicSnd, 1, 160)
+                            }
+                        } naw {
+                            running = cap
+                        }
+                    }
+                } naw fr g.phase == P_WIN || g.phase == P_LOSE {
+                    // Win/Lose banner: any confirm returns to the menu.
+                    fr code == KEY_ENTER || code == KEY_SPACE {
+                        screen = S_MENU
+                        fr gameVoice != 0 {
+                            gg.stop(gameVoice)
+                            gameVoice = 0
+                        }
+                    }
+                } naw fr code == KEY_LEFT || code == KEY_A {
+                    leftHeld = 1
+                } naw fr code == KEY_RIGHT || code == KEY_D {
+                    rightHeld = 1
+                } naw fr code == KEY_SPACE || code == KEY_UP {
+                    fr g.phase == P_AIM {
+                        g.vx = SPEED * coss[g.ang]
+                        g.vy = 0 - SPEED * sins[g.ang]
+                        g.fx = LAUNCH_X * Q16
+                        g.fy = LAUNCH_Y * Q16
+                        g.phase = P_FLY
+                        g.shots = g.shots + 1
+                        voice = gg.play(launchSnd, 0, 256)
+                    }
+                }
+            } naw fr kind == EV_KEYUP {
+                fr code == KEY_LEFT || code == KEY_A {
+                    leftHeld = 0
+                } naw fr code == KEY_RIGHT || code == KEY_D {
+                    rightHeld = 0
+                }
+            }
+        }
+
+        // ---- update (Play only) ----
+        fr screen == S_PLAY {
+            fr g.phase == P_AIM {
+                fr leftHeld == 1 {
+                    g.ang = g.ang + AIM_STEP
+                }
+                fr rightHeld == 1 {
+                    g.ang = g.ang - AIM_STEP
+                }
+                fr g.ang > AIM_MAX {
+                    g.ang = AIM_MAX
+                }
+                fr g.ang < AIM_MIN {
+                    g.ang = AIM_MIN
+                }
+            }
+            fr g.phase == P_FLY {
+                g = stepFlight(g, board, gen)
+            }
+        }
+
+        // ---- draw ----
+        fr screen == S_MENU {
+            gg.frame(640, 480, CLEAR)
+            gg.sprite(menuTex, 0, 0)
+            drawText(fontHiTex, fontX, fontW, "FROZEN BUBBLE", 170, 70)
+            lowkey pTex = fontTex
+            fr menuSel == 0 {
+                pTex = fontHiTex
+            }
+            lowkey qTex = fontTex
+            fr menuSel == 1 {
+                qTex = fontHiTex
+            }
+            drawText(pTex, fontX, fontW, "PLAY", 268, 250)
+            drawText(qTex, fontX, fontW, "QUIT", 268, 310)
+            drawText(fontTex, fontX, fontW, "UP DOWN ENTER", 196, 420)
+        } naw {
+            gg.frame(640, 480, CLEAR)
+            gg.sprite(bgTex, 0, 0)
+
+            lowkey r = 0
+            vibin r < MAXROWS {
+                lowkey cc = 0
+                vibin cc < colsInRow(r) {
+                    lowkey v = cellColor(board, r * COLS + cc)
+                    fr v >= 1 {
+                        gg.sprite(bubTex[v], cellCX(r, cc) - RADIUS, cellCY(r, g.descent) - RADIUS)
+                    }
+                    cc = cc + 1
+                }
+                r = r + 1
+            }
+
+            fr g.phase == P_AIM {
+                drawAim(coss, sins, g.ang, g.descent)
+                gg.sprite(bubTex[g.cur], LAUNCH_X - RADIUS, LAUNCH_Y - RADIUS)
+            }
+            fr g.phase == P_FLY {
+                gg.sprite(bubTex[g.cur], (g.fx / Q16) - RADIUS, (g.fy / Q16) - RADIUS)
+            }
+            gg.sprite(bubTex[g.next], NEXT_X, NEXT_Y)
+
+            // ---- HUD (left margin, clear of the x>=190 playfield) ----
+            drawText(fontTex, fontX, fontW, "SCORE", 36, 58)
+            drawInt(fontTex, fontX, fontW, g.score, 36, 98)
+            drawText(fontTex, fontX, fontW, "SHOTS", 36, 168)
+            drawInt(fontTex, fontX, fontW, g.shots, 36, 208)
+
+            fr g.phase == P_WIN {
+                drawText(fontHiTex, fontX, fontW, "YOU WIN", 236, 188)
+                drawText(fontTex, fontX, fontW, "PRESS ENTER", 214, 250)
+            }
+            fr g.phase == P_LOSE {
+                drawText(fontHiTex, fontX, fontW, "GAME OVER", 220, 188)
+                drawText(fontTex, fontX, fontW, "PRESS ENTER", 214, 250)
+            }
+        }
+
+        gg.flush()
+
+        // ---- pace to ~60fps (16.6ms) ----
+        lowkey target = last + 16600000
+        vibin gg.ticks() < target {
+        }
+        last = gg.ticks()
+    }
+
+    spill.f("frozen-bubble: score {} shots {}\n", g.score, g.shots)
+}

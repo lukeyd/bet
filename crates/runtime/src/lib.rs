@@ -1007,6 +1007,65 @@ pub unsafe extern "C" fn bet_gg_ticks() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_nanos() as u64
 }
 
+// gg compositor / mixer / mouse — headless (matches rt-stub): id-returning entry points yield
+// `0`, the rest are no-ops. `bet_gg_mouse` is NOT cfg-split (it delegates to gg-backend below).
+
+#[cfg(not(feature = "gg-desktop"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_tex(_rgba: *const u8, _w: u32, _h: u32) -> u32 {
+    0
+}
+
+#[cfg(not(feature = "gg-desktop"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_frame(_w: u32, _h: u32, _clear_argb: u32) {}
+
+#[cfg(not(feature = "gg-desktop"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_sprite(_tex: u32, _dx: i32, _dy: i32) {}
+
+#[cfg(not(feature = "gg-desktop"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_sprite_sub(
+    _tex: u32,
+    _sx: i32,
+    _sy: i32,
+    _sw: u32,
+    _sh: u32,
+    _dx: i32,
+    _dy: i32,
+) {
+}
+
+#[cfg(not(feature = "gg-desktop"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_rect(_dx: i32, _dy: i32, _w: u32, _h: u32, _argb: u32) {}
+
+#[cfg(not(feature = "gg-desktop"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_flush() {}
+
+#[cfg(not(feature = "gg-desktop"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_sound(
+    _pcm: *const u8,
+    _byte_len: usize,
+    _channels: u32,
+    _rate: u32,
+) -> u32 {
+    0
+}
+
+#[cfg(not(feature = "gg-desktop"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_play(_sound: u32, _loop: u32, _vol_q8: u32) -> u32 {
+    0
+}
+
+#[cfg(not(feature = "gg-desktop"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_stop(_voice: u32) {}
+
 // --- desktop (`gg-desktop`) — delegate to the real gg-backend. ---
 
 #[cfg(feature = "gg-desktop")]
@@ -1051,9 +1110,95 @@ pub unsafe extern "C" fn bet_gg_ticks() -> u64 {
     gg_backend::ticks()
 }
 
+#[cfg(feature = "gg-desktop")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_tex(rgba: *const u8, w: u32, h: u32) -> u32 {
+    if rgba.is_null() || w == 0 || h == 0 {
+        return 0;
+    }
+    let len = (w as usize) * (h as usize) * 4;
+    // SAFETY: the contract says `rgba` addresses `w * h * 4` readable bytes (RGBA8).
+    let px = unsafe { std::slice::from_raw_parts(rgba, len) };
+    gg_backend::tex(px, w, h)
+}
+
+#[cfg(feature = "gg-desktop")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_frame(w: u32, h: u32, clear_argb: u32) {
+    gg_backend::frame(w, h, clear_argb);
+}
+
+#[cfg(feature = "gg-desktop")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_sprite(tex: u32, dx: i32, dy: i32) {
+    gg_backend::sprite(tex, dx, dy);
+}
+
+#[cfg(feature = "gg-desktop")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_sprite_sub(
+    tex: u32,
+    sx: i32,
+    sy: i32,
+    sw: u32,
+    sh: u32,
+    dx: i32,
+    dy: i32,
+) {
+    gg_backend::sprite_sub(tex, sx, sy, sw, sh, dx, dy);
+}
+
+#[cfg(feature = "gg-desktop")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_rect(dx: i32, dy: i32, w: u32, h: u32, argb: u32) {
+    gg_backend::rect(dx, dy, w, h, argb);
+}
+
+#[cfg(feature = "gg-desktop")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_flush() {
+    gg_backend::flush();
+}
+
+#[cfg(feature = "gg-desktop")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_sound(
+    pcm: *const u8,
+    byte_len: usize,
+    channels: u32,
+    rate: u32,
+) -> u32 {
+    if pcm.is_null() || byte_len == 0 {
+        return 0;
+    }
+    // SAFETY: the contract says `pcm` addresses `byte_len` readable bytes (interleaved LE i16).
+    let bytes = unsafe { std::slice::from_raw_parts(pcm, byte_len) };
+    gg_backend::sound(bytes, channels, rate)
+}
+
+#[cfg(feature = "gg-desktop")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_play(sound: u32, loop_: u32, vol_q8: u32) -> u32 {
+    gg_backend::play(sound, loop_, vol_q8)
+}
+
+#[cfg(feature = "gg-desktop")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_stop(voice: u32) {
+    gg_backend::stop(voice);
+}
+
 /// `bet_gg_size` — the 5th gg primitive (dynamic resolution). Not cfg-split: `gg_backend::size`
 /// reports the live window size under `gg-desktop` and the fixed headless default otherwise.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bet_gg_size() -> u64 {
     gg_backend::size()
+}
+
+/// `bet_gg_mouse` — the mouse position in logical-canvas coordinates, packed `x << 32 | y`. Not
+/// cfg-split (mirrors `bet_gg_size`): `gg_backend::mouse` reports the live cursor under
+/// `gg-desktop` and `0` otherwise.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_mouse() -> u64 {
+    gg_backend::mouse()
 }

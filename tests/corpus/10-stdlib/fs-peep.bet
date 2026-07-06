@@ -1,0 +1,13 @@
+// fs-peep — read a small binary fixture as []u8 and print deterministic facts about it.
+pull "spill"
+pull "fs"
+pull "str"
+pull "bytes"
+
+finna main() {
+    lowkey data = fs.peep("tests/corpus/10-stdlib/fs-peep.bin")
+    lowkey s = str.fromBytesTrust(data)
+    spill.it(str.len(s))                // 8   (real slice length from bet_fs_read out_len)
+    spill.it(s)                         // BETBYTES
+    spill.it(bytes.readU16le(data, 0))  // 17730  (0x42,0x45 little-endian = 0x4542)
+}
