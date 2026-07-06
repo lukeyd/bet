@@ -1,0 +1,277 @@
+// tools/simcore_smoke.bet — the P2.1 SIM-CORE proof. Cops a GameState, fills the generated data
+// tables, wires NO-OP stubs into all 74 g.actions.a* and the 7 g.hooks.*, wires the mobj thinker
+// dispatch (g.hooks.mobjThink -> p_mobj.mobjThinker), then:
+//   (1) UNIT-TESTS the thinker list: add 5, remove 2, runThinkers once — confirming the two
+//       removed nodes are unlinked + evicted (their tags ghost) and the other three stay live.
+//   (2) Spawns several assorted MT_* mobjs onto a flat synthetic sector (no real map: numnodes=0
+//       so R_PointInSubsector returns subsector 0; bmapWidth=0 so things link off-blockmap; a
+//       high ceiling keeps ZMovement inert) and runs runThinkers for 50 tics, dumping a
+//       DETERMINISTIC per-tic trace of each live mobj's (stateIdx, tics, x>>16, y>>16, z>>16).
+//
+// The mobjs sit at rest (no momentum) so xyMovement/zMovement early-out and the trace is a pure
+// state-machine walk (actions are no-ops, so RNG-driven behaviour is suppressed — this is a
+// SELF-CONSISTENCY baseline, goldens/simcore.golden; the definitive check is the W3 demo oracle).
+// MT_PUFF runs its 4-frame chain to S_NULL, self-removing ~tic 16 — exercising the evict path
+// inside runThinkers.
+//
+// Build+run NATIVE headless:
+//   cargo build -p driver --features llvm
+//   bet build ports/doom/tools/simcore_smoke.bet --runtime real -o /tmp/simcore_smoke
+//   BET_GG_HEADLESS=1 /tmp/simcore_smoke
+pull "spill"
+pull "mem"
+pull "vec"
+pull "../defs/gs" as gs
+pull "../defs/think" as think
+pull "../defs/info" as info
+pull "../defs/sounds" as sounds
+pull "../defs/tables" as tables
+pull "../util/m_random" as rnd
+pull "../p/p_think" as pthink
+pull "../p/p_mobj" as pmobj
+
+// no-op action stubs (one per Actions signature group) — installed into every g.actions.a* so
+// runAction/runPsprAction never dereference a null fn-value while the trace runs.
+flex finna noopMobj(gt: tag gs.GameState, actor: tag think.Thinker) {
+}
+flex finna noopPspr(gt: tag gs.GameState, playerIdx: int, pspIdx: int) {
+}
+
+// no-op movement/special hooks (P2.4 wires the real p_map versions).
+flex finna noopTryMove(gt: tag gs.GameState, thing: tag think.Thinker, x: i32, y: i32) -> bool {
+    bet nocap
+}
+flex finna noopSlideMove(gt: tag gs.GameState, mo: tag think.Thinker) {
+}
+flex finna noopCheckPosition(gt: tag gs.GameState, thing: tag think.Thinker, x: i32, y: i32) -> bool {
+    bet nocap
+}
+flex finna noopAim(gt: tag gs.GameState, t1: tag think.Thinker, angle: u32, distance: i32) -> i32 {
+    bet 0
+}
+flex finna noopCrossSpecial(gt: tag gs.GameState, linenum: i32, side: i32, thing: tag think.Thinker) {
+}
+flex finna noopShootSpecial(gt: tag gs.GameState, thing: tag think.Thinker, line: i32) {
+}
+flex finna noopUseSpecial(gt: tag gs.GameState, thing: tag think.Thinker, line: i32, side: i32) -> bool {
+    bet cap
+}
+
+// printTrace — walk the thinker ring and dump every live FUNC_MOBJ node in list order.
+flex finna printTrace(gt: tag gs.GameState, tic: int) {
+    lowkey capT: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        capT = g.tick.thinkercap
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey cur: tag think.Thinker = ghosted
+    holla c = capT in gs.thinkers {
+        cur = c.next
+    } ghosted {
+        yeet("cap")
+    }
+    lowkey idx: int = 0
+    vibin !(cur == capT) {
+        lowkey fid: int = 0
+        lowkey nxt: tag think.Thinker = ghosted
+        lowkey st: int = 0
+        lowkey tics: int = 0
+        lowkey x: int = 0
+        lowkey y: int = 0
+        lowkey z: int = 0
+        holla n = cur in gs.thinkers {
+            fid = n.funcId as int
+            nxt = n.next
+            st = n.mobj.stateIdx as int
+            tics = n.mobj.tics as int
+            x = (n.mobj.x >> 16) as int
+            y = (n.mobj.y >> 16) as int
+            z = (n.mobj.z >> 16) as int
+        } ghosted {
+            yeet("cur")
+        }
+        fr fid == think.FUNC_MOBJ {
+            spill.f("t{} m{} st={} tics={} x={} y={} z={}\n", tic, idx, st, tics, x, y, z)
+            idx = idx + 1
+        }
+        cur = nxt
+    }
+}
+
+finna main() {
+    lowkey g0 = cop gs.GameState{} in gs.gsc
+    gs.gsInit(g0)
+
+    holla g = g0 in gs.gsc {
+        // generated data tables
+        info.initStatesAll(g.info.states)
+        info.initMobjinfoAll(g.info.mobjinfo)
+        sounds.initSfxAll(g.info.sfx)
+        g.info.finesine = tables.initFinesineAll(g.info.finesine)
+        g.info.finetangent = tables.initFinetangentAll(g.info.finetangent)
+        g.info.tantoangle = tables.initTantoangleAll(g.info.tantoangle)
+        g.tick.rndtable = rnd.initRndtable(g.tick.rndtable)
+        // a flat synthetic level: 1 sector / 1 subsector / no nodes / no blockmap
+        g.level.numnodes = 0
+        g.level.numsubsectors = 1
+        g.level.numsectors = 1
+        g.level.ssSector = mem.slab[i32](1)
+        g.level.ssNumLines = mem.slab[i32](1)
+        g.level.ssFirstLine = mem.slab[i32](1)
+        g.level.secFloorH = mem.slab[i32](1)
+        g.level.secCeilH = mem.slab[i32](1)
+        g.level.secCeilH[0] = 8388608          // 128*FRACUNIT ceiling
+        g.level.bmapWidth = 0
+        g.level.bmapHeight = 0
+        // shell
+        g.shell.gameskill = doomSkill()
+        g.shell.gametic = 0
+        // hooks (no-op p_map stand-ins) + the mobj thinker dispatch
+        g.hooks.tryMove = noopTryMove
+        g.hooks.slideMove = noopSlideMove
+        g.hooks.checkPosition = noopCheckPosition
+        g.hooks.aimLineAttack = noopAim
+        g.hooks.crossSpecialLine = noopCrossSpecial
+        g.hooks.shootSpecialLine = noopShootSpecial
+        g.hooks.useSpecialLine = noopUseSpecial
+        g.hooks.mobjThink = pmobj.mobjThinker
+        // all 52 mobj-signature actions -> noopMobj
+        g.actions.aBFGSpray = noopMobj
+        g.actions.aBabyMetal = noopMobj
+        g.actions.aBossDeath = noopMobj
+        g.actions.aBrainAwake = noopMobj
+        g.actions.aBrainDie = noopMobj
+        g.actions.aBrainExplode = noopMobj
+        g.actions.aBrainPain = noopMobj
+        g.actions.aBrainScream = noopMobj
+        g.actions.aBrainSpit = noopMobj
+        g.actions.aBruisAttack = noopMobj
+        g.actions.aBspiAttack = noopMobj
+        g.actions.aCPosAttack = noopMobj
+        g.actions.aCPosRefire = noopMobj
+        g.actions.aChase = noopMobj
+        g.actions.aCyberAttack = noopMobj
+        g.actions.aExplode = noopMobj
+        g.actions.aFaceTarget = noopMobj
+        g.actions.aFall = noopMobj
+        g.actions.aFatAttack1 = noopMobj
+        g.actions.aFatAttack2 = noopMobj
+        g.actions.aFatAttack3 = noopMobj
+        g.actions.aFatRaise = noopMobj
+        g.actions.aFire = noopMobj
+        g.actions.aFireCrackle = noopMobj
+        g.actions.aHeadAttack = noopMobj
+        g.actions.aHoof = noopMobj
+        g.actions.aKeenDie = noopMobj
+        g.actions.aLook = noopMobj
+        g.actions.aMetal = noopMobj
+        g.actions.aPain = noopMobj
+        g.actions.aPainAttack = noopMobj
+        g.actions.aPainDie = noopMobj
+        g.actions.aPlayerScream = noopMobj
+        g.actions.aPosAttack = noopMobj
+        g.actions.aSPosAttack = noopMobj
+        g.actions.aSargAttack = noopMobj
+        g.actions.aScream = noopMobj
+        g.actions.aSkelFist = noopMobj
+        g.actions.aSkelMissile = noopMobj
+        g.actions.aSkelWhoosh = noopMobj
+        g.actions.aSkullAttack = noopMobj
+        g.actions.aSpawnFly = noopMobj
+        g.actions.aSpawnSound = noopMobj
+        g.actions.aSpidRefire = noopMobj
+        g.actions.aStartFire = noopMobj
+        g.actions.aTracer = noopMobj
+        g.actions.aTroopAttack = noopMobj
+        g.actions.aVileAttack = noopMobj
+        g.actions.aVileChase = noopMobj
+        g.actions.aVileStart = noopMobj
+        g.actions.aVileTarget = noopMobj
+        g.actions.aXScream = noopMobj
+        // all 22 weapon/psprite-signature actions -> noopPspr
+        g.actions.aBFGsound = noopPspr
+        g.actions.aCheckReload = noopPspr
+        g.actions.aCloseShotgun2 = noopPspr
+        g.actions.aFireBFG = noopPspr
+        g.actions.aFireCGun = noopPspr
+        g.actions.aFireMissile = noopPspr
+        g.actions.aFirePistol = noopPspr
+        g.actions.aFirePlasma = noopPspr
+        g.actions.aFireShotgun = noopPspr
+        g.actions.aFireShotgun2 = noopPspr
+        g.actions.aGunFlash = noopPspr
+        g.actions.aLight0 = noopPspr
+        g.actions.aLight1 = noopPspr
+        g.actions.aLight2 = noopPspr
+        g.actions.aLoadShotgun2 = noopPspr
+        g.actions.aLower = noopPspr
+        g.actions.aOpenShotgun2 = noopPspr
+        g.actions.aPunch = noopPspr
+        g.actions.aRaise = noopPspr
+        g.actions.aReFire = noopPspr
+        g.actions.aSaw = noopPspr
+        g.actions.aWeaponReady = noopPspr
+    } ghosted {
+        yeet("gs")
+    }
+    rnd.clearRandom(g0)
+    pthink.initThinkers(g0)
+
+    // ---- (1) thinker add / remove / evict unit test -----------------------------------------
+    lowkey tags = vec.new[tag think.Thinker]()
+    lowkey k = 0
+    vibin k < 5 {
+        lowkey d = cop think.Thinker{ funcId: think.FUNC_MOBJ as i32 } in gs.thinkers
+        holla dd = d in gs.thinkers {
+            dd.mobj.health = (100 + k) as i32
+        } ghosted {
+            yeet("d")
+        }
+        pthink.addThinker(g0, d)
+        tags.stack(d)
+        k = k + 1
+    }
+    pthink.removeThinker(g0, tags[1])
+    pthink.removeThinker(g0, tags[3])
+    pthink.runThinkers(g0)
+    lowkey live = 0
+    lowkey ghost = 0
+    lowkey i = 0
+    vibin i < 5 {
+        holla x = tags[i] in gs.thinkers {
+            live = live + 1
+        } ghosted {
+            ghost = ghost + 1
+        }
+        i = i + 1
+    }
+    spill.f("evict-test: {} live, {} ghost (expect 3 live, 2 ghost)\n", live, ghost)
+
+    // reset the list so the orphaned dummies do not pollute the trace
+    pthink.initThinkers(g0)
+
+    // ---- (2) spawn assorted mobjs + 50-tic deterministic trace -------------------------------
+    lowkey m0 = pmobj.spawnMobj(g0, (100 * 65536) as i32, 0, think.ONFLOORZ, info.MT_POSSESSED)
+    lowkey m1 = pmobj.spawnMobj(g0, (200 * 65536) as i32, (10 * 65536) as i32, think.ONFLOORZ, info.MT_TROOP)
+    lowkey m2 = pmobj.spawnMobj(g0, (300 * 65536) as i32, (20 * 65536) as i32, think.ONFLOORZ, info.MT_BARREL)
+    lowkey m3 = pmobj.spawnMobj(g0, (400 * 65536) as i32, (30 * 65536) as i32, think.ONFLOORZ, info.MT_PUFF)
+    spill.f("spawned 4 mobjs (POSSESSED/TROOP/BARREL/PUFF); running 50 tics\n")
+
+    lowkey tic = 0
+    vibin tic < 50 {
+        printTrace(g0, tic)
+        pthink.runThinkers(g0)
+        holla g = g0 in gs.gsc {
+            g.tick.leveltime = g.tick.leveltime + 1
+        } ghosted {
+            yeet("gs")
+        }
+        tic = tic + 1
+    }
+}
+
+// doomSkill — SK_MEDIUM as an i32 (kept out of the big setup holla for readability).
+flex finna doomSkill() -> i32 {
+    bet 2
+}

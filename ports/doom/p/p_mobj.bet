@@ -1,0 +1,1184 @@
+// p/p_mobj.bet — map-object (mobj) lifecycle + momentum physics + spawn helpers
+// (linuxdoom-1.10 p_mobj.c). Signatures FROZEN in ports/doom/p-sigs.md ("p/p_mobj").
+//
+// PORTED: P_SetMobjState, P_ExplodeMissile, P_XYMovement, P_ZMovement, P_NightmareRespawn,
+//   P_MobjThinker, P_SpawnMobj, P_RemoveMobj, P_RespawnSpecials, P_SpawnPuff, P_SpawnBlood,
+//   P_CheckMissileSpawn, P_SpawnMissile, P_SpawnPlayerMissile.
+// NOT here (live elsewhere per the port split): P_SpawnPlayer / P_SpawnMapThing (p_setup, P2.5).
+//
+// SEAMS (fn-value fields, null until P2.4 wires them — see gs.bet Hooks). Native cannot
+// null-compare a fn-value, so these are CALLED unconditionally on the paths that reach them; the
+// smoke harness installs no-op stubs so the trace never dereferences a null hook:
+//   * g.hooks.tryMove        P_TryMove       — xyMovement / checkMissileSpawn
+//   * g.hooks.slideMove      P_SlideMove     — xyMovement (player blocked move)
+//   * g.hooks.checkPosition  P_CheckPosition — nightmareRespawn
+//   * g.hooks.aimLineAttack  P_AimLineAttack — spawnPlayerMissile (also reads g.tick.linetarget)
+//   * g.actions.a*           the state actions — via p_think.runAction from setMobjState
+//
+// RNG / DEMO-SYNC NOTES: every P_Random is m_random.pRandom (the play RNG, prndindex). Call ORDER
+// is preserved verbatim. `(P_Random() - P_Random())` is evaluated LEFT-TO-RIGHT (first call is the
+// minuend); the DOS/oracle order for this idiom is a demo-sync detail to confirm at W3.
+//
+// NATIVE is the correctness target (mutable state threads through value-struct fields / holla).
+pull "../defs/gs" as gs
+pull "../defs/think" as think
+pull "../defs/fixed" as fixed
+pull "../defs/tables" as tables
+pull "../defs/doomdef" as doomdef
+pull "../defs/player" as pdef
+pull "../defs/info" as info
+pull "../defs/sounds" as sounds
+pull "../util/m_random" as rnd
+pull "../r/r_geom" as rgeom
+pull "../s/s_sound" as ssnd
+pull "../p/p_maputl" as pmaputl
+pull "../p/p_think" as pthink
+
+// ---- constants (p_mobj.c / p_local.h) -----------------------------------------------------
+flex facts STOPSPEED: i32 = 4096        // 0x1000
+flex facts FRICTION: i32 = 59392        // 0xe800
+flex facts MAXMOVE: i32 = 1966080       // 30*FRACUNIT
+flex facts GRAVITY: i32 = 65536         // FRACUNIT
+flex facts FLOATSPEED: i32 = 262144     // FRACUNIT*4
+flex facts VIEWHEIGHT: i32 = 2686976    // 41*FRACUNIT
+flex facts MELEERANGE: i32 = 4194304    // 64*FRACUNIT
+flex facts MAXPLAYERS: int = 4
+
+// ===========================================================================================
+// hook trampolines (read the fn-value out of g.hooks, call it after closing the holla)
+// ===========================================================================================
+flex finna callTryMove(gt: tag gs.GameState, thing: tag think.Thinker, x: i32, y: i32) -> bool {
+    lowkey fn: finna(tag gs.GameState, tag think.Thinker, i32, i32) -> bool = ghosted
+    holla g = gt in gs.gsc {
+        fn = g.hooks.tryMove
+    } ghosted {
+        yeet("gs")
+    }
+    bet fn(gt, thing, x, y)
+}
+flex finna callSlideMove(gt: tag gs.GameState, mo: tag think.Thinker) {
+    lowkey fn: finna(tag gs.GameState, tag think.Thinker) -> void = ghosted
+    holla g = gt in gs.gsc {
+        fn = g.hooks.slideMove
+    } ghosted {
+        yeet("gs")
+    }
+    fn(gt, mo)
+}
+flex finna callCheckPosition(gt: tag gs.GameState, thing: tag think.Thinker, x: i32, y: i32) -> bool {
+    lowkey fn: finna(tag gs.GameState, tag think.Thinker, i32, i32) -> bool = ghosted
+    holla g = gt in gs.gsc {
+        fn = g.hooks.checkPosition
+    } ghosted {
+        yeet("gs")
+    }
+    bet fn(gt, thing, x, y)
+}
+flex finna callAimLineAttack(gt: tag gs.GameState, t1: tag think.Thinker, angle: u32, distance: i32) -> i32 {
+    lowkey fn: finna(tag gs.GameState, tag think.Thinker, u32, i32) -> i32 = ghosted
+    holla g = gt in gs.gsc {
+        fn = g.hooks.aimLineAttack
+    } ghosted {
+        yeet("gs")
+    }
+    bet fn(gt, t1, angle, distance)
+}
+
+// ===========================================================================================
+// state machine
+// ===========================================================================================
+
+// setMobjState — P_SetMobjState: walk states[] (following nextstate through 0-tic states),
+// stamping sprite/frame/tics and running each state's action. false if the mobj removed itself.
+flex finna setMobjState(gt: tag gs.GameState, mo: tag think.Thinker, state: int) -> bool {
+    lowkey st: int = state
+    lowkey running = nocap
+    lowkey result = nocap
+    vibin running {
+        fr st == info.S_NULL {
+            holla t = mo in gs.thinkers {
+                t.mobj.stateIdx = info.S_NULL as i32
+            } ghosted {
+                yeet("mo")
+            }
+            removeMobj(gt, mo)
+            result = cap
+            running = cap
+        } naw {
+            lowkey tics: int = 0
+            lowkey spr: int = 0
+            lowkey frame: int = 0
+            lowkey act: int = 0
+            lowkey nextstate: int = 0
+            holla g = gt in gs.gsc {
+                lowkey s = g.info.states[st]
+                tics = s.tics as int
+                spr = s.spriteIdx as int
+                frame = s.frame as int
+                act = s.actionId as int
+                nextstate = s.nextstate as int
+            } ghosted {
+                yeet("gs")
+            }
+            holla t = mo in gs.thinkers {
+                t.mobj.stateIdx = st as i32
+                t.mobj.tics = tics as i32
+                t.mobj.spriteIdx = spr as i32
+                t.mobj.frame = frame as i32
+            } ghosted {
+                yeet("mo")
+            }
+            fr act != info.AID_NONE {
+                pthink.runAction(gt, act, mo)
+            }
+            st = nextstate
+            fr tics != 0 {
+                running = cap
+            }
+        }
+    }
+    bet result
+}
+
+// explodeMissile — P_ExplodeMissile: zero momentum, enter the death state, jitter tics, drop the
+// MISSILE flag and play the death sound.
+flex finna explodeMissile(gt: tag gs.GameState, mo: tag think.Thinker) {
+    lowkey typ: int = 0
+    holla t = mo in gs.thinkers {
+        t.mobj.momx = 0
+        t.mobj.momy = 0
+        t.mobj.momz = 0
+        typ = t.mobj.typeIdx as int
+    } ghosted {
+        yeet("mo")
+    }
+    lowkey deathstate: int = 0
+    lowkey deathsound: int = 0
+    holla g = gt in gs.gsc {
+        deathstate = g.info.mobjinfo[typ].deathstate as int
+        deathsound = g.info.mobjinfo[typ].deathsound as int
+    } ghosted {
+        yeet("gs")
+    }
+    setMobjState(gt, mo, deathstate)
+    lowkey j: int = rnd.pRandom(gt) & 3
+    holla t = mo in gs.thinkers {
+        lowkey nt: int = (t.mobj.tics as int) - j
+        fr nt < 1 {
+            nt = 1
+        }
+        t.mobj.tics = nt as i32
+        lowkey nf: int = (t.mobj.flags as int) & ~think.MF_MISSILE
+        t.mobj.flags = nf as i32
+    } ghosted {
+        yeet("mo")
+    }
+    fr deathsound != 0 {
+        ssnd.startSound(gt, mo, deathsound)
+    }
+}
+
+// ===========================================================================================
+// momentum
+// ===========================================================================================
+
+// xyMovement — P_XYMovement: step the mobj by its (clamped) x/y momentum through tryMove, sliding
+// (players) / exploding (missiles) / stopping on a blocked step, then apply friction.
+flex finna xyMovement(gt: tag gs.GameState, mo: tag think.Thinker) {
+    lowkey momx: i32 = 0
+    lowkey momy: i32 = 0
+    lowkey flags0: int = 0
+    lowkey player: int = -1
+    lowkey typ: int = 0
+    holla t = mo in gs.thinkers {
+        momx = t.mobj.momx
+        momy = t.mobj.momy
+        flags0 = t.mobj.flags as int
+        player = t.mobj.player as int
+        typ = t.mobj.typeIdx as int
+    } ghosted {
+        yeet("mo")
+    }
+    fr momx == 0 && momy == 0 {
+        fr (flags0 & think.MF_SKULLFLY) != 0 {
+            lowkey spawnstate: int = 0
+            holla g = gt in gs.gsc {
+                spawnstate = g.info.mobjinfo[typ].spawnstate as int
+            } ghosted {
+                yeet("gs")
+            }
+            holla t = mo in gs.thinkers {
+                t.mobj.flags = (flags0 & ~think.MF_SKULLFLY) as i32
+                t.mobj.momx = 0
+                t.mobj.momy = 0
+                t.mobj.momz = 0
+            } ghosted {
+                yeet("mo")
+            }
+            setMobjState(gt, mo, spawnstate)
+        }
+        bet
+    }
+    fr momx > MAXMOVE {
+        momx = MAXMOVE
+    } naw fr momx < (0 - MAXMOVE) {
+        momx = 0 - MAXMOVE
+    }
+    fr momy > MAXMOVE {
+        momy = MAXMOVE
+    } naw fr momy < (0 - MAXMOVE) {
+        momy = 0 - MAXMOVE
+    }
+    holla t = mo in gs.thinkers {
+        t.mobj.momx = momx
+        t.mobj.momy = momy
+    } ghosted {
+        yeet("mo")
+    }
+    lowkey xmove: i32 = momx
+    lowkey ymove: i32 = momy
+    lowkey looping = nocap
+    lowkey removed = cap
+    vibin looping {
+        lowkey cx: i32 = 0
+        lowkey cy: i32 = 0
+        lowkey flags: int = 0
+        holla t = mo in gs.thinkers {
+            cx = t.mobj.x
+            cy = t.mobj.y
+            flags = t.mobj.flags as int
+        } ghosted {
+            yeet("mo")
+        }
+        lowkey ptryx: i32 = 0
+        lowkey ptryy: i32 = 0
+        fr xmove > (MAXMOVE / 2) || ymove > (MAXMOVE / 2) {
+            ptryx = cx + (xmove / 2)
+            ptryy = cy + (ymove / 2)
+            xmove = xmove >> 1
+            ymove = ymove >> 1
+        } naw {
+            ptryx = cx + xmove
+            ptryy = cy + ymove
+            xmove = 0
+            ymove = 0
+        }
+        lowkey moved = callTryMove(gt, mo, ptryx, ptryy)
+        fr !moved {
+            fr player != -1 {
+                callSlideMove(gt, mo)
+            } naw fr (flags & think.MF_MISSILE) != 0 {
+                lowkey skyHit = cap
+                holla g = gt in gs.gsc {
+                    lowkey cl: int = g.tick.ceilingline as int
+                    fr cl != -1 {
+                        lowkey bsec: int = g.level.lineBack[cl] as int
+                        fr bsec != -1 {
+                            fr g.level.secCeilPic[bsec] == g.render.skyflatnum {
+                                skyHit = nocap
+                            }
+                        }
+                    }
+                } ghosted {
+                    yeet("gs")
+                }
+                fr skyHit {
+                    removeMobj(gt, mo)
+                    removed = nocap
+                    looping = cap
+                } naw {
+                    explodeMissile(gt, mo)
+                }
+            } naw {
+                holla t = mo in gs.thinkers {
+                    t.mobj.momx = 0
+                    t.mobj.momy = 0
+                } ghosted {
+                    yeet("mo")
+                }
+            }
+        }
+        fr !removed && xmove == 0 && ymove == 0 {
+            looping = cap
+        }
+    }
+    fr removed {
+        bet
+    }
+    // friction / stopping
+    lowkey cheats: int = 0
+    fr player != -1 {
+        holla g = gt in gs.gsc {
+            cheats = g.shell.players[player].cheats as int
+        } ghosted {
+            yeet("gs")
+        }
+    }
+    fr player != -1 && (cheats & pdef.CF_NOMOMENTUM) != 0 {
+        holla t = mo in gs.thinkers {
+            t.mobj.momx = 0
+            t.mobj.momy = 0
+        } ghosted {
+            yeet("mo")
+        }
+        bet
+    }
+    lowkey flagsF: int = 0
+    lowkey mx: i32 = 0
+    lowkey my: i32 = 0
+    lowkey mz: i32 = 0
+    lowkey floorz: i32 = 0
+    lowkey sub: int = 0
+    holla t = mo in gs.thinkers {
+        flagsF = t.mobj.flags as int
+        mx = t.mobj.momx
+        my = t.mobj.momy
+        mz = t.mobj.z
+        floorz = t.mobj.floorz
+        sub = t.mobj.subsector as int
+    } ghosted {
+        yeet("mo")
+    }
+    fr (flagsF & (think.MF_MISSILE | think.MF_SKULLFLY)) != 0 {
+        bet
+    }
+    fr mz > floorz {
+        bet
+    }
+    fr (flagsF & think.MF_CORPSE) != 0 {
+        fr mx > (fixed.FRACUNIT / 4) || mx < (0 - (fixed.FRACUNIT / 4)) || my > (fixed.FRACUNIT / 4) || my < (0 - (fixed.FRACUNIT / 4)) {
+            lowkey secFloor: i32 = 0
+            holla g = gt in gs.gsc {
+                secFloor = g.level.secFloorH[g.level.ssSector[sub] as int]
+            } ghosted {
+                yeet("gs")
+            }
+            fr floorz != secFloor {
+                bet
+            }
+        }
+    }
+    lowkey fmove: int = 0
+    lowkey smove: int = 0
+    lowkey stateIdx: int = 0
+    fr player != -1 {
+        holla g = gt in gs.gsc {
+            fmove = g.shell.players[player].cmd.forwardmove as int
+            smove = g.shell.players[player].cmd.sidemove as int
+        } ghosted {
+            yeet("gs")
+        }
+    }
+    fr mx > (0 - STOPSPEED) && mx < STOPSPEED && my > (0 - STOPSPEED) && my < STOPSPEED && (player == -1 || (fmove == 0 && smove == 0)) {
+        fr player != -1 {
+            lowkey pmo: tag think.Thinker = ghosted
+            holla g = gt in gs.gsc {
+                pmo = g.shell.players[player].mo
+            } ghosted {
+                yeet("gs")
+            }
+            holla pm = pmo in gs.thinkers {
+                stateIdx = pm.mobj.stateIdx as int
+            } ghosted {
+                yeet("pmo")
+            }
+            lowkey d: int = stateIdx - info.S_PLAY_RUN1
+            fr d >= 0 && d < 4 {
+                setMobjState(gt, pmo, info.S_PLAY)
+            }
+        }
+        holla t = mo in gs.thinkers {
+            t.mobj.momx = 0
+            t.mobj.momy = 0
+        } ghosted {
+            yeet("mo")
+        }
+    } naw {
+        holla t = mo in gs.thinkers {
+            t.mobj.momx = fixed.fixedMul(mx, FRICTION)
+            t.mobj.momy = fixed.fixedMul(my, FRICTION)
+        } ghosted {
+            yeet("mo")
+        }
+    }
+}
+
+// zMovement — P_ZMovement: adjust view bob (players), apply momz + float-to-target, clip to
+// floor/ceiling (playing landing sound / exploding missiles as needed) and apply gravity.
+flex finna zMovement(gt: tag gs.GameState, mo: tag think.Thinker) {
+    lowkey x: i32 = 0
+    lowkey y: i32 = 0
+    lowkey z: i32 = 0
+    lowkey momz: i32 = 0
+    lowkey floorz: i32 = 0
+    lowkey ceilingz: i32 = 0
+    lowkey height: i32 = 0
+    lowkey flags: int = 0
+    lowkey player: int = -1
+    lowkey target: tag think.Thinker = ghosted
+    holla t = mo in gs.thinkers {
+        x = t.mobj.x
+        y = t.mobj.y
+        z = t.mobj.z
+        momz = t.mobj.momz
+        floorz = t.mobj.floorz
+        ceilingz = t.mobj.ceilingz
+        height = t.mobj.height
+        flags = t.mobj.flags as int
+        player = t.mobj.player as int
+        target = t.mobj.target
+    } ghosted {
+        yeet("mo")
+    }
+    // smooth step up (players)
+    fr player != -1 && z < floorz {
+        holla g = gt in gs.gsc {
+            g.shell.players[player].viewheight = g.shell.players[player].viewheight - (floorz - z)
+            g.shell.players[player].deltaviewheight = (VIEWHEIGHT - g.shell.players[player].viewheight) >> 3
+        } ghosted {
+            yeet("gs")
+        }
+    }
+    z = z + momz
+    // float toward target
+    fr (flags & think.MF_FLOAT) != 0 && !(target == ghosted) {
+        fr (flags & think.MF_SKULLFLY) == 0 && (flags & think.MF_INFLOAT) == 0 {
+            lowkey tx: i32 = 0
+            lowkey ty: i32 = 0
+            lowkey tz: i32 = 0
+            holla tm = target in gs.thinkers {
+                tx = tm.mobj.x
+                ty = tm.mobj.y
+                tz = tm.mobj.z
+            } ghosted {
+                yeet("target")
+            }
+            lowkey dist: i32 = fixed.aproxDistance(x - tx, y - ty)
+            lowkey delta: i32 = (tz + (height >> 1)) - z
+            fr delta < 0 && dist < (0 - (delta * 3)) {
+                z = z - FLOATSPEED
+            } naw fr delta > 0 && dist < (delta * 3) {
+                z = z + FLOATSPEED
+            }
+        }
+    }
+    lowkey exploded = cap
+    // clip to floor
+    fr z <= floorz {
+        fr (flags & think.MF_SKULLFLY) != 0 {
+            momz = 0 - momz
+        }
+        fr momz < 0 {
+            fr player != -1 && momz < (0 - (GRAVITY * 8)) {
+                holla g = gt in gs.gsc {
+                    g.shell.players[player].deltaviewheight = momz >> 3
+                } ghosted {
+                    yeet("gs")
+                }
+                ssnd.startSound(gt, mo, sounds.SFX_OOF)
+            }
+            momz = 0
+        }
+        z = floorz
+        fr (flags & think.MF_MISSILE) != 0 && (flags & think.MF_NOCLIP) == 0 {
+            holla t = mo in gs.thinkers {
+                t.mobj.z = z
+                t.mobj.momz = momz
+            } ghosted {
+                yeet("mo")
+            }
+            explodeMissile(gt, mo)
+            exploded = nocap
+        }
+    } naw fr (flags & think.MF_NOGRAVITY) == 0 {
+        fr momz == 0 {
+            momz = 0 - (GRAVITY * 2)
+        } naw {
+            momz = momz - GRAVITY
+        }
+    }
+    fr !exploded {
+        // clip to ceiling
+        fr (z + height) > ceilingz {
+            fr momz > 0 {
+                momz = 0
+            }
+            z = ceilingz - height
+            fr (flags & think.MF_SKULLFLY) != 0 {
+                momz = 0 - momz
+            }
+            fr (flags & think.MF_MISSILE) != 0 && (flags & think.MF_NOCLIP) == 0 {
+                holla t = mo in gs.thinkers {
+                    t.mobj.z = z
+                    t.mobj.momz = momz
+                } ghosted {
+                    yeet("mo")
+                }
+                explodeMissile(gt, mo)
+                exploded = nocap
+            }
+        }
+        fr !exploded {
+            holla t = mo in gs.thinkers {
+                t.mobj.z = z
+                t.mobj.momz = momz
+            } ghosted {
+                yeet("mo")
+            }
+        }
+    }
+}
+
+// nightmareRespawn — P_NightmareRespawn: re-spawn the monster at its map spot (nightmare skill).
+flex finna nightmareRespawn(gt: tag gs.GameState, mobj: tag think.Thinker) {
+    lowkey spx: int = 0
+    lowkey spy: int = 0
+    lowkey spAngle: int = 0
+    lowkey spTyp: int = 0
+    lowkey spOptions: int = 0
+    lowkey ox: i32 = 0
+    lowkey oy: i32 = 0
+    lowkey osub: int = 0
+    lowkey typ: int = 0
+    holla t = mobj in gs.thinkers {
+        spx = t.mobj.spawnpoint.x as int
+        spy = t.mobj.spawnpoint.y as int
+        spAngle = t.mobj.spawnpoint.angle as int
+        spTyp = t.mobj.spawnpoint.typ as int
+        spOptions = t.mobj.spawnpoint.options as int
+        ox = t.mobj.x
+        oy = t.mobj.y
+        osub = t.mobj.subsector as int
+        typ = t.mobj.typeIdx as int
+    } ghosted {
+        yeet("mobj")
+    }
+    lowkey x: i32 = (spx << 16) as i32
+    lowkey y: i32 = (spy << 16) as i32
+    fr !callCheckPosition(gt, mobj, x, y) {
+        bet
+    }
+    // teleport fog at the old spot
+    lowkey oldFloor: i32 = 0
+    holla g = gt in gs.gsc {
+        oldFloor = g.level.secFloorH[g.level.ssSector[osub] as int]
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey fog1 = spawnMobj(gt, ox, oy, oldFloor, info.MT_TFOG)
+    ssnd.startSound(gt, fog1, sounds.SFX_TELEPT)
+    // teleport fog at the new spot
+    lowkey nsub: int = rgeom.pointInSubsector(gt, x, y)
+    lowkey newFloor: i32 = 0
+    holla g = gt in gs.gsc {
+        newFloor = g.level.secFloorH[g.level.ssSector[nsub] as int]
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey fog2 = spawnMobj(gt, x, y, newFloor, info.MT_TFOG)
+    ssnd.startSound(gt, fog2, sounds.SFX_TELEPT)
+    // the new monster
+    lowkey spawnceil = cap
+    holla g = gt in gs.gsc {
+        fr ((g.info.mobjinfo[typ].flags as int) & think.MF_SPAWNCEILING) != 0 {
+            spawnceil = nocap
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey z: i32 = think.ONFLOORZ
+    fr spawnceil {
+        z = think.ONCEILINGZ
+    }
+    lowkey nm = spawnMobj(gt, x, y, z, typ)
+    lowkey ang: u32 = tables.ANG45 * ((spAngle / 45) as u32)
+    holla t = nm in gs.thinkers {
+        t.mobj.spawnpoint.x = spx as i32
+        t.mobj.spawnpoint.y = spy as i32
+        t.mobj.spawnpoint.angle = spAngle as i32
+        t.mobj.spawnpoint.typ = spTyp as i32
+        t.mobj.spawnpoint.options = spOptions as i32
+        t.mobj.angle = ang
+        fr (spOptions & doomdef.MTF_AMBUSH) != 0 {
+            lowkey nf: int = (t.mobj.flags as int) | think.MF_AMBUSH
+            t.mobj.flags = nf as i32
+        }
+        t.mobj.reactiontime = 18
+    } ghosted {
+        yeet("nm")
+    }
+    removeMobj(gt, mobj)
+}
+
+// mobjThinker — P_MobjThinker: the per-tic mobj update (momentum then state advance / respawn).
+flex finna mobjThinker(gt: tag gs.GameState, mo: tag think.Thinker) {
+    lowkey momx: i32 = 0
+    lowkey momy: i32 = 0
+    lowkey flags: int = 0
+    holla t = mo in gs.thinkers {
+        momx = t.mobj.momx
+        momy = t.mobj.momy
+        flags = t.mobj.flags as int
+    } ghosted {
+        yeet("mo")
+    }
+    fr momx != 0 || momy != 0 || (flags & think.MF_SKULLFLY) != 0 {
+        xyMovement(gt, mo)
+        lowkey fid: int = 0
+        holla t = mo in gs.thinkers {
+            fid = t.funcId as int
+        } ghosted {
+            yeet("mo")
+        }
+        fr fid == think.FUNC_REMOVED {
+            bet
+        }
+    }
+    lowkey z: i32 = 0
+    lowkey floorz: i32 = 0
+    lowkey momz: i32 = 0
+    holla t = mo in gs.thinkers {
+        z = t.mobj.z
+        floorz = t.mobj.floorz
+        momz = t.mobj.momz
+    } ghosted {
+        yeet("mo")
+    }
+    fr z != floorz || momz != 0 {
+        zMovement(gt, mo)
+        lowkey fid: int = 0
+        holla t = mo in gs.thinkers {
+            fid = t.funcId as int
+        } ghosted {
+            yeet("mo")
+        }
+        fr fid == think.FUNC_REMOVED {
+            bet
+        }
+    }
+    lowkey tics: int = 0
+    lowkey stateIdx: int = 0
+    lowkey flags2: int = 0
+    holla t = mo in gs.thinkers {
+        tics = t.mobj.tics as int
+        stateIdx = t.mobj.stateIdx as int
+        flags2 = t.mobj.flags as int
+    } ghosted {
+        yeet("mo")
+    }
+    fr tics != -1 {
+        lowkey nt: int = tics - 1
+        holla t = mo in gs.thinkers {
+            t.mobj.tics = nt as i32
+        } ghosted {
+            yeet("mo")
+        }
+        fr nt == 0 {
+            lowkey nextstate: int = 0
+            holla g = gt in gs.gsc {
+                nextstate = g.info.states[stateIdx].nextstate as int
+            } ghosted {
+                yeet("gs")
+            }
+            setMobjState(gt, mo, nextstate)
+        }
+    } naw {
+        fr (flags2 & think.MF_COUNTKILL) == 0 {
+            bet
+        }
+        lowkey respawn = cap
+        lowkey lt: int = 0
+        holla g = gt in gs.gsc {
+            respawn = g.shell.respawnmonsters
+            lt = g.tick.leveltime as int
+        } ghosted {
+            yeet("gs")
+        }
+        fr !respawn {
+            bet
+        }
+        lowkey mc: int = 0
+        holla t = mo in gs.thinkers {
+            mc = (t.mobj.movecount as int) + 1
+            t.mobj.movecount = mc as i32
+        } ghosted {
+            yeet("mo")
+        }
+        fr mc < (12 * 35) {
+            bet
+        }
+        fr (lt & 31) != 0 {
+            bet
+        }
+        fr rnd.pRandom(gt) > 4 {
+            bet
+        }
+        nightmareRespawn(gt, mo)
+    }
+}
+
+// ===========================================================================================
+// spawn / remove
+// ===========================================================================================
+
+// spawnMobj — P_SpawnMobj: allocate + init a mobj of `typ` at (x,y,z), link it into the world and
+// the thinker list. z == ONFLOORZ/ONCEILINGZ resolves against the containing sector.
+flex finna spawnMobj(gt: tag gs.GameState, x: i32, y: i32, z: i32, typ: int) -> tag think.Thinker {
+    lowkey mo = cop think.Thinker{ funcId: think.FUNC_MOBJ as i32 } in gs.thinkers
+    lowkey radius: i32 = 0
+    lowkey height: i32 = 0
+    lowkey mflags: int = 0
+    lowkey spawnhealth: int = 0
+    lowkey reactiontime: int = 0
+    lowkey spawnstate: int = 0
+    lowkey stTics: int = 0
+    lowkey stSprite: int = 0
+    lowkey stFrame: int = 0
+    lowkey nightmare = cap
+    holla g = gt in gs.gsc {
+        lowkey mi = g.info.mobjinfo[typ]
+        radius = mi.radius
+        height = mi.height
+        mflags = mi.flags as int
+        spawnhealth = mi.spawnhealth as int
+        reactiontime = mi.reactiontime as int
+        spawnstate = mi.spawnstate as int
+        fr g.shell.gameskill == doomdef.SK_NIGHTMARE as i32 {
+            nightmare = nocap
+        }
+        lowkey st = g.info.states[spawnstate]
+        stTics = st.tics as int
+        stSprite = st.spriteIdx as int
+        stFrame = st.frame as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey rt: int = 0
+    fr !nightmare {
+        rt = reactiontime
+    }
+    lowkey lastlook: int = rnd.pRandom(gt) % MAXPLAYERS
+    holla t = mo in gs.thinkers {
+        t.mobj.typeIdx = typ as i32
+        t.mobj.x = x
+        t.mobj.y = y
+        t.mobj.radius = radius
+        t.mobj.height = height
+        t.mobj.flags = mflags as i32
+        t.mobj.health = spawnhealth as i32
+        t.mobj.reactiontime = rt as i32
+        t.mobj.lastlook = lastlook as i32
+        t.mobj.stateIdx = spawnstate as i32
+        t.mobj.tics = stTics as i32
+        t.mobj.spriteIdx = stSprite as i32
+        t.mobj.frame = stFrame as i32
+    } ghosted {
+        yeet("mo")
+    }
+    pmaputl.setThingPosition(gt, mo)
+    lowkey sub: int = 0
+    holla t = mo in gs.thinkers {
+        sub = t.mobj.subsector as int
+    } ghosted {
+        yeet("mo")
+    }
+    lowkey floorz: i32 = 0
+    lowkey ceilingz: i32 = 0
+    holla g = gt in gs.gsc {
+        lowkey sec: int = g.level.ssSector[sub] as int
+        floorz = g.level.secFloorH[sec]
+        ceilingz = g.level.secCeilH[sec]
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey zz: i32 = z
+    fr z == think.ONFLOORZ {
+        zz = floorz
+    } naw fr z == think.ONCEILINGZ {
+        zz = ceilingz - height
+    }
+    holla t = mo in gs.thinkers {
+        t.mobj.floorz = floorz
+        t.mobj.ceilingz = ceilingz
+        t.mobj.z = zz
+    } ghosted {
+        yeet("mo")
+    }
+    pthink.addThinker(gt, mo)
+    bet mo
+}
+
+// removeMobj — P_RemoveMobj: queue the item for respawn (deathmatch), unlink from the world,
+// stop its sound, and lazily free the thinker.
+flex finna removeMobj(gt: tag gs.GameState, mo: tag think.Thinker) {
+    lowkey flags: int = 0
+    lowkey typ: int = 0
+    lowkey spx: int = 0
+    lowkey spy: int = 0
+    lowkey spAngle: int = 0
+    lowkey spTyp: int = 0
+    lowkey spOptions: int = 0
+    holla t = mo in gs.thinkers {
+        flags = t.mobj.flags as int
+        typ = t.mobj.typeIdx as int
+        spx = t.mobj.spawnpoint.x as int
+        spy = t.mobj.spawnpoint.y as int
+        spAngle = t.mobj.spawnpoint.angle as int
+        spTyp = t.mobj.spawnpoint.typ as int
+        spOptions = t.mobj.spawnpoint.options as int
+    } ghosted {
+        yeet("mo")
+    }
+    fr (flags & think.MF_SPECIAL) != 0 && (flags & think.MF_DROPPED) == 0 && typ != info.MT_INV && typ != info.MT_INS {
+        holla g = gt in gs.gsc {
+            lowkey h: int = g.tick.iquehead as int
+            g.tick.itemrespawnque[h].x = spx as i32
+            g.tick.itemrespawnque[h].y = spy as i32
+            g.tick.itemrespawnque[h].angle = spAngle as i32
+            g.tick.itemrespawnque[h].typ = spTyp as i32
+            g.tick.itemrespawnque[h].options = spOptions as i32
+            g.tick.itemrespawntime[h] = g.tick.leveltime
+            lowkey nh: int = (h + 1) & (gs.ITEMQUESIZE - 1)
+            g.tick.iquehead = nh as i32
+            fr nh == g.tick.iquetail as int {
+                g.tick.iquetail = ((g.tick.iquetail as int + 1) & (gs.ITEMQUESIZE - 1)) as i32
+            }
+        } ghosted {
+            yeet("gs")
+        }
+    }
+    pmaputl.unsetThingPosition(gt, mo)
+    ssnd.stopSound(gt, mo)
+    pthink.removeThinker(gt, mo)
+}
+
+// respawnSpecials — P_RespawnSpecials: in altdeath, re-spawn the oldest queued item after 30s.
+flex finna respawnSpecials(gt: tag gs.GameState) {
+    lowkey deathmatch: int = 0
+    lowkey iquehead: int = 0
+    lowkey iquetail: int = 0
+    lowkey leveltime: int = 0
+    holla g = gt in gs.gsc {
+        deathmatch = g.shell.deathmatch as int
+        iquehead = g.tick.iquehead as int
+        iquetail = g.tick.iquetail as int
+        leveltime = g.tick.leveltime as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr deathmatch != 2 {
+        bet
+    }
+    fr iquehead == iquetail {
+        bet
+    }
+    lowkey mtx: int = 0
+    lowkey mty: int = 0
+    lowkey mtAngle: int = 0
+    lowkey mtType: int = 0
+    lowkey rtime: int = 0
+    holla g = gt in gs.gsc {
+        mtx = g.tick.itemrespawnque[iquetail].x as int
+        mty = g.tick.itemrespawnque[iquetail].y as int
+        mtAngle = g.tick.itemrespawnque[iquetail].angle as int
+        mtType = g.tick.itemrespawnque[iquetail].typ as int
+        rtime = g.tick.itemrespawntime[iquetail] as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr (leveltime - rtime) < (30 * 35) {
+        bet
+    }
+    lowkey x: i32 = (mtx << 16) as i32
+    lowkey y: i32 = (mty << 16) as i32
+    lowkey ss: int = rgeom.pointInSubsector(gt, x, y)
+    lowkey floorz: i32 = 0
+    lowkey numtypes: int = 0
+    holla g = gt in gs.gsc {
+        floorz = g.level.secFloorH[g.level.ssSector[ss] as int]
+        numtypes = g.info.mobjinfo.gang() as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey fog = spawnMobj(gt, x, y, floorz, info.MT_IFOG)
+    ssnd.startSound(gt, fog, sounds.SFX_ITMBK)
+    // find the mobjtype whose doomednum matches
+    lowkey which: int = 0
+    lowkey i: int = 0
+    lowkey searching = nocap
+    vibin i < numtypes && searching {
+        lowkey den: int = 0
+        holla g = gt in gs.gsc {
+            den = g.info.mobjinfo[i].doomednum as int
+        } ghosted {
+            yeet("gs")
+        }
+        fr mtType == den {
+            which = i
+            searching = cap
+        } naw {
+            i = i + 1
+        }
+    }
+    lowkey spawnceil = cap
+    holla g = gt in gs.gsc {
+        fr ((g.info.mobjinfo[which].flags as int) & think.MF_SPAWNCEILING) != 0 {
+            spawnceil = nocap
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey z: i32 = think.ONFLOORZ
+    fr spawnceil {
+        z = think.ONCEILINGZ
+    }
+    lowkey mo = spawnMobj(gt, x, y, z, which)
+    lowkey ang: u32 = tables.ANG45 * ((mtAngle / 45) as u32)
+    holla t = mo in gs.thinkers {
+        t.mobj.spawnpoint.x = mtx as i32
+        t.mobj.spawnpoint.y = mty as i32
+        t.mobj.spawnpoint.angle = mtAngle as i32
+        t.mobj.spawnpoint.typ = mtType as i32
+        t.mobj.angle = ang
+    } ghosted {
+        yeet("mo")
+    }
+    holla g = gt in gs.gsc {
+        g.tick.iquetail = ((iquetail + 1) & (gs.ITEMQUESIZE - 1)) as i32
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// ===========================================================================================
+// projectile / effect spawns
+// ===========================================================================================
+
+// spawnPuff — P_SpawnPuff: a bullet-impact puff; punches (MELEERANGE) start at S_PUFF3.
+flex finna spawnPuff(gt: tag gs.GameState, x: i32, y: i32, z: i32) {
+    lowkey r1: int = rnd.pRandom(gt)
+    lowkey r2: int = rnd.pRandom(gt)
+    lowkey zz: i32 = (z as int + ((r1 - r2) << 10)) as i32
+    lowkey th = spawnMobj(gt, x, y, zz, info.MT_PUFF)
+    lowkey j: int = rnd.pRandom(gt) & 3
+    holla t = th in gs.thinkers {
+        t.mobj.momz = fixed.FRACUNIT
+        lowkey nt: int = (t.mobj.tics as int) - j
+        fr nt < 1 {
+            nt = 1
+        }
+        t.mobj.tics = nt as i32
+    } ghosted {
+        yeet("th")
+    }
+    lowkey ar: i32 = 0
+    holla g = gt in gs.gsc {
+        ar = g.tick.attackrange
+    } ghosted {
+        yeet("gs")
+    }
+    fr ar == MELEERANGE {
+        setMobjState(gt, th, info.S_PUFF3)
+    }
+}
+
+// spawnBlood — P_SpawnBlood: a blood spray; the start frame reflects the damage amount.
+flex finna spawnBlood(gt: tag gs.GameState, x: i32, y: i32, z: i32, damage: int) {
+    lowkey r1: int = rnd.pRandom(gt)
+    lowkey r2: int = rnd.pRandom(gt)
+    lowkey zz: i32 = (z as int + ((r1 - r2) << 10)) as i32
+    lowkey th = spawnMobj(gt, x, y, zz, info.MT_BLOOD)
+    lowkey j: int = rnd.pRandom(gt) & 3
+    holla t = th in gs.thinkers {
+        t.mobj.momz = (fixed.FRACUNIT * 2) as i32
+        lowkey nt: int = (t.mobj.tics as int) - j
+        fr nt < 1 {
+            nt = 1
+        }
+        t.mobj.tics = nt as i32
+    } ghosted {
+        yeet("th")
+    }
+    fr damage <= 12 && damage >= 9 {
+        setMobjState(gt, th, info.S_BLOOD2)
+    } naw fr damage < 9 {
+        setMobjState(gt, th, info.S_BLOOD3)
+    }
+}
+
+// checkMissileSpawn — P_CheckMissileSpawn: nudge a fresh missile forward a half-step; if that
+// intersects a wall, explode it immediately.
+flex finna checkMissileSpawn(gt: tag gs.GameState, th: tag think.Thinker) {
+    lowkey j: int = rnd.pRandom(gt) & 3
+    lowkey nx: i32 = 0
+    lowkey ny: i32 = 0
+    holla t = th in gs.thinkers {
+        lowkey nt: int = (t.mobj.tics as int) - j
+        fr nt < 1 {
+            nt = 1
+        }
+        t.mobj.tics = nt as i32
+        t.mobj.x = t.mobj.x + (t.mobj.momx >> 1)
+        t.mobj.y = t.mobj.y + (t.mobj.momy >> 1)
+        t.mobj.z = t.mobj.z + (t.mobj.momz >> 1)
+        nx = t.mobj.x
+        ny = t.mobj.y
+    } ghosted {
+        yeet("th")
+    }
+    fr !callTryMove(gt, th, nx, ny) {
+        explodeMissile(gt, th)
+    }
+}
+
+// spawnMissile — P_SpawnMissile: launch a `typ` missile from `source` toward `dest`.
+flex finna spawnMissile(gt: tag gs.GameState, source: tag think.Thinker, dest: tag think.Thinker, typ: int) -> tag think.Thinker {
+    lowkey sx: i32 = 0
+    lowkey sy: i32 = 0
+    lowkey sz: i32 = 0
+    holla s = source in gs.thinkers {
+        sx = s.mobj.x
+        sy = s.mobj.y
+        sz = s.mobj.z
+    } ghosted {
+        yeet("source")
+    }
+    lowkey dx: i32 = 0
+    lowkey dy: i32 = 0
+    lowkey dz: i32 = 0
+    lowkey dflags: int = 0
+    holla d = dest in gs.thinkers {
+        dx = d.mobj.x
+        dy = d.mobj.y
+        dz = d.mobj.z
+        dflags = d.mobj.flags as int
+    } ghosted {
+        yeet("dest")
+    }
+    lowkey th = spawnMobj(gt, sx, sy, (sz as int + 32 * 65536) as i32, typ)
+    lowkey seesound: int = 0
+    lowkey speed: i32 = 0
+    holla g = gt in gs.gsc {
+        seesound = g.info.mobjinfo[typ].seesound as int
+        speed = g.info.mobjinfo[typ].speed
+    } ghosted {
+        yeet("gs")
+    }
+    fr seesound != 0 {
+        ssnd.startSound(gt, th, seesound)
+    }
+    lowkey an: u32 = 0
+    holla g = gt in gs.gsc {
+        an = rgeom.pointToAngle2(g.info.tantoangle, sx, sy, dx, dy)
+    } ghosted {
+        yeet("gs")
+    }
+    fr (dflags & think.MF_SHADOW) != 0 {
+        lowkey r1: int = rnd.pRandom(gt)
+        lowkey r2: int = rnd.pRandom(gt)
+        an = (an as int + ((r1 - r2) << 20)) as u32
+    }
+    lowkey fine: int = (an >> 19) as int
+    lowkey mx: i32 = 0
+    lowkey my: i32 = 0
+    holla g = gt in gs.gsc {
+        mx = fixed.fixedMul(speed, g.info.finesine[fine + 2048])
+        my = fixed.fixedMul(speed, g.info.finesine[fine])
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey dist: int = fixed.aproxDistance((dx as int - sx as int) as i32, (dy as int - sy as int) as i32) as int
+    lowkey speedI: int = speed as int
+    dist = dist / speedI
+    fr dist < 1 {
+        dist = 1
+    }
+    lowkey mz: i32 = ((dz as int - sz as int) / dist) as i32
+    holla t = th in gs.thinkers {
+        t.mobj.target = source
+        t.mobj.angle = an
+        t.mobj.momx = mx
+        t.mobj.momy = my
+        t.mobj.momz = mz
+    } ghosted {
+        yeet("th")
+    }
+    checkMissileSpawn(gt, th)
+    bet th
+}
+
+// spawnPlayerMissile — P_SpawnPlayerMissile: fire `typ` from `source` with auto-aim.
+flex finna spawnPlayerMissile(gt: tag gs.GameState, source: tag think.Thinker, typ: int) {
+    lowkey sx: i32 = 0
+    lowkey sy: i32 = 0
+    lowkey sz: i32 = 0
+    lowkey sangle: u32 = 0
+    holla s = source in gs.thinkers {
+        sx = s.mobj.x
+        sy = s.mobj.y
+        sz = s.mobj.z
+        sangle = s.mobj.angle
+    } ghosted {
+        yeet("source")
+    }
+    lowkey an: u32 = sangle
+    lowkey slope: i32 = callAimLineAttack(gt, source, an, 67108864)   // 16*64*FRACUNIT
+    fr targetNull(gt) {
+        an = (sangle as int + (1 << 26)) as u32
+        slope = callAimLineAttack(gt, source, an, 67108864)
+        fr targetNull(gt) {
+            an = (sangle as int - (2 << 26)) as u32
+            slope = callAimLineAttack(gt, source, an, 67108864)
+            fr targetNull(gt) {
+                an = sangle
+                slope = 0
+            }
+        }
+    }
+    lowkey z: i32 = (sz as int + 32 * 65536) as i32
+    lowkey th = spawnMobj(gt, sx, sy, z, typ)
+    lowkey seesound: int = 0
+    lowkey speed: i32 = 0
+    holla g = gt in gs.gsc {
+        seesound = g.info.mobjinfo[typ].seesound as int
+        speed = g.info.mobjinfo[typ].speed
+    } ghosted {
+        yeet("gs")
+    }
+    fr seesound != 0 {
+        ssnd.startSound(gt, th, seesound)
+    }
+    lowkey fine: int = (an >> 19) as int
+    lowkey mx: i32 = 0
+    lowkey my: i32 = 0
+    holla g = gt in gs.gsc {
+        mx = fixed.fixedMul(speed, g.info.finesine[fine + 2048])
+        my = fixed.fixedMul(speed, g.info.finesine[fine])
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey mz: i32 = fixed.fixedMul(speed, slope)
+    holla t = th in gs.thinkers {
+        t.mobj.target = source
+        t.mobj.angle = an
+        t.mobj.momx = mx
+        t.mobj.momy = my
+        t.mobj.momz = mz
+    } ghosted {
+        yeet("th")
+    }
+    checkMissileSpawn(gt, th)
+}
+
+// targetNull — !linetarget (g.tick.linetarget is the aim result set by aimLineAttack, P2.4).
+flex finna targetNull(gt: tag gs.GameState) -> bool {
+    lowkey isNull = cap
+    holla g = gt in gs.gsc {
+        fr g.tick.linetarget == ghosted {
+            isNull = nocap
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    bet isNull
+}

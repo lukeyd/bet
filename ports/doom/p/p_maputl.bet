@@ -1,0 +1,831 @@
+// p/p_maputl.bet — movement/collision geometry utilities + BLOCKMAP iterators + path traversal
+// (linuxdoom-1.10 p_maputl.c). Signatures are FROZEN in ports/doom/p-sigs.md ("p/p_maputl").
+// Every stateful fn takes `gt: tag gs.GameState` first and opens `holla g = gt in gs.gsc`.
+//
+// PORTED: P_PointOnLineSide, P_BoxOnLineSide, P_PointOnDivlineSide, P_MakeDivline,
+//   P_InterceptVector, P_LineOpening, P_UnsetThingPosition, P_SetThingPosition,
+//   P_BlockLinesIterator, P_BlockThingsIterator, P_PathTraverse, plus the traversers
+//   PIT_AddLineIntercepts / PIT_AddThingIntercepts and P_TraverseIntercepts.
+//
+// TYPE NOTES:
+//   * divline_t -> `gs.Divline` (a value drip; the type lives in gs.bet — TickState.trace is a
+//     gs.Divline. p-sigs.md writes `think.Divline`, but Divline is a gs type; same shape, no
+//     signature change). pointOnDivlineSide/interceptVector take it BY VALUE; makeDivline RETURNS
+//     one (p-sigs allows "returning think.Divline or filling g.tick.trace" — returning is the
+//     natural bet idiom, used by PIT_AddLineIntercepts with a local divline).
+//   * line_t*/sector_t*/vertex_t* -> i32 indices into the Level SoA slabs; mobj_t* -> tag Thinker.
+//   * intrusive mobj links snext/sprev/bnext/bprev are the tag fields on Mobj; the per-sector
+//     thinglist head is g.level.secLinks[sec].thinglist; the per-block chain head is
+//     g.level.blockLinks[block].t (see CONTRACTS "W1-integration native-safety amendment").
+//
+// BLOCKMAP LAYOUT CONTRACT (for p/p_setup, P2.5): `g.level.blockmap` is the decoded BLOCKMAP as a
+//   single []i32 = [ offset table: bmapWidth*bmapHeight entries ] ++ [ per-block linedef lists ].
+//   Each offset-table entry is the START INDEX (into this same array, header already rebased out)
+//   of that block's linedef list; a list is a run of linedef indices terminated by -1 (vanilla's
+//   leading 0 padding may be kept — the iterator just runs offset..-1, which is vanilla-faithful).
+//   bmapWidth/bmapHeight/bmapOrgX/bmapOrgY are the separate scalar fields. blockLinesIterator reads
+//   the offset at [y*bmapWidth + x] and iterates from there. (Not exercised by the sim smoke test —
+//   no map is loaded; first driven at P2.5/W3.)
+//
+// NATIVE is the correctness target (fixed shares slab backing; the interpreter clones per element).
+pull "../defs/gs" as gs
+pull "../defs/think" as think
+pull "../defs/fixed" as fixed
+pull "../r/r_geom" as rgeom
+pull "../util/m_bbox" as m_bbox
+
+// ---- constants (p_local.h) ----------------------------------------------------------------
+flex facts MAPBLOCKSHIFT: i32 = 23      // FRACBITS + 7 (i32: it is only ever a shift amount on i32)
+flex facts MAPBMASK: i32 = 8388607      // MAPBLOCKSIZE - 1 (128*FRACUNIT - 1)
+flex facts MAPBTOFRAC: i32 = 7          // MAPBLOCKSHIFT - FRACBITS
+flex facts PT_ADDLINES: int = 1
+flex facts PT_ADDTHINGS: int = 2
+flex facts PT_EARLYOUT: int = 4
+// slopetype_t (r_defs.h) — the ordinal p/p_setup writes into g.level.lineSlopetype[].
+flex facts ST_HORIZONTAL: int = 0
+flex facts ST_VERTICAL: int = 1
+flex facts ST_POSITIVE: int = 2
+flex facts ST_NEGATIVE: int = 3
+
+// ===========================================================================================
+// point / line side tests
+// ===========================================================================================
+
+// pointOnLineSide — P_PointOnLineSide: 0 (front) or 1 (back). No sign-bit fast path (that is
+// R_PointOnSide in r_geom); this is the exact p_maputl form.
+flex finna pointOnLineSide(gt: tag gs.GameState, x: i32, y: i32, line: i32) -> int {
+    lowkey ldx: i32 = 0
+    lowkey ldy: i32 = 0
+    lowkey v1x: i32 = 0
+    lowkey v1y: i32 = 0
+    holla g = gt in gs.gsc {
+        ldx = g.level.lineDx[line]
+        ldy = g.level.lineDy[line]
+        lowkey v1: int = g.level.lineV1[line] as int
+        v1x = g.level.vtxX[v1]
+        v1y = g.level.vtxY[v1]
+    } ghosted {
+        yeet("gs")
+    }
+    fr ldx == 0 {
+        fr x <= v1x {
+            fr ldy > 0 {
+                bet 1
+            }
+            bet 0
+        }
+        fr ldy < 0 {
+            bet 1
+        }
+        bet 0
+    }
+    fr ldy == 0 {
+        fr y <= v1y {
+            fr ldx < 0 {
+                bet 1
+            }
+            bet 0
+        }
+        fr ldx > 0 {
+            bet 1
+        }
+        bet 0
+    }
+    lowkey dx: i32 = x - v1x
+    lowkey dy: i32 = y - v1y
+    lowkey left: i32 = fixed.fixedMul(ldy >> 16, dx)
+    lowkey right: i32 = fixed.fixedMul(dy, ldx >> 16)
+    fr right < left {
+        bet 0
+    }
+    bet 1
+}
+
+// pointOnDivlineSide — P_PointOnDivlineSide: 0 or 1, with id's sign-bit quick decision. gs-free.
+flex finna pointOnDivlineSide(x: i32, y: i32, dl: gs.Divline) -> int {
+    fr dl.dx == 0 {
+        fr x <= dl.x {
+            fr dl.dy > 0 {
+                bet 1
+            }
+            bet 0
+        }
+        fr dl.dy < 0 {
+            bet 1
+        }
+        bet 0
+    }
+    fr dl.dy == 0 {
+        fr y <= dl.y {
+            fr dl.dx < 0 {
+                bet 1
+            }
+            bet 0
+        }
+        fr dl.dx > 0 {
+            bet 1
+        }
+        bet 0
+    }
+    lowkey dx: i32 = x - dl.x
+    lowkey dy: i32 = y - dl.y
+    lowkey xr: i32 = dl.dy ^ dl.dx ^ dx ^ dy
+    fr xr < 0 {
+        lowkey xr2: i32 = dl.dy ^ dx
+        fr xr2 < 0 {
+            bet 1
+        }
+        bet 0
+    }
+    lowkey left: i32 = fixed.fixedMul(dl.dy >> 8, dx >> 8)
+    lowkey right: i32 = fixed.fixedMul(dy >> 8, dl.dx >> 8)
+    fr right < left {
+        bet 0
+    }
+    bet 1
+}
+
+// boxOnLineSide — P_BoxOnLineSide: side 0/1 for the whole tmbox, or -1 if it crosses the line.
+// `box` is a []i32 with a `base` offset (m_bbox layout: BOXTOP/BOTTOM/LEFT/RIGHT = 0/1/2/3).
+flex finna boxOnLineSide(gt: tag gs.GameState, box: []i32, base: int, line: i32) -> int {
+    lowkey slope: int = 0
+    lowkey ldx: i32 = 0
+    lowkey ldy: i32 = 0
+    lowkey v1x: i32 = 0
+    lowkey v1y: i32 = 0
+    holla g = gt in gs.gsc {
+        slope = g.level.lineSlopetype[line] as int
+        ldx = g.level.lineDx[line]
+        ldy = g.level.lineDy[line]
+        lowkey v1: int = g.level.lineV1[line] as int
+        v1x = g.level.vtxX[v1]
+        v1y = g.level.vtxY[v1]
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey p1: int = 0
+    lowkey p2: int = 0
+    fr slope == ST_HORIZONTAL {
+        fr box[base + m_bbox.BOXTOP] > v1y {
+            p1 = 1
+        }
+        fr box[base + m_bbox.BOXBOTTOM] > v1y {
+            p2 = 1
+        }
+        fr ldx < 0 {
+            p1 = p1 ^ 1
+            p2 = p2 ^ 1
+        }
+    } naw fr slope == ST_VERTICAL {
+        fr box[base + m_bbox.BOXRIGHT] < v1x {
+            p1 = 1
+        }
+        fr box[base + m_bbox.BOXLEFT] < v1x {
+            p2 = 1
+        }
+        fr ldy < 0 {
+            p1 = p1 ^ 1
+            p2 = p2 ^ 1
+        }
+    } naw fr slope == ST_POSITIVE {
+        p1 = pointOnLineSide(gt, box[base + m_bbox.BOXLEFT], box[base + m_bbox.BOXTOP], line)
+        p2 = pointOnLineSide(gt, box[base + m_bbox.BOXRIGHT], box[base + m_bbox.BOXBOTTOM], line)
+    } naw {
+        p1 = pointOnLineSide(gt, box[base + m_bbox.BOXRIGHT], box[base + m_bbox.BOXTOP], line)
+        p2 = pointOnLineSide(gt, box[base + m_bbox.BOXLEFT], box[base + m_bbox.BOXBOTTOM], line)
+    }
+    fr p1 == p2 {
+        bet p1
+    }
+    bet -1
+}
+
+// makeDivline — P_MakeDivline: build a divline from linedef `line` (v1 origin, dx/dy direction).
+flex finna makeDivline(gt: tag gs.GameState, line: i32) -> gs.Divline {
+    lowkey ox: i32 = 0
+    lowkey oy: i32 = 0
+    lowkey ddx: i32 = 0
+    lowkey ddy: i32 = 0
+    holla g = gt in gs.gsc {
+        lowkey v1: int = g.level.lineV1[line] as int
+        ox = g.level.vtxX[v1]
+        oy = g.level.vtxY[v1]
+        ddx = g.level.lineDx[line]
+        ddy = g.level.lineDy[line]
+    } ghosted {
+        yeet("gs")
+    }
+    bet gs.Divline{ x: ox, y: oy, dx: ddx, dy: ddy }
+}
+
+// interceptVector — P_InterceptVector: fractional intercept of v2 along v1 (the #if 1 fixed path).
+flex finna interceptVector(v2: gs.Divline, v1: gs.Divline) -> i32 {
+    lowkey den: i32 = fixed.fixedMul(v1.dy >> 8, v2.dx) - fixed.fixedMul(v1.dx >> 8, v2.dy)
+    fr den == 0 {
+        bet 0
+    }
+    lowkey na: i32 = fixed.fixedMul((v1.x - v2.x) >> 8, v1.dy)
+    lowkey nb: i32 = fixed.fixedMul((v2.y - v1.y) >> 8, v1.dx)
+    lowkey num: i32 = na + nb
+    bet fixed.fixedDiv(num, den)
+}
+
+// ===========================================================================================
+// line opening
+// ===========================================================================================
+
+// lineOpening — P_LineOpening: set opentop/openbottom/openrange/lowfloor for a two-sided line.
+flex finna lineOpening(gt: tag gs.GameState, line: i32) {
+    holla g = gt in gs.gsc {
+        fr g.level.lineSide1[line] == -1 {
+            g.tick.openrange = 0
+        } naw {
+            lowkey front: int = g.level.lineFront[line] as int
+            lowkey back: int = g.level.lineBack[line] as int
+            lowkey fc: i32 = g.level.secCeilH[front]
+            lowkey bc: i32 = g.level.secCeilH[back]
+            fr fc < bc {
+                g.tick.opentop = fc
+            } naw {
+                g.tick.opentop = bc
+            }
+            lowkey ff: i32 = g.level.secFloorH[front]
+            lowkey bf: i32 = g.level.secFloorH[back]
+            fr ff > bf {
+                g.tick.openbottom = ff
+                g.tick.lowfloor = bf
+            } naw {
+                g.tick.openbottom = bf
+                g.tick.lowfloor = ff
+            }
+            g.tick.openrange = g.tick.opentop - g.tick.openbottom
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// ===========================================================================================
+// thing position: block/sector list (un)linking
+// ===========================================================================================
+
+// unsetThingPosition — P_UnsetThingPosition: unlink `thing` from its sector thinglist and its
+// blockmap chain (respecting MF_NOSECTOR/MF_NOBLOCKMAP), fixing up neighbour intrusive links.
+flex finna unsetThingPosition(gt: tag gs.GameState, thing: tag think.Thinker) {
+    lowkey flags: int = 0
+    lowkey snext: tag think.Thinker = ghosted
+    lowkey sprev: tag think.Thinker = ghosted
+    lowkey bnext: tag think.Thinker = ghosted
+    lowkey bprev: tag think.Thinker = ghosted
+    lowkey ssidx: int = 0
+    lowkey tx: i32 = 0
+    lowkey ty: i32 = 0
+    holla t = thing in gs.thinkers {
+        flags = t.mobj.flags as int
+        snext = t.mobj.snext
+        sprev = t.mobj.sprev
+        bnext = t.mobj.bnext
+        bprev = t.mobj.bprev
+        ssidx = t.mobj.subsector as int
+        tx = t.mobj.x
+        ty = t.mobj.y
+    } ghosted {
+        yeet("thing")
+    }
+    fr (flags & think.MF_NOSECTOR) == 0 {
+        fr !(snext == ghosted) {
+            holla sn = snext in gs.thinkers {
+                sn.mobj.sprev = sprev
+            } ghosted {
+            }
+        }
+        fr !(sprev == ghosted) {
+            holla sp = sprev in gs.thinkers {
+                sp.mobj.snext = snext
+            } ghosted {
+            }
+        } naw {
+            holla g = gt in gs.gsc {
+                lowkey sec: int = g.level.ssSector[ssidx] as int
+                g.level.secLinks[sec].thinglist = snext
+            } ghosted {
+                yeet("gs")
+            }
+        }
+    }
+    fr (flags & think.MF_NOBLOCKMAP) == 0 {
+        fr !(bnext == ghosted) {
+            holla bn = bnext in gs.thinkers {
+                bn.mobj.bprev = bprev
+            } ghosted {
+            }
+        }
+        fr !(bprev == ghosted) {
+            holla bp = bprev in gs.thinkers {
+                bp.mobj.bnext = bnext
+            } ghosted {
+            }
+        } naw {
+            holla g = gt in gs.gsc {
+                lowkey bx: int = ((tx - g.level.bmapOrgX) >> MAPBLOCKSHIFT) as int
+                lowkey by: int = ((ty - g.level.bmapOrgY) >> MAPBLOCKSHIFT) as int
+                lowkey bw: int = g.level.bmapWidth as int
+                lowkey bh: int = g.level.bmapHeight as int
+                fr bx >= 0 && bx < bw && by >= 0 && by < bh {
+                    g.level.blockLinks[by * bw + bx].t = bnext
+                }
+            } ghosted {
+                yeet("gs")
+            }
+        }
+    }
+}
+
+// setThingPosition — P_SetThingPosition: set thing->subsector (R_PointInSubsector), then link the
+// thing at the HEAD of its sector thinglist and its blockmap chain (respecting the NO* flags).
+flex finna setThingPosition(gt: tag gs.GameState, thing: tag think.Thinker) {
+    lowkey flags: int = 0
+    lowkey tx: i32 = 0
+    lowkey ty: i32 = 0
+    holla t = thing in gs.thinkers {
+        flags = t.mobj.flags as int
+        tx = t.mobj.x
+        ty = t.mobj.y
+    } ghosted {
+        yeet("thing")
+    }
+    lowkey ss: int = rgeom.pointInSubsector(gt, tx, ty)
+    holla t = thing in gs.thinkers {
+        t.mobj.subsector = ss as i32
+    } ghosted {
+        yeet("thing")
+    }
+    fr (flags & think.MF_NOSECTOR) == 0 {
+        lowkey oldhead: tag think.Thinker = ghosted
+        lowkey sec: int = 0
+        holla g = gt in gs.gsc {
+            sec = g.level.ssSector[ss] as int
+            oldhead = g.level.secLinks[sec].thinglist
+        } ghosted {
+            yeet("gs")
+        }
+        holla t = thing in gs.thinkers {
+            t.mobj.sprev = ghosted
+            t.mobj.snext = oldhead
+        } ghosted {
+            yeet("thing")
+        }
+        fr !(oldhead == ghosted) {
+            holla oh = oldhead in gs.thinkers {
+                oh.mobj.sprev = thing
+            } ghosted {
+            }
+        }
+        holla g = gt in gs.gsc {
+            g.level.secLinks[sec].thinglist = thing
+        } ghosted {
+            yeet("gs")
+        }
+    }
+    fr (flags & think.MF_NOBLOCKMAP) == 0 {
+        lowkey inRange = cap
+        lowkey idx: int = 0
+        lowkey oldbhead: tag think.Thinker = ghosted
+        holla g = gt in gs.gsc {
+            lowkey bx: int = ((tx - g.level.bmapOrgX) >> MAPBLOCKSHIFT) as int
+            lowkey by: int = ((ty - g.level.bmapOrgY) >> MAPBLOCKSHIFT) as int
+            lowkey bw: int = g.level.bmapWidth as int
+            lowkey bh: int = g.level.bmapHeight as int
+            fr bx >= 0 && bx < bw && by >= 0 && by < bh {
+                inRange = nocap
+                idx = by * bw + bx
+                oldbhead = g.level.blockLinks[idx].t
+            }
+        } ghosted {
+            yeet("gs")
+        }
+        fr inRange {
+            holla t = thing in gs.thinkers {
+                t.mobj.bprev = ghosted
+                t.mobj.bnext = oldbhead
+            } ghosted {
+                yeet("thing")
+            }
+            fr !(oldbhead == ghosted) {
+                holla ob = oldbhead in gs.thinkers {
+                    ob.mobj.bprev = thing
+                } ghosted {
+                }
+            }
+            holla g = gt in gs.gsc {
+                g.level.blockLinks[idx].t = thing
+            } ghosted {
+                yeet("gs")
+            }
+        } naw {
+            holla t = thing in gs.thinkers {
+                t.mobj.bnext = ghosted
+                t.mobj.bprev = ghosted
+            } ghosted {
+                yeet("thing")
+            }
+        }
+    }
+}
+
+// ===========================================================================================
+// BLOCKMAP iterators (callbacks are fn-value params, per p-sigs)
+// ===========================================================================================
+
+// blockLinesIterator — P_BlockLinesIterator: call func(gt, lineIdx) for each line whose blockmap
+// cell is (x,y) and whose validcount is stale (marking it current). Stop early if func returns cap.
+flex finna blockLinesIterator(gt: tag gs.GameState, x: int, y: int, func: finna(tag gs.GameState, i32) -> bool) -> bool {
+    lowkey bw: int = 0
+    lowkey bh: int = 0
+    holla g = gt in gs.gsc {
+        bw = g.level.bmapWidth as int
+        bh = g.level.bmapHeight as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr x < 0 || y < 0 || x >= bw || y >= bh {
+        bet nocap
+    }
+    lowkey list: int = 0
+    holla g = gt in gs.gsc {
+        list = g.level.blockmap[y * bw + x] as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey keepGoing = nocap
+    lowkey running = nocap
+    vibin running {
+        lowkey lnum: int = -1
+        lowkey vc: int = 0
+        lowkey lv: int = 0
+        holla g = gt in gs.gsc {
+            lnum = g.level.blockmap[list] as int
+            fr lnum != -1 {
+                vc = g.tick.validcount as int
+                lv = g.level.lineValid[lnum] as int
+            }
+        } ghosted {
+            yeet("gs")
+        }
+        fr lnum == -1 {
+            running = cap
+        } naw {
+            fr lv != vc {
+                holla g = gt in gs.gsc {
+                    g.level.lineValid[lnum] = g.tick.validcount
+                } ghosted {
+                    yeet("gs")
+                }
+                fr !func(gt, lnum as i32) {
+                    keepGoing = cap
+                    running = cap
+                }
+            }
+            list = list + 1
+        }
+    }
+    bet keepGoing
+}
+
+// blockThingsIterator — P_BlockThingsIterator: call func(gt, thing) for each mobj in blockmap
+// cell (x,y). Stop early if func returns cap. bnext is re-read AFTER func (as id's for-increment).
+flex finna blockThingsIterator(gt: tag gs.GameState, x: int, y: int, func: finna(tag gs.GameState, tag think.Thinker) -> bool) -> bool {
+    lowkey bw: int = 0
+    lowkey bh: int = 0
+    holla g = gt in gs.gsc {
+        bw = g.level.bmapWidth as int
+        bh = g.level.bmapHeight as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr x < 0 || y < 0 || x >= bw || y >= bh {
+        bet nocap
+    }
+    lowkey mo: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        mo = g.level.blockLinks[y * bw + x].t
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey keepGoing = nocap
+    vibin !(mo == ghosted) {
+        fr !func(gt, mo) {
+            keepGoing = cap
+            mo = ghosted
+        } naw {
+            lowkey nb: tag think.Thinker = ghosted
+            holla m = mo in gs.thinkers {
+                nb = m.mobj.bnext
+            } ghosted {
+            }
+            mo = nb
+        }
+    }
+    bet keepGoing
+}
+
+// ===========================================================================================
+// intercept routines + path traversal
+// ===========================================================================================
+
+// traceOf — read g.tick.trace as a value (used by the PIT traversers).
+flex finna traceOf(gt: tag gs.GameState) -> gs.Divline {
+    lowkey d = gs.Divline{ x: 0, y: 0, dx: 0, dy: 0 }
+    holla g = gt in gs.gsc {
+        d = gs.Divline{ x: g.tick.trace.x, y: g.tick.trace.y, dx: g.tick.trace.dx, dy: g.tick.trace.dy }
+    } ghosted {
+        yeet("gs")
+    }
+    bet d
+}
+
+// addLineIntercept — PIT_AddLineIntercepts body (earlyout selected by the wrapper). Adds an
+// intercept for linedef `ld` if the trace crosses it in front of the source. Returns cap only to
+// stop the whole traverse on an earlyout solid-wall hit.
+flex finna addLineIntercept(gt: tag gs.GameState, ld: i32, eo: bool) -> bool {
+    lowkey tr = traceOf(gt)
+    lowkey v1x: i32 = 0
+    lowkey v1y: i32 = 0
+    lowkey v2x: i32 = 0
+    lowkey v2y: i32 = 0
+    lowkey back: int = 0
+    holla g = gt in gs.gsc {
+        lowkey v1: int = g.level.lineV1[ld] as int
+        lowkey v2: int = g.level.lineV2[ld] as int
+        v1x = g.level.vtxX[v1]
+        v1y = g.level.vtxY[v1]
+        v2x = g.level.vtxX[v2]
+        v2y = g.level.vtxY[v2]
+        back = g.level.lineBack[ld] as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey s1: int = 0
+    lowkey s2: int = 0
+    lowkey big: i32 = 1048576              // FRACUNIT*16
+    fr tr.dx > big || tr.dy > big || tr.dx < (0 - big) || tr.dy < (0 - big) {
+        s1 = pointOnDivlineSide(v1x, v1y, tr)
+        s2 = pointOnDivlineSide(v2x, v2y, tr)
+    } naw {
+        s1 = pointOnLineSide(gt, tr.x, tr.y, ld)
+        s2 = pointOnLineSide(gt, tr.x + tr.dx, tr.y + tr.dy, ld)
+    }
+    fr s1 == s2 {
+        bet nocap
+    }
+    lowkey dl = makeDivline(gt, ld)
+    lowkey frac: i32 = interceptVector(tr, dl)
+    fr frac < 0 {
+        bet nocap
+    }
+    fr eo && frac < fixed.FRACUNIT && back == -1 {
+        bet cap
+    }
+    addIntercept(gt, frac, nocap, ghosted, ld)
+    bet nocap
+}
+
+// PIT wrappers: the earlyout flag is encoded in WHICH callback is passed (no shared global).
+flex finna pitAddLine(gt: tag gs.GameState, ld: i32) -> bool {
+    bet addLineIntercept(gt, ld, cap)
+}
+flex finna pitAddLineEO(gt: tag gs.GameState, ld: i32) -> bool {
+    bet addLineIntercept(gt, ld, nocap)
+}
+
+// addThingIntercept — PIT_AddThingIntercepts: add an intercept for `thing` if the trace crosses
+// its corner-to-corner diagonal in front of the source.
+flex finna addThingIntercept(gt: tag gs.GameState, thing: tag think.Thinker) -> bool {
+    lowkey tr = traceOf(gt)
+    lowkey mx: i32 = 0
+    lowkey my: i32 = 0
+    lowkey rad: i32 = 0
+    holla m = thing in gs.thinkers {
+        mx = m.mobj.x
+        my = m.mobj.y
+        rad = m.mobj.radius
+    } ghosted {
+        yeet("thing")
+    }
+    lowkey tracepositive = (tr.dx ^ tr.dy) > 0
+    lowkey x1: i32 = 0
+    lowkey y1: i32 = 0
+    lowkey x2: i32 = 0
+    lowkey y2: i32 = 0
+    fr tracepositive {
+        x1 = mx - rad
+        y1 = my + rad
+        x2 = mx + rad
+        y2 = my - rad
+    } naw {
+        x1 = mx - rad
+        y1 = my - rad
+        x2 = mx + rad
+        y2 = my + rad
+    }
+    lowkey s1: int = pointOnDivlineSide(x1, y1, tr)
+    lowkey s2: int = pointOnDivlineSide(x2, y2, tr)
+    fr s1 == s2 {
+        bet nocap
+    }
+    lowkey dl = gs.Divline{ x: x1, y: y1, dx: x2 - x1, dy: y2 - y1 }
+    lowkey frac: i32 = interceptVector(tr, dl)
+    fr frac < 0 {
+        bet nocap
+    }
+    addIntercept(gt, frac, cap, thing, -1)
+    bet nocap
+}
+
+// addIntercept — append to g.tick.intercepts[interceptP] (yeet on MAXINTERCEPTS overflow).
+flex finna addIntercept(gt: tag gs.GameState, frac: i32, isaline: bool, thingT: tag think.Thinker, lineIdx: i32) {
+    holla g = gt in gs.gsc {
+        lowkey p: int = g.tick.interceptP as int
+        fr p >= gs.MAXINTERCEPTS {
+            yeet("intercepts overflow")
+        }
+        g.tick.intercepts[p].frac = frac
+        g.tick.intercepts[p].isaline = isaline
+        g.tick.intercepts[p].thingT = thingT
+        g.tick.intercepts[p].lineIdx = lineIdx
+        g.tick.interceptP = (p + 1) as i32
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// traverseIntercepts — P_TraverseIntercepts: repeatedly pick the nearest un-consumed intercept and
+// hand its index to `func`; stop when past maxfrac or when func returns cap.
+flex finna traverseIntercepts(gt: tag gs.GameState, func: finna(tag gs.GameState, i32) -> bool, maxfrac: i32) -> bool {
+    lowkey count: int = 0
+    holla g = gt in gs.gsc {
+        count = g.tick.interceptP as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey result = nocap
+    lowkey running = nocap
+    vibin count > 0 && running {
+        lowkey dist: i32 = fixed.MAXINT
+        lowkey pick: int = -1
+        holla g = gt in gs.gsc {
+            lowkey n: int = g.tick.interceptP as int
+            lowkey scan: int = 0
+            vibin scan < n {
+                fr g.tick.intercepts[scan].frac < dist {
+                    dist = g.tick.intercepts[scan].frac
+                    pick = scan
+                }
+                scan = scan + 1
+            }
+        } ghosted {
+            yeet("gs")
+        }
+        fr dist > maxfrac {
+            running = cap
+        } naw {
+            fr !func(gt, pick as i32) {
+                result = cap
+                running = cap
+            } naw {
+                holla g = gt in gs.gsc {
+                    g.tick.intercepts[pick].frac = fixed.MAXINT
+                } ghosted {
+                    yeet("gs")
+                }
+            }
+        }
+        count = count - 1
+    }
+    bet result
+}
+
+// pathTraverse — P_PathTraverse: DDA-walk the blockmap from (x1,y1) to (x2,y2), collecting line
+// and/or thing intercepts per `flags`, then hand the sorted list to `trav`.
+flex finna pathTraverse(gt: tag gs.GameState, x1: i32, y1: i32, x2: i32, y2: i32, flags: int, trav: finna(tag gs.GameState, i32) -> bool) -> bool {
+    // pick the line callback (earlyout is encoded in the choice).
+    lowkey lineFn: finna(tag gs.GameState, i32) -> bool = pitAddLine
+    fr (flags & PT_EARLYOUT) != 0 {
+        lineFn = pitAddLineEO
+    }
+    lowkey orgx: i32 = 0
+    lowkey orgy: i32 = 0
+    lowkey lx1: i32 = x1
+    lowkey ly1: i32 = y1
+    holla g = gt in gs.gsc {
+        orgx = g.level.bmapOrgX
+        orgy = g.level.bmapOrgY
+    } ghosted {
+        yeet("gs")
+    }
+    fr ((lx1 - orgx) & MAPBMASK) == 0 {
+        lx1 = lx1 + fixed.FRACUNIT
+    }
+    fr ((ly1 - orgy) & MAPBMASK) == 0 {
+        ly1 = ly1 + fixed.FRACUNIT
+    }
+    // trace + validcount++ + reset the intercept list.
+    holla g = gt in gs.gsc {
+        g.tick.validcount = g.tick.validcount + 1
+        g.tick.interceptP = 0
+        g.tick.trace.x = lx1
+        g.tick.trace.y = ly1
+        g.tick.trace.dx = x2 - lx1
+        g.tick.trace.dy = y2 - ly1
+    } ghosted {
+        yeet("gs")
+    }
+    // block-space endpoints.
+    lowkey ax1: i32 = lx1 - orgx
+    lowkey ay1: i32 = ly1 - orgy
+    lowkey ax2: i32 = x2 - orgx
+    lowkey ay2: i32 = y2 - orgy
+    lowkey xt1: int = (ax1 >> MAPBLOCKSHIFT) as int
+    lowkey yt1: int = (ay1 >> MAPBLOCKSHIFT) as int
+    lowkey xt2: int = (ax2 >> MAPBLOCKSHIFT) as int
+    lowkey yt2: int = (ay2 >> MAPBLOCKSHIFT) as int
+    lowkey mapxstep: int = 0
+    lowkey mapystep: int = 0
+    lowkey partial: i32 = 0
+    lowkey xstep: i32 = 0
+    lowkey ystep: i32 = 0
+    // x stepping
+    fr xt2 > xt1 {
+        mapxstep = 1
+        partial = fixed.FRACUNIT - ((ax1 >> MAPBTOFRAC) & (fixed.FRACUNIT - 1))
+        ystep = fixed.fixedDiv(y2 - ly1, absI32(x2 - lx1))
+    } naw fr xt2 < xt1 {
+        mapxstep = -1
+        partial = (ax1 >> MAPBTOFRAC) & (fixed.FRACUNIT - 1)
+        ystep = fixed.fixedDiv(y2 - ly1, absI32(x2 - lx1))
+    } naw {
+        mapxstep = 0
+        partial = fixed.FRACUNIT
+        ystep = 16777216              // 256*FRACUNIT
+    }
+    lowkey yintercept: i32 = (ay1 >> MAPBTOFRAC) + fixed.fixedMul(partial, ystep)
+    // y stepping
+    fr yt2 > yt1 {
+        mapystep = 1
+        partial = fixed.FRACUNIT - ((ay1 >> MAPBTOFRAC) & (fixed.FRACUNIT - 1))
+        xstep = fixed.fixedDiv(x2 - lx1, absI32(y2 - ly1))
+    } naw fr yt2 < yt1 {
+        mapystep = -1
+        partial = (ay1 >> MAPBTOFRAC) & (fixed.FRACUNIT - 1)
+        xstep = fixed.fixedDiv(x2 - lx1, absI32(y2 - ly1))
+    } naw {
+        mapystep = 0
+        partial = fixed.FRACUNIT
+        xstep = 16777216              // 256*FRACUNIT
+    }
+    lowkey xintercept: i32 = (ax1 >> MAPBTOFRAC) + fixed.fixedMul(partial, xstep)
+    // step through map blocks (count guards against round-off skipping the break).
+    lowkey mapx: int = xt1
+    lowkey mapy: int = yt1
+    lowkey count: int = 0
+    lowkey earlyExit = cap
+    lowkey failed = cap
+    vibin count < 64 && !earlyExit {
+        fr (flags & PT_ADDLINES) != 0 {
+            fr !blockLinesIterator(gt, mapx, mapy, lineFn) {
+                failed = nocap
+                earlyExit = nocap
+            }
+        }
+        fr !earlyExit && (flags & PT_ADDTHINGS) != 0 {
+            fr !blockThingsIterator(gt, mapx, mapy, addThingIntercept) {
+                failed = nocap
+                earlyExit = nocap
+            }
+        }
+        fr !earlyExit {
+            fr mapx == xt2 && mapy == yt2 {
+                earlyExit = nocap
+            } naw fr ((yintercept >> 16) as int) == mapy {
+                yintercept = yintercept + ystep
+                mapx = mapx + mapxstep
+            } naw fr ((xintercept >> 16) as int) == mapx {
+                xintercept = xintercept + xstep
+                mapy = mapy + mapystep
+            }
+        }
+        count = count + 1
+    }
+    fr failed {
+        bet cap
+    }
+    bet traverseIntercepts(gt, trav, fixed.FRACUNIT)
+}
+
+// absI32 — local |x| for i32 (the sim never passes INT_MIN here).
+flex finna absI32(x: i32) -> i32 {
+    fr x < 0 {
+        bet 0 - x
+    }
+    bet x
+}
