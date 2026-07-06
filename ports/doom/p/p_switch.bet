@@ -1,0 +1,442 @@
+pull "../defs/gs" as gs
+pull "../defs/think" as think
+pull "../defs/doomdef" as doomdef
+pull "../defs/sounds" as sounds
+pull "../p/p_specutil" as psu
+pull "../p/p_floor" as pfloor
+pull "../p/p_ceilng" as pceilng
+pull "../p/p_doors" as pdoors
+pull "../p/p_plats" as pplats
+pull "../p/p_lights" as plights
+pull "../r/r_data" as rdata
+pull "../s/s_sound" as ssnd
+
+flex finna addSwitch(gt: tag gs.GameState, idx: int, n1: str, n2: str, swEpisode: int, episode: int) -> int {
+    fr swEpisode > episode {
+        bet idx
+    }
+    lowkey t1: int = rdata.textureNumForName(gt, n1)
+    lowkey t2: int = rdata.textureNumForName(gt, n2)
+    holla g = gt in gs.gsc {
+        g.tick.switchlist[idx] = t1 as i32
+        g.tick.switchlist[idx + 1] = t2 as i32
+    } ghosted {
+        yeet("gs")
+    }
+    bet idx + 2
+}
+
+flex finna initSwitchList(gt: tag gs.GameState) {
+    lowkey episode: int = 1
+    holla g = gt in gs.gsc {
+        fr g.shell.gamemode == doomdef.GM_REGISTERED as i32 {
+            episode = 2
+        } naw fr g.shell.gamemode == doomdef.GM_COMMERCIAL as i32 {
+            episode = 3
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey idx: int = 0
+    idx = addSwitch(gt, idx, "SW1BRCOM", "SW2BRCOM", 1, episode)
+    idx = addSwitch(gt, idx, "SW1BRN1", "SW2BRN1", 1, episode)
+    idx = addSwitch(gt, idx, "SW1BRN2", "SW2BRN2", 1, episode)
+    idx = addSwitch(gt, idx, "SW1BRNGN", "SW2BRNGN", 1, episode)
+    idx = addSwitch(gt, idx, "SW1BROWN", "SW2BROWN", 1, episode)
+    idx = addSwitch(gt, idx, "SW1COMM", "SW2COMM", 1, episode)
+    idx = addSwitch(gt, idx, "SW1COMP", "SW2COMP", 1, episode)
+    idx = addSwitch(gt, idx, "SW1DIRT", "SW2DIRT", 1, episode)
+    idx = addSwitch(gt, idx, "SW1EXIT", "SW2EXIT", 1, episode)
+    idx = addSwitch(gt, idx, "SW1GRAY", "SW2GRAY", 1, episode)
+    idx = addSwitch(gt, idx, "SW1GRAY1", "SW2GRAY1", 1, episode)
+    idx = addSwitch(gt, idx, "SW1METAL", "SW2METAL", 1, episode)
+    idx = addSwitch(gt, idx, "SW1PIPE", "SW2PIPE", 1, episode)
+    idx = addSwitch(gt, idx, "SW1SLAD", "SW2SLAD", 1, episode)
+    idx = addSwitch(gt, idx, "SW1STARG", "SW2STARG", 1, episode)
+    idx = addSwitch(gt, idx, "SW1STON1", "SW2STON1", 1, episode)
+    idx = addSwitch(gt, idx, "SW1STON2", "SW2STON2", 1, episode)
+    idx = addSwitch(gt, idx, "SW1STONE", "SW2STONE", 1, episode)
+    idx = addSwitch(gt, idx, "SW1STRTN", "SW2STRTN", 1, episode)
+    idx = addSwitch(gt, idx, "SW1BLUE", "SW2BLUE", 2, episode)
+    idx = addSwitch(gt, idx, "SW1CMT", "SW2CMT", 2, episode)
+    idx = addSwitch(gt, idx, "SW1GARG", "SW2GARG", 2, episode)
+    idx = addSwitch(gt, idx, "SW1GSTON", "SW2GSTON", 2, episode)
+    idx = addSwitch(gt, idx, "SW1HOT", "SW2HOT", 2, episode)
+    idx = addSwitch(gt, idx, "SW1LION", "SW2LION", 2, episode)
+    idx = addSwitch(gt, idx, "SW1SATYR", "SW2SATYR", 2, episode)
+    idx = addSwitch(gt, idx, "SW1SKIN", "SW2SKIN", 2, episode)
+    idx = addSwitch(gt, idx, "SW1VINE", "SW2VINE", 2, episode)
+    idx = addSwitch(gt, idx, "SW1WOOD", "SW2WOOD", 2, episode)
+    idx = addSwitch(gt, idx, "SW1PANEL", "SW2PANEL", 3, episode)
+    idx = addSwitch(gt, idx, "SW1ROCK", "SW2ROCK", 3, episode)
+    idx = addSwitch(gt, idx, "SW1MET2", "SW2MET2", 3, episode)
+    idx = addSwitch(gt, idx, "SW1WDMET", "SW2WDMET", 3, episode)
+    idx = addSwitch(gt, idx, "SW1BRIK", "SW2BRIK", 3, episode)
+    idx = addSwitch(gt, idx, "SW1MOD1", "SW2MOD1", 3, episode)
+    idx = addSwitch(gt, idx, "SW1ZIM", "SW2ZIM", 3, episode)
+    idx = addSwitch(gt, idx, "SW1STON6", "SW2STON6", 3, episode)
+    idx = addSwitch(gt, idx, "SW1TEK", "SW2TEK", 3, episode)
+    idx = addSwitch(gt, idx, "SW1MARB", "SW2MARB", 3, episode)
+    idx = addSwitch(gt, idx, "SW1SKULL", "SW2SKULL", 3, episode)
+    holla g = gt in gs.gsc {
+        g.tick.numswitches = (idx / 2) as i32
+        fr idx < 100 {
+            g.tick.switchlist[idx] = -1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna startButton(gt: tag gs.GameState, line: int, w: int, texture: int, time: int) {
+    lowkey front: int = 0
+    holla g = gt in gs.gsc {
+        front = g.level.lineFront[line] as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey done: bool = cap
+    holla g = gt in gs.gsc {
+        lowkey i: int = 0
+        vibin i < psu.MAXBUTTONS {
+            fr g.tick.buttonlist[i].btimer != 0 && g.tick.buttonlist[i].lineIdx as int == line {
+                done = nocap
+                dip
+            }
+            i = i + 1
+        }
+        fr !done {
+            lowkey j: int = 0
+            lowkey placed: bool = cap
+            vibin j < psu.MAXBUTTONS {
+                fr g.tick.buttonlist[j].btimer == 0 {
+                    g.tick.buttonlist[j].lineIdx = line as i32
+                    g.tick.buttonlist[j].where = w as i32
+                    g.tick.buttonlist[j].btexture = texture as i32
+                    g.tick.buttonlist[j].btimer = time as i32
+                    g.tick.buttonlist[j].soundorgSec = front as i32
+                    placed = nocap
+                    dip
+                }
+                j = j + 1
+            }
+            fr !placed {
+                yeet("P_StartButton: no button slots left")
+            }
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna changeSwitchTexture(gt: tag gs.GameState, line: int, useAgain: int) {
+    lowkey sd0: int = 0
+    lowkey texTop: int = 0
+    lowkey texMid: int = 0
+    lowkey texBot: int = 0
+    lowkey special: int = 0
+    lowkey numsw: int = 0
+    holla g = gt in gs.gsc {
+        fr useAgain == 0 {
+            g.level.lineSpecial[line] = 0
+        }
+        sd0 = g.level.lineSide0[line] as int
+        texTop = g.level.sdTopTex[sd0] as int
+        texMid = g.level.sdMidTex[sd0] as int
+        texBot = g.level.sdBotTex[sd0] as int
+        special = g.level.lineSpecial[line] as int
+        numsw = g.tick.numswitches as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey sound: int = sounds.SFX_SWTCHN
+    fr special == 11 {
+        sound = sounds.SFX_SWTCHX
+    }
+    lowkey i: int = 0
+    vibin i < numsw * 2 {
+        lowkey sw: int = 0
+        holla g = gt in gs.gsc {
+            sw = g.tick.switchlist[i] as int
+        } ghosted {
+            yeet("gs")
+        }
+        fr sw == texTop {
+            ssnd.startSound(gt, ghosted, sound)
+            lowkey opp: int = 0
+            holla g = gt in gs.gsc {
+                opp = g.tick.switchlist[i ^ 1] as int
+                g.level.sdTopTex[sd0] = opp as i32
+            } ghosted {
+                yeet("gs")
+            }
+            fr useAgain != 0 {
+                startButton(gt, line, psu.BW_TOP, sw, psu.BUTTONTIME)
+            }
+            bet
+        } naw fr sw == texMid {
+            ssnd.startSound(gt, ghosted, sound)
+            holla g = gt in gs.gsc {
+                lowkey opp: int = g.tick.switchlist[i ^ 1] as int
+                g.level.sdMidTex[sd0] = opp as i32
+            } ghosted {
+                yeet("gs")
+            }
+            fr useAgain != 0 {
+                startButton(gt, line, psu.BW_MIDDLE, sw, psu.BUTTONTIME)
+            }
+            bet
+        } naw fr sw == texBot {
+            ssnd.startSound(gt, ghosted, sound)
+            holla g = gt in gs.gsc {
+                lowkey opp: int = g.tick.switchlist[i ^ 1] as int
+                g.level.sdBotTex[sd0] = opp as i32
+            } ghosted {
+                yeet("gs")
+            }
+            fr useAgain != 0 {
+                startButton(gt, line, psu.BW_BOTTOM, sw, psu.BUTTONTIME)
+            }
+            bet
+        }
+        i = i + 1
+    }
+}
+
+flex finna exitLevel(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.shell.gameaction = doomdef.GA_COMPLETED as i32
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna useSpecialLine(gt: tag gs.GameState, thing: tag think.Thinker, lineArg: i32, sideArg: i32) -> bool {
+    lowkey line: int = lineArg as int
+    lowkey side: int = sideArg as int
+    lowkey special: int = 0
+    lowkey flags: int = 0
+    holla g = gt in gs.gsc {
+        special = g.level.lineSpecial[line] as int
+        flags = g.level.lineFlags[line] as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr side != 0 {
+        fr special == 124 {
+        } naw {
+            bet cap
+        }
+    }
+    lowkey playerIdx: int = -1
+    holla t = thing in gs.thinkers {
+        playerIdx = t.mobj.player as int
+    } ghosted {
+        yeet("thing")
+    }
+    fr playerIdx < 0 {
+        fr flags & doomdef.ML_SECRET != 0 {
+            bet cap
+        }
+        fr special == 1 || special == 32 || special == 33 || special == 34 {
+        } naw {
+            bet cap
+        }
+    }
+    fr special == 1 || special == 26 || special == 27 || special == 28 || special == 31 || special == 32 || special == 33 || special == 34 || special == 117 || special == 118 {
+        pdoors.evVerticalDoor(gt, line, thing)
+    } naw fr special == 7 {
+        fr pfloor.evBuildStairs(gt, line, psu.STAIR_BUILD8) != 0 {
+            changeSwitchTexture(gt, line, 0)
+        }
+    } naw fr special == 9 {
+        fr pfloor.evDoDonut(gt, line) != 0 {
+            changeSwitchTexture(gt, line, 0)
+        }
+    } naw fr special == 11 {
+        changeSwitchTexture(gt, line, 0)
+        exitLevel(gt)
+    } naw fr special == 14 {
+        fr pplats.evDoPlat(gt, line, psu.PLATT_RAISEANDCHANGE, 32) != 0 {
+            changeSwitchTexture(gt, line, 0)
+        }
+    } naw fr special == 15 {
+        fr pplats.evDoPlat(gt, line, psu.PLATT_RAISEANDCHANGE, 24) != 0 {
+            changeSwitchTexture(gt, line, 0)
+        }
+    } naw fr special == 18 {
+        fr pfloor.evDoFloor(gt, line, psu.FLOOR_RAISEFLOORTONEAREST) != 0 {
+            changeSwitchTexture(gt, line, 0)
+        }
+    } naw fr special == 20 {
+        fr pplats.evDoPlat(gt, line, psu.PLATT_RAISETONEARESTANDCHANGE, 0) != 0 {
+            changeSwitchTexture(gt, line, 0)
+        }
+    } naw fr special == 21 {
+        fr pplats.evDoPlat(gt, line, psu.PLATT_DOWNWAITUPSTAY, 0) != 0 {
+            changeSwitchTexture(gt, line, 0)
+        }
+    } naw fr special == 23 {
+        fr pfloor.evDoFloor(gt, line, psu.FLOOR_LOWERFLOORTOLOWEST) != 0 {
+            changeSwitchTexture(gt, line, 0)
+        }
+    } naw fr special == 29 {
+        fr pdoors.evDoDoor(gt, line, psu.DOOR_NORMAL) != 0 {
+            changeSwitchTexture(gt, line, 0)
+        }
+    } naw fr special == 41 {
+        fr pceilng.evDoCeiling(gt, line, psu.CEIL_LOWERTOFLOOR) != 0 {
+            changeSwitchTexture(gt, line, 0)
+        }
+    } naw fr special == 71 {
+        fr pfloor.evDoFloor(gt, line, psu.FLOOR_TURBOLOWER) != 0 {
+            changeSwitchTexture(gt, line, 0)
+        }
+    } naw fr special == 49 {
+        fr pceilng.evDoCeiling(gt, line, psu.CEIL_CRUSHANDRAISE) != 0 {
+            changeSwitchTexture(gt, line, 0)
+        }
+    } naw fr special == 50 {
+        fr pdoors.evDoDoor(gt, line, psu.DOOR_CLOSE) != 0 {
+            changeSwitchTexture(gt, line, 0)
+        }
+    } naw fr special == 51 {
+        changeSwitchTexture(gt, line, 0)
+        exitLevel(gt)
+    } naw fr special == 55 {
+        fr pfloor.evDoFloor(gt, line, psu.FLOOR_RAISEFLOORCRUSH) != 0 {
+            changeSwitchTexture(gt, line, 0)
+        }
+    } naw fr special == 101 {
+        fr pfloor.evDoFloor(gt, line, psu.FLOOR_RAISEFLOOR) != 0 {
+            changeSwitchTexture(gt, line, 0)
+        }
+    } naw fr special == 102 {
+        fr pfloor.evDoFloor(gt, line, psu.FLOOR_LOWERFLOOR) != 0 {
+            changeSwitchTexture(gt, line, 0)
+        }
+    } naw fr special == 103 {
+        fr pdoors.evDoDoor(gt, line, psu.DOOR_OPEN) != 0 {
+            changeSwitchTexture(gt, line, 0)
+        }
+    } naw fr special == 111 {
+        fr pdoors.evDoDoor(gt, line, psu.DOOR_BLAZERAISE) != 0 {
+            changeSwitchTexture(gt, line, 0)
+        }
+    } naw fr special == 112 {
+        fr pdoors.evDoDoor(gt, line, psu.DOOR_BLAZEOPEN) != 0 {
+            changeSwitchTexture(gt, line, 0)
+        }
+    } naw fr special == 113 {
+        fr pdoors.evDoDoor(gt, line, psu.DOOR_BLAZECLOSE) != 0 {
+            changeSwitchTexture(gt, line, 0)
+        }
+    } naw fr special == 122 {
+        fr pplats.evDoPlat(gt, line, psu.PLATT_BLAZEDWUS, 0) != 0 {
+            changeSwitchTexture(gt, line, 0)
+        }
+    } naw fr special == 127 {
+        fr pfloor.evBuildStairs(gt, line, psu.STAIR_TURBO16) != 0 {
+            changeSwitchTexture(gt, line, 0)
+        }
+    } naw fr special == 131 {
+        fr pfloor.evDoFloor(gt, line, psu.FLOOR_RAISEFLOORTURBO) != 0 {
+            changeSwitchTexture(gt, line, 0)
+        }
+    } naw fr special == 133 || special == 135 || special == 137 {
+        fr pdoors.evDoLockedDoor(gt, line, psu.DOOR_BLAZEOPEN, thing) != 0 {
+            changeSwitchTexture(gt, line, 0)
+        }
+    } naw fr special == 140 {
+        fr pfloor.evDoFloor(gt, line, psu.FLOOR_RAISEFLOOR512) != 0 {
+            changeSwitchTexture(gt, line, 0)
+        }
+    } naw fr special == 42 {
+        fr pdoors.evDoDoor(gt, line, psu.DOOR_CLOSE) != 0 {
+            changeSwitchTexture(gt, line, 1)
+        }
+    } naw fr special == 43 {
+        fr pceilng.evDoCeiling(gt, line, psu.CEIL_LOWERTOFLOOR) != 0 {
+            changeSwitchTexture(gt, line, 1)
+        }
+    } naw fr special == 45 {
+        fr pfloor.evDoFloor(gt, line, psu.FLOOR_LOWERFLOOR) != 0 {
+            changeSwitchTexture(gt, line, 1)
+        }
+    } naw fr special == 60 {
+        fr pfloor.evDoFloor(gt, line, psu.FLOOR_LOWERFLOORTOLOWEST) != 0 {
+            changeSwitchTexture(gt, line, 1)
+        }
+    } naw fr special == 61 {
+        fr pdoors.evDoDoor(gt, line, psu.DOOR_OPEN) != 0 {
+            changeSwitchTexture(gt, line, 1)
+        }
+    } naw fr special == 62 {
+        fr pplats.evDoPlat(gt, line, psu.PLATT_DOWNWAITUPSTAY, 1) != 0 {
+            changeSwitchTexture(gt, line, 1)
+        }
+    } naw fr special == 63 {
+        fr pdoors.evDoDoor(gt, line, psu.DOOR_NORMAL) != 0 {
+            changeSwitchTexture(gt, line, 1)
+        }
+    } naw fr special == 64 {
+        fr pfloor.evDoFloor(gt, line, psu.FLOOR_RAISEFLOOR) != 0 {
+            changeSwitchTexture(gt, line, 1)
+        }
+    } naw fr special == 66 {
+        fr pplats.evDoPlat(gt, line, psu.PLATT_RAISEANDCHANGE, 24) != 0 {
+            changeSwitchTexture(gt, line, 1)
+        }
+    } naw fr special == 67 {
+        fr pplats.evDoPlat(gt, line, psu.PLATT_RAISEANDCHANGE, 32) != 0 {
+            changeSwitchTexture(gt, line, 1)
+        }
+    } naw fr special == 65 {
+        fr pfloor.evDoFloor(gt, line, psu.FLOOR_RAISEFLOORCRUSH) != 0 {
+            changeSwitchTexture(gt, line, 1)
+        }
+    } naw fr special == 68 {
+        fr pplats.evDoPlat(gt, line, psu.PLATT_RAISETONEARESTANDCHANGE, 0) != 0 {
+            changeSwitchTexture(gt, line, 1)
+        }
+    } naw fr special == 69 {
+        fr pfloor.evDoFloor(gt, line, psu.FLOOR_RAISEFLOORTONEAREST) != 0 {
+            changeSwitchTexture(gt, line, 1)
+        }
+    } naw fr special == 70 {
+        fr pfloor.evDoFloor(gt, line, psu.FLOOR_TURBOLOWER) != 0 {
+            changeSwitchTexture(gt, line, 1)
+        }
+    } naw fr special == 114 {
+        fr pdoors.evDoDoor(gt, line, psu.DOOR_BLAZERAISE) != 0 {
+            changeSwitchTexture(gt, line, 1)
+        }
+    } naw fr special == 115 {
+        fr pdoors.evDoDoor(gt, line, psu.DOOR_BLAZEOPEN) != 0 {
+            changeSwitchTexture(gt, line, 1)
+        }
+    } naw fr special == 116 {
+        fr pdoors.evDoDoor(gt, line, psu.DOOR_BLAZECLOSE) != 0 {
+            changeSwitchTexture(gt, line, 1)
+        }
+    } naw fr special == 123 {
+        fr pplats.evDoPlat(gt, line, psu.PLATT_BLAZEDWUS, 0) != 0 {
+            changeSwitchTexture(gt, line, 1)
+        }
+    } naw fr special == 132 {
+        fr pfloor.evDoFloor(gt, line, psu.FLOOR_RAISEFLOORTURBO) != 0 {
+            changeSwitchTexture(gt, line, 1)
+        }
+    } naw fr special == 99 || special == 134 || special == 136 {
+        fr pdoors.evDoLockedDoor(gt, line, psu.DOOR_BLAZEOPEN, thing) != 0 {
+            changeSwitchTexture(gt, line, 1)
+        }
+    } naw fr special == 138 {
+        plights.evLightTurnOn(gt, line, 255)
+        changeSwitchTexture(gt, line, 1)
+    } naw fr special == 139 {
+        plights.evLightTurnOn(gt, line, 35)
+        changeSwitchTexture(gt, line, 1)
+    }
+    bet nocap
+}

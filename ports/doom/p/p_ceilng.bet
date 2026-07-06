@@ -1,0 +1,309 @@
+pull "../defs/gs" as gs
+pull "../defs/think" as think
+pull "../defs/sounds" as sounds
+pull "../p/p_specutil" as psu
+pull "../p/p_floor" as pfloor
+pull "../p/p_think" as pthink
+pull "../s/s_sound" as ssnd
+
+flex finna tMoveCeiling(gt: tag gs.GameState, ceilT: tag think.Thinker) {
+    lowkey secnum: int = 0
+    lowkey speed: i32 = 0
+    lowkey topheight: i32 = 0
+    lowkey bottomheight: i32 = 0
+    lowkey crush: bool = cap
+    lowkey direction: int = 0
+    lowkey kind: int = 0
+    holla t = ceilT in gs.thinkers {
+        secnum = t.sa.secnum as int
+        speed = t.sa.speed
+        topheight = t.sa.topheight
+        bottomheight = t.sa.bottomheight
+        crush = t.sa.crush
+        direction = t.sa.direction as int
+        kind = t.sa.kind as int
+    } ghosted {
+        yeet("ceil")
+    }
+    lowkey lt: int = 0
+    holla g = gt in gs.gsc {
+        lt = g.tick.leveltime as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr direction == 1 {
+        lowkey res: int = pfloor.tMovePlane(gt, secnum, speed, topheight, cap, 1, direction)
+        fr lt & 7 == 0 {
+            fr kind != psu.CEIL_SILENTCRUSHANDRAISE {
+                ssnd.startSound(gt, ghosted, sounds.SFX_STNMOV)
+            }
+        }
+        fr res == psu.RES_PASTDEST {
+            fr kind == psu.CEIL_RAISETOHIGHEST {
+                removeActiveCeiling(gt, ceilT)
+            } naw fr kind == psu.CEIL_SILENTCRUSHANDRAISE {
+                ssnd.startSound(gt, ghosted, sounds.SFX_PSTOP)
+                setCeilDirection(gt, ceilT, -1)
+            } naw fr kind == psu.CEIL_FASTCRUSHANDRAISE || kind == psu.CEIL_CRUSHANDRAISE {
+                setCeilDirection(gt, ceilT, -1)
+            }
+        }
+    } naw fr direction == -1 {
+        lowkey res: int = pfloor.tMovePlane(gt, secnum, speed, bottomheight, crush, 1, direction)
+        fr lt & 7 == 0 {
+            fr kind != psu.CEIL_SILENTCRUSHANDRAISE {
+                ssnd.startSound(gt, ghosted, sounds.SFX_STNMOV)
+            }
+        }
+        fr res == psu.RES_PASTDEST {
+            fr kind == psu.CEIL_SILENTCRUSHANDRAISE {
+                ssnd.startSound(gt, ghosted, sounds.SFX_PSTOP)
+                setCeilSpeed(gt, ceilT, psu.CEILSPEED)
+                setCeilDirection(gt, ceilT, 1)
+            } naw fr kind == psu.CEIL_CRUSHANDRAISE {
+                setCeilSpeed(gt, ceilT, psu.CEILSPEED)
+                setCeilDirection(gt, ceilT, 1)
+            } naw fr kind == psu.CEIL_FASTCRUSHANDRAISE {
+                setCeilDirection(gt, ceilT, 1)
+            } naw fr kind == psu.CEIL_LOWERANDCRUSH || kind == psu.CEIL_LOWERTOFLOOR {
+                removeActiveCeiling(gt, ceilT)
+            }
+        } naw {
+            fr res == psu.RES_CRUSHED {
+                fr kind == psu.CEIL_SILENTCRUSHANDRAISE || kind == psu.CEIL_CRUSHANDRAISE || kind == psu.CEIL_LOWERANDCRUSH {
+                    setCeilSpeed(gt, ceilT, (psu.CEILSPEED / 8) as i32)
+                }
+            }
+        }
+    }
+}
+
+flex finna setCeilDirection(gt: tag gs.GameState, ceilT: tag think.Thinker, d: int) {
+    holla t = ceilT in gs.thinkers {
+        t.sa.direction = d as i32
+    } ghosted {
+        yeet("ceil")
+    }
+}
+
+flex finna setCeilSpeed(gt: tag gs.GameState, ceilT: tag think.Thinker, s: i32) {
+    holla t = ceilT in gs.thinkers {
+        t.sa.speed = s
+    } ghosted {
+        yeet("ceil")
+    }
+}
+
+flex finna evDoCeiling(gt: tag gs.GameState, line: int, ceiltype: int) -> int {
+    lowkey secnum: int = -1
+    lowkey rtn: int = 0
+    fr ceiltype == psu.CEIL_FASTCRUSHANDRAISE || ceiltype == psu.CEIL_SILENTCRUSHANDRAISE || ceiltype == psu.CEIL_CRUSHANDRAISE {
+        activateInStasisCeiling(gt, line)
+    }
+    vibin nocap {
+        secnum = psu.findSectorFromLineTag(gt, line, secnum)
+        fr secnum < 0 {
+            dip
+        }
+        fr psu.hasSpecialData(gt, secnum) {
+            skip
+        }
+        rtn = 1
+        lowkey ceilT = cop think.Thinker{ funcId: think.FUNC_CEILING as i32 } in gs.thinkers
+        pthink.addThinker(gt, ceilT)
+        psu.setSectorSpecialData(gt, secnum, ceilT)
+        lowkey secFloor: i32 = psu.getFloorH(gt, secnum)
+        lowkey secCeil: i32 = psu.getCeilH(gt, secnum)
+        lowkey secTag: int = 0
+        holla g = gt in gs.gsc {
+            secTag = g.level.secTag[secnum] as int
+        } ghosted {
+            yeet("gs")
+        }
+        holla t = ceilT in gs.thinkers {
+            t.sa.secnum = secnum as i32
+            t.sa.crush = cap
+        } ghosted {
+            yeet("ceil")
+        }
+        fr ceiltype == psu.CEIL_FASTCRUSHANDRAISE {
+            holla t = ceilT in gs.thinkers {
+                t.sa.crush = nocap
+                t.sa.topheight = secCeil
+                t.sa.bottomheight = (secFloor + 8 * 65536) as i32
+                t.sa.direction = -1
+                t.sa.speed = (psu.CEILSPEED * 2) as i32
+            } ghosted {
+                yeet("ceil")
+            }
+        } naw fr ceiltype == psu.CEIL_SILENTCRUSHANDRAISE || ceiltype == psu.CEIL_CRUSHANDRAISE {
+            holla t = ceilT in gs.thinkers {
+                t.sa.crush = nocap
+                t.sa.topheight = secCeil
+                t.sa.bottomheight = (secFloor + 8 * 65536) as i32
+                t.sa.direction = -1
+                t.sa.speed = psu.CEILSPEED
+            } ghosted {
+                yeet("ceil")
+            }
+        } naw fr ceiltype == psu.CEIL_LOWERANDCRUSH {
+            holla t = ceilT in gs.thinkers {
+                t.sa.bottomheight = (secFloor + 8 * 65536) as i32
+                t.sa.direction = -1
+                t.sa.speed = psu.CEILSPEED
+            } ghosted {
+                yeet("ceil")
+            }
+        } naw fr ceiltype == psu.CEIL_LOWERTOFLOOR {
+            holla t = ceilT in gs.thinkers {
+                t.sa.bottomheight = secFloor
+                t.sa.direction = -1
+                t.sa.speed = psu.CEILSPEED
+            } ghosted {
+                yeet("ceil")
+            }
+        } naw fr ceiltype == psu.CEIL_RAISETOHIGHEST {
+            lowkey top: i32 = psu.findHighestCeilingSurrounding(gt, secnum)
+            holla t = ceilT in gs.thinkers {
+                t.sa.topheight = top
+                t.sa.direction = 1
+                t.sa.speed = psu.CEILSPEED
+            } ghosted {
+                yeet("ceil")
+            }
+        }
+        holla t = ceilT in gs.thinkers {
+            t.sa.secTag = secTag as i32
+            t.sa.kind = ceiltype as i32
+        } ghosted {
+            yeet("ceil")
+        }
+        addActiveCeiling(gt, ceilT)
+    }
+    bet rtn
+}
+
+flex finna addActiveCeiling(gt: tag gs.GameState, c: tag think.Thinker) {
+    holla g = gt in gs.gsc {
+        lowkey i: int = 0
+        vibin i < psu.MAXCEILINGS {
+            fr g.tick.activeceilings[i].t == ghosted {
+                g.tick.activeceilings[i].t = c
+                dip
+            }
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna removeActiveCeiling(gt: tag gs.GameState, c: tag think.Thinker) {
+    lowkey found: int = -1
+    lowkey sec: int = -1
+    holla g = gt in gs.gsc {
+        lowkey i: int = 0
+        vibin i < psu.MAXCEILINGS {
+            fr g.tick.activeceilings[i].t == c {
+                found = i
+                dip
+            }
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    fr found < 0 {
+        bet
+    }
+    holla t = c in gs.thinkers {
+        sec = t.sa.secnum as int
+    } ghosted {
+        yeet("ceil")
+    }
+    psu.clearSectorSpecialData(gt, sec)
+    pthink.removeThinker(gt, c)
+    holla g = gt in gs.gsc {
+        g.tick.activeceilings[found].t = ghosted
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna activateInStasisCeiling(gt: tag gs.GameState, line: int) {
+    lowkey ltag: int = 0
+    holla g = gt in gs.gsc {
+        ltag = g.level.lineTag[line] as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey i: int = 0
+    vibin i < psu.MAXCEILINGS {
+        lowkey c: tag think.Thinker = ghosted
+        holla g = gt in gs.gsc {
+            c = g.tick.activeceilings[i].t
+        } ghosted {
+            yeet("gs")
+        }
+        fr !(c == ghosted) {
+            lowkey cTag: int = 0
+            lowkey cDir: int = 0
+            lowkey cOld: int = 0
+            holla t = c in gs.thinkers {
+                cTag = t.sa.secTag as int
+                cDir = t.sa.direction as int
+                cOld = t.sa.olddirection as int
+            } ghosted {
+                yeet("ceil")
+            }
+            fr cTag == ltag && cDir == 0 {
+                holla t = c in gs.thinkers {
+                    t.sa.direction = cOld as i32
+                } ghosted {
+                    yeet("ceil")
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+flex finna evCeilingCrushStop(gt: tag gs.GameState, line: int) -> int {
+    lowkey ltag: int = 0
+    holla g = gt in gs.gsc {
+        ltag = g.level.lineTag[line] as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey rtn: int = 0
+    lowkey i: int = 0
+    vibin i < psu.MAXCEILINGS {
+        lowkey c: tag think.Thinker = ghosted
+        holla g = gt in gs.gsc {
+            c = g.tick.activeceilings[i].t
+        } ghosted {
+            yeet("gs")
+        }
+        fr !(c == ghosted) {
+            lowkey cTag: int = 0
+            lowkey cDir: int = 0
+            holla t = c in gs.thinkers {
+                cTag = t.sa.secTag as int
+                cDir = t.sa.direction as int
+            } ghosted {
+                yeet("ceil")
+            }
+            fr cTag == ltag && cDir != 0 {
+                holla t = c in gs.thinkers {
+                    t.sa.olddirection = cDir as i32
+                    t.sa.direction = 0
+                } ghosted {
+                    yeet("ceil")
+                }
+                rtn = 1
+            }
+        }
+        i = i + 1
+    }
+    bet rtn
+}

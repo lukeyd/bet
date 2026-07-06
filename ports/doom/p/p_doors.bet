@@ -1,0 +1,427 @@
+pull "../defs/gs" as gs
+pull "../defs/think" as think
+pull "../defs/doomdef" as doomdef
+pull "../defs/player" as pdef
+pull "../defs/sounds" as sounds
+pull "../defs/strings" as strings
+pull "../p/p_specutil" as psu
+pull "../p/p_floor" as pfloor
+pull "../p/p_think" as pthink
+pull "../s/s_sound" as ssnd
+
+flex finna tVerticalDoor(gt: tag gs.GameState, doorT: tag think.Thinker) {
+    lowkey secnum: int = 0
+    lowkey speed: i32 = 0
+    lowkey topheight: i32 = 0
+    lowkey direction: int = 0
+    lowkey topwait: int = 0
+    lowkey topcountdown: int = 0
+    lowkey kind: int = 0
+    holla t = doorT in gs.thinkers {
+        secnum = t.sa.secnum as int
+        speed = t.sa.speed
+        topheight = t.sa.topheight
+        direction = t.sa.direction as int
+        topwait = t.sa.topwait as int
+        topcountdown = t.sa.topcountdown as int
+        kind = t.sa.kind as int
+    } ghosted {
+        yeet("door")
+    }
+    fr direction == 0 {
+        topcountdown = topcountdown - 1
+        holla t = doorT in gs.thinkers {
+            t.sa.topcountdown = topcountdown as i32
+        } ghosted {
+            yeet("door")
+        }
+        fr topcountdown == 0 {
+            fr kind == psu.DOOR_BLAZERAISE {
+                setDoorDir(gt, doorT, -1)
+                ssnd.startSound(gt, ghosted, sounds.SFX_BDCLS)
+            } naw fr kind == psu.DOOR_NORMAL {
+                setDoorDir(gt, doorT, -1)
+                ssnd.startSound(gt, ghosted, sounds.SFX_DORCLS)
+            } naw fr kind == psu.DOOR_CLOSE30THENOPEN {
+                setDoorDir(gt, doorT, 1)
+                ssnd.startSound(gt, ghosted, sounds.SFX_DOROPN)
+            }
+        }
+    } naw fr direction == 2 {
+        topcountdown = topcountdown - 1
+        holla t = doorT in gs.thinkers {
+            t.sa.topcountdown = topcountdown as i32
+        } ghosted {
+            yeet("door")
+        }
+        fr topcountdown == 0 {
+            fr kind == psu.DOOR_RAISEIN5MINS {
+                holla t = doorT in gs.thinkers {
+                    t.sa.direction = 1
+                    t.sa.kind = psu.DOOR_NORMAL as i32
+                } ghosted {
+                    yeet("door")
+                }
+                ssnd.startSound(gt, ghosted, sounds.SFX_DOROPN)
+            }
+        }
+    } naw fr direction == -1 {
+        lowkey secFloor: i32 = psu.getFloorH(gt, secnum)
+        lowkey res: int = pfloor.tMovePlane(gt, secnum, speed, secFloor, cap, 1, direction)
+        fr res == psu.RES_PASTDEST {
+            fr kind == psu.DOOR_BLAZERAISE || kind == psu.DOOR_BLAZECLOSE {
+                psu.clearSectorSpecialData(gt, secnum)
+                pthink.removeThinker(gt, doorT)
+                ssnd.startSound(gt, ghosted, sounds.SFX_BDCLS)
+            } naw fr kind == psu.DOOR_NORMAL || kind == psu.DOOR_CLOSE {
+                psu.clearSectorSpecialData(gt, secnum)
+                pthink.removeThinker(gt, doorT)
+            } naw fr kind == psu.DOOR_CLOSE30THENOPEN {
+                holla t = doorT in gs.thinkers {
+                    t.sa.direction = 0
+                    t.sa.topcountdown = (35 * 30) as i32
+                } ghosted {
+                    yeet("door")
+                }
+            }
+        } naw fr res == psu.RES_CRUSHED {
+            fr kind == psu.DOOR_BLAZECLOSE || kind == psu.DOOR_CLOSE {
+                bet
+            } naw {
+                setDoorDir(gt, doorT, 1)
+                ssnd.startSound(gt, ghosted, sounds.SFX_DOROPN)
+            }
+        }
+    } naw fr direction == 1 {
+        lowkey res: int = pfloor.tMovePlane(gt, secnum, speed, topheight, cap, 1, direction)
+        fr res == psu.RES_PASTDEST {
+            fr kind == psu.DOOR_BLAZERAISE || kind == psu.DOOR_NORMAL {
+                holla t = doorT in gs.thinkers {
+                    t.sa.direction = 0
+                    t.sa.topcountdown = topwait as i32
+                } ghosted {
+                    yeet("door")
+                }
+            } naw fr kind == psu.DOOR_CLOSE30THENOPEN || kind == psu.DOOR_BLAZEOPEN || kind == psu.DOOR_OPEN {
+                psu.clearSectorSpecialData(gt, secnum)
+                pthink.removeThinker(gt, doorT)
+            }
+        }
+    }
+}
+
+flex finna setDoorDir(gt: tag gs.GameState, doorT: tag think.Thinker, d: int) {
+    holla t = doorT in gs.thinkers {
+        t.sa.direction = d as i32
+    } ghosted {
+        yeet("door")
+    }
+}
+
+flex finna evDoDoor(gt: tag gs.GameState, line: int, doortype: int) -> int {
+    lowkey secnum: int = -1
+    lowkey rtn: int = 0
+    vibin nocap {
+        secnum = psu.findSectorFromLineTag(gt, line, secnum)
+        fr secnum < 0 {
+            dip
+        }
+        fr psu.hasSpecialData(gt, secnum) {
+            skip
+        }
+        rtn = 1
+        lowkey doorT = cop think.Thinker{ funcId: think.FUNC_DOOR as i32 } in gs.thinkers
+        pthink.addThinker(gt, doorT)
+        psu.setSectorSpecialData(gt, secnum, doorT)
+        holla t = doorT in gs.thinkers {
+            t.sa.secnum = secnum as i32
+            t.sa.kind = doortype as i32
+            t.sa.topwait = psu.VDOORWAIT as i32
+            t.sa.speed = psu.VDOORSPEED
+        } ghosted {
+            yeet("door")
+        }
+        lowkey secCeil: i32 = psu.getCeilH(gt, secnum)
+        fr doortype == psu.DOOR_BLAZECLOSE {
+            lowkey top: i32 = (psu.findLowestCeilingSurrounding(gt, secnum) - 4 * 65536) as i32
+            holla t = doorT in gs.thinkers {
+                t.sa.topheight = top
+                t.sa.direction = -1
+                t.sa.speed = (psu.VDOORSPEED * 4) as i32
+            } ghosted {
+                yeet("door")
+            }
+            ssnd.startSound(gt, ghosted, sounds.SFX_BDCLS)
+        } naw fr doortype == psu.DOOR_CLOSE {
+            lowkey top: i32 = (psu.findLowestCeilingSurrounding(gt, secnum) - 4 * 65536) as i32
+            holla t = doorT in gs.thinkers {
+                t.sa.topheight = top
+                t.sa.direction = -1
+            } ghosted {
+                yeet("door")
+            }
+            ssnd.startSound(gt, ghosted, sounds.SFX_DORCLS)
+        } naw fr doortype == psu.DOOR_CLOSE30THENOPEN {
+            holla t = doorT in gs.thinkers {
+                t.sa.topheight = secCeil
+                t.sa.direction = -1
+            } ghosted {
+                yeet("door")
+            }
+            ssnd.startSound(gt, ghosted, sounds.SFX_DORCLS)
+        } naw fr doortype == psu.DOOR_BLAZERAISE || doortype == psu.DOOR_BLAZEOPEN {
+            lowkey top: i32 = (psu.findLowestCeilingSurrounding(gt, secnum) - 4 * 65536) as i32
+            holla t = doorT in gs.thinkers {
+                t.sa.direction = 1
+                t.sa.topheight = top
+                t.sa.speed = (psu.VDOORSPEED * 4) as i32
+            } ghosted {
+                yeet("door")
+            }
+            fr top != secCeil {
+                ssnd.startSound(gt, ghosted, sounds.SFX_BDOPN)
+            }
+        } naw fr doortype == psu.DOOR_NORMAL || doortype == psu.DOOR_OPEN {
+            lowkey top: i32 = (psu.findLowestCeilingSurrounding(gt, secnum) - 4 * 65536) as i32
+            holla t = doorT in gs.thinkers {
+                t.sa.direction = 1
+                t.sa.topheight = top
+            } ghosted {
+                yeet("door")
+            }
+            fr top != secCeil {
+                ssnd.startSound(gt, ghosted, sounds.SFX_DOROPN)
+            }
+        }
+    }
+    bet rtn
+}
+
+flex finna evDoLockedDoor(gt: tag gs.GameState, line: int, doortype: int, thing: tag think.Thinker) -> int {
+    lowkey playerIdx: int = -1
+    holla t = thing in gs.thinkers {
+        playerIdx = t.mobj.player as int
+    } ghosted {
+        yeet("thing")
+    }
+    fr playerIdx < 0 {
+        bet 0
+    }
+    lowkey special: int = 0
+    holla g = gt in gs.gsc {
+        special = g.level.lineSpecial[line] as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr special == 99 || special == 133 {
+        fr !hasCard(gt, playerIdx, doomdef.IT_BLUECARD) && !hasCard(gt, playerIdx, doomdef.IT_BLUESKULL) {
+            setMessage(gt, playerIdx, strings.PD_BLUEO)
+            ssnd.startSound(gt, ghosted, sounds.SFX_OOF)
+            bet 0
+        }
+    } naw fr special == 134 || special == 135 {
+        fr !hasCard(gt, playerIdx, doomdef.IT_REDCARD) && !hasCard(gt, playerIdx, doomdef.IT_REDSKULL) {
+            setMessage(gt, playerIdx, strings.PD_REDO)
+            ssnd.startSound(gt, ghosted, sounds.SFX_OOF)
+            bet 0
+        }
+    } naw fr special == 136 || special == 137 {
+        fr !hasCard(gt, playerIdx, doomdef.IT_YELLOWCARD) && !hasCard(gt, playerIdx, doomdef.IT_YELLOWSKULL) {
+            setMessage(gt, playerIdx, strings.PD_YELLOWO)
+            ssnd.startSound(gt, ghosted, sounds.SFX_OOF)
+            bet 0
+        }
+    }
+    bet evDoDoor(gt, line, doortype)
+}
+
+flex finna hasCard(gt: tag gs.GameState, playerIdx: int, card: int) -> bool {
+    lowkey has: bool = cap
+    holla g = gt in gs.gsc {
+        has = g.shell.players[playerIdx].cards[card]
+    } ghosted {
+        yeet("gs")
+    }
+    bet has
+}
+
+flex finna setMessage(gt: tag gs.GameState, playerIdx: int, msg: str) {
+    holla g = gt in gs.gsc {
+        g.shell.players[playerIdx].message = msg
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna evVerticalDoor(gt: tag gs.GameState, line: int, thing: tag think.Thinker) {
+    lowkey playerIdx: int = -1
+    holla t = thing in gs.thinkers {
+        playerIdx = t.mobj.player as int
+    } ghosted {
+        yeet("thing")
+    }
+    lowkey special: int = 0
+    holla g = gt in gs.gsc {
+        special = g.level.lineSpecial[line] as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr special == 26 || special == 32 {
+        fr playerIdx < 0 {
+            bet
+        }
+        fr !hasCard(gt, playerIdx, doomdef.IT_BLUECARD) && !hasCard(gt, playerIdx, doomdef.IT_BLUESKULL) {
+            setMessage(gt, playerIdx, strings.PD_BLUEK)
+            ssnd.startSound(gt, ghosted, sounds.SFX_OOF)
+            bet
+        }
+    } naw fr special == 27 || special == 34 {
+        fr playerIdx < 0 {
+            bet
+        }
+        fr !hasCard(gt, playerIdx, doomdef.IT_YELLOWCARD) && !hasCard(gt, playerIdx, doomdef.IT_YELLOWSKULL) {
+            setMessage(gt, playerIdx, strings.PD_YELLOWK)
+            ssnd.startSound(gt, ghosted, sounds.SFX_OOF)
+            bet
+        }
+    } naw fr special == 28 || special == 33 {
+        fr playerIdx < 0 {
+            bet
+        }
+        fr !hasCard(gt, playerIdx, doomdef.IT_REDCARD) && !hasCard(gt, playerIdx, doomdef.IT_REDSKULL) {
+            setMessage(gt, playerIdx, strings.PD_REDK)
+            ssnd.startSound(gt, ghosted, sounds.SFX_OOF)
+            bet
+        }
+    }
+    lowkey sd1: int = 0
+    holla g = gt in gs.gsc {
+        sd1 = g.level.lineSide1[line] as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey sec: int = 0
+    holla g = gt in gs.gsc {
+        sec = g.level.sdSector[sd1] as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr psu.hasSpecialData(gt, sec) {
+        fr special == 1 || special == 26 || special == 27 || special == 28 || special == 117 {
+            lowkey door: tag think.Thinker = psu.sectorSpecialData(gt, sec)
+            lowkey dir: int = 0
+            holla t = door in gs.thinkers {
+                dir = t.sa.direction as int
+            } ghosted {
+                yeet("door")
+            }
+            fr dir == -1 {
+                holla t = door in gs.thinkers {
+                    t.sa.direction = 1
+                } ghosted {
+                    yeet("door")
+                }
+            } naw {
+                fr playerIdx < 0 {
+                    bet
+                }
+                holla t = door in gs.thinkers {
+                    t.sa.direction = -1
+                } ghosted {
+                    yeet("door")
+                }
+            }
+            bet
+        }
+    }
+    fr special == 117 || special == 118 {
+        ssnd.startSound(gt, ghosted, sounds.SFX_BDOPN)
+    } naw {
+        ssnd.startSound(gt, ghosted, sounds.SFX_DOROPN)
+    }
+    lowkey doorT = cop think.Thinker{ funcId: think.FUNC_DOOR as i32 } in gs.thinkers
+    pthink.addThinker(gt, doorT)
+    psu.setSectorSpecialData(gt, sec, doorT)
+    holla t = doorT in gs.thinkers {
+        t.sa.secnum = sec as i32
+        t.sa.direction = 1
+        t.sa.speed = psu.VDOORSPEED
+        t.sa.topwait = psu.VDOORWAIT as i32
+    } ghosted {
+        yeet("door")
+    }
+    lowkey kind: int = psu.DOOR_NORMAL
+    lowkey speed: i32 = psu.VDOORSPEED
+    fr special == 1 || special == 26 || special == 27 || special == 28 {
+        kind = psu.DOOR_NORMAL
+    } naw fr special == 31 || special == 32 || special == 33 || special == 34 {
+        kind = psu.DOOR_OPEN
+        holla g = gt in gs.gsc {
+            g.level.lineSpecial[line] = 0
+        } ghosted {
+            yeet("gs")
+        }
+    } naw fr special == 117 {
+        kind = psu.DOOR_BLAZERAISE
+        speed = (psu.VDOORSPEED * 4) as i32
+    } naw fr special == 118 {
+        kind = psu.DOOR_BLAZEOPEN
+        holla g = gt in gs.gsc {
+            g.level.lineSpecial[line] = 0
+        } ghosted {
+            yeet("gs")
+        }
+        speed = (psu.VDOORSPEED * 4) as i32
+    }
+    lowkey top: i32 = (psu.findLowestCeilingSurrounding(gt, sec) - 4 * 65536) as i32
+    holla t = doorT in gs.thinkers {
+        t.sa.kind = kind as i32
+        t.sa.speed = speed
+        t.sa.topheight = top
+    } ghosted {
+        yeet("door")
+    }
+}
+
+flex finna spawnDoorCloseIn30(gt: tag gs.GameState, sec: int) {
+    lowkey doorT = cop think.Thinker{ funcId: think.FUNC_DOOR as i32 } in gs.thinkers
+    pthink.addThinker(gt, doorT)
+    psu.setSectorSpecialData(gt, sec, doorT)
+    holla g = gt in gs.gsc {
+        g.level.secSpecial[sec] = 0
+    } ghosted {
+        yeet("gs")
+    }
+    holla t = doorT in gs.thinkers {
+        t.sa.secnum = sec as i32
+        t.sa.direction = 0
+        t.sa.kind = psu.DOOR_NORMAL as i32
+        t.sa.speed = psu.VDOORSPEED
+        t.sa.topcountdown = (30 * 35) as i32
+    } ghosted {
+        yeet("door")
+    }
+}
+
+flex finna spawnDoorRaiseIn5Mins(gt: tag gs.GameState, sec: int) {
+    lowkey doorT = cop think.Thinker{ funcId: think.FUNC_DOOR as i32 } in gs.thinkers
+    pthink.addThinker(gt, doorT)
+    psu.setSectorSpecialData(gt, sec, doorT)
+    holla g = gt in gs.gsc {
+        g.level.secSpecial[sec] = 0
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey top: i32 = (psu.findLowestCeilingSurrounding(gt, sec) - 4 * 65536) as i32
+    holla t = doorT in gs.thinkers {
+        t.sa.secnum = sec as i32
+        t.sa.direction = 2
+        t.sa.kind = psu.DOOR_RAISEIN5MINS as i32
+        t.sa.speed = psu.VDOORSPEED
+        t.sa.topheight = top
+        t.sa.topwait = psu.VDOORWAIT as i32
+        t.sa.topcountdown = (5 * 60 * 35) as i32
+    } ghosted {
+        yeet("door")
+    }
+}

@@ -1,0 +1,562 @@
+pull "../defs/gs" as gs
+pull "../defs/think" as think
+pull "../defs/fixed" as fixed
+pull "../defs/sounds" as sounds
+pull "../p/p_specutil" as psu
+pull "../p/p_think" as pthink
+pull "../p/p_map" as pmap
+pull "../s/s_sound" as ssnd
+
+flex finna tMovePlane(gt: tag gs.GameState, secnum: int, speed: i32, dest: i32, crush: bool, floorOrCeiling: int, direction: int) -> int {
+    lowkey lastpos: i32 = 0
+    lowkey flag: bool = cap
+    fr floorOrCeiling == 0 {
+        fr direction == -1 {
+            lowkey cur: i32 = psu.getFloorH(gt, secnum)
+            fr cur - speed < dest {
+                lastpos = cur
+                psu.setFloorH(gt, secnum, dest)
+                flag = pmap.changeSector(gt, secnum, crush)
+                fr flag {
+                    psu.setFloorH(gt, secnum, lastpos)
+                    pmap.changeSector(gt, secnum, crush)
+                }
+                bet psu.RES_PASTDEST
+            } naw {
+                lastpos = cur
+                psu.setFloorH(gt, secnum, (cur - speed) as i32)
+                flag = pmap.changeSector(gt, secnum, crush)
+                fr flag {
+                    psu.setFloorH(gt, secnum, lastpos)
+                    pmap.changeSector(gt, secnum, crush)
+                    bet psu.RES_CRUSHED
+                }
+            }
+        } naw fr direction == 1 {
+            lowkey cur: i32 = psu.getFloorH(gt, secnum)
+            fr cur + speed > dest {
+                lastpos = cur
+                psu.setFloorH(gt, secnum, dest)
+                flag = pmap.changeSector(gt, secnum, crush)
+                fr flag {
+                    psu.setFloorH(gt, secnum, lastpos)
+                    pmap.changeSector(gt, secnum, crush)
+                }
+                bet psu.RES_PASTDEST
+            } naw {
+                lastpos = cur
+                psu.setFloorH(gt, secnum, (cur + speed) as i32)
+                flag = pmap.changeSector(gt, secnum, crush)
+                fr flag {
+                    fr crush {
+                        bet psu.RES_CRUSHED
+                    }
+                    psu.setFloorH(gt, secnum, lastpos)
+                    pmap.changeSector(gt, secnum, crush)
+                    bet psu.RES_CRUSHED
+                }
+            }
+        }
+    } naw fr floorOrCeiling == 1 {
+        fr direction == -1 {
+            lowkey cur: i32 = psu.getCeilH(gt, secnum)
+            fr cur - speed < dest {
+                lastpos = cur
+                psu.setCeilH(gt, secnum, dest)
+                flag = pmap.changeSector(gt, secnum, crush)
+                fr flag {
+                    psu.setCeilH(gt, secnum, lastpos)
+                    pmap.changeSector(gt, secnum, crush)
+                }
+                bet psu.RES_PASTDEST
+            } naw {
+                lastpos = cur
+                psu.setCeilH(gt, secnum, (cur - speed) as i32)
+                flag = pmap.changeSector(gt, secnum, crush)
+                fr flag {
+                    fr crush {
+                        bet psu.RES_CRUSHED
+                    }
+                    psu.setCeilH(gt, secnum, lastpos)
+                    pmap.changeSector(gt, secnum, crush)
+                    bet psu.RES_CRUSHED
+                }
+            }
+        } naw fr direction == 1 {
+            lowkey cur: i32 = psu.getCeilH(gt, secnum)
+            fr cur + speed > dest {
+                lastpos = cur
+                psu.setCeilH(gt, secnum, dest)
+                flag = pmap.changeSector(gt, secnum, crush)
+                fr flag {
+                    psu.setCeilH(gt, secnum, lastpos)
+                    pmap.changeSector(gt, secnum, crush)
+                }
+                bet psu.RES_PASTDEST
+            } naw {
+                lastpos = cur
+                psu.setCeilH(gt, secnum, (cur + speed) as i32)
+                pmap.changeSector(gt, secnum, crush)
+            }
+        }
+    }
+    bet psu.RES_OK
+}
+
+flex finna tMoveFloor(gt: tag gs.GameState, floorT: tag think.Thinker) {
+    lowkey secnum: int = 0
+    lowkey speed: i32 = 0
+    lowkey dest: i32 = 0
+    lowkey crush: bool = cap
+    lowkey direction: int = 0
+    lowkey kind: int = 0
+    lowkey newspecial: int = 0
+    lowkey texture: int = 0
+    holla t = floorT in gs.thinkers {
+        secnum = t.sa.secnum as int
+        speed = t.sa.speed
+        dest = t.sa.floordestheight
+        crush = t.sa.crush
+        direction = t.sa.direction as int
+        kind = t.sa.kind as int
+        newspecial = t.sa.newspecial as int
+        texture = t.sa.texture as int
+    } ghosted {
+        yeet("floor")
+    }
+    lowkey res: int = tMovePlane(gt, secnum, speed, dest, crush, 0, direction)
+    lowkey lt: int = 0
+    holla g = gt in gs.gsc {
+        lt = g.tick.leveltime as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr lt & 7 == 0 {
+        ssnd.startSound(gt, ghosted, sounds.SFX_STNMOV)
+    }
+    fr res == psu.RES_PASTDEST {
+        psu.clearSectorSpecialData(gt, secnum)
+        fr direction == 1 {
+            fr kind == psu.FLOOR_DONUTRAISE {
+                holla g = gt in gs.gsc {
+                    g.level.secSpecial[secnum] = newspecial as i32
+                    g.level.secFloorPic[secnum] = texture as i32
+                } ghosted {
+                    yeet("gs")
+                }
+            }
+        } naw fr direction == -1 {
+            fr kind == psu.FLOOR_LOWERANDCHANGE {
+                holla g = gt in gs.gsc {
+                    g.level.secSpecial[secnum] = newspecial as i32
+                    g.level.secFloorPic[secnum] = texture as i32
+                } ghosted {
+                    yeet("gs")
+                }
+            }
+        }
+        pthink.removeThinker(gt, floorT)
+        ssnd.startSound(gt, ghosted, sounds.SFX_PSTOP)
+    }
+}
+
+flex finna newFloorThinker(gt: tag gs.GameState, sec: int, floortype: int) -> tag think.Thinker {
+    lowkey floorT = cop think.Thinker{ funcId: think.FUNC_FLOOR as i32 } in gs.thinkers
+    holla t = floorT in gs.thinkers {
+        t.sa.secnum = sec as i32
+        t.sa.kind = floortype as i32
+        t.sa.crush = cap
+    } ghosted {
+        yeet("floor")
+    }
+    pthink.addThinker(gt, floorT)
+    psu.setSectorSpecialData(gt, sec, floorT)
+    bet floorT
+}
+
+flex finna evDoFloor(gt: tag gs.GameState, line: int, floortype: int) -> int {
+    lowkey secnum: int = -1
+    lowkey rtn: int = 0
+    vibin nocap {
+        secnum = psu.findSectorFromLineTag(gt, line, secnum)
+        fr secnum < 0 {
+            dip
+        }
+        fr psu.hasSpecialData(gt, secnum) {
+            skip
+        }
+        rtn = 1
+        lowkey floorT = newFloorThinker(gt, secnum, floortype)
+        lowkey secFloor: i32 = psu.getFloorH(gt, secnum)
+        fr floortype == psu.FLOOR_LOWERFLOOR {
+            lowkey d = psu.findHighestFloorSurrounding(gt, secnum)
+            holla t = floorT in gs.thinkers {
+                t.sa.direction = -1
+                t.sa.speed = psu.FLOORSPEED
+                t.sa.floordestheight = d
+            } ghosted {
+                yeet("floor")
+            }
+        } naw fr floortype == psu.FLOOR_LOWERFLOORTOLOWEST {
+            lowkey d = psu.findLowestFloorSurrounding(gt, secnum)
+            holla t = floorT in gs.thinkers {
+                t.sa.direction = -1
+                t.sa.speed = psu.FLOORSPEED
+                t.sa.floordestheight = d
+            } ghosted {
+                yeet("floor")
+            }
+        } naw fr floortype == psu.FLOOR_TURBOLOWER {
+            lowkey d = psu.findHighestFloorSurrounding(gt, secnum)
+            fr d != secFloor {
+                d = (d + 8 * 65536) as i32
+            }
+            holla t = floorT in gs.thinkers {
+                t.sa.direction = -1
+                t.sa.speed = (psu.FLOORSPEED * 4) as i32
+                t.sa.floordestheight = d
+            } ghosted {
+                yeet("floor")
+            }
+        } naw fr floortype == psu.FLOOR_RAISEFLOORCRUSH || floortype == psu.FLOOR_RAISEFLOOR {
+            lowkey secCeil: i32 = psu.getCeilH(gt, secnum)
+            lowkey d = psu.findLowestCeilingSurrounding(gt, secnum)
+            fr d > secCeil {
+                d = secCeil
+            }
+            fr floortype == psu.FLOOR_RAISEFLOORCRUSH {
+                d = (d - 8 * 65536) as i32
+            }
+            lowkey isCrush: bool = floortype == psu.FLOOR_RAISEFLOORCRUSH
+            holla t = floorT in gs.thinkers {
+                t.sa.crush = isCrush
+                t.sa.direction = 1
+                t.sa.speed = psu.FLOORSPEED
+                t.sa.floordestheight = d
+            } ghosted {
+                yeet("floor")
+            }
+        } naw fr floortype == psu.FLOOR_RAISEFLOORTURBO {
+            lowkey d = psu.findNextHighestFloor(gt, secnum, secFloor)
+            holla t = floorT in gs.thinkers {
+                t.sa.direction = 1
+                t.sa.speed = (psu.FLOORSPEED * 4) as i32
+                t.sa.floordestheight = d
+            } ghosted {
+                yeet("floor")
+            }
+        } naw fr floortype == psu.FLOOR_RAISEFLOORTONEAREST {
+            lowkey d = psu.findNextHighestFloor(gt, secnum, secFloor)
+            holla t = floorT in gs.thinkers {
+                t.sa.direction = 1
+                t.sa.speed = psu.FLOORSPEED
+                t.sa.floordestheight = d
+            } ghosted {
+                yeet("floor")
+            }
+        } naw fr floortype == psu.FLOOR_RAISEFLOOR24 {
+            holla t = floorT in gs.thinkers {
+                t.sa.direction = 1
+                t.sa.speed = psu.FLOORSPEED
+                t.sa.floordestheight = (secFloor + 24 * 65536) as i32
+            } ghosted {
+                yeet("floor")
+            }
+        } naw fr floortype == psu.FLOOR_RAISEFLOOR512 {
+            holla t = floorT in gs.thinkers {
+                t.sa.direction = 1
+                t.sa.speed = psu.FLOORSPEED
+                t.sa.floordestheight = (secFloor + 512 * 65536) as i32
+            } ghosted {
+                yeet("floor")
+            }
+        } naw fr floortype == psu.FLOOR_RAISEFLOOR24ANDCHANGE {
+            lowkey frontpic: int = 0
+            lowkey frontspec: int = 0
+            holla g = gt in gs.gsc {
+                lowkey fs: int = g.level.lineFront[line] as int
+                frontpic = g.level.secFloorPic[fs] as int
+                frontspec = g.level.secSpecial[fs] as int
+                g.level.secFloorPic[secnum] = frontpic as i32
+                g.level.secSpecial[secnum] = frontspec as i32
+            } ghosted {
+                yeet("gs")
+            }
+            holla t = floorT in gs.thinkers {
+                t.sa.direction = 1
+                t.sa.speed = psu.FLOORSPEED
+                t.sa.floordestheight = (secFloor + 24 * 65536) as i32
+            } ghosted {
+                yeet("floor")
+            }
+        } naw fr floortype == psu.FLOOR_RAISETOTEXTURE {
+            lowkey minsize: int = fixed.MAXINT as int
+            lowkey n: int = psu.sectorLineCount(gt, secnum)
+            lowkey i: int = 0
+            vibin i < n {
+                fr psu.twoSided(gt, secnum, i) != 0 {
+                    lowkey sd0: int = psu.getSide(gt, secnum, i, 0)
+                    fr sd0 >= 0 {
+                        lowkey bt: int = 0
+                        holla g = gt in gs.gsc {
+                            bt = g.level.sdBotTex[sd0] as int
+                        } ghosted {
+                            yeet("gs")
+                        }
+                        fr bt >= 0 {
+                            lowkey th: int = 0
+                            holla g = gt in gs.gsc {
+                                th = g.render.textureHeight[bt] as int
+                            } ghosted {
+                                yeet("gs")
+                            }
+                            fr th < minsize {
+                                minsize = th
+                            }
+                        }
+                    }
+                    lowkey sd1: int = psu.getSide(gt, secnum, i, 1)
+                    fr sd1 >= 0 {
+                        lowkey bt: int = 0
+                        holla g = gt in gs.gsc {
+                            bt = g.level.sdBotTex[sd1] as int
+                        } ghosted {
+                            yeet("gs")
+                        }
+                        fr bt >= 0 {
+                            lowkey th: int = 0
+                            holla g = gt in gs.gsc {
+                                th = g.render.textureHeight[bt] as int
+                            } ghosted {
+                                yeet("gs")
+                            }
+                            fr th < minsize {
+                                minsize = th
+                            }
+                        }
+                    }
+                }
+                i = i + 1
+            }
+            holla t = floorT in gs.thinkers {
+                t.sa.direction = 1
+                t.sa.speed = psu.FLOORSPEED
+                t.sa.floordestheight = (secFloor as int + minsize) as i32
+            } ghosted {
+                yeet("floor")
+            }
+        } naw fr floortype == psu.FLOOR_LOWERANDCHANGE {
+            lowkey d = psu.findLowestFloorSurrounding(gt, secnum)
+            lowkey tex: int = 0
+            holla g = gt in gs.gsc {
+                tex = g.level.secFloorPic[secnum] as int
+            } ghosted {
+                yeet("gs")
+            }
+            lowkey newspec: int = 0
+            lowkey n: int = psu.sectorLineCount(gt, secnum)
+            lowkey i: int = 0
+            vibin i < n {
+                fr psu.twoSided(gt, secnum, i) != 0 {
+                    lowkey side0sec: int = psu.getSector(gt, secnum, i, 0)
+                    lowkey osec: int = -1
+                    fr side0sec == secnum {
+                        osec = psu.getSector(gt, secnum, i, 1)
+                    } naw {
+                        osec = psu.getSector(gt, secnum, i, 0)
+                    }
+                    fr osec >= 0 {
+                        lowkey ofh: i32 = psu.getFloorH(gt, osec)
+                        fr ofh == d {
+                            holla g = gt in gs.gsc {
+                                tex = g.level.secFloorPic[osec] as int
+                                newspec = g.level.secSpecial[osec] as int
+                            } ghosted {
+                                yeet("gs")
+                            }
+                            holla t = floorT in gs.thinkers {
+                                t.sa.texture = tex as i32
+                                t.sa.newspecial = newspec as i32
+                            } ghosted {
+                                yeet("floor")
+                            }
+                            dip
+                        }
+                    }
+                }
+                i = i + 1
+            }
+            holla t = floorT in gs.thinkers {
+                t.sa.direction = -1
+                t.sa.speed = psu.FLOORSPEED
+                t.sa.floordestheight = d
+                t.sa.texture = tex as i32
+            } ghosted {
+                yeet("floor")
+            }
+        }
+    }
+    bet rtn
+}
+
+flex finna evBuildStairs(gt: tag gs.GameState, line: int, stairtype: int) -> int {
+    lowkey secnum: int = -1
+    lowkey rtn: int = 0
+    vibin nocap {
+        secnum = psu.findSectorFromLineTag(gt, line, secnum)
+        fr secnum < 0 {
+            dip
+        }
+        fr psu.hasSpecialData(gt, secnum) {
+            skip
+        }
+        rtn = 1
+        lowkey speed: i32 = 0
+        lowkey stairsize: i32 = 0
+        fr stairtype == psu.STAIR_BUILD8 {
+            speed = (psu.FLOORSPEED / 4) as i32
+            stairsize = (8 * 65536) as i32
+        } naw {
+            speed = (psu.FLOORSPEED * 4) as i32
+            stairsize = (16 * 65536) as i32
+        }
+        lowkey sec: int = secnum
+        lowkey height: i32 = (psu.getFloorH(gt, sec) + stairsize) as i32
+        lowkey floorT = newFloorThinker(gt, sec, 0)
+        holla t = floorT in gs.thinkers {
+            t.sa.direction = 1
+            t.sa.speed = speed
+            t.sa.floordestheight = height
+        } ghosted {
+            yeet("floor")
+        }
+        lowkey texture: int = 0
+        holla g = gt in gs.gsc {
+            texture = g.level.secFloorPic[sec] as int
+        } ghosted {
+            yeet("gs")
+        }
+        lowkey ok: bool = nocap
+        vibin ok {
+            ok = cap
+            lowkey n: int = psu.sectorLineCount(gt, sec)
+            lowkey i: int = 0
+            vibin i < n {
+                lowkey ld: int = psu.lineOfSector(gt, sec, i)
+                lowkey flags: int = 0
+                lowkey front: int = 0
+                lowkey back: int = 0
+                holla g = gt in gs.gsc {
+                    flags = g.level.lineFlags[ld] as int
+                    front = g.level.lineFront[ld] as int
+                    back = g.level.lineBack[ld] as int
+                } ghosted {
+                    yeet("gs")
+                }
+                fr flags & 4 == 0 {
+                    i = i + 1
+                    skip
+                }
+                fr secnum != front {
+                    i = i + 1
+                    skip
+                }
+                lowkey tsec: int = back
+                lowkey tpic: int = 0
+                holla g = gt in gs.gsc {
+                    tpic = g.level.secFloorPic[tsec] as int
+                } ghosted {
+                    yeet("gs")
+                }
+                fr tpic != texture {
+                    i = i + 1
+                    skip
+                }
+                height = (height + stairsize) as i32
+                fr psu.hasSpecialData(gt, tsec) {
+                    i = i + 1
+                    skip
+                }
+                sec = tsec
+                secnum = tsec
+                lowkey nextT = newFloorThinker(gt, sec, 0)
+                holla t = nextT in gs.thinkers {
+                    t.sa.direction = 1
+                    t.sa.speed = speed
+                    t.sa.floordestheight = height
+                } ghosted {
+                    yeet("floor")
+                }
+                ok = nocap
+                dip
+            }
+        }
+    }
+    bet rtn
+}
+
+flex finna evDoDonut(gt: tag gs.GameState, line: int) -> int {
+    lowkey secnum: int = -1
+    lowkey rtn: int = 0
+    vibin nocap {
+        secnum = psu.findSectorFromLineTag(gt, line, secnum)
+        fr secnum < 0 {
+            dip
+        }
+        lowkey s1: int = secnum
+        fr psu.hasSpecialData(gt, s1) {
+            skip
+        }
+        rtn = 1
+        lowkey l0: int = psu.lineOfSector(gt, s1, 0)
+        lowkey s2: int = psu.getNextSector(gt, l0, s1)
+        fr s2 < 0 {
+            skip
+        }
+        lowkey n: int = psu.sectorLineCount(gt, s2)
+        lowkey i: int = 0
+        vibin i < n {
+            lowkey ld: int = psu.lineOfSector(gt, s2, i)
+            lowkey back: int = 0
+            holla g = gt in gs.gsc {
+                back = g.level.lineBack[ld] as int
+            } ghosted {
+                yeet("gs")
+            }
+            fr back == s1 {
+                i = i + 1
+                skip
+            }
+            lowkey s3: int = back
+            lowkey s3floor: i32 = psu.getFloorH(gt, s3)
+            lowkey s3pic: int = 0
+            holla g = gt in gs.gsc {
+                s3pic = g.level.secFloorPic[s3] as int
+            } ghosted {
+                yeet("gs")
+            }
+            lowkey riseT = newFloorThinker(gt, s2, psu.FLOOR_DONUTRAISE)
+            holla t = riseT in gs.thinkers {
+                t.sa.crush = cap
+                t.sa.direction = 1
+                t.sa.speed = (psu.FLOORSPEED / 2) as i32
+                t.sa.texture = s3pic as i32
+                t.sa.newspecial = 0
+                t.sa.floordestheight = s3floor
+            } ghosted {
+                yeet("floor")
+            }
+            lowkey holeT = newFloorThinker(gt, s1, psu.FLOOR_LOWERFLOOR)
+            holla t = holeT in gs.thinkers {
+                t.sa.crush = cap
+                t.sa.direction = -1
+                t.sa.speed = (psu.FLOORSPEED / 2) as i32
+                t.sa.floordestheight = s3floor
+            } ghosted {
+                yeet("floor")
+            }
+            dip
+        }
+    }
+    bet rtn
+}

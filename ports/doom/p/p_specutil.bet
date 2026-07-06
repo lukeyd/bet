@@ -1,0 +1,383 @@
+pull "../defs/gs" as gs
+pull "../defs/think" as think
+pull "../defs/fixed" as fixed
+pull "../defs/doomdef" as doomdef
+
+flex facts FLOOR_LOWERFLOOR: int = 0
+flex facts FLOOR_LOWERFLOORTOLOWEST: int = 1
+flex facts FLOOR_TURBOLOWER: int = 2
+flex facts FLOOR_RAISEFLOOR: int = 3
+flex facts FLOOR_RAISEFLOORTONEAREST: int = 4
+flex facts FLOOR_RAISETOTEXTURE: int = 5
+flex facts FLOOR_LOWERANDCHANGE: int = 6
+flex facts FLOOR_RAISEFLOOR24: int = 7
+flex facts FLOOR_RAISEFLOOR24ANDCHANGE: int = 8
+flex facts FLOOR_RAISEFLOORCRUSH: int = 9
+flex facts FLOOR_RAISEFLOORTURBO: int = 10
+flex facts FLOOR_DONUTRAISE: int = 11
+flex facts FLOOR_RAISEFLOOR512: int = 12
+flex facts STAIR_BUILD8: int = 0
+flex facts STAIR_TURBO16: int = 1
+flex facts RES_OK: int = 0
+flex facts RES_CRUSHED: int = 1
+flex facts RES_PASTDEST: int = 2
+flex facts CEIL_LOWERTOFLOOR: int = 0
+flex facts CEIL_RAISETOHIGHEST: int = 1
+flex facts CEIL_LOWERANDCRUSH: int = 2
+flex facts CEIL_CRUSHANDRAISE: int = 3
+flex facts CEIL_FASTCRUSHANDRAISE: int = 4
+flex facts CEIL_SILENTCRUSHANDRAISE: int = 5
+flex facts DOOR_NORMAL: int = 0
+flex facts DOOR_CLOSE30THENOPEN: int = 1
+flex facts DOOR_CLOSE: int = 2
+flex facts DOOR_OPEN: int = 3
+flex facts DOOR_RAISEIN5MINS: int = 4
+flex facts DOOR_BLAZERAISE: int = 5
+flex facts DOOR_BLAZEOPEN: int = 6
+flex facts DOOR_BLAZECLOSE: int = 7
+flex facts PLAT_UP: int = 0
+flex facts PLAT_DOWN: int = 1
+flex facts PLAT_WAITING: int = 2
+flex facts PLAT_INSTASIS: int = 3
+flex facts PLATT_PERPETUALRAISE: int = 0
+flex facts PLATT_DOWNWAITUPSTAY: int = 1
+flex facts PLATT_RAISEANDCHANGE: int = 2
+flex facts PLATT_RAISETONEARESTANDCHANGE: int = 3
+flex facts PLATT_BLAZEDWUS: int = 4
+flex facts BW_TOP: int = 0
+flex facts BW_MIDDLE: int = 1
+flex facts BW_BOTTOM: int = 2
+flex facts MO_TELEPORTMAN: int = 14
+flex facts GLOWSPEED: int = 8
+flex facts STROBEBRIGHT: int = 5
+flex facts FASTDARK: int = 15
+flex facts SLOWDARK: int = 35
+flex facts CEILSPEED: i32 = 65536
+flex facts CEILWAIT: int = 150
+flex facts MAXCEILINGS: int = 30
+flex facts VDOORSPEED: i32 = 131072
+flex facts VDOORWAIT: int = 150
+flex facts FLOORSPEED: i32 = 65536
+flex facts PLATWAIT: int = 3
+flex facts PLATSPEED: i32 = 65536
+flex facts MAXPLATS: int = 30
+flex facts MAXBUTTONS: int = 16
+flex facts BUTTONTIME: int = 35
+flex facts MAXSWITCHES: int = 50
+flex facts MAX_ADJOINING_SECTORS: int = 20
+
+flex finna lineOfSector(gt: tag gs.GameState, sec: int, i: int) -> int {
+    lowkey ld: int = -1
+    holla g = gt in gs.gsc {
+        ld = g.level.secLinesList[g.level.secLineOfs[sec] as int + i] as int
+    } ghosted {
+        yeet("gs")
+    }
+    bet ld
+}
+
+flex finna sectorLineCount(gt: tag gs.GameState, sec: int) -> int {
+    lowkey n: int = 0
+    holla g = gt in gs.gsc {
+        n = g.level.secLineCount[sec] as int
+    } ghosted {
+        yeet("gs")
+    }
+    bet n
+}
+
+flex finna getSide(gt: tag gs.GameState, currentSector: int, line: int, side: int) -> int {
+    lowkey ld: int = lineOfSector(gt, currentSector, line)
+    lowkey sd: int = -1
+    holla g = gt in gs.gsc {
+        fr side == 0 {
+            sd = g.level.lineSide0[ld] as int
+        } naw {
+            sd = g.level.lineSide1[ld] as int
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    bet sd
+}
+
+flex finna getSector(gt: tag gs.GameState, currentSector: int, line: int, side: int) -> int {
+    lowkey sd: int = getSide(gt, currentSector, line, side)
+    fr sd < 0 {
+        bet -1
+    }
+    lowkey sec: int = -1
+    holla g = gt in gs.gsc {
+        sec = g.level.sdSector[sd] as int
+    } ghosted {
+        yeet("gs")
+    }
+    bet sec
+}
+
+flex finna twoSided(gt: tag gs.GameState, sector: int, line: int) -> int {
+    lowkey ld: int = lineOfSector(gt, sector, line)
+    lowkey f: int = 0
+    holla g = gt in gs.gsc {
+        f = g.level.lineFlags[ld] as int & doomdef.ML_TWOSIDED
+    } ghosted {
+        yeet("gs")
+    }
+    bet f
+}
+
+flex finna getNextSector(gt: tag gs.GameState, line: int, sec: int) -> int {
+    lowkey flags: int = 0
+    lowkey front: int = 0
+    lowkey back: int = 0
+    holla g = gt in gs.gsc {
+        flags = g.level.lineFlags[line] as int
+        front = g.level.lineFront[line] as int
+        back = g.level.lineBack[line] as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr flags & doomdef.ML_TWOSIDED == 0 {
+        bet -1
+    }
+    fr front == sec {
+        bet back
+    }
+    bet front
+}
+
+flex finna findLowestFloorSurrounding(gt: tag gs.GameState, sec: int) -> i32 {
+    lowkey floor: i32 = getFloorH(gt, sec)
+    lowkey n: int = sectorLineCount(gt, sec)
+    lowkey i: int = 0
+    vibin i < n {
+        lowkey check: int = lineOfSector(gt, sec, i)
+        lowkey other: int = getNextSector(gt, check, sec)
+        fr other >= 0 {
+            lowkey oh: i32 = getFloorH(gt, other)
+            fr oh < floor {
+                floor = oh
+            }
+        }
+        i = i + 1
+    }
+    bet floor
+}
+
+flex finna findHighestFloorSurrounding(gt: tag gs.GameState, sec: int) -> i32 {
+    lowkey floor: i32 = (-500 * 65536) as i32
+    lowkey n: int = sectorLineCount(gt, sec)
+    lowkey i: int = 0
+    vibin i < n {
+        lowkey check: int = lineOfSector(gt, sec, i)
+        lowkey other: int = getNextSector(gt, check, sec)
+        fr other >= 0 {
+            lowkey oh: i32 = getFloorH(gt, other)
+            fr oh > floor {
+                floor = oh
+            }
+        }
+        i = i + 1
+    }
+    bet floor
+}
+
+flex finna findNextHighestFloor(gt: tag gs.GameState, sec: int, currentheight: i32) -> i32 {
+    lowkey minSet: bool = cap
+    lowkey minv: i32 = 0
+    lowkey h: int = 0
+    lowkey n: int = sectorLineCount(gt, sec)
+    lowkey i: int = 0
+    vibin i < n {
+        lowkey check: int = lineOfSector(gt, sec, i)
+        lowkey other: int = getNextSector(gt, check, sec)
+        fr other >= 0 {
+            lowkey oh: i32 = getFloorH(gt, other)
+            fr oh > currentheight {
+                fr !minSet {
+                    minv = oh
+                    minSet = nocap
+                } naw fr oh < minv {
+                    minv = oh
+                }
+                h = h + 1
+                fr h >= MAX_ADJOINING_SECTORS {
+                    dip
+                }
+            }
+        }
+        i = i + 1
+    }
+    fr !minSet {
+        bet currentheight
+    }
+    bet minv
+}
+
+flex finna findLowestCeilingSurrounding(gt: tag gs.GameState, sec: int) -> i32 {
+    lowkey height: i32 = fixed.MAXINT
+    lowkey n: int = sectorLineCount(gt, sec)
+    lowkey i: int = 0
+    vibin i < n {
+        lowkey check: int = lineOfSector(gt, sec, i)
+        lowkey other: int = getNextSector(gt, check, sec)
+        fr other >= 0 {
+            lowkey oh: i32 = getCeilH(gt, other)
+            fr oh < height {
+                height = oh
+            }
+        }
+        i = i + 1
+    }
+    bet height
+}
+
+flex finna findHighestCeilingSurrounding(gt: tag gs.GameState, sec: int) -> i32 {
+    lowkey height: i32 = 0
+    lowkey n: int = sectorLineCount(gt, sec)
+    lowkey i: int = 0
+    vibin i < n {
+        lowkey check: int = lineOfSector(gt, sec, i)
+        lowkey other: int = getNextSector(gt, check, sec)
+        fr other >= 0 {
+            lowkey oh: i32 = getCeilH(gt, other)
+            fr oh > height {
+                height = oh
+            }
+        }
+        i = i + 1
+    }
+    bet height
+}
+
+flex finna findSectorFromLineTag(gt: tag gs.GameState, line: int, start: int) -> int {
+    lowkey res: int = -1
+    holla g = gt in gs.gsc {
+        lowkey ltag: int = g.level.lineTag[line] as int
+        lowkey nsec: int = g.level.numsectors as int
+        lowkey i: int = start + 1
+        vibin i < nsec {
+            fr g.level.secTag[i] as int == ltag {
+                res = i
+                dip
+            }
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    bet res
+}
+
+flex finna findMinSurroundingLight(gt: tag gs.GameState, sec: int, max: int) -> int {
+    lowkey minv: int = max
+    lowkey n: int = sectorLineCount(gt, sec)
+    lowkey i: int = 0
+    vibin i < n {
+        lowkey line: int = lineOfSector(gt, sec, i)
+        lowkey check: int = getNextSector(gt, line, sec)
+        fr check >= 0 {
+            lowkey ll: int = 0
+            holla g = gt in gs.gsc {
+                ll = g.level.secLight[check] as int
+            } ghosted {
+                yeet("gs")
+            }
+            fr ll < minv {
+                minv = ll
+            }
+        }
+        i = i + 1
+    }
+    bet minv
+}
+
+flex finna getFloorH(gt: tag gs.GameState, sec: int) -> i32 {
+    lowkey v: i32 = 0
+    holla g = gt in gs.gsc {
+        v = g.level.secFloorH[sec]
+    } ghosted {
+        yeet("gs")
+    }
+    bet v
+}
+
+flex finna setFloorH(gt: tag gs.GameState, sec: int, v: i32) {
+    holla g = gt in gs.gsc {
+        g.level.secFloorH[sec] = v
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna getCeilH(gt: tag gs.GameState, sec: int) -> i32 {
+    lowkey v: i32 = 0
+    holla g = gt in gs.gsc {
+        v = g.level.secCeilH[sec]
+    } ghosted {
+        yeet("gs")
+    }
+    bet v
+}
+
+flex finna setCeilH(gt: tag gs.GameState, sec: int, v: i32) {
+    holla g = gt in gs.gsc {
+        g.level.secCeilH[sec] = v
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna getSecLight(gt: tag gs.GameState, sec: int) -> int {
+    lowkey v: int = 0
+    holla g = gt in gs.gsc {
+        v = g.level.secLight[sec] as int
+    } ghosted {
+        yeet("gs")
+    }
+    bet v
+}
+
+flex finna setSecLight(gt: tag gs.GameState, sec: int, v: int) {
+    holla g = gt in gs.gsc {
+        g.level.secLight[sec] = v as i32
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna sectorSpecialData(gt: tag gs.GameState, sec: int) -> tag think.Thinker {
+    lowkey t: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        t = g.level.secLinks[sec].specialT
+    } ghosted {
+        yeet("gs")
+    }
+    bet t
+}
+
+flex finna hasSpecialData(gt: tag gs.GameState, sec: int) -> bool {
+    lowkey has: bool = cap
+    holla g = gt in gs.gsc {
+        has = !(g.level.secLinks[sec].specialT == ghosted)
+    } ghosted {
+        yeet("gs")
+    }
+    bet has
+}
+
+flex finna setSectorSpecialData(gt: tag gs.GameState, sec: int, t: tag think.Thinker) {
+    holla g = gt in gs.gsc {
+        g.level.secLinks[sec].specialT = t
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna clearSectorSpecialData(gt: tag gs.GameState, sec: int) {
+    holla g = gt in gs.gsc {
+        g.level.secLinks[sec].specialT = ghosted
+    } ghosted {
+        yeet("gs")
+    }
+}

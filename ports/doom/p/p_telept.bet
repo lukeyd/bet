@@ -1,0 +1,139 @@
+pull "../defs/gs" as gs
+pull "../defs/think" as think
+pull "../defs/info" as info
+pull "../defs/sounds" as sounds
+pull "../p/p_map" as pmap
+pull "../p/p_mobj" as pmobj
+pull "../s/s_sound" as ssnd
+
+flex finna evTeleport(gt: tag gs.GameState, line: int, side: int, thing: tag think.Thinker) -> int {
+    lowkey flags: int = 0
+    holla t = thing in gs.thinkers {
+        flags = t.mobj.flags as int
+    } ghosted {
+        yeet("thing")
+    }
+    fr flags & think.MF_MISSILE != 0 {
+        bet 0
+    }
+    fr side == 1 {
+        bet 0
+    }
+    lowkey ltag: int = 0
+    lowkey nsec: int = 0
+    lowkey capT: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        ltag = g.level.lineTag[line] as int
+        nsec = g.level.numsectors as int
+        capT = g.tick.thinkercap
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey i: int = 0
+    vibin i < nsec {
+        lowkey sTag: int = 0
+        holla g = gt in gs.gsc {
+            sTag = g.level.secTag[i] as int
+        } ghosted {
+            yeet("gs")
+        }
+        fr sTag == ltag {
+            lowkey cur: tag think.Thinker = ghosted
+            holla c = capT in gs.thinkers {
+                cur = c.next
+            } ghosted {
+                yeet("cap")
+            }
+            vibin !(cur == capT) {
+                lowkey fid: int = 0
+                lowkey typ: int = 0
+                lowkey sub: int = -1
+                lowkey mx: i32 = 0
+                lowkey my: i32 = 0
+                lowkey mAngle: u32 = 0
+                lowkey nxt: tag think.Thinker = ghosted
+                holla m = cur in gs.thinkers {
+                    fid = m.funcId as int
+                    typ = m.mobj.typeIdx as int
+                    sub = m.mobj.subsector as int
+                    mx = m.mobj.x
+                    my = m.mobj.y
+                    mAngle = m.mobj.angle
+                    nxt = m.next
+                } ghosted {
+                    yeet("cur")
+                }
+                fr fid == think.FUNC_MOBJ && typ == info.MT_TELEPORTMAN {
+                    lowkey msec: int = -1
+                    holla g = gt in gs.gsc {
+                        msec = g.level.ssSector[sub] as int
+                    } ghosted {
+                        yeet("gs")
+                    }
+                    fr msec == i {
+                        lowkey oldx: i32 = 0
+                        lowkey oldy: i32 = 0
+                        lowkey oldz: i32 = 0
+                        holla t = thing in gs.thinkers {
+                            oldx = t.mobj.x
+                            oldy = t.mobj.y
+                            oldz = t.mobj.z
+                        } ghosted {
+                            yeet("thing")
+                        }
+                        fr !pmap.teleportMove(gt, thing, mx, my) {
+                            bet 0
+                        }
+                        lowkey playerIdx: int = -1
+                        lowkey floorz: i32 = 0
+                        holla t = thing in gs.thinkers {
+                            floorz = t.mobj.floorz
+                            t.mobj.z = floorz
+                            playerIdx = t.mobj.player as int
+                        } ghosted {
+                            yeet("thing")
+                        }
+                        fr playerIdx >= 0 {
+                            holla g = gt in gs.gsc {
+                                g.shell.players[playerIdx].viewz = (floorz as int + g.shell.players[playerIdx].viewheight as int) as i32
+                            } ghosted {
+                                yeet("gs")
+                            }
+                        }
+                        lowkey fog1 = pmobj.spawnMobj(gt, oldx, oldy, oldz, info.MT_TFOG)
+                        ssnd.startSound(gt, fog1, sounds.SFX_TELEPT)
+                        lowkey an: int = (mAngle >> 19) as int
+                        lowkey fcos: i32 = 0
+                        lowkey fsin: i32 = 0
+                        holla g = gt in gs.gsc {
+                            fcos = g.info.finesine[an + 2048]
+                            fsin = g.info.finesine[an]
+                        } ghosted {
+                            yeet("gs")
+                        }
+                        lowkey fx: i32 = (mx as int + 20 * fcos as int) as i32
+                        lowkey fy: i32 = (my as int + 20 * fsin as int) as i32
+                        lowkey tz: i32 = floorz
+                        lowkey fog2 = pmobj.spawnMobj(gt, fx, fy, tz, info.MT_TFOG)
+                        ssnd.startSound(gt, fog2, sounds.SFX_TELEPT)
+                        holla t = thing in gs.thinkers {
+                            fr playerIdx >= 0 {
+                                t.mobj.reactiontime = 18
+                            }
+                            t.mobj.angle = mAngle
+                            t.mobj.momx = 0
+                            t.mobj.momy = 0
+                            t.mobj.momz = 0
+                        } ghosted {
+                            yeet("thing")
+                        }
+                        bet 1
+                    }
+                }
+                cur = nxt
+            }
+        }
+        i = i + 1
+    }
+    bet 0
+}

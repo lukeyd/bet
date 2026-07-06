@@ -1,0 +1,232 @@
+pull "spill"
+pull "../defs/gs" as gs
+pull "../defs/think" as think
+pull "../defs/info" as info
+pull "../defs/sounds" as sounds
+pull "../defs/tables" as tables
+pull "../defs/doomdef" as doomdef
+pull "../util/m_random" as rnd
+pull "../w/w_wad" as wad
+pull "../r/r_data" as rdata
+pull "../p/p_setup" as psetup
+pull "../p/p_think" as pthink
+pull "../p/p_mobj" as pmobj
+pull "../p/p_specutil" as psu
+pull "../p/p_doors" as pdoors
+pull "../p/p_plats" as pplats
+pull "../p/p_spec" as pspec
+
+flex finna noopMobj(gt: tag gs.GameState, actor: tag think.Thinker) {
+}
+
+flex finna noopPspr(gt: tag gs.GameState, playerIdx: int, pspIdx: int) {
+}
+
+flex finna noopTryMove(gt: tag gs.GameState, thing: tag think.Thinker, x: i32, y: i32) -> bool {
+    bet nocap
+}
+
+flex finna noopSlideMove(gt: tag gs.GameState, mo: tag think.Thinker) {
+}
+
+flex finna noopCheckPosition(gt: tag gs.GameState, thing: tag think.Thinker, x: i32, y: i32) -> bool {
+    bet nocap
+}
+
+flex finna noopAim(gt: tag gs.GameState, t1: tag think.Thinker, angle: u32, distance: i32) -> i32 {
+    bet 0
+}
+
+flex finna doomSkill() -> i32 {
+    bet doomdef.SK_HARD as i32
+}
+
+finna main() {
+    lowkey g0 = cop gs.GameState{} in gs.gsc
+    gs.gsInit(g0)
+    holla g = g0 in gs.gsc {
+        info.initStatesAll(g.info.states)
+        info.initMobjinfoAll(g.info.mobjinfo)
+        sounds.initSfxAll(g.info.sfx)
+        g.info.finesine = tables.initFinesineAll(g.info.finesine)
+        g.info.finetangent = tables.initFinetangentAll(g.info.finetangent)
+        g.info.tantoangle = tables.initTantoangleAll(g.info.tantoangle)
+        g.tick.rndtable = rnd.initRndtable(g.tick.rndtable)
+        g.shell.gamemode = doomdef.GM_SHAREWARE as i32
+        g.shell.gameskill = doomSkill()
+        g.shell.gameepisode = 1
+        g.shell.gamemap = 1
+        g.shell.consoleplayer = 0
+        g.shell.displayplayer = 0
+        g.shell.playeringame[0] = nocap
+        g.shell.netgame = cap
+        g.shell.deathmatch = 0
+        g.shell.nomonsters = nocap
+        g.hooks.tryMove = noopTryMove
+        g.hooks.slideMove = noopSlideMove
+        g.hooks.checkPosition = noopCheckPosition
+        g.hooks.aimLineAttack = noopAim
+        g.hooks.mobjThink = pmobj.mobjThinker
+        g.actions.aBFGSpray = noopMobj
+        g.actions.aBabyMetal = noopMobj
+        g.actions.aBossDeath = noopMobj
+        g.actions.aBrainAwake = noopMobj
+        g.actions.aBrainDie = noopMobj
+        g.actions.aBrainExplode = noopMobj
+        g.actions.aBrainPain = noopMobj
+        g.actions.aBrainScream = noopMobj
+        g.actions.aBrainSpit = noopMobj
+        g.actions.aBruisAttack = noopMobj
+        g.actions.aBspiAttack = noopMobj
+        g.actions.aCPosAttack = noopMobj
+        g.actions.aCPosRefire = noopMobj
+        g.actions.aChase = noopMobj
+        g.actions.aCyberAttack = noopMobj
+        g.actions.aExplode = noopMobj
+        g.actions.aFaceTarget = noopMobj
+        g.actions.aFall = noopMobj
+        g.actions.aFatAttack1 = noopMobj
+        g.actions.aFatAttack2 = noopMobj
+        g.actions.aFatAttack3 = noopMobj
+        g.actions.aFatRaise = noopMobj
+        g.actions.aFire = noopMobj
+        g.actions.aFireCrackle = noopMobj
+        g.actions.aHeadAttack = noopMobj
+        g.actions.aHoof = noopMobj
+        g.actions.aKeenDie = noopMobj
+        g.actions.aLook = noopMobj
+        g.actions.aMetal = noopMobj
+        g.actions.aPain = noopMobj
+        g.actions.aPainAttack = noopMobj
+        g.actions.aPainDie = noopMobj
+        g.actions.aPlayerScream = noopMobj
+        g.actions.aPosAttack = noopMobj
+        g.actions.aSPosAttack = noopMobj
+        g.actions.aSargAttack = noopMobj
+        g.actions.aScream = noopMobj
+        g.actions.aSkelFist = noopMobj
+        g.actions.aSkelMissile = noopMobj
+        g.actions.aSkelWhoosh = noopMobj
+        g.actions.aSkullAttack = noopMobj
+        g.actions.aSpawnFly = noopMobj
+        g.actions.aSpawnSound = noopMobj
+        g.actions.aSpidRefire = noopMobj
+        g.actions.aStartFire = noopMobj
+        g.actions.aTracer = noopMobj
+        g.actions.aTroopAttack = noopMobj
+        g.actions.aVileAttack = noopMobj
+        g.actions.aVileChase = noopMobj
+        g.actions.aVileStart = noopMobj
+        g.actions.aVileTarget = noopMobj
+        g.actions.aXScream = noopMobj
+        g.actions.aBFGsound = noopPspr
+        g.actions.aCheckReload = noopPspr
+        g.actions.aCloseShotgun2 = noopPspr
+        g.actions.aFireBFG = noopPspr
+        g.actions.aFireCGun = noopPspr
+        g.actions.aFireMissile = noopPspr
+        g.actions.aFirePistol = noopPspr
+        g.actions.aFirePlasma = noopPspr
+        g.actions.aFireShotgun = noopPspr
+        g.actions.aFireShotgun2 = noopPspr
+        g.actions.aGunFlash = noopPspr
+        g.actions.aLight0 = noopPspr
+        g.actions.aLight1 = noopPspr
+        g.actions.aLight2 = noopPspr
+        g.actions.aLoadShotgun2 = noopPspr
+        g.actions.aLower = noopPspr
+        g.actions.aOpenShotgun2 = noopPspr
+        g.actions.aPunch = noopPspr
+        g.actions.aRaise = noopPspr
+        g.actions.aReFire = noopPspr
+        g.actions.aSaw = noopPspr
+        g.actions.aWeaponReady = noopPspr
+    } ghosted {
+        yeet("gs")
+    }
+    rnd.clearRandom(g0)
+    wad.initWad(g0, "/Users/lukebaggett/Documents/bet/doom-reference/doom1.wad")
+    rdata.initData(g0)
+    psetup.setupLevel(g0, 1, 1, doomdef.SK_HARD)
+    pspec.wireHooks(g0)
+    pspec.initPicAnims(g0)
+    pspec.spawnSpecials(g0)
+    lowkey nsec: int = 0
+    holla g = g0 in gs.gsc {
+        nsec = g.level.numsectors as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey doorSec: int = -1
+    lowkey s: int = 0
+    vibin s < nsec {
+        fr !psu.hasSpecialData(g0, s) {
+            lowkey fh: i32 = psu.getFloorH(g0, s)
+            lowkey lcs: i32 = psu.findLowestCeilingSurrounding(g0, s)
+            fr lcs != 2147483647 && (lcs - 4 * 65536) as i32 > fh {
+                doorSec = s
+                dip
+            }
+        }
+        s = s + 1
+    }
+    fr doorSec < 0 {
+        yeet("spec_smoke: no suitable door sector on E1M1")
+    }
+    lowkey platSec: int = -1
+    s = 0
+    vibin s < nsec {
+        fr s != doorSec && !psu.hasSpecialData(g0, s) {
+            lowkey fh: i32 = psu.getFloorH(g0, s)
+            lowkey lfs: i32 = psu.findLowestFloorSurrounding(g0, s)
+            fr lfs < fh {
+                platSec = s
+                dip
+            }
+        }
+        s = s + 1
+    }
+    fr platSec < 0 {
+        yeet("spec_smoke: no suitable lift sector on E1M1")
+    }
+    lowkey doorTop: i32 = (psu.findLowestCeilingSurrounding(g0, doorSec) - 4 * 65536) as i32
+    lowkey platLow: i32 = psu.findLowestFloorSurrounding(g0, platSec)
+    holla g = g0 in gs.gsc {
+        g.level.secCeilH[doorSec] = g.level.secFloorH[doorSec]
+        g.level.secTag[doorSec] = 991
+        g.level.lineTag[0] = 991
+        g.level.secTag[platSec] = 992
+        g.level.lineTag[1] = 992
+    } ghosted {
+        yeet("gs")
+    }
+    spill.f("DOORSEC {} floor={} top={}\n", doorSec, floorOf(g0, doorSec), (doorTop >> 16) as int)
+    spill.f("PLATSEC {} floor={} low={}\n", platSec, floorOf(g0, platSec), (platLow >> 16) as int)
+    lowkey rDoor: int = pdoors.evDoDoor(g0, 0, psu.DOOR_NORMAL)
+    lowkey rPlat: int = pplats.evDoPlat(g0, 1, psu.PLATT_DOWNWAITUPSTAY, 0)
+    spill.f("TRIGGER door_rtn={} plat_rtn={}\n", rDoor, rPlat)
+    lowkey tic: int = 0
+    vibin tic < 100 {
+        holla g = g0 in gs.gsc {
+            g.tick.leveltime = (g.tick.leveltime as int + 1) as i32
+        } ghosted {
+            yeet("gs")
+        }
+        pthink.runThinkers(g0)
+        pspec.updateSpecials(g0)
+        lowkey dh: int = 0
+        lowkey ph: int = 0
+        holla g = g0 in gs.gsc {
+            dh = (g.level.secCeilH[doorSec] >> 16) as int
+            ph = (g.level.secFloorH[platSec] >> 16) as int
+        } ghosted {
+            yeet("gs")
+        }
+        spill.f("TIC {} door={} plat={}\n", tic, dh, ph)
+        tic = tic + 1
+    }
+}
+
+flex finna floorOf(gt: tag gs.GameState, sec: int) -> int {
+    bet (psu.getFloorH(gt, sec) >> 16) as int
+}
