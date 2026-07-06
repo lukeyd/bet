@@ -5,6 +5,7 @@ pull "../defs/tables" as tables
 pull "../r/r_geom" as rgeom
 pull "../r/r_plane" as rplane
 pull "../r/r_segs" as rsegs
+pull "../r/r_things" as rthings
 
 flex facts NF_SUBSECTOR: int = 32768
 
@@ -364,10 +365,12 @@ flex finna subsector(gt: tag gs.GameState, num: int) {
     lowkey fpic = 0
     lowkey cpic = 0
     lowkey light = 0
+    lowkey secnum = 0
     holla g = gt in gs.gsc {
         g.render.sscount = g.render.sscount + 1
         lowkey fs = g.level.ssSector[num]
         g.render.frontsector = fs
+        secnum = fs as int
         count = g.level.ssNumLines[num] as int
         firstline = g.level.ssFirstLine[num] as int
         fh = g.level.secFloorH[fs as int]
@@ -398,6 +401,8 @@ flex finna subsector(gt: tag gs.GameState, num: int) {
     } ghosted {
         yeet("gs")
     }
+    // SEAM: R_AddSprites(frontsector) — project this sector's things into vissprites (P2.7).
+    rthings.addSprites(gt, secnum)
     lowkey i = 0
     vibin i < count {
         addLine(gt, firstline + i)
