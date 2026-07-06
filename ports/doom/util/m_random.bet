@@ -1,0 +1,303 @@
+// util/m_random.bet — DOOM's demo-critical RNG (m_random.c). The RNG state (prndindex,
+// rndindex) lives in gs.TickState; the 256-byte rndtable is a slab in TickState populated by
+// initRndtable (the verbatim literal below, copied from m_random.c). P_Random is the
+// deterministic one used by the play sim — it MUST reproduce m_random.c exactly:
+// prndindex = (prndindex+1)&0xff; return rndtable[prndindex]. Do NOT use math.cook.
+// This is verified bit-for-bit by ports/doom/goldens/random.golden (via the goldens.bet twin).
+pull "../defs/gs" as gs
+
+// initRndtable: fill a 256-slot []u8 with id's rndtable literal. Value-threaded (slabs are
+// value-copied by the interpreter): call as `g.tick.rndtable = m_random.initRndtable(g.tick.rndtable)`.
+flex finna initRndtable(t: []u8) -> []u8 {
+    t[0] = 0
+    t[1] = 8
+    t[2] = 109
+    t[3] = 220
+    t[4] = 222
+    t[5] = 241
+    t[6] = 149
+    t[7] = 107
+    t[8] = 75
+    t[9] = 248
+    t[10] = 254
+    t[11] = 140
+    t[12] = 16
+    t[13] = 66
+    t[14] = 74
+    t[15] = 21
+    t[16] = 211
+    t[17] = 47
+    t[18] = 80
+    t[19] = 242
+    t[20] = 154
+    t[21] = 27
+    t[22] = 205
+    t[23] = 128
+    t[24] = 161
+    t[25] = 89
+    t[26] = 77
+    t[27] = 36
+    t[28] = 95
+    t[29] = 110
+    t[30] = 85
+    t[31] = 48
+    t[32] = 212
+    t[33] = 140
+    t[34] = 211
+    t[35] = 249
+    t[36] = 22
+    t[37] = 79
+    t[38] = 200
+    t[39] = 50
+    t[40] = 28
+    t[41] = 188
+    t[42] = 52
+    t[43] = 140
+    t[44] = 202
+    t[45] = 120
+    t[46] = 68
+    t[47] = 145
+    t[48] = 62
+    t[49] = 70
+    t[50] = 184
+    t[51] = 190
+    t[52] = 91
+    t[53] = 197
+    t[54] = 152
+    t[55] = 224
+    t[56] = 149
+    t[57] = 104
+    t[58] = 25
+    t[59] = 178
+    t[60] = 252
+    t[61] = 182
+    t[62] = 202
+    t[63] = 182
+    t[64] = 141
+    t[65] = 197
+    t[66] = 4
+    t[67] = 81
+    t[68] = 181
+    t[69] = 242
+    t[70] = 145
+    t[71] = 42
+    t[72] = 39
+    t[73] = 227
+    t[74] = 156
+    t[75] = 198
+    t[76] = 225
+    t[77] = 193
+    t[78] = 219
+    t[79] = 93
+    t[80] = 122
+    t[81] = 175
+    t[82] = 249
+    t[83] = 0
+    t[84] = 175
+    t[85] = 143
+    t[86] = 70
+    t[87] = 239
+    t[88] = 46
+    t[89] = 246
+    t[90] = 163
+    t[91] = 53
+    t[92] = 163
+    t[93] = 109
+    t[94] = 168
+    t[95] = 135
+    t[96] = 2
+    t[97] = 235
+    t[98] = 25
+    t[99] = 92
+    t[100] = 20
+    t[101] = 145
+    t[102] = 138
+    t[103] = 77
+    t[104] = 69
+    t[105] = 166
+    t[106] = 78
+    t[107] = 176
+    t[108] = 173
+    t[109] = 212
+    t[110] = 166
+    t[111] = 113
+    t[112] = 94
+    t[113] = 161
+    t[114] = 41
+    t[115] = 50
+    t[116] = 239
+    t[117] = 49
+    t[118] = 111
+    t[119] = 164
+    t[120] = 70
+    t[121] = 60
+    t[122] = 2
+    t[123] = 37
+    t[124] = 171
+    t[125] = 75
+    t[126] = 136
+    t[127] = 156
+    t[128] = 11
+    t[129] = 56
+    t[130] = 42
+    t[131] = 146
+    t[132] = 138
+    t[133] = 229
+    t[134] = 73
+    t[135] = 146
+    t[136] = 77
+    t[137] = 61
+    t[138] = 98
+    t[139] = 196
+    t[140] = 135
+    t[141] = 106
+    t[142] = 63
+    t[143] = 197
+    t[144] = 195
+    t[145] = 86
+    t[146] = 96
+    t[147] = 203
+    t[148] = 113
+    t[149] = 101
+    t[150] = 170
+    t[151] = 247
+    t[152] = 181
+    t[153] = 113
+    t[154] = 80
+    t[155] = 250
+    t[156] = 108
+    t[157] = 7
+    t[158] = 255
+    t[159] = 237
+    t[160] = 129
+    t[161] = 226
+    t[162] = 79
+    t[163] = 107
+    t[164] = 112
+    t[165] = 166
+    t[166] = 103
+    t[167] = 241
+    t[168] = 24
+    t[169] = 223
+    t[170] = 239
+    t[171] = 120
+    t[172] = 198
+    t[173] = 58
+    t[174] = 60
+    t[175] = 82
+    t[176] = 128
+    t[177] = 3
+    t[178] = 184
+    t[179] = 66
+    t[180] = 143
+    t[181] = 224
+    t[182] = 145
+    t[183] = 224
+    t[184] = 81
+    t[185] = 206
+    t[186] = 163
+    t[187] = 45
+    t[188] = 63
+    t[189] = 90
+    t[190] = 168
+    t[191] = 114
+    t[192] = 59
+    t[193] = 33
+    t[194] = 159
+    t[195] = 95
+    t[196] = 28
+    t[197] = 139
+    t[198] = 123
+    t[199] = 98
+    t[200] = 125
+    t[201] = 196
+    t[202] = 15
+    t[203] = 70
+    t[204] = 194
+    t[205] = 253
+    t[206] = 54
+    t[207] = 14
+    t[208] = 109
+    t[209] = 226
+    t[210] = 71
+    t[211] = 17
+    t[212] = 161
+    t[213] = 93
+    t[214] = 186
+    t[215] = 87
+    t[216] = 244
+    t[217] = 138
+    t[218] = 20
+    t[219] = 52
+    t[220] = 123
+    t[221] = 251
+    t[222] = 26
+    t[223] = 36
+    t[224] = 17
+    t[225] = 46
+    t[226] = 52
+    t[227] = 231
+    t[228] = 232
+    t[229] = 76
+    t[230] = 31
+    t[231] = 221
+    t[232] = 84
+    t[233] = 37
+    t[234] = 216
+    t[235] = 165
+    t[236] = 212
+    t[237] = 106
+    t[238] = 197
+    t[239] = 242
+    t[240] = 98
+    t[241] = 43
+    t[242] = 39
+    t[243] = 175
+    t[244] = 254
+    t[245] = 145
+    t[246] = 190
+    t[247] = 84
+    t[248] = 118
+    t[249] = 222
+    t[250] = 187
+    t[251] = 136
+    t[252] = 120
+    t[253] = 163
+    t[254] = 236
+    t[255] = 249
+    bet t
+}
+
+// P_Random: the play-sim RNG (deterministic; drives all game logic and demos).
+flex finna pRandom(gt: tag gs.GameState) -> int {
+    lowkey r = 0
+    holla g = gt in gs.gsc {
+        g.tick.prndindex = (g.tick.prndindex + 1) & 255
+        r = g.tick.rndtable[g.tick.prndindex] as int
+    } ghosted {
+        yeet("gs")
+    }
+    bet r
+}
+
+// M_Random: the menu/UI RNG (its own index; never affects demo sync).
+flex finna mRandom(gt: tag gs.GameState) -> int {
+    lowkey r = 0
+    holla g = gt in gs.gsc {
+        g.tick.rndindex = (g.tick.rndindex + 1) & 255
+        r = g.tick.rndtable[g.tick.rndindex] as int
+    } ghosted {
+        yeet("gs")
+    }
+    bet r
+}
+
+// M_ClearRandom: reset both indices (level start).
+flex finna clearRandom(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.tick.prndindex = 0
+        g.tick.rndindex = 0
+    } ghosted {
+        yeet("gs")
+    }
+}

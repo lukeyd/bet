@@ -1,0 +1,66 @@
+// util/bstream.bet — little-endian binary reads over a ([]u8, ofs) cursor. Subsumes m_swap.c
+// (DOOM's LE<->host swaps): WAD data is always little-endian, so these are direct decodes.
+// All return `int` (i64) holding the decoded value; callers narrow with `as i16`/`as u32`/etc.
+pull "bytes"
+pull "mem"
+pull "str"
+
+// unsigned byte 0..255
+flex finna rdU8(buf: []u8, ofs: int) -> int {
+    bet buf[ofs] as int
+}
+
+// signed byte -128..127
+flex finna rdI8(buf: []u8, ofs: int) -> int {
+    lowkey v = buf[ofs] as int
+    fr v >= 128 {
+        bet v - 256
+    }
+    bet v
+}
+
+// unsigned 16-bit LE
+flex finna rdU16(buf: []u8, ofs: int) -> int {
+    bet bytes.readU16le(buf, ofs)
+}
+
+// signed 16-bit LE
+flex finna rdI16(buf: []u8, ofs: int) -> int {
+    bet bytes.readI16le(buf, ofs)
+}
+
+// unsigned 32-bit LE
+flex finna rdU32(buf: []u8, ofs: int) -> int {
+    bet bytes.readU32le(buf, ofs)
+}
+
+// signed 32-bit LE (readU32le then two's-complement fold)
+flex finna rdI32(buf: []u8, ofs: int) -> int {
+    lowkey v = bytes.readU32le(buf, ofs)
+    fr v >= 2147483648 {
+        bet v - 4294967296
+    }
+    bet v
+}
+
+// name8: an 8-byte lump name (WAD directory / texture patch names). NUL-trimmed and
+// upper-cased, matching id's convention (names are compared upper-case).
+flex finna name8(buf: []u8, ofs: int) -> str {
+    lowkey n = 0
+    vibin n < 8 {
+        fr buf[ofs + n] as int == 0 {
+            dip
+        }
+        n = n + 1
+    }
+    fr n == 0 {
+        bet ""
+    }
+    lowkey tmp = mem.slab[u8](n)
+    lowkey i = 0
+    vibin i < n {
+        tmp[i] = buf[ofs + i]
+        i = i + 1
+    }
+    bet str.glow(str.fromBytesTrust(tmp))
+}

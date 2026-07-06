@@ -1,0 +1,19 @@
+// util/m_argv.bet — command-line parameter scan (m_argv.c). `sys.argc`/`sys.arg` give the
+// process args on both the interpreter and native. M_CheckParm is case-insensitive
+// (strcasecmp); we uppercase both sides and compare with str.slaps.
+pull "sys"
+pull "str"
+
+// M_CheckParm: index (1..argc-1) of the first arg equal to `check`, or 0 if absent.
+flex finna checkParm(check: str) -> int {
+    lowkey want = str.glow(check)
+    lowkey n = sys.argc()
+    lowkey i = 1
+    vibin i < n {
+        fr str.slaps(str.glow(sys.arg(i)), want) {
+            bet i
+        }
+        i = i + 1
+    }
+    bet 0
+}

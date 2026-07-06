@@ -1,0 +1,55 @@
+// util/m_cheat.bet — the cheat-sequence matcher (m_cheat.c). st_stuff (P2.9) owns the actual
+// cheat tables; this provides the SCRAMBLE obfuscation and the per-key matcher. A cheat is a
+// mutable []u8 sequence of SCRAMBLE'd bytes terminated by 0xff, with 0/1 param markers. The
+// match position `p` is caller-held state (returned in CheatResult, since bet has no pointers).
+pull "../defs/gs" as gs
+
+// SCRAMBLE(a) from m_cheat.h — bit permutation used to obfuscate stored cheat codes.
+flex finna scramble(a: int) -> int {
+    bet ((a & 1) << 7) + ((a & 2) << 5) + (a & 4) + ((a & 8) << 1) + ((a & 16) >> 1) + (a & 32) + ((a & 64) >> 5) + ((a & 128) >> 7)
+}
+
+// checkCheat's result: rc==1 on a completed sequence, and the next match position `p`.
+flex drip CheatResult {
+    flex rc: int
+    flex p: int
+}
+
+// cht_CheckCheat: feed one typed key into a cheat sequence at position `p`. Mirrors
+// m_cheat.c: a 0 slot captures the raw key (a parameter, read later via getParam), a
+// scrambled-key match advances, a mismatch resets; slot 1 skips a consumed param and 0xff
+// ends the sequence (rc = 1). `seq` is mutated in place for param capture (native shares the
+// slab backing).
+flex finna checkCheat(seq: []u8, p: int, key: int) -> CheatResult {
+    lowkey rc = 0
+    lowkey pos = p
+    fr seq[pos] as int == 0 {
+        seq[pos] = (key & 255) as u8
+        pos = pos + 1
+    } naw fr scramble(key & 255) == seq[pos] as int {
+        pos = pos + 1
+    } naw {
+        pos = 0
+    }
+    fr seq[pos] as int == 1 {
+        pos = pos + 1
+    } naw fr seq[pos] as int == 255 {
+        pos = 0
+        rc = 1
+    }
+    bet CheatResult{ rc: rc, p: pos }
+}
+
+// cht_GetParam: read the captured parameter bytes (unscrambling is not needed — checkCheat
+// stores the raw key at 0-slots). Copies from `seq[start ..]` up to the 0xff terminator into
+// `outBuf`, returning the count. st_stuff uses this for idclevXX / idmusXX map/music digits.
+flex finna getParam(seq: []u8, start: int, outBuf: []u8) -> int {
+    lowkey n = 0
+    lowkey i = start
+    vibin seq[i] as int != 255 {
+        outBuf[n] = seq[i]
+        n = n + 1
+        i = i + 1
+    }
+    bet n
+}

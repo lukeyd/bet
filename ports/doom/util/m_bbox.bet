@@ -1,0 +1,32 @@
+// util/m_bbox.bet — bounding-box helpers (m_bbox.c). A box is 4 consecutive i32s inside a
+// slab; callers pass the slab and the base index of the box (levels pack many boxes back to
+// back — e.g. sector blockbox, line bbox). Native shares the slab backing across the call
+// (doom is native-first), so these mutate in place.
+pull "../defs/fixed" as fixed
+
+flex facts BOXTOP: int = 0
+flex facts BOXBOTTOM: int = 1
+flex facts BOXLEFT: int = 2
+flex facts BOXRIGHT: int = 3
+
+// M_ClearBox: top/right = MININT, bottom/left = MAXINT.
+flex finna clearBox(box: []i32, base: int) {
+    box[base + 0] = fixed.MININT   // BOXTOP
+    box[base + 3] = fixed.MININT   // BOXRIGHT
+    box[base + 1] = fixed.MAXINT   // BOXBOTTOM
+    box[base + 2] = fixed.MAXINT   // BOXLEFT
+}
+
+// M_AddToBox: grow the box to include (x, y).
+flex finna addToBox(box: []i32, base: int, x: i32, y: i32) {
+    fr x < box[base + 2] {
+        box[base + 2] = x          // BOXLEFT
+    } naw fr x > box[base + 3] {
+        box[base + 3] = x          // BOXRIGHT
+    }
+    fr y < box[base + 1] {
+        box[base + 1] = y          // BOXBOTTOM
+    } naw fr y > box[base + 0] {
+        box[base + 0] = y          // BOXTOP
+    }
+}
