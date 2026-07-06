@@ -1,0 +1,105 @@
+// setup.bet — intro/instructions, marksman-skill prompt, and the initial purchases.
+pull "spill"
+pull "state"
+pull "util"
+
+// ---------------------------------------------------------------------------
+// Intro, instructions, marksman skill.
+// ---------------------------------------------------------------------------
+
+finna instructions() {
+    spill.it("")
+    spill.it("THIS PROGRAM SIMULATES A TRIP OVER THE OREGON TRAIL FROM")
+    spill.it("INDEPENDENCE, MISSOURI TO OREGON CITY, OREGON IN 1847.")
+    spill.it("YOUR FAMILY OF FIVE WILL COVER THE 2040 MILE OREGON TRAIL")
+    spill.it("IN 5-6 MONTHS --- IF YOU MAKE IT ALIVE.")
+    spill.it("")
+    spill.it("YOU HAD SAVED $900 TO SPEND FOR THE TRIP, AND YOU'VE JUST")
+    spill.it("PAID $200 FOR A WAGON.")
+    spill.it("YOU WILL NEED TO SPEND THE REST OF YOUR MONEY ON THESE ITEMS:")
+    spill.it("")
+    spill.it("   OXEN - SPEND $200-$300; MORE MEANS A FASTER TEAM.")
+    spill.it("   FOOD - MORE FOOD MEANS LESS CHANCE OF ILLNESS.")
+    spill.it("   AMMUNITION - $1 BUYS A BELT OF 50 BULLETS.")
+    spill.it("   CLOTHING - ESPECIALLY IMPORTANT FOR THE COLD MOUNTAINS.")
+    spill.it("   MISC. SUPPLIES - MEDICINE AND EMERGENCY REPAIRS.")
+    spill.it("")
+    spill.it("YOU CAN SPEND ALL YOUR MONEY BEFORE YOU START, OR SAVE SOME")
+    spill.it("TO SPEND AT FORTS ALONG THE WAY (ITEMS COST MORE THERE).")
+    spill.it("WHENEVER YOU HAVE TO USE YOUR RIFLE, YOU WILL BE TOLD TO TYPE")
+    spill.it("A WORD -- THE FASTER AND TRUER YOUR AIM, THE BETTER YOUR LUCK.")
+    spill.it("")
+    spill.it("GOOD LUCK!!!")
+    spill.it("")
+}
+
+// Ask whether to show the instructions.
+flex finna maybeInstructions() {
+    spill.it("DO YOU NEED INSTRUCTIONS (YES/NO)")
+    lowkey ans = sys.peep()
+    fr str.slaps(str.glow(ans), "NO") {
+        bet
+    }
+    instructions()
+}
+
+// Ask the claimed marksman skill (1..5); anything else -> 0 (dead-eye penalty, per BASIC).
+flex finna askSkill(s: state.Trip) -> state.Trip {
+    lowkey r = s
+    spill.it("")
+    spill.it("HOW GOOD A SHOT ARE YOU WITH YOUR RIFLE?")
+    spill.it("  (1) ACE MARKSMAN  (2) GOOD SHOT  (3) FAIR TO MIDDLIN'")
+    spill.it("  (4) NEED MORE PRACTICE  (5) SHAKY KNEES")
+    spill.it("ENTER ONE OF THE ABOVE -- THE BETTER YOU CLAIM YOU ARE, THE")
+    spill.it("FASTER YOU'LL HAVE TO BE WITH YOUR GUN.")
+    lowkey d9 = util.readNum()
+    fr d9 > 5 {
+        d9 = 0
+    }
+    fr d9 < 1 {
+        d9 = 1
+    }
+    r.skill = d9
+    bet r
+}
+
+// The initial purchases: oxen (200..300), then food/ammo/clothing/misc, all within $700.
+// Re-buys the whole slate if the total is overspent (BASIC line 1130-1160).
+flex finna initialPurchases(s: state.Trip, g: rng) -> state.Trip {
+    lowkey r = s
+    vibin r.done == 0 {
+        spill.it("")
+        lowkey ox = 0
+        vibin ox < 200 || ox > 300 {
+            ox = util.buyPrompt("YOUR OXEN TEAM (200-300)")
+            fr ox < 200 {
+                spill.it("NOT ENOUGH")
+            } naw fr ox > 300 {
+                spill.it("TOO MUCH")
+            }
+            // Guard against an EOF loop: a zero (no input) breaks out with a default team.
+            fr ox == 0 {
+                ox = 200
+            }
+        }
+        lowkey food = util.buyPrompt("FOOD")
+        lowkey ammo = util.buyPrompt("AMMUNITION")
+        lowkey clothing = util.buyPrompt("CLOTHING")
+        lowkey supplies = util.buyPrompt("MISCELLANEOUS SUPPLIES")
+        lowkey left = 700 - ox - food - ammo - clothing - supplies
+        fr left < 0 {
+            spill.it("YOU OVERSPENT--YOU ONLY HAD $700 TO SPEND.  BUY AGAIN")
+        } naw {
+            r.oxen = ox
+            r.food = food
+            r.bullets = 50 * ammo
+            r.cloth = clothing
+            r.misc = supplies
+            r.cash = left
+            spill.f("AFTER ALL YOUR PURCHASES, YOU NOW HAVE {} DOLLARS LEFT\n", left)
+            r.done = 99   // sentinel: purchases complete (reset to 0 by caller)
+        }
+    }
+    r.done = 0
+    bet r
+}

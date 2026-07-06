@@ -1,0 +1,207 @@
+// perils.bet — illness, the random-event table, mountains, and blizzards.
+pull "spill"
+pull "state"
+pull "util"
+pull "combat"
+
+// ---------------------------------------------------------------------------
+// The illness sub-routine (BASIC 6300). Severity scales with how poorly you ate.
+// ---------------------------------------------------------------------------
+finna illness(s: state.Trip, g: rng) -> state.Trip {
+    lowkey r = s
+    fr g.upTo(100) < 10 + 35 * (r.ate - 1) {
+        spill.it("MILD ILLNESS---MEDICINE USED")
+        r.miles = r.miles - 5
+        r.misc = r.misc - 2
+    } naw fr g.upTo(100) < 100 - 40 / (r.ate) {
+        spill.it("BAD ILLNESS---MEDICINE USED")
+        r.miles = r.miles - 5
+        r.misc = r.misc - 5
+    } naw {
+        spill.it("SERIOUS ILLNESS---YOU MUST STOP FOR MEDICAL ATTENTION")
+        r.misc = r.misc - 10
+        r.ill = 1
+    }
+    fr r.misc < 0 {
+        r.epitaph = "YOU RAN OUT OF MEDICAL SUPPLIES AND DIED OF ILLNESS"
+        r.done = 1
+    }
+    bet r
+}
+
+// ---------------------------------------------------------------------------
+// The random-event table (BASIC 3540-4690): 15 events chosen by cumulative thresholds.
+// ---------------------------------------------------------------------------
+flex finna events(s: state.Trip, g: rng) -> state.Trip {
+    lowkey r = s
+    lowkey pick = g.upTo(100)
+    fr pick < 6 {
+        spill.it("WAGON BREAKS DOWN--LOSE TIME AND SUPPLIES FIXING IT")
+        r.miles = r.miles - 15 - g.upTo(5)
+        r.misc = r.misc - 8
+    } naw fr pick < 11 {
+        spill.it("OX INJURES LEG---SLOWS YOU DOWN REST OF TRIP")
+        r.miles = r.miles - 25
+        r.oxen = r.oxen - 20
+    } naw fr pick < 13 {
+        spill.it("BAD LUCK---YOUR DAUGHTER BROKE HER ARM.  YOU MAKE A SLING")
+        r.miles = r.miles - 5 - g.upTo(4)
+        r.misc = r.misc - 2 - g.upTo(3)
+    } naw fr pick < 15 {
+        spill.it("OX WANDERS OFF---SPEND TIME LOOKING FOR IT")
+        r.miles = r.miles - 17
+    } naw fr pick < 17 {
+        spill.it("YOUR SON GETS LOST---SPEND HALF THE DAY LOOKING FOR HIM")
+        r.miles = r.miles - 10
+    } naw fr pick < 22 {
+        spill.it("UNSAFE WATER--LOSE TIME LOOKING FOR A CLEAN SPRING")
+        r.miles = r.miles - 2 - g.upTo(10)
+    } naw fr pick < 32 {
+        spill.it("HEAVY RAINS---TIME AND SUPPLIES LOST")
+        r.food = r.food - 10
+        r.bullets = r.bullets - 500
+        r.misc = r.misc - 15
+        r.miles = r.miles - 5 - g.upTo(10)
+    } naw fr pick < 35 {
+        spill.it("BANDITS ATTACK")
+        lowkey b1 = combat.shoot(r, g)
+        r.bullets = r.bullets - 20 * b1
+        fr r.bullets < 0 {
+            spill.it("YOU RAN OUT OF BULLETS---THEY GET LOTS OF CASH")
+            r.cash = r.cash / 3
+        } naw fr b1 <= 1 {
+            spill.it("QUICKEST DRAW OUTSIDE OF DODGE CITY!!!  YOU GOT 'EM!")
+        } naw {
+            spill.it("YOU GOT SHOT IN THE LEG AND THEY TOOK ONE OF YOUR OXEN")
+            spill.it("BETTER HAVE A DOC LOOK AT YOUR WOUND")
+            r.injured = 1
+            r.misc = r.misc - 5
+            r.oxen = r.oxen - 20
+        }
+        r.bullets = util.atLeastZero(r.bullets)
+    } naw fr pick < 37 {
+        spill.it("THERE WAS A FIRE IN YOUR WAGON--FOOD AND SUPPLIES DAMAGED")
+        r.food = r.food - 40
+        r.bullets = r.bullets - 400
+        r.misc = r.misc - 3 - g.upTo(8)
+        r.miles = r.miles - 15
+    } naw fr pick < 42 {
+        spill.it("LOSE YOUR WAY IN HEAVY FOG---TIME IS LOST")
+        r.miles = r.miles - 10 - g.upTo(5)
+    } naw fr pick < 44 {
+        spill.it("YOU KILLED A POISONOUS SNAKE AFTER IT BIT YOU")
+        r.bullets = r.bullets - 10
+        r.misc = r.misc - 5
+        fr r.misc < 0 {
+            r.epitaph = "YOU DIE OF SNAKEBITE SINCE YOU HAVE NO MEDICINE"
+            r.done = 1
+        }
+    } naw fr pick < 54 {
+        spill.it("WAGON GETS SWAMPED FORDING RIVER--LOSE FOOD AND CLOTHES")
+        r.food = r.food - 30
+        r.cloth = r.cloth - 20
+        r.miles = r.miles - 20 - g.upTo(20)
+    } naw fr pick < 64 {
+        spill.it("WILD ANIMALS ATTACK!")
+        lowkey b1 = combat.shoot(r, g)
+        fr r.bullets <= 39 {
+            spill.it("YOU WERE TOO LOW ON BULLETS--THE WOLVES OVERPOWERED YOU")
+            r.injured = 1
+            r.epitaph = "YOU DIED OF INJURIES"
+            r.done = 1
+        } naw {
+            fr b1 <= 2 {
+                spill.it("NICE SHOOTIN' PARTNER---THEY DIDN'T GET MUCH")
+            } naw {
+                spill.it("SLOW ON THE DRAW---THEY GOT AT YOUR FOOD AND CLOTHES")
+            }
+            r.bullets = r.bullets - 20 * b1
+            r.cloth = r.cloth - b1 * 4
+            r.food = r.food - b1 * 8
+        }
+    } naw fr pick < 69 {
+        spill.it("COLD WEATHER---BRRRRRRR!")
+        fr r.cloth <= 22 + g.upTo(4) {
+            spill.it("YOU DON'T HAVE ENOUGH CLOTHING TO KEEP YOU WARM")
+            r = illness(r, g)
+        } naw {
+            spill.it("YOU HAVE ENOUGH CLOTHING TO KEEP YOU WARM")
+        }
+    } naw fr pick < 95 {
+        spill.it("HAIL STORM---SUPPLIES DAMAGED")
+        r.miles = r.miles - 5 - g.upTo(10)
+        r.bullets = r.bullets - 200
+        r.misc = r.misc - 4 - g.upTo(3)
+    } naw {
+        spill.it("HELPFUL INDIANS SHOW YOU WHERE TO FIND MORE FOOD")
+        r.food = r.food + 14
+    }
+    r.bullets = util.atLeastZero(r.bullets)
+    bet r
+}
+
+// ---------------------------------------------------------------------------
+// Mountains (BASIC 4700-5040): only past mile 950. Rugged going, South Pass, Blue Mountains,
+// blizzards.
+// ---------------------------------------------------------------------------
+flex finna mountains(s: state.Trip, g: rng) -> state.Trip {
+    lowkey r = s
+    fr r.miles <= 950 {
+        bet r
+    }
+    lowkey k = r.miles / 100 - 15
+    lowkey num = k * k + 72
+    lowkey den = k * k + 12
+    fr g.upTo(10) * den <= (9 * den - num) {
+        spill.it("RUGGED MOUNTAINS")
+        fr g.upTo(10) < 1 {
+            spill.it("YOU GOT LOST---LOSE VALUABLE TIME TRYING TO FIND THE TRAIL!")
+            r.miles = r.miles - 60
+        } naw fr g.upTo(100) < 11 {
+            spill.it("WAGON DAMAGED!---LOSE TIME AND SUPPLIES")
+            r.misc = r.misc - 5
+            r.bullets = r.bullets - 200
+            r.miles = r.miles - 20 - g.upTo(30)
+        } naw {
+            spill.it("THE GOING GETS SLOW")
+            r.miles = r.miles - 45 - g.upTo(50)
+        }
+    }
+    // South Pass (once).
+    fr r.clearedSouth == 0 {
+        r.clearedSouth = 1
+        fr g.upTo(10) < 8 {
+            spill.it("YOU MADE IT SAFELY THROUGH SOUTH PASS--NO SNOW")
+        } naw {
+            r = blizzard(r, g)
+            bet r
+        }
+        r.southMiles = 1
+    }
+    // Blue Mountains (once, past 1700).
+    fr r.miles >= 1700 && r.clearedBlue == 0 {
+        r.clearedBlue = 1
+        fr g.upTo(10) < 7 {
+            spill.it("YOU CLEARED THE BLUE MOUNTAINS")
+        } naw {
+            r = blizzard(r, g)
+        }
+    }
+    bet r
+}
+
+// A mountain-pass blizzard (BASIC 4970).
+finna blizzard(s: state.Trip, g: rng) -> state.Trip {
+    lowkey r = s
+    spill.it("BLIZZARD IN THE MOUNTAIN PASS--TIME AND SUPPLIES LOST")
+    r.blizzard = 1
+    r.food = r.food - 25
+    r.misc = r.misc - 10
+    r.bullets = r.bullets - 300
+    r.miles = r.miles - 30 - g.upTo(40)
+    r.bullets = util.atLeastZero(r.bullets)
+    fr r.cloth < 18 + g.upTo(2) {
+        r = illness(r, g)
+    }
+    bet r
+}

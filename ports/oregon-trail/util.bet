@@ -1,0 +1,87 @@
+// util.bet — small stateless helpers: numeric input, clamping, fort/purchase prompts, dates.
+pull "spill"
+
+// ---------------------------------------------------------------------------
+// Small helpers.
+// ---------------------------------------------------------------------------
+
+// Parse the leading non-negative integer of `s` (skips leading spaces, stops at the first
+// non-digit). Empty / non-numeric -> 0. Backs every numeric prompt.
+finna parseInt(s: str) -> int {
+    lowkey n = 0
+    lowkey i = 0
+    lowkey len = str.len(s)
+    lowkey started = cap
+    vibin i < len {
+        lowkey ch = str.at(s, i)
+        fr ch >= 48 && ch <= 57 {
+            n = n * 10 + (ch - 48)
+            started = nocap
+        } naw fr started {
+            i = len
+        }
+        i = i + 1
+    }
+    bet n
+}
+
+// Read one line from stdin and parse it as an integer.
+flex finna readNum() -> int {
+    bet parseInt(sys.peep())
+}
+
+// Clamp a value to be non-negative.
+flex finna atLeastZero(x: int) -> int {
+    fr x < 0 {
+        bet 0
+    }
+    bet x
+}
+
+// Prompt for a single non-negative purchase amount.
+flex finna buyPrompt(label: str) -> int {
+    spill.f("HOW MUCH DO YOU WANT TO SPEND ON {}", label)
+    spill.it("?")
+    lowkey v = readNum()
+    bet atLeastZero(v)
+}
+
+// ---------------------------------------------------------------------------
+// Fort shopping.
+// ---------------------------------------------------------------------------
+flex finna spendAtFort(label: str, cash: int) -> int {
+    // Returns dollars actually spent (0 if it would overspend), printing on refusal.
+    spill.f("  {}? ", label)
+    lowkey p = atLeastZero(readNum())
+    fr p > cash {
+        spill.it("YOU DON'T HAVE THAT MUCH--KEEP YOUR SPENDING DOWN")
+        bet 0
+    }
+    bet p
+}
+
+// ---------------------------------------------------------------------------
+// Dates. Turn 1 = April 12 1847; each turn is two weeks. Turn > 20 = too long on the trail.
+// ---------------------------------------------------------------------------
+flex finna dateStr(turn: int) -> str {
+    fr turn == 1 { bet "APRIL 12" }
+    fr turn == 2 { bet "APRIL 26" }
+    fr turn == 3 { bet "MAY 10" }
+    fr turn == 4 { bet "MAY 24" }
+    fr turn == 5 { bet "JUNE 7" }
+    fr turn == 6 { bet "JUNE 21" }
+    fr turn == 7 { bet "JULY 5" }
+    fr turn == 8 { bet "JULY 19" }
+    fr turn == 9 { bet "AUGUST 2" }
+    fr turn == 10 { bet "AUGUST 16" }
+    fr turn == 11 { bet "AUGUST 31" }
+    fr turn == 12 { bet "SEPTEMBER 13" }
+    fr turn == 13 { bet "SEPTEMBER 27" }
+    fr turn == 14 { bet "OCTOBER 11" }
+    fr turn == 15 { bet "OCTOBER 25" }
+    fr turn == 16 { bet "NOVEMBER 8" }
+    fr turn == 17 { bet "NOVEMBER 22" }
+    fr turn == 18 { bet "DECEMBER 6" }
+    fr turn == 19 { bet "DECEMBER 20" }
+    bet "JANUARY 1"
+}

@@ -1,0 +1,155 @@
+// turn.bet — the per-turn cycle: status table, fort, action menu, eating, one full turn.
+pull "spill"
+pull "state"
+pull "util"
+pull "combat"
+pull "perils"
+
+// ---------------------------------------------------------------------------
+// Per-turn beginning: clamp resources, doctor's bill, print the status table.
+// ---------------------------------------------------------------------------
+finna showStatus(s: state.Trip, g: rng) -> state.Trip {
+    lowkey r = s
+    r.food = util.atLeastZero(r.food)
+    r.bullets = util.atLeastZero(r.bullets)
+    r.cloth = util.atLeastZero(r.cloth)
+    r.misc = util.atLeastZero(r.misc)
+    fr r.food < 13 {
+        spill.it("YOU'D BETTER DO SOME HUNTING OR BUY FOOD AND SOON!!!!")
+    }
+    r.prevMiles = r.miles
+    // Doctor's bill for illness or injury.
+    fr r.ill == 1 || r.injured == 1 {
+        r.cash = r.cash - 20
+        fr r.cash < 0 {
+            r.epitaph = "YOU CAN'T AFFORD A DOCTOR.  YOU DIED OF YOUR AILMENT"
+            r.done = 1
+            bet r
+        }
+        spill.it("DOCTOR'S BILL IS $20")
+        r.ill = 0
+        r.injured = 0
+    }
+    lowkey shown = r.miles
+    fr r.southMiles == 1 {
+        shown = 950
+        r.southMiles = 0
+    }
+    spill.f("TOTAL MILEAGE IS {}\n", shown)
+    spill.it("FOOD  BULLETS  CLOTHING  MISC.SUPP.  CASH")
+    spill.f("{}    {}      {}       {}         {}\n", r.food, r.bullets, r.cloth, r.misc, r.cash)
+    bet r
+}
+
+finna fort(s: state.Trip, g: rng) -> state.Trip {
+    lowkey r = s
+    spill.it("ENTER WHAT YOU WISH TO SPEND ON THE FOLLOWING")
+    lowkey p = util.spendAtFort("FOOD", r.cash)
+    r.cash = r.cash - p
+    r.food = r.food + (2 * p) / 3
+    p = util.spendAtFort("AMMUNITION", r.cash)
+    r.cash = r.cash - p
+    r.bullets = r.bullets + (2 * p * 50) / 3
+    p = util.spendAtFort("CLOTHING", r.cash)
+    r.cash = r.cash - p
+    r.cloth = r.cloth + (2 * p) / 3
+    p = util.spendAtFort("MISCELLANEOUS SUPPLIES", r.cash)
+    r.cash = r.cash - p
+    r.misc = r.misc + (2 * p) / 3
+    r.miles = r.miles - 45
+    bet r
+}
+
+// ---------------------------------------------------------------------------
+// The action menu (fort every other turn, else hunt-or-continue). Returns updated state.
+// ---------------------------------------------------------------------------
+finna chooseAction(s: state.Trip, g: rng) -> state.Trip {
+    lowkey r = s
+    lowkey choice = 3   // default: continue
+    fr r.fortFlag == 1 {
+        spill.it("DO YOU WANT TO (1) STOP AT THE NEXT FORT, (2) HUNT, OR (3) CONTINUE")
+        lowkey x = util.readNum()
+        fr x >= 1 && x <= 3 {
+            choice = x
+        }
+        r.fortFlag = -1
+    } naw {
+        spill.it("DO YOU WANT TO (1) HUNT, OR (2) CONTINUE")
+        lowkey x = util.readNum()
+        fr x == 1 {
+            choice = 2   // hunt
+        } naw {
+            choice = 3   // continue
+        }
+        r.fortFlag = 1
+    }
+    // Hunting needs bullets.
+    fr choice == 2 && r.bullets <= 39 {
+        spill.it("TOUGH---YOU NEED MORE BULLETS TO GO HUNTING")
+        choice = 3
+    }
+    fr choice == 1 {
+        r = fort(r, g)
+    } naw fr choice == 2 {
+        r = combat.hunt(r, g)
+    }
+    bet r
+}
+
+// ---------------------------------------------------------------------------
+// Eating.
+// ---------------------------------------------------------------------------
+finna eat(s: state.Trip, g: rng) -> state.Trip {
+    lowkey r = s
+    fr r.food < 13 {
+        r.epitaph = "YOU RAN OUT OF FOOD AND STARVED TO DEATH"
+        r.done = 1
+        bet r
+    }
+    spill.it("DO YOU WANT TO EAT (1) POORLY  (2) MODERATELY  (3) WELL")
+    lowkey e = util.readNum()
+    fr e < 1 || e > 3 {
+        e = 2
+    }
+    r.ate = e
+    r.food = r.food - (8 + 5 * e)
+    fr r.food < 0 {
+        r.food = r.food + (8 + 5 * e)
+        spill.it("YOU CAN'T EAT THAT WELL -- YOU EAT MODERATELY")
+        r.ate = 2
+        r.food = r.food - 18
+    }
+    bet r
+}
+
+// ---------------------------------------------------------------------------
+// One turn.
+// ---------------------------------------------------------------------------
+flex finna oneTurn(s: state.Trip, g: rng) -> state.Trip {
+    lowkey r = s
+    r.turn = r.turn + 1
+    fr r.turn > 20 {
+        spill.it("YOU HAVE BEEN ON THE TRAIL TOO LONG  ------")
+        spill.it("YOUR FAMILY DIES IN THE FIRST BLIZZARD OF WINTER")
+        r.epitaph = "WINTER CLAIMED YOUR FAMILY ON THE TRAIL"
+        r.done = 1
+        bet r
+    }
+    spill.it("")
+    spill.f("MONDAY {} 1847\n", util.dateStr(r.turn))
+    r = showStatus(r, g)
+    fr r.done != 0 { bet r }
+    r = chooseAction(r, g)
+    fr r.done != 0 { bet r }
+    r = eat(r, g)
+    fr r.done != 0 { bet r }
+    // Advance the wagon (BASIC 2860): base + team quality + luck.
+    r.miles = r.miles + 200 + (r.oxen - 220) / 5 + g.upTo(11)
+    r.blizzard = 0
+    r = combat.riders(r, g)
+    fr r.done != 0 { bet r }
+    r = perils.events(r, g)
+    fr r.done != 0 { bet r }
+    r = perils.mountains(r, g)
+    bet r
+}

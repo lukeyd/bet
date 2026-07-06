@@ -1,0 +1,28 @@
+// state.bet — the shared game-state struct (value-threaded across every phase).
+
+// ---------------------------------------------------------------------------
+// Game state — one value-threaded struct (bet structs are value-copy, so each phase takes the
+// state and returns the updated state: `s = phase(s, g)`). Mirrors the BASIC global variables.
+// ---------------------------------------------------------------------------
+flex drip Trip {
+    flex food: int        // F   — food (dollars' worth)
+    flex bullets: int     // B   — bullets (1 dollar = 50)
+    flex cloth: int       // C   — clothing
+    flex misc: int        // M1  — miscellaneous supplies (incl. medicine)
+    flex cash: int        // T   — cash on hand
+    flex oxen: int        // A   — spent on the ox team (200..300)
+    flex miles: int       // M   — total miles travelled
+    flex prevMiles: int   // M2  — miles through the previous turn
+    flex turn: int        // D3  — turn number (each turn is two weeks)
+    flex skill: int       // D9  — claimed marksman skill (1 ace .. 5 shaky)
+    flex ate: int         // E   — last eating choice (1 poorly, 2 moderately, 3 well)
+    flex injured: int     // K8  — injury flag
+    flex ill: int         // S4  — illness flag
+    flex blizzard: int    // L1  — blizzard-in-progress flag
+    flex clearedSouth: int// F1  — cleared South Pass
+    flex clearedBlue: int // F2  — cleared the Blue Mountains
+    flex southMiles: int  // M9  — show "950" for mileage after South Pass
+    flex fortFlag: int    // X1  — fort option offered every other turn (starts -1)
+    flex done: int        // 0 playing, 1 dead, 2 arrived
+    flex epitaph: str     // cause-of-death line for the funeral
+}

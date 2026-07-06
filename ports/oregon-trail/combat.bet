@@ -1,0 +1,118 @@
+// combat.bet — the shooting draw, hunting, and the riders encounter.
+pull "spill"
+pull "state"
+pull "util"
+
+// The shooting sub-routine: return a shot-quality bucket B1 (lower is better). Replaces the
+// BASIC timed-typing draw with a skill+luck draw: a better claimed skill narrows the range
+// toward fast, clean shots; a worse claim risks slow or fumbled ones.
+flex finna shoot(s: state.Trip, g: rng) -> int {
+    spill.it("BANG!  BLAM!  POW!  ...you draw")
+    bet g.upTo(s.skill + 2)
+}
+
+// ---------------------------------------------------------------------------
+// Hunting.
+// ---------------------------------------------------------------------------
+flex finna hunt(s: state.Trip, g: rng) -> state.Trip {
+    lowkey r = s
+    r.miles = r.miles - 45
+    lowkey b1 = shoot(r, g)
+    fr b1 <= 1 {
+        spill.it("RIGHT BETWEEN THE EYES---YOU GOT A BIG ONE!!!!  FULL BELLIES TONIGHT!")
+        r.food = r.food + 52 + g.upTo(6)
+        r.bullets = r.bullets - 10 - g.upTo(4)
+    } naw fr g.upTo(100) < 13 * b1 {
+        spill.it("YOU MISSED---AND YOUR DINNER GOT AWAY.....")
+    } naw {
+        spill.it("NICE SHOT--RIGHT ON TARGET--GOOD EATIN' TONIGHT!!")
+        r.food = r.food + 48 - 2 * b1
+        r.bullets = r.bullets - 10 - 3 * b1
+    }
+    r.bullets = util.atLeastZero(r.bullets)
+    bet r
+}
+
+// ---------------------------------------------------------------------------
+// Riders attack. Probability rises with mileage (integer rendering of the BASIC ratio).
+// ---------------------------------------------------------------------------
+flex finna riders(s: state.Trip, g: rng) -> state.Trip {
+    lowkey r = s
+    lowkey k = r.miles / 100 - 4
+    lowkey num = k * k + 72
+    lowkey den = k * k + 12
+    // BASIC: skip riders unless RND*10*(num/den) <= 1, i.e. chance ~ den/(10*num).
+    fr g.upTo(10 * num) >= den {
+        bet r
+    }
+    lowkey hostile = 1
+    fr g.upTo(10) < 8 {
+        hostile = 0
+    }
+    fr hostile == 1 {
+        spill.it("RIDERS AHEAD.  THEY LOOK HOSTILE")
+    } naw {
+        spill.it("RIDERS AHEAD.  THEY DON'T LOOK HOSTILE")
+    }
+    spill.it("TACTICS: (1) RUN  (2) ATTACK  (3) CONTINUE  (4) CIRCLE WAGONS")
+    lowkey t = util.readNum()
+    fr t < 1 || t > 4 {
+        t = 3
+    }
+    // A 20% chance the riders' true intent flips (BASIC line 2980).
+    fr g.upTo(10) < 2 {
+        hostile = 1 - hostile
+    }
+    fr hostile == 1 {
+        // Hostile riders.
+        fr t == 1 {
+            spill.it("YOU RUN.")
+            r.miles = r.miles + 20
+            r.misc = r.misc - 15
+            r.bullets = r.bullets - 150
+            r.oxen = r.oxen - 40
+        } naw fr t == 2 {
+            lowkey b1 = shoot(r, g)
+            r.bullets = r.bullets - b1 * 40 - 80
+            fr b1 <= 1 {
+                spill.it("NICE SHOOTING---YOU DROVE THEM OFF")
+            } naw fr b1 > 4 {
+                spill.it("LOUSY SHOT---YOU GOT KNIFED.  YOU HAVE TO SEE OL' DOC BLANCHARD")
+                r.injured = 1
+            } naw {
+                spill.it("KINDA SLOW WITH YOUR COLT .45")
+            }
+        } naw fr t == 3 {
+            fr g.upTo(10) < 8 {
+                spill.it("THEY DID NOT ATTACK")
+            } naw {
+                r.bullets = r.bullets - 150
+                r.misc = r.misc - 15
+            }
+        } naw {
+            lowkey b1 = shoot(r, g)
+            r.bullets = r.bullets - b1 * 30 - 80
+            r.miles = r.miles - 25
+        }
+        spill.it("RIDERS WERE HOSTILE--CHECK FOR LOSSES")
+        fr r.bullets < 0 {
+            r.epitaph = "YOU RAN OUT OF BULLETS AND GOT MASSACRED BY THE RIDERS"
+            r.done = 1
+            bet r
+        }
+    } naw {
+        // Friendly riders.
+        fr t == 1 {
+            r.miles = r.miles + 15
+            r.oxen = r.oxen - 10
+        } naw fr t == 2 {
+            r.miles = r.miles - 5
+            r.bullets = r.bullets - 100
+        } naw fr t == 4 {
+            r.miles = r.miles - 20
+        }
+        spill.it("RIDERS WERE FRIENDLY, BUT CHECK FOR POSSIBLE LOSSES")
+    }
+    r.bullets = util.atLeastZero(r.bullets)
+    bet r
+}
