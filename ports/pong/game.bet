@@ -1,0 +1,96 @@
+// game.bet — ball/paddle/score state (`Game`) and the pure physics + AI `step`.
+// `step` is value-in/value-out (takes a `Game`, returns the next `Game`); the ball stores a
+// DIRECTION (±1), not a velocity, so speed is derived from the current `Dims` each frame and the
+// ball auto-scales with resolution. Geometry (`Dims`, `clampPaddle`) comes from the `dims` module.
+pull "dims"
+
+// Ball position (pixels) + DIRECTION (±1, not velocity), paddle y's, scores, sound flag.
+flex drip Game {
+    flex bx: int
+    flex by: int
+    flex dirx: int
+    flex diry: int
+    flex p1: int
+    flex p2: int
+    flex s1: int
+    flex s2: int
+    flex beep: int
+}
+
+// Pure physics/AI step using the current `Dims`. `l*`/`r*` are the paddle key states (0/1).
+flex finna step(g: Game, d: dims.Dims, lUp: int, lDn: int, rUp: int, rDn: int) -> Game {
+    g.beep = 0
+
+    // left paddle (W/S)
+    fr lUp != 0 {
+        g.p1 = dims.clampPaddle(g.p1 - d.psp, d)
+    }
+    fr lDn != 0 {
+        g.p1 = dims.clampPaddle(g.p1 + d.psp, d)
+    }
+
+    // right paddle: arrow keys if pressed, else drift toward the ball (simple AI)
+    fr rUp != 0 {
+        g.p2 = dims.clampPaddle(g.p2 - d.psp, d)
+    } naw fr rDn != 0 {
+        g.p2 = dims.clampPaddle(g.p2 + d.psp, d)
+    } naw {
+        lowkey bc = g.by + d.bs / 2
+        lowkey pc = g.p2 + d.ph / 2
+        fr bc < pc - d.psp {
+            g.p2 = dims.clampPaddle(g.p2 - d.psp, d)
+        } naw fr bc > pc + d.psp {
+            g.p2 = dims.clampPaddle(g.p2 + d.psp, d)
+        }
+    }
+
+    // advance ball: velocity = direction * speed (so it scales with resolution)
+    g.bx = g.bx + g.dirx * d.spx
+    g.by = g.by + g.diry * d.spy
+
+    // top / bottom walls
+    fr g.by <= 0 {
+        g.by = 0
+        g.diry = 0 - g.diry
+        g.beep = 1
+    } naw fr g.by + d.bs >= d.h {
+        g.by = d.h - d.bs
+        g.diry = 0 - g.diry
+        g.beep = 1
+    }
+
+    // left paddle collision
+    lowkey lxr = d.lx + d.pw
+    fr g.bx <= lxr && g.bx >= d.lx && g.by + d.bs >= g.p1 && g.by <= g.p1 + d.ph {
+        g.bx = lxr
+        g.dirx = 0 - g.dirx
+        g.beep = 1
+    }
+
+    // right paddle collision
+    lowkey rx = d.w - d.lx - d.pw
+    fr g.bx + d.bs >= rx && g.bx + d.bs <= rx + d.pw && g.by + d.bs >= g.p2 && g.by <= g.p2 + d.ph {
+        g.bx = rx - d.bs
+        g.dirx = 0 - g.dirx
+        g.beep = 1
+    }
+
+    // scoring: ball past an edge -> point + recenter
+    fr g.bx < 0 {
+        g.s2 = g.s2 + 1
+        g.bx = d.w / 2
+        g.by = d.h / 2
+        g.dirx = 1
+        g.diry = 1
+        g.beep = 2
+    } naw fr g.bx + d.bs > d.w {
+        g.s1 = g.s1 + 1
+        g.bx = d.w / 2
+        g.by = d.h / 2
+        g.dirx = 0 - 1
+        g.diry = 1
+        g.beep = 2
+    }
+
+    bet g
+}

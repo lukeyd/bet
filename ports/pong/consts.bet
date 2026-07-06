@@ -1,0 +1,23 @@
+// consts.bet — shared vocabulary for the Pong port: colors, keycodes, event kinds, audio.
+// All `flex` so `pong.bet` (the entry) can reach them as `consts.WHITE`, `consts.KEY_W`, etc.
+
+// framebuffer colors (32-bit RGBA)
+flex facts WHITE: u32 = 0x00FFFFFF
+flex facts BLACK: u32 = 0x00000000
+
+// keycodes (must match gg-backend's `key` mapping)
+flex facts KEY_W: int = 87
+flex facts KEY_S: int = 83
+flex facts KEY_UP: int = 256
+flex facts KEY_DOWN: int = 257
+flex facts KEY_ESC: int = 27
+
+// event kinds (rt-abi event_kind)
+flex facts EV_NONE: int = 0
+flex facts EV_KEYDOWN: int = 1
+flex facts EV_KEYUP: int = 2
+flex facts EV_QUIT: int = 4
+
+// audio
+flex facts SR: int = 44100
+flex facts BEEP_FRAMES: int = 2600

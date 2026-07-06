@@ -1,0 +1,52 @@
+// dims.bet — per-frame geometry, all derived from the current window size (fill-window, no
+// letterbox). `dimsFor` recomputes the whole board proportionally each frame so it scales with
+// the window; `clampPaddle` keeps a paddle inside the field. `maxi` is a private helper.
+
+flex drip Dims {
+    flex w: int
+    flex h: int
+    flex ph: int      // paddle height
+    flex pw: int      // paddle width
+    flex bs: int      // ball size
+    flex spx: int     // ball x speed
+    flex spy: int     // ball y speed
+    flex psp: int     // paddle speed
+    flex lx: int      // side margin
+}
+
+finna maxi(a: int, b: int) -> int {
+    fr a > b {
+        bet a
+    }
+    bet b
+}
+
+// Compute the geometry for a window of size (w, h). Ball/paddle/speed are all proportional, so
+// the whole board scales with the window; `maxi(..)` floors keep tiny windows playable.
+flex finna dimsFor(w: int, h: int) -> Dims {
+    lowkey mn = h
+    fr w < h {
+        mn = w
+    }
+    bet Dims{
+        w: w,
+        h: h,
+        ph: maxi(8, h / 5),
+        pw: maxi(4, w / 60),
+        bs: maxi(4, mn / 64),
+        spx: maxi(2, w / 128),
+        spy: maxi(2, h / 160),
+        psp: maxi(3, h / 100),
+        lx: maxi(4, w / 30)
+    }
+}
+
+flex finna clampPaddle(y: int, d: Dims) -> int {
+    fr y < 0 {
+        bet 0
+    }
+    fr y > d.h - d.ph {
+        bet d.h - d.ph
+    }
+    bet y
+}
