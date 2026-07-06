@@ -483,13 +483,16 @@ size = 3
 # self-host property is enforced on every selfhost.yml run.
 status = "done"
 
-# ─────────────────────── The gate this plan STOPS at (out of scope) ───────────────────────
+# ─────────────────────── Milestone 7.2: the Doom port (gate green — ACTIVE) ───────────────────────
+# Gate met; port underway. Plan: ~/.claude/plans/it-s-time-to-port-deep-umbrella.md
+# W0 (language: evict-slot/fs.drop/zero-cop/12-doom corpus; gg: keys/mouseDelta/tune/show/
+# audioSpec/pending/headless/Esc-contract) landed on the `doom` branch, all gates green.
 
 [[task]]
 slug = "doom"
-name = "Milestone 7.2: Doom port targeting gg — BLOCKED ON GATE; out of scope for the 'Open Doom's Gate' plan (do not start until gate is green)"
+name = "Milestone 7.2: Doom port targeting gg — pixel-perfect vs demo-lump oracle (plan: it-s-time-to-port-deep-umbrella.md)"
 size = 34
-status = "todo"
+status = "doing"
 
 # ─────────────────────── Oregon Trail port + the language features it needs ───────────────────────
 # A faithful port of the 1978 MECC Oregon Trail BASIC listing (ports/oregon-trail/). It needs two
