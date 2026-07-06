@@ -1,0 +1,1247 @@
+// p/p_inter.bet — item pickups + damage/kill interactions (linuxdoom-1.10 p_inter.c).
+// Signatures FROZEN in ports/doom/p-sigs.md ("p/p_inter"): touchSpecialThing + damageMobj.
+//
+// PORTED: P_GiveAmmo, P_GiveWeapon, P_GiveBody, P_GiveArmor, P_GiveCard, P_GivePower,
+//   P_TouchSpecialThing, P_KillMobj, P_DamageMobj. Plus the p_inter.c ammo tables
+//   (maxammo/clipammo) via initAmmoTables and the weaponinfo[].ammo column via weaponAmmo.
+//
+// TYPE NOTES:
+//   * player_t* -> `player: int` index into g.shell.players[] (-1 = none). Every give* helper
+//     takes the index; touchSpecialThing/damageMobj resolve toucher->player / target->player.
+//   * mobj_t* -> `tag think.Thinker`; a null tag (ghosted) is C NULL (inflictor/source may be
+//     null for slime/environment damage). weapontype/ammotype/card/power -> doomdef facts.
+//   * maxammo[]/clipammo[] (p_inter.c file globals) -> g.shell.maxammo/clipammo (CONTRACTS);
+//     P_GiveAmmo reads clipammo + the PER-PLAYER Player.maxammo cap (doubled by the backpack).
+//
+// SEAM (P2.4 / p_pspr): P_KillMobj's player-death branch calls P_DropWeapon(player) — a p_pspr
+//   (weapon psprite) routine that does not exist until P2.4. It is left as a documented SEAM at
+//   the exact call site below: P2.4 adds `ppspr.dropWeapon(gt, player)` there once p_pspr lands
+//   (p_inter -> p_pspr edge, acyclic — p_pspr never pulls p_inter). No gs field / hook is added
+//   for it; the player-death path is not exercised by the sim smoke (no player dies there).
+//   AM_Stop() (automap teardown) is reduced to its observable effect g.shell.automapactive=false.
+//
+// RNG / DEMO-SYNC: every P_Random is m_random.pRandom (the play RNG). Call ORDER is verbatim.
+//   * P_DamageMobj: the fall-forwards `(P_Random()&1)` fires ONLY when inflictor!=null and the
+//     4 fall conditions hold; the pain `(P_Random()<painchance)` fires on any NON-fatal hit; a
+//     FATAL hit calls P_KillMobj (which draws `P_Random()&3` for the death-tic jitter) and
+//     returns BEFORE the pain roll — so a kill consumes the kill-jitter roll, not the pain roll.
+//   * dropped-item deaths (POSSESSED/SHOTGUY/CHAINGUY/WOLFSS) draw a further P_Random inside
+//     P_SpawnMobj (lastlook); plain deaths (default arm) draw none.
+//
+// NATIVE is the correctness target (mutable state threads through holla; helpers close their gsc
+// holla BEFORE calling another gsc-opening helper — never a nested gsc holla, per the state model).
+pull "../defs/gs" as gs
+pull "../defs/think" as think
+pull "../defs/fixed" as fixed
+pull "../defs/doomdef" as doomdef
+pull "../defs/tables" as tables
+pull "../defs/info" as info
+pull "../defs/sounds" as sounds
+pull "../defs/strings" as strings
+pull "../util/m_random" as rnd
+pull "../r/r_geom" as rgeom
+pull "../s/s_sound" as ssnd
+pull "../p/p_mobj" as pmobj
+
+// ---- constants (p_inter.c / p_local.h / doomdef.h) ----------------------------------------
+flex facts BONUSADD: int = 6
+flex facts MAXHEALTH: int = 100          // doomdef.h
+flex facts BASETHRESHOLD: int = 100      // p_local.h (retaliation threshold)
+
+// ===========================================================================================
+// static ammo tables (p_inter.c file globals: maxammo/clipammo). Rehomed to g.shell.* per
+// CONTRACTS; provided here (their natural home) so the game/harness can install id's literals.
+// initAmmoTables installs {200,50,300,50} / {10,4,20,1}. P_GiveAmmo reads clipammo below.
+// ===========================================================================================
+flex finna initAmmoTables(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.shell.maxammo[0] = 200
+        g.shell.maxammo[1] = 50
+        g.shell.maxammo[2] = 300
+        g.shell.maxammo[3] = 50
+        g.shell.clipammo[0] = 10
+        g.shell.clipammo[1] = 4
+        g.shell.clipammo[2] = 20
+        g.shell.clipammo[3] = 1
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// weaponAmmo — weaponinfo[weapon].ammo (the ONLY weaponinfo column P_GiveWeapon needs). The
+// full weaponinfo table (up/down/ready/atk/flash states) lives in p/p_pspr (P2.4); this is the
+// ammo mapping only, copied from p_pspr.c's weaponinfo[] initializer.
+flex finna weaponAmmo(weapon: int) -> int {
+    fr weapon == doomdef.WP_FIST {
+        bet doomdef.AM_NOAMMO
+    }
+    fr weapon == doomdef.WP_PISTOL {
+        bet doomdef.AM_CLIP
+    }
+    fr weapon == doomdef.WP_SHOTGUN {
+        bet doomdef.AM_SHELL
+    }
+    fr weapon == doomdef.WP_CHAINGUN {
+        bet doomdef.AM_CLIP
+    }
+    fr weapon == doomdef.WP_MISSILE {
+        bet doomdef.AM_MISL
+    }
+    fr weapon == doomdef.WP_PLASMA {
+        bet doomdef.AM_CELL
+    }
+    fr weapon == doomdef.WP_BFG {
+        bet doomdef.AM_CELL
+    }
+    fr weapon == doomdef.WP_CHAINSAW {
+        bet doomdef.AM_NOAMMO
+    }
+    fr weapon == doomdef.WP_SUPERSHOTGUN {
+        bet doomdef.AM_SHELL
+    }
+    bet doomdef.AM_NOAMMO
+}
+
+// ===========================================================================================
+// GET STUFF — the give* helpers (return true/false = "was it needed", exactly as p_inter.c).
+// ===========================================================================================
+
+// giveAmmo — P_GiveAmmo. num is CLIP LOADS (0 == half a clip). false if already full / no ammo.
+flex finna giveAmmo(gt: tag gs.GameState, player: int, ammo: int, num: int) -> bool {
+    fr ammo == doomdef.AM_NOAMMO {
+        bet cap
+    }
+    // id's bounds guard is `ammo < 0 || ammo > NUMAMMO` (note: `>`, an original off-by-one; kept).
+    fr ammo < 0 || ammo > doomdef.NUMAMMO {
+        yeet("P_GiveAmmo: bad type")
+    }
+    lowkey have: int = 0
+    lowkey cap0: int = 0
+    lowkey clip: int = 0
+    lowkey skill: int = 0
+    holla g = gt in gs.gsc {
+        have = g.shell.players[player].ammo[ammo] as int
+        cap0 = g.shell.players[player].maxammo[ammo] as int
+        clip = g.shell.clipammo[ammo] as int
+        skill = g.shell.gameskill as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr have == cap0 {
+        bet cap
+    }
+    lowkey add: int = 0
+    fr num != 0 {
+        add = num * clip
+    } naw {
+        add = clip / 2
+    }
+    fr skill == doomdef.SK_BABY || skill == doomdef.SK_NIGHTMARE {
+        // double ammo in trainer / nightmare mode
+        add = add << 1
+    }
+    lowkey newammo: int = have + add
+    fr newammo > cap0 {
+        newammo = cap0
+    }
+    holla g = gt in gs.gsc {
+        g.shell.players[player].ammo[ammo] = newammo as i32
+    } ghosted {
+        yeet("gs")
+    }
+    // If we were NOT at zero, don't auto-switch weapons (player was low on purpose).
+    fr have != 0 {
+        bet nocap
+    }
+    // We were at zero: pick a better weapon by ammo type.
+    lowkey ready: int = 0
+    lowkey ownChaingun = cap
+    lowkey ownShotgun = cap
+    lowkey ownPlasma = cap
+    lowkey ownMissile = cap
+    holla g = gt in gs.gsc {
+        ready = g.shell.players[player].readyweapon as int
+        ownChaingun = g.shell.players[player].weaponowned[doomdef.WP_CHAINGUN]
+        ownShotgun = g.shell.players[player].weaponowned[doomdef.WP_SHOTGUN]
+        ownPlasma = g.shell.players[player].weaponowned[doomdef.WP_PLASMA]
+        ownMissile = g.shell.players[player].weaponowned[doomdef.WP_MISSILE]
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey pend: int = -1
+    fr ammo == doomdef.AM_CLIP {
+        fr ready == doomdef.WP_FIST {
+            fr ownChaingun {
+                pend = doomdef.WP_CHAINGUN
+            } naw {
+                pend = doomdef.WP_PISTOL
+            }
+        }
+    } naw fr ammo == doomdef.AM_SHELL {
+        fr ready == doomdef.WP_FIST || ready == doomdef.WP_PISTOL {
+            fr ownShotgun {
+                pend = doomdef.WP_SHOTGUN
+            }
+        }
+    } naw fr ammo == doomdef.AM_CELL {
+        fr ready == doomdef.WP_FIST || ready == doomdef.WP_PISTOL {
+            fr ownPlasma {
+                pend = doomdef.WP_PLASMA
+            }
+        }
+    } naw fr ammo == doomdef.AM_MISL {
+        fr ready == doomdef.WP_FIST {
+            fr ownMissile {
+                pend = doomdef.WP_MISSILE
+            }
+        }
+    }
+    fr pend != -1 {
+        holla g = gt in gs.gsc {
+            g.shell.players[player].pendingweapon = pend as i32
+        } ghosted {
+            yeet("gs")
+        }
+    }
+    bet nocap
+}
+
+// giveWeapon — P_GiveWeapon. `dropped` == the pickup carried MF_DROPPED (1 clip vs 2).
+flex finna giveWeapon(gt: tag gs.GameState, player: int, weapon: int, dropped: bool) -> bool {
+    lowkey netgame = cap
+    lowkey deathmatch: int = 0
+    lowkey consoleplayer: int = 0
+    holla g = gt in gs.gsc {
+        netgame = g.shell.netgame
+        deathmatch = g.shell.deathmatch as int
+        consoleplayer = g.shell.consoleplayer as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey ammo: int = weaponAmmo(weapon)
+    fr netgame && deathmatch != 2 && !dropped {
+        // net (non-altdeath): placed weapons stay forever; grant ammo + a bonus, keep the weapon.
+        lowkey already = cap
+        holla g = gt in gs.gsc {
+            already = g.shell.players[player].weaponowned[weapon]
+        } ghosted {
+            yeet("gs")
+        }
+        fr already {
+            bet cap
+        }
+        holla g = gt in gs.gsc {
+            g.shell.players[player].bonuscount = (g.shell.players[player].bonuscount as int + BONUSADD) as i32
+            g.shell.players[player].weaponowned[weapon] = nocap
+            g.shell.players[player].pendingweapon = weapon as i32
+        } ghosted {
+            yeet("gs")
+        }
+        fr deathmatch != 0 {
+            giveAmmo(gt, player, ammo, 5)
+        } naw {
+            giveAmmo(gt, player, ammo, 2)
+        }
+        fr player == consoleplayer {
+            ssnd.startSound(gt, ghosted, sounds.SFX_WPNUP)
+        }
+        bet cap
+    }
+    lowkey gaveammo = cap
+    fr ammo != doomdef.AM_NOAMMO {
+        // one clip for a dropped weapon, two for a placed weapon
+        fr dropped {
+            gaveammo = giveAmmo(gt, player, ammo, 1)
+        } naw {
+            gaveammo = giveAmmo(gt, player, ammo, 2)
+        }
+    }
+    lowkey gaveweapon = cap
+    lowkey already = cap
+    holla g = gt in gs.gsc {
+        already = g.shell.players[player].weaponowned[weapon]
+    } ghosted {
+        yeet("gs")
+    }
+    fr !already {
+        gaveweapon = nocap
+        holla g = gt in gs.gsc {
+            g.shell.players[player].weaponowned[weapon] = nocap
+            g.shell.players[player].pendingweapon = weapon as i32
+        } ghosted {
+            yeet("gs")
+        }
+    }
+    bet gaveweapon || gaveammo
+}
+
+// giveBody — P_GiveBody: heal up to MAXHEALTH. false if already full.
+flex finna giveBody(gt: tag gs.GameState, player: int, num: int) -> bool {
+    lowkey needed = cap
+    holla g = gt in gs.gsc {
+        fr g.shell.players[player].health as int >= MAXHEALTH {
+            needed = nocap
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    fr needed {
+        bet cap
+    }
+    lowkey pmo: tag think.Thinker = ghosted
+    lowkey nh: int = 0
+    holla g = gt in gs.gsc {
+        nh = g.shell.players[player].health as int + num
+        fr nh > MAXHEALTH {
+            nh = MAXHEALTH
+        }
+        g.shell.players[player].health = nh as i32
+        pmo = g.shell.players[player].mo
+    } ghosted {
+        yeet("gs")
+    }
+    holla m = pmo in gs.thinkers {
+        m.mobj.health = nh as i32
+    } ghosted {
+        yeet("mo")
+    }
+    bet nocap
+}
+
+// giveArmor — P_GiveArmor: false if the new armor would be worse than what is worn.
+flex finna giveArmor(gt: tag gs.GameState, player: int, armortype: int) -> bool {
+    lowkey worse = cap
+    lowkey hits: int = armortype * 100
+    holla g = gt in gs.gsc {
+        fr g.shell.players[player].armorpoints as int >= hits {
+            worse = nocap
+        } naw {
+            g.shell.players[player].armortype = armortype as i32
+            g.shell.players[player].armorpoints = hits as i32
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    fr worse {
+        bet cap
+    }
+    bet nocap
+}
+
+// giveCard — P_GiveCard: grant a keycard (idempotent), bumping bonuscount.
+flex finna giveCard(gt: tag gs.GameState, player: int, card: int) {
+    holla g = gt in gs.gsc {
+        fr g.shell.players[player].cards[card] {
+            bet
+        }
+        g.shell.players[player].bonuscount = BONUSADD as i32
+        g.shell.players[player].cards[card] = nocap
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// givePower — P_GivePower: activate a powerup; false only for a repeat of a "one-shot" power.
+flex finna givePower(gt: tag gs.GameState, player: int, power: int) -> bool {
+    fr power == doomdef.PW_INVULNERABILITY {
+        holla g = gt in gs.gsc {
+            g.shell.players[player].powers[power] = doomdef.INVULNTICS as i32
+        } ghosted {
+            yeet("gs")
+        }
+        bet nocap
+    }
+    fr power == doomdef.PW_INVISIBILITY {
+        lowkey pmo: tag think.Thinker = ghosted
+        holla g = gt in gs.gsc {
+            g.shell.players[player].powers[power] = doomdef.INVISTICS as i32
+            pmo = g.shell.players[player].mo
+        } ghosted {
+            yeet("gs")
+        }
+        holla m = pmo in gs.thinkers {
+            m.mobj.flags = (m.mobj.flags as int | think.MF_SHADOW) as i32
+        } ghosted {
+            yeet("mo")
+        }
+        bet nocap
+    }
+    fr power == doomdef.PW_INFRARED {
+        holla g = gt in gs.gsc {
+            g.shell.players[player].powers[power] = doomdef.INFRATICS as i32
+        } ghosted {
+            yeet("gs")
+        }
+        bet nocap
+    }
+    fr power == doomdef.PW_IRONFEET {
+        holla g = gt in gs.gsc {
+            g.shell.players[player].powers[power] = doomdef.IRONTICS as i32
+        } ghosted {
+            yeet("gs")
+        }
+        bet nocap
+    }
+    fr power == doomdef.PW_STRENGTH {
+        giveBody(gt, player, 100)
+        holla g = gt in gs.gsc {
+            g.shell.players[player].powers[power] = 1
+        } ghosted {
+            yeet("gs")
+        }
+        bet nocap
+    }
+    lowkey already = cap
+    holla g = gt in gs.gsc {
+        fr g.shell.players[player].powers[power] != 0 {
+            already = nocap
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    fr already {
+        bet cap
+    }
+    holla g = gt in gs.gsc {
+        g.shell.players[player].powers[power] = 1
+    } ghosted {
+        yeet("gs")
+    }
+    bet nocap
+}
+
+// setMessage — player->message = msg (a give* side effect; own holla so callers stay flat).
+flex finna setMessage(gt: tag gs.GameState, player: int, msg: str) {
+    holla g = gt in gs.gsc {
+        g.shell.players[player].message = msg
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// ===========================================================================================
+// P_TouchSpecialThing — pick up `special` for the player mobj `toucher`. FROZEN sig.
+// ===========================================================================================
+flex finna touchSpecialThing(gt: tag gs.GameState, special: tag think.Thinker, toucher: tag think.Thinker) {
+    lowkey sz: i32 = 0
+    lowkey spr: int = 0
+    lowkey sflags: int = 0
+    holla s = special in gs.thinkers {
+        sz = s.mobj.z
+        spr = s.mobj.spriteIdx as int
+        sflags = s.mobj.flags as int
+    } ghosted {
+        yeet("special")
+    }
+    lowkey tz: i32 = 0
+    lowkey theight: i32 = 0
+    lowkey thealth: int = 0
+    lowkey player: int = -1
+    holla t = toucher in gs.thinkers {
+        tz = t.mobj.z
+        theight = t.mobj.height
+        thealth = t.mobj.health as int
+        player = t.mobj.player as int
+    } ghosted {
+        yeet("toucher")
+    }
+    lowkey delta: i32 = sz - tz
+    fr delta > theight || delta < (0 - (8 * fixed.FRACUNIT)) {
+        // out of reach vertically
+        bet
+    }
+    // Dead thing touching (sliding corpse) — no pickup.
+    fr thealth <= 0 {
+        bet
+    }
+    lowkey sound: int = sounds.SFX_ITEMUP
+    lowkey netgame = cap
+    lowkey gamemode: int = 0
+    lowkey consoleplayer: int = 0
+    holla g = gt in gs.gsc {
+        netgame = g.shell.netgame
+        gamemode = g.shell.gamemode as int
+        consoleplayer = g.shell.consoleplayer as int
+    } ghosted {
+        yeet("gs")
+    }
+    // Identify by sprite (id's big switch). Each arm either `bet` (no pickup) or sets a message
+    // (and maybe `sound`) and falls to the common tail. Keys `bet` in netgame (leave for others).
+    fr spr == info.SPR_ARM1 {
+        fr !giveArmor(gt, player, 1) {
+            bet
+        }
+        setMessage(gt, player, strings.GOTARMOR)
+    } naw fr spr == info.SPR_ARM2 {
+        fr !giveArmor(gt, player, 2) {
+            bet
+        }
+        setMessage(gt, player, strings.GOTMEGA)
+    } naw fr spr == info.SPR_BON1 {
+        // health bonus — can go over 100%, capped at 200.
+        lowkey pmo: tag think.Thinker = ghosted
+        lowkey nh: int = 0
+        holla g = gt in gs.gsc {
+            nh = g.shell.players[player].health as int + 1
+            fr nh > 200 {
+                nh = 200
+            }
+            g.shell.players[player].health = nh as i32
+            pmo = g.shell.players[player].mo
+        } ghosted {
+            yeet("gs")
+        }
+        holla m = pmo in gs.thinkers {
+            m.mobj.health = nh as i32
+        } ghosted {
+            yeet("mo")
+        }
+        setMessage(gt, player, strings.GOTHTHBONUS)
+    } naw fr spr == info.SPR_BON2 {
+        // armor bonus — can go over 100%, capped at 200; sets armortype 1 if unarmored.
+        holla g = gt in gs.gsc {
+            lowkey na: int = g.shell.players[player].armorpoints as int + 1
+            fr na > 200 {
+                na = 200
+            }
+            g.shell.players[player].armorpoints = na as i32
+            fr g.shell.players[player].armortype as int == 0 {
+                g.shell.players[player].armortype = 1
+            }
+        } ghosted {
+            yeet("gs")
+        }
+        setMessage(gt, player, strings.GOTARMBONUS)
+    } naw fr spr == info.SPR_SOUL {
+        lowkey pmo: tag think.Thinker = ghosted
+        lowkey nh: int = 0
+        holla g = gt in gs.gsc {
+            nh = g.shell.players[player].health as int + 100
+            fr nh > 200 {
+                nh = 200
+            }
+            g.shell.players[player].health = nh as i32
+            pmo = g.shell.players[player].mo
+        } ghosted {
+            yeet("gs")
+        }
+        holla m = pmo in gs.thinkers {
+            m.mobj.health = nh as i32
+        } ghosted {
+            yeet("mo")
+        }
+        setMessage(gt, player, strings.GOTSUPER)
+        sound = sounds.SFX_GETPOW
+    } naw fr spr == info.SPR_MEGA {
+        fr gamemode != doomdef.GM_COMMERCIAL {
+            bet
+        }
+        lowkey pmo: tag think.Thinker = ghosted
+        holla g = gt in gs.gsc {
+            g.shell.players[player].health = 200
+            pmo = g.shell.players[player].mo
+        } ghosted {
+            yeet("gs")
+        }
+        holla m = pmo in gs.thinkers {
+            m.mobj.health = 200
+        } ghosted {
+            yeet("mo")
+        }
+        giveArmor(gt, player, 2)
+        setMessage(gt, player, strings.GOTMSPHERE)
+        sound = sounds.SFX_GETPOW
+    } naw fr spr == info.SPR_BKEY {
+        fr !hasCard(gt, player, doomdef.IT_BLUECARD) {
+            setMessage(gt, player, strings.GOTBLUECARD)
+        }
+        giveCard(gt, player, doomdef.IT_BLUECARD)
+        fr netgame {
+            bet
+        }
+    } naw fr spr == info.SPR_YKEY {
+        fr !hasCard(gt, player, doomdef.IT_YELLOWCARD) {
+            setMessage(gt, player, strings.GOTYELWCARD)
+        }
+        giveCard(gt, player, doomdef.IT_YELLOWCARD)
+        fr netgame {
+            bet
+        }
+    } naw fr spr == info.SPR_RKEY {
+        fr !hasCard(gt, player, doomdef.IT_REDCARD) {
+            setMessage(gt, player, strings.GOTREDCARD)
+        }
+        giveCard(gt, player, doomdef.IT_REDCARD)
+        fr netgame {
+            bet
+        }
+    } naw fr spr == info.SPR_BSKU {
+        fr !hasCard(gt, player, doomdef.IT_BLUESKULL) {
+            setMessage(gt, player, strings.GOTBLUESKUL)
+        }
+        giveCard(gt, player, doomdef.IT_BLUESKULL)
+        fr netgame {
+            bet
+        }
+    } naw fr spr == info.SPR_YSKU {
+        fr !hasCard(gt, player, doomdef.IT_YELLOWSKULL) {
+            setMessage(gt, player, strings.GOTYELWSKUL)
+        }
+        giveCard(gt, player, doomdef.IT_YELLOWSKULL)
+        fr netgame {
+            bet
+        }
+    } naw fr spr == info.SPR_RSKU {
+        fr !hasCard(gt, player, doomdef.IT_REDSKULL) {
+            setMessage(gt, player, strings.GOTREDSKULL)
+        }
+        giveCard(gt, player, doomdef.IT_REDSKULL)
+        fr netgame {
+            bet
+        }
+    } naw fr spr == info.SPR_STIM {
+        fr !giveBody(gt, player, 10) {
+            bet
+        }
+        setMessage(gt, player, strings.GOTSTIM)
+    } naw fr spr == info.SPR_MEDI {
+        fr !giveBody(gt, player, 25) {
+            bet
+        }
+        lowkey low = cap
+        holla g = gt in gs.gsc {
+            fr g.shell.players[player].health as int < 25 {
+                low = nocap
+            }
+        } ghosted {
+            yeet("gs")
+        }
+        fr low {
+            setMessage(gt, player, strings.GOTMEDINEED)
+        } naw {
+            setMessage(gt, player, strings.GOTMEDIKIT)
+        }
+    } naw fr spr == info.SPR_PINV {
+        fr !givePower(gt, player, doomdef.PW_INVULNERABILITY) {
+            bet
+        }
+        setMessage(gt, player, strings.GOTINVUL)
+        sound = sounds.SFX_GETPOW
+    } naw fr spr == info.SPR_PSTR {
+        fr !givePower(gt, player, doomdef.PW_STRENGTH) {
+            bet
+        }
+        setMessage(gt, player, strings.GOTBERSERK)
+        lowkey ready: int = 0
+        holla g = gt in gs.gsc {
+            ready = g.shell.players[player].readyweapon as int
+        } ghosted {
+            yeet("gs")
+        }
+        fr ready != doomdef.WP_FIST {
+            holla g = gt in gs.gsc {
+                g.shell.players[player].pendingweapon = doomdef.WP_FIST as i32
+            } ghosted {
+                yeet("gs")
+            }
+        }
+        sound = sounds.SFX_GETPOW
+    } naw fr spr == info.SPR_PINS {
+        fr !givePower(gt, player, doomdef.PW_INVISIBILITY) {
+            bet
+        }
+        setMessage(gt, player, strings.GOTINVIS)
+        sound = sounds.SFX_GETPOW
+    } naw fr spr == info.SPR_SUIT {
+        fr !givePower(gt, player, doomdef.PW_IRONFEET) {
+            bet
+        }
+        setMessage(gt, player, strings.GOTSUIT)
+        sound = sounds.SFX_GETPOW
+    } naw fr spr == info.SPR_PMAP {
+        fr !givePower(gt, player, doomdef.PW_ALLMAP) {
+            bet
+        }
+        setMessage(gt, player, strings.GOTMAP)
+        sound = sounds.SFX_GETPOW
+    } naw fr spr == info.SPR_PVIS {
+        fr !givePower(gt, player, doomdef.PW_INFRARED) {
+            bet
+        }
+        setMessage(gt, player, strings.GOTVISOR)
+        sound = sounds.SFX_GETPOW
+    } naw fr spr == info.SPR_CLIP {
+        // MF_DROPPED clip gives half a clip (num 0), a placed clip gives a full one (num 1).
+        fr (sflags & think.MF_DROPPED) != 0 {
+            fr !giveAmmo(gt, player, doomdef.AM_CLIP, 0) {
+                bet
+            }
+        } naw {
+            fr !giveAmmo(gt, player, doomdef.AM_CLIP, 1) {
+                bet
+            }
+        }
+        setMessage(gt, player, strings.GOTCLIP)
+    } naw fr spr == info.SPR_AMMO {
+        fr !giveAmmo(gt, player, doomdef.AM_CLIP, 5) {
+            bet
+        }
+        setMessage(gt, player, strings.GOTCLIPBOX)
+    } naw fr spr == info.SPR_ROCK {
+        fr !giveAmmo(gt, player, doomdef.AM_MISL, 1) {
+            bet
+        }
+        setMessage(gt, player, strings.GOTROCKET)
+    } naw fr spr == info.SPR_BROK {
+        fr !giveAmmo(gt, player, doomdef.AM_MISL, 5) {
+            bet
+        }
+        setMessage(gt, player, strings.GOTROCKBOX)
+    } naw fr spr == info.SPR_CELL {
+        fr !giveAmmo(gt, player, doomdef.AM_CELL, 1) {
+            bet
+        }
+        setMessage(gt, player, strings.GOTCELL)
+    } naw fr spr == info.SPR_CELP {
+        fr !giveAmmo(gt, player, doomdef.AM_CELL, 5) {
+            bet
+        }
+        setMessage(gt, player, strings.GOTCELLBOX)
+    } naw fr spr == info.SPR_SHEL {
+        fr !giveAmmo(gt, player, doomdef.AM_SHELL, 1) {
+            bet
+        }
+        setMessage(gt, player, strings.GOTSHELLS)
+    } naw fr spr == info.SPR_SBOX {
+        fr !giveAmmo(gt, player, doomdef.AM_SHELL, 5) {
+            bet
+        }
+        setMessage(gt, player, strings.GOTSHELLBOX)
+    } naw fr spr == info.SPR_BPAK {
+        lowkey hadpack = cap
+        holla g = gt in gs.gsc {
+            hadpack = g.shell.players[player].backpack
+        } ghosted {
+            yeet("gs")
+        }
+        fr !hadpack {
+            holla g = gt in gs.gsc {
+                lowkey i: int = 0
+                vibin i < doomdef.NUMAMMO {
+                    g.shell.players[player].maxammo[i] = (g.shell.players[player].maxammo[i] as int * 2) as i32
+                    i = i + 1
+                }
+                g.shell.players[player].backpack = nocap
+            } ghosted {
+                yeet("gs")
+            }
+        }
+        lowkey i: int = 0
+        vibin i < doomdef.NUMAMMO {
+            giveAmmo(gt, player, i, 1)
+            i = i + 1
+        }
+        setMessage(gt, player, strings.GOTBACKPACK)
+    } naw fr spr == info.SPR_BFUG {
+        fr !giveWeapon(gt, player, doomdef.WP_BFG, cap) {
+            bet
+        }
+        setMessage(gt, player, strings.GOTBFG9000)
+        sound = sounds.SFX_WPNUP
+    } naw fr spr == info.SPR_MGUN {
+        fr !giveWeapon(gt, player, doomdef.WP_CHAINGUN, (sflags & think.MF_DROPPED) != 0) {
+            bet
+        }
+        setMessage(gt, player, strings.GOTCHAINGUN)
+        sound = sounds.SFX_WPNUP
+    } naw fr spr == info.SPR_CSAW {
+        fr !giveWeapon(gt, player, doomdef.WP_CHAINSAW, cap) {
+            bet
+        }
+        setMessage(gt, player, strings.GOTCHAINSAW)
+        sound = sounds.SFX_WPNUP
+    } naw fr spr == info.SPR_LAUN {
+        fr !giveWeapon(gt, player, doomdef.WP_MISSILE, cap) {
+            bet
+        }
+        setMessage(gt, player, strings.GOTLAUNCHER)
+        sound = sounds.SFX_WPNUP
+    } naw fr spr == info.SPR_PLAS {
+        fr !giveWeapon(gt, player, doomdef.WP_PLASMA, cap) {
+            bet
+        }
+        setMessage(gt, player, strings.GOTPLASMA)
+        sound = sounds.SFX_WPNUP
+    } naw fr spr == info.SPR_SHOT {
+        fr !giveWeapon(gt, player, doomdef.WP_SHOTGUN, (sflags & think.MF_DROPPED) != 0) {
+            bet
+        }
+        setMessage(gt, player, strings.GOTSHOTGUN)
+        sound = sounds.SFX_WPNUP
+    } naw fr spr == info.SPR_SGN2 {
+        fr !giveWeapon(gt, player, doomdef.WP_SUPERSHOTGUN, (sflags & think.MF_DROPPED) != 0) {
+            bet
+        }
+        setMessage(gt, player, strings.GOTSHOTGUN2)
+        sound = sounds.SFX_WPNUP
+    } naw {
+        yeet("P_SpecialThing: Unknown gettable thing")
+    }
+    // common tail: count the item, remove it, bonus flash, play the pickup sound.
+    fr (sflags & think.MF_COUNTITEM) != 0 {
+        holla g = gt in gs.gsc {
+            g.shell.players[player].itemcount = (g.shell.players[player].itemcount as int + 1) as i32
+        } ghosted {
+            yeet("gs")
+        }
+    }
+    pmobj.removeMobj(gt, special)
+    holla g = gt in gs.gsc {
+        g.shell.players[player].bonuscount = (g.shell.players[player].bonuscount as int + BONUSADD) as i32
+    } ghosted {
+        yeet("gs")
+    }
+    fr player == consoleplayer {
+        ssnd.startSound(gt, ghosted, sound)
+    }
+}
+
+// hasCard — player->cards[card] (a small read helper so the touch switch stays flat).
+flex finna hasCard(gt: tag gs.GameState, player: int, card: int) -> bool {
+    lowkey has = cap
+    holla g = gt in gs.gsc {
+        has = g.shell.players[player].cards[card]
+    } ghosted {
+        yeet("gs")
+    }
+    bet has
+}
+
+// ===========================================================================================
+// P_KillMobj — enter the death state, drop the corpse/loot, tally the kill. Internal helper of
+// P_DamageMobj (not in p-sigs). `source` may be null (environment kill).
+// ===========================================================================================
+flex finna killMobj(gt: tag gs.GameState, source: tag think.Thinker, target: tag think.Thinker) {
+    lowkey typ: int = 0
+    lowkey tflags: int = 0
+    lowkey thealth: int = 0
+    lowkey tplayer: int = -1
+    holla t = target in gs.thinkers {
+        typ = t.mobj.typeIdx as int
+        tflags = t.mobj.flags as int
+        thealth = t.mobj.health as int
+        tplayer = t.mobj.player as int
+    } ghosted {
+        yeet("target")
+    }
+    // clear shootable/float/skullfly; keep gravity on skulls; mark corpse + dropoff; shrink box.
+    lowkey nf: int = tflags & ~(think.MF_SHOOTABLE | think.MF_FLOAT | think.MF_SKULLFLY)
+    fr typ != info.MT_SKULL {
+        nf = nf & ~think.MF_NOGRAVITY
+    }
+    nf = nf | think.MF_CORPSE | think.MF_DROPOFF
+    holla t = target in gs.thinkers {
+        t.mobj.flags = nf as i32
+        t.mobj.height = t.mobj.height >> 2
+    } ghosted {
+        yeet("target")
+    }
+    // kill counting: a player killer tallies killcount/frags; else non-net monster kills go to p0.
+    lowkey srcNull = cap
+    lowkey sPlayer: int = -1
+    fr !(source == ghosted) {
+        srcNull = nocap
+        holla s = source in gs.thinkers {
+            sPlayer = s.mobj.player as int
+        } ghosted {
+            yeet("source")
+        }
+    }
+    fr !srcNull && sPlayer != -1 {
+        fr (tflags & think.MF_COUNTKILL) != 0 {
+            holla g = gt in gs.gsc {
+                g.shell.players[sPlayer].killcount = (g.shell.players[sPlayer].killcount as int + 1) as i32
+            } ghosted {
+                yeet("gs")
+            }
+        }
+        fr tplayer != -1 {
+            holla g = gt in gs.gsc {
+                g.shell.players[sPlayer].frags[tplayer] = (g.shell.players[sPlayer].frags[tplayer] as int + 1) as i32
+            } ghosted {
+                yeet("gs")
+            }
+        }
+    } naw {
+        lowkey netgame = cap
+        holla g = gt in gs.gsc {
+            netgame = g.shell.netgame
+        } ghosted {
+            yeet("gs")
+        }
+        fr !netgame && (tflags & think.MF_COUNTKILL) != 0 {
+            holla g = gt in gs.gsc {
+                g.shell.players[0].killcount = (g.shell.players[0].killcount as int + 1) as i32
+            } ghosted {
+                yeet("gs")
+            }
+        }
+    }
+    // player death: environment kill self-frags, drop solidity, PST_DEAD, drop weapon, leave map.
+    fr tplayer != -1 {
+        fr srcNull {
+            holla g = gt in gs.gsc {
+                g.shell.players[tplayer].frags[tplayer] = (g.shell.players[tplayer].frags[tplayer] as int + 1) as i32
+            } ghosted {
+                yeet("gs")
+            }
+        }
+        holla t = target in gs.thinkers {
+            t.mobj.flags = (t.mobj.flags as int & ~think.MF_SOLID) as i32
+        } ghosted {
+            yeet("target")
+        }
+        lowkey consoleplayer: int = 0
+        lowkey automapactive = cap
+        holla g = gt in gs.gsc {
+            g.shell.players[tplayer].playerstate = pdefPSTDEAD()
+            consoleplayer = g.shell.consoleplayer as int
+            automapactive = g.shell.automapactive
+        } ghosted {
+            yeet("gs")
+        }
+        // SEAM (P2.4 / p_pspr): P_DropWeapon(&players[tplayer]) — lowers the ready weapon's
+        // psprite. p_pspr does not exist yet; P2.4 inserts `ppspr.dropWeapon(gt, tplayer)` here.
+        fr tplayer == consoleplayer && automapactive {
+            // AM_Stop() reduced to its observable state (full automap teardown is am_map's).
+            holla g = gt in gs.gsc {
+                g.shell.automapactive = cap
+                g.am.active = cap
+            } ghosted {
+                yeet("gs")
+            }
+        }
+    }
+    // choose the (gib) death state, then jitter the tic count.
+    lowkey spawnhealth: int = 0
+    lowkey xdeathstate: int = 0
+    lowkey deathstate: int = 0
+    holla g = gt in gs.gsc {
+        spawnhealth = g.info.mobjinfo[typ].spawnhealth as int
+        xdeathstate = g.info.mobjinfo[typ].xdeathstate as int
+        deathstate = g.info.mobjinfo[typ].deathstate as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr thealth < (0 - spawnhealth) && xdeathstate != info.S_NULL {
+        pmobj.setMobjState(gt, target, xdeathstate)
+    } naw {
+        pmobj.setMobjState(gt, target, deathstate)
+    }
+    lowkey j: int = rnd.pRandom(gt) & 3
+    holla t = target in gs.thinkers {
+        lowkey nt: int = (t.mobj.tics as int) - j
+        fr nt < 1 {
+            nt = 1
+        }
+        t.mobj.tics = nt as i32
+    } ghosted {
+        yeet("target")
+    }
+    // Drop loot for the human enemies; everything else drops nothing.
+    lowkey item: int = -1
+    fr typ == info.MT_WOLFSS || typ == info.MT_POSSESSED {
+        item = info.MT_CLIP
+    } naw fr typ == info.MT_SHOTGUY {
+        item = info.MT_SHOTGUN
+    } naw fr typ == info.MT_CHAINGUY {
+        item = info.MT_CHAINGUN
+    }
+    fr item == -1 {
+        bet
+    }
+    lowkey tx: i32 = 0
+    lowkey ty: i32 = 0
+    holla t = target in gs.thinkers {
+        tx = t.mobj.x
+        ty = t.mobj.y
+    } ghosted {
+        yeet("target")
+    }
+    lowkey mo = pmobj.spawnMobj(gt, tx, ty, think.ONFLOORZ, item)
+    holla m = mo in gs.thinkers {
+        m.mobj.flags = (m.mobj.flags as int | think.MF_DROPPED) as i32
+    } ghosted {
+        yeet("mo")
+    }
+}
+
+// pdefPSTDEAD — player.PST_DEAD as an i32 (kept off the big holla; player pull avoided here).
+flex finna pdefPSTDEAD() -> i32 {
+    bet 1
+}
+
+// ===========================================================================================
+// P_DamageMobj — apply `damage` to `target` from `inflictor` (the projectile/monster, for
+// knockback; may be null) attributed to `source` (retaliation target; may be null). FROZEN sig.
+// ===========================================================================================
+flex finna damageMobj(gt: tag gs.GameState, target: tag think.Thinker, inflictor: tag think.Thinker, source: tag think.Thinker, damage: int) {
+    lowkey tflags: int = 0
+    lowkey thealth: int = 0
+    lowkey tplayer: int = -1
+    lowkey ttype: int = 0
+    holla t = target in gs.thinkers {
+        tflags = t.mobj.flags as int
+        thealth = t.mobj.health as int
+        tplayer = t.mobj.player as int
+        ttype = t.mobj.typeIdx as int
+    } ghosted {
+        yeet("target")
+    }
+    fr (tflags & think.MF_SHOOTABLE) == 0 {
+        bet
+    }
+    fr thealth <= 0 {
+        bet
+    }
+    fr (tflags & think.MF_SKULLFLY) != 0 {
+        holla t = target in gs.thinkers {
+            t.mobj.momx = 0
+            t.mobj.momy = 0
+            t.mobj.momz = 0
+        } ghosted {
+            yeet("target")
+        }
+    }
+    lowkey dmg: int = damage
+    lowkey skill: int = 0
+    holla g = gt in gs.gsc {
+        skill = g.shell.gameskill as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr tplayer != -1 && skill == doomdef.SK_BABY {
+        // half damage in trainer mode
+        dmg = dmg >> 1
+    }
+    // ---- knockback thrust (only with an inflictor, unless chainsaw / NOCLIP target) ----------
+    lowkey inflNull = cap
+    fr inflictor == ghosted {
+        inflNull = nocap
+    }
+    lowkey srcNull = cap
+    lowkey sPlayer: int = -1
+    fr source == ghosted {
+        srcNull = nocap
+    } naw {
+        holla s = source in gs.thinkers {
+            sPlayer = s.mobj.player as int
+        } ghosted {
+            yeet("source")
+        }
+    }
+    lowkey chainsaw = cap
+    fr !srcNull && sPlayer != -1 {
+        holla g = gt in gs.gsc {
+            fr g.shell.players[sPlayer].readyweapon as int == doomdef.WP_CHAINSAW {
+                chainsaw = nocap
+            }
+        } ghosted {
+            yeet("gs")
+        }
+    }
+    fr !inflNull && (tflags & think.MF_NOCLIP) == 0 && (srcNull || sPlayer == -1 || !chainsaw) {
+        lowkey ix: i32 = 0
+        lowkey iy: i32 = 0
+        lowkey iz: i32 = 0
+        holla i = inflictor in gs.thinkers {
+            ix = i.mobj.x
+            iy = i.mobj.y
+            iz = i.mobj.z
+        } ghosted {
+            yeet("inflictor")
+        }
+        lowkey tx: i32 = 0
+        lowkey ty: i32 = 0
+        lowkey tz: i32 = 0
+        lowkey mass: int = 0
+        holla t = target in gs.thinkers {
+            tx = t.mobj.x
+            ty = t.mobj.y
+            tz = t.mobj.z
+        } ghosted {
+            yeet("target")
+        }
+        holla g = gt in gs.gsc {
+            mass = g.info.mobjinfo[ttype].mass as int
+        } ghosted {
+            yeet("gs")
+        }
+        lowkey ang: u32 = 0
+        holla g = gt in gs.gsc {
+            ang = rgeom.pointToAngle2(g.info.tantoangle, ix, iy, tx, ty)
+        } ghosted {
+            yeet("gs")
+        }
+        // thrust = damage*(FRACUNIT>>3)*100/mass, in 32-bit int exactly as id (wraps like C int).
+        lowkey thrust: i32 = (((dmg as i32) * (fixed.FRACUNIT >> 3)) * (100 as i32)) / (mass as i32)
+        // sometimes fall forwards (low damage, lethal, from below, coin flip)
+        fr dmg < 40 && dmg > thealth && ((tz as int) - (iz as int)) > (64 * (fixed.FRACUNIT as int)) && (rnd.pRandom(gt) & 1) != 0 {
+            ang = ang + tables.ANG180
+            thrust = thrust * (4 as i32)
+        }
+        lowkey fine: int = (ang >> 19) as int
+        lowkey cx: i32 = 0
+        lowkey cy: i32 = 0
+        holla g = gt in gs.gsc {
+            cx = fixed.fixedMul(thrust, g.info.finesine[fine + 2048])
+            cy = fixed.fixedMul(thrust, g.info.finesine[fine])
+        } ghosted {
+            yeet("gs")
+        }
+        holla t = target in gs.thinkers {
+            t.mobj.momx = t.mobj.momx + cx
+            t.mobj.momy = t.mobj.momy + cy
+        } ghosted {
+            yeet("target")
+        }
+    }
+    // ---- player-specific: hell hack, god/invuln, armor absorption, screen flash -------------
+    lowkey godInvuln = cap
+    fr tplayer != -1 {
+        lowkey sub: int = 0
+        holla t = target in gs.thinkers {
+            sub = t.mobj.subsector as int
+        } ghosted {
+            yeet("target")
+        }
+        lowkey special: int = 0
+        lowkey phealth: int = 0
+        holla g = gt in gs.gsc {
+            special = g.level.secSpecial[g.level.ssSector[sub] as int] as int
+            phealth = g.shell.players[tplayer].health as int
+        } ghosted {
+            yeet("gs")
+        }
+        // end-of-game hell hack: sector special 11 can't quite kill you
+        fr special == 11 && dmg >= phealth {
+            dmg = phealth - 1
+        }
+        holla g = gt in gs.gsc {
+            fr dmg < 1000 && ((g.shell.players[tplayer].cheats as int & pdefCFGODMODE()) != 0 || g.shell.players[tplayer].powers[doomdef.PW_INVULNERABILITY] as int != 0) {
+                godInvuln = nocap
+            }
+        } ghosted {
+            yeet("gs")
+        }
+        fr godInvuln {
+            bet
+        }
+        holla g = gt in gs.gsc {
+            lowkey atype: int = g.shell.players[tplayer].armortype as int
+            fr atype != 0 {
+                lowkey saved: int = 0
+                fr atype == 1 {
+                    saved = dmg / 3
+                } naw {
+                    saved = dmg / 2
+                }
+                lowkey apts: int = g.shell.players[tplayer].armorpoints as int
+                fr apts <= saved {
+                    // armor used up
+                    saved = apts
+                    g.shell.players[tplayer].armortype = 0
+                }
+                g.shell.players[tplayer].armorpoints = (apts - saved) as i32
+                dmg = dmg - saved
+            }
+            lowkey nh: int = g.shell.players[tplayer].health as int - dmg
+            fr nh < 0 {
+                nh = 0
+            }
+            g.shell.players[tplayer].health = nh as i32
+            g.shell.players[tplayer].attacker = source
+            lowkey dc: int = g.shell.players[tplayer].damagecount as int + dmg
+            fr dc > 100 {
+                dc = 100
+            }
+            g.shell.players[tplayer].damagecount = dc as i32
+            // I_Tactile(40,10,40+temp*2) is a no-op on this platform (Linux force-feedback stub).
+        } ghosted {
+            yeet("gs")
+        }
+    }
+    // ---- apply damage to the mobj; kill or enter pain ---------------------------------------
+    lowkey nh: int = thealth - dmg
+    holla t = target in gs.thinkers {
+        t.mobj.health = nh as i32
+    } ghosted {
+        yeet("target")
+    }
+    fr nh <= 0 {
+        killMobj(gt, source, target)
+        bet
+    }
+    lowkey painchance: int = 0
+    lowkey painstate: int = 0
+    holla g = gt in gs.gsc {
+        painchance = g.info.mobjinfo[ttype].painchance as int
+        painstate = g.info.mobjinfo[ttype].painstate as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr rnd.pRandom(gt) < painchance && (tflags & think.MF_SKULLFLY) == 0 {
+        holla t = target in gs.thinkers {
+            t.mobj.flags = (t.mobj.flags as int | think.MF_JUSTHIT) as i32
+        } ghosted {
+            yeet("target")
+        }
+        pmobj.setMobjState(gt, target, painstate)
+    }
+    holla t = target in gs.thinkers {
+        t.mobj.reactiontime = 0
+    } ghosted {
+        yeet("target")
+    }
+    // ---- retaliation: chase the source unless already intent on another (or VILE special) ----
+    lowkey threshold: int = 0
+    lowkey stateIdx: int = 0
+    holla t = target in gs.thinkers {
+        threshold = t.mobj.threshold as int
+        stateIdx = t.mobj.stateIdx as int
+    } ghosted {
+        yeet("target")
+    }
+    lowkey sType: int = -1
+    fr !srcNull {
+        holla s = source in gs.thinkers {
+            sType = s.mobj.typeIdx as int
+        } ghosted {
+            yeet("source")
+        }
+    }
+    fr (threshold == 0 || ttype == info.MT_VILE) && !srcNull && !(source == target) && sType != info.MT_VILE {
+        lowkey spawnstate: int = 0
+        lowkey seestate: int = 0
+        holla g = gt in gs.gsc {
+            spawnstate = g.info.mobjinfo[ttype].spawnstate as int
+            seestate = g.info.mobjinfo[ttype].seestate as int
+        } ghosted {
+            yeet("gs")
+        }
+        holla t = target in gs.thinkers {
+            t.mobj.target = source
+            t.mobj.threshold = BASETHRESHOLD as i32
+        } ghosted {
+            yeet("target")
+        }
+        fr stateIdx == spawnstate && seestate != info.S_NULL {
+            pmobj.setMobjState(gt, target, seestate)
+        }
+    }
+}
+
+// pdefCFGODMODE — player.CF_GODMODE (=2); kept local so damageMobj need not pull defs/player.
+flex finna pdefCFGODMODE() -> int {
+    bet 2
+}
