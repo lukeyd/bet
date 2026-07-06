@@ -1,0 +1,2 @@
+MENU main=0x39e65ddc nz=000031ea episode=0xd947d8a7 skill=0xb2510b64 skillDown=0xee177004 quit=0x4be483bc nzQuit=00000949
+AUTOMAP fresh=0x97e13daa nz=00000006 iddt=0xe95f4088 nz=00000b09 tick=0xe2835415

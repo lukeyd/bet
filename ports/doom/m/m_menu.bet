@@ -1,0 +1,1758 @@
+// m/m_menu.bet — the DOOM menu system (linuxdoom-1.10 m_menu.c): the main / episode / skill /
+// options / sound / load / save menudefs, the skull cursor, the pop-up control panel, the message
+// prompts, and the keyboard responder.
+//
+// bet has no fn-ptr menu tables, so id's `menu_t`/`menuitem_t` arrays (each item carrying a
+// void(*routine)(int)) are re-expressed as DATA: every menu is an integer id (MENU_*), and each
+// item's status/name(patch)/alphaKey is returned by a small if-chain keyed on (menuId, item). The
+// per-item ACTION and the per-menu draw routine are likewise dispatched by (menuId, item) if-chains
+// (routeItem / drawMenuExtras) rather than a function pointer. The pending message-response routine
+// (M_StartMessage's `void* routine`) is an MRT_* id stored in MenuState.messageRoutineId.
+//
+// State: gs.MenuState (menuactive/currentMenu/itemOn/skull anim/message/save-string/screenSize/
+// detailLevel/showMessages + the P2.9b additive menuLastOn/messageRoutineId/epi/screenblocks). The
+// console player is g.shell.players[g.shell.consoleplayer]; menuactive mirrors to g.shell.menuactive.
+//
+// PORTED: M_Init, M_Responder, M_Drawer, M_Ticker, M_StartControlPanel, M_ClearMenus,
+//   M_SetupNextMenu, M_StartMessage/M_StopMessage, all the menudefs + M_* item routines, the
+//   thermo/save-load-border draw helpers, M_WriteText/M_StringWidth/M_StringHeight (hu_font).
+// SEAMS (left for P2.8 g_game / P2.11 p_saveg — the field/gameaction is set, the downstream noted):
+//   M_NewGame/M_ChooseSkill/M_VerifyNightmare -> G_DeferedInitNew (sets startskill/episode/map +
+//   gameaction=GA_NEWGAME); M_EndGame yes-response -> D_StartTitle (sets gameaction=GA_NOTHING +
+//   gamestate=GS_DEMOSCREEN, real title/demo seq is P2.8); M_LoadSelect/M_DoSave/M_QuickSave/Load
+//   -> G_LoadGame/G_SaveGame (P2.11); the save-string char editing (P2.11 savegame layer); the
+//   devparm F1 G_ScreenShot; R_SetViewSize on size change (render seam). S_SetSfxVolume/
+//   S_SetMusicVolume and S_StartSound ARE wired (they exist).
+pull "mem"
+pull "str"
+pull "vec"
+pull "../defs/gs" as gs
+pull "../defs/doomdef" as doomdef
+pull "../defs/strings" as strings
+pull "../defs/sounds" as sounds
+pull "../defs/think" as think
+pull "../util/bstream" as bstream
+pull "../w/w_wad" as wad
+pull "../v/v_video" as vv
+pull "../s/s_sound" as ssnd
+pull "../i/i_video" as iv
+
+// ---- constants ----------------------------------------------------------------------------
+flex facts SKULLXOFF: int = -32
+flex facts LINEHEIGHT: int = 16
+flex facts SAVESTRINGSIZE: int = 24
+flex facts LOAD_END: int = 6            // # of load/save slots
+flex facts HU_FONTSTART: int = 33
+flex facts HU_FONTSIZE: int = 63
+
+// menu ids (index into the menudef if-chains + MenuState.menuLastOn).
+flex facts MENU_MAIN: int = 0
+flex facts MENU_EPISODE: int = 1
+flex facts MENU_NEWGAME: int = 2        // skill select
+flex facts MENU_OPTIONS: int = 3
+flex facts MENU_READ1: int = 4
+flex facts MENU_READ2: int = 5
+flex facts MENU_SOUND: int = 6
+flex facts MENU_LOAD: int = 7
+flex facts MENU_SAVE: int = 8
+
+// message-response routine ids (M_StartMessage's `routine`).
+flex facts MRT_NONE: int = 0
+flex facts MRT_QUIT: int = 1            // M_QuitResponse
+flex facts MRT_ENDGAME: int = 2         // M_EndGameResponse
+flex facts MRT_NIGHTMARE: int = 3       // M_VerifyNightmare
+flex facts MRT_QUICKSAVE: int = 4       // M_QuickSaveResponse (P2.11)
+flex facts MRT_QUICKLOAD: int = 5       // M_QuickLoadResponse (P2.11)
+
+// options-menu item ordinals (options_e) used by the draw routine.
+flex facts OPT_MESSAGES: int = 1
+flex facts OPT_DETAIL: int = 2
+flex facts OPT_SCRNSIZE: int = 3
+flex facts OPT_MOUSESENS: int = 5
+// sound-menu item ordinals.
+flex facts SND_SFXVOL: int = 0
+flex facts SND_MUSICVOL: int = 2
+// skill-menu nightmare ordinal.
+flex facts SKILL_NIGHTMARE: int = 4
+
+// ============================================================================================
+// small string helpers (str is immutable; build via byte buffers)
+// ============================================================================================
+// concatenate two strings.
+flex finna cat2(a: str, b: str) -> str {
+    lowkey na = str.len(a)
+    lowkey nb = str.len(b)
+    lowkey buf = mem.slab[u8](na + nb)
+    lowkey i = 0
+    vibin i < na {
+        buf[i] = str.at(a, i) as u8
+        i = i + 1
+    }
+    i = 0
+    vibin i < nb {
+        buf[na + i] = str.at(b, i) as u8
+        i = i + 1
+    }
+    bet str.fromBytesTrust(buf)
+}
+
+// toupper for a single char code.
+flex finna toUp(c: int) -> int {
+    fr c >= 97 && c <= 122 {
+        bet c - 32
+    }
+    bet c
+}
+
+// ============================================================================================
+// sound + palette glue
+// ============================================================================================
+// menuSnd — S_StartSound(NULL, sfx): a UI sound with a null (global) origin.
+flex finna menuSnd(gt: tag gs.GameState, sfx: int) {
+    lowkey nullOrigin: tag think.Thinker = ghosted
+    ssnd.startSound(gt, nullOrigin, sfx)
+}
+
+// ============================================================================================
+// hu_font text (M_WriteText / M_StringWidth / M_StringHeight). Glyph byte-offsets live in
+// HudState.huFontOfs (loaded by HU_Init); glyph index = toupper(c) - HU_FONTSTART.
+// ============================================================================================
+flex finna fontOfs(gt: tag gs.GameState) -> []i32 {
+    lowkey f = mem.slab[i32](0)
+    holla g = gt in gs.gsc {
+        f = g.hud.huFontOfs
+    } ghosted {
+        yeet("gs")
+    }
+    bet f
+}
+
+// patch width (rdU16 at ofs) / height (rdI16 at ofs+2) for a glyph byte-offset.
+flex finna patchW(gt: tag gs.GameState, ofs: int) -> int {
+    lowkey w = 0
+    holla g = gt in gs.gsc {
+        w = bstream.rdU16(g.wad.buf, ofs)
+    } ghosted {
+        yeet("gs")
+    }
+    bet w
+}
+flex finna patchH(gt: tag gs.GameState, ofs: int) -> int {
+    lowkey h = 0
+    holla g = gt in gs.gsc {
+        h = bstream.rdI16(g.wad.buf, ofs + 2)
+    } ghosted {
+        yeet("gs")
+    }
+    bet h
+}
+
+// M_StringWidth — sum of hu_font glyph widths (non-glyph chars advance 4).
+flex finna stringWidth(gt: tag gs.GameState, font: []i32, s: str) -> int {
+    lowkey w = 0
+    lowkey n = str.len(s)
+    lowkey i = 0
+    vibin i < n {
+        lowkey c = toUp(str.at(s, i)) - HU_FONTSTART
+        fr c < 0 || c >= HU_FONTSIZE {
+            w = w + 4
+        } naw {
+            w = w + patchW(gt, font[c] as int)
+        }
+        i = i + 1
+    }
+    bet w
+}
+
+// M_StringHeight — hu_font[0] height, +height per '\n'.
+flex finna stringHeight(gt: tag gs.GameState, font: []i32, s: str) -> int {
+    lowkey height = patchH(gt, font[0] as int)
+    lowkey h = height
+    lowkey n = str.len(s)
+    lowkey i = 0
+    vibin i < n {
+        fr str.at(s, i) == 10 {
+            h = h + height
+        }
+        i = i + 1
+    }
+    bet h
+}
+
+// M_WriteText — draw string with the hu_font at (x,y); '\n' resets x and steps y by 12.
+flex finna writeText(gt: tag gs.GameState, font: []i32, x0: int, y0: int, s: str) {
+    lowkey cx = x0
+    lowkey cy = y0
+    lowkey n = str.len(s)
+    lowkey i = 0
+    vibin i < n {
+        lowkey c = str.at(s, i)
+        fr c == 10 {
+            cx = x0
+            cy = cy + 12
+        } naw {
+            lowkey c2 = toUp(c) - HU_FONTSTART
+            fr c2 < 0 || c2 >= HU_FONTSIZE {
+                cx = cx + 4
+            } naw {
+                lowkey ofs = font[c2] as int
+                lowkey w = patchW(gt, ofs)
+                fr cx + w > doomdef.SCREENWIDTH {
+                    dip
+                }
+                vv.drawPatch(gt, cx, cy, 0, ofs)
+                cx = cx + w
+            }
+        }
+        i = i + 1
+    }
+}
+
+// ============================================================================================
+// menudef tables (data). gamemode adjusts the main-menu length/y and the episode count.
+// ============================================================================================
+flex finna gamemodeOf(gt: tag gs.GameState) -> int {
+    lowkey gm = 0
+    holla g = gt in gs.gsc {
+        gm = g.shell.gamemode as int
+    } ghosted {
+        yeet("gs")
+    }
+    bet gm
+}
+
+// menuNumItems — # of items in menu `id` (gamemode-adjusted for main + episode).
+flex finna menuNumItems(gt: tag gs.GameState, id: int) -> int {
+    lowkey gm = gamemodeOf(gt)
+    fr id == MENU_MAIN {
+        fr gm == doomdef.GM_COMMERCIAL {
+            bet 5
+        }
+        bet 6
+    }
+    fr id == MENU_EPISODE {
+        fr gm == doomdef.GM_RETAIL {
+            bet 4
+        }
+        bet 3           // shareware / registered
+    }
+    fr id == MENU_NEWGAME {
+        bet 5
+    }
+    fr id == MENU_OPTIONS {
+        bet 8
+    }
+    fr id == MENU_READ1 {
+        bet 1
+    }
+    fr id == MENU_READ2 {
+        bet 1
+    }
+    fr id == MENU_SOUND {
+        bet 4
+    }
+    bet LOAD_END        // LOAD / SAVE
+}
+
+flex finna menuX(id: int) -> int {
+    fr id == MENU_MAIN {
+        bet 97
+    }
+    fr id == MENU_EPISODE {
+        bet 48
+    }
+    fr id == MENU_NEWGAME {
+        bet 48
+    }
+    fr id == MENU_OPTIONS {
+        bet 60
+    }
+    fr id == MENU_READ1 {
+        bet 280
+    }
+    fr id == MENU_READ2 {
+        bet 330
+    }
+    fr id == MENU_SOUND {
+        bet 80
+    }
+    bet 80              // LOAD / SAVE
+}
+
+flex finna menuY(gt: tag gs.GameState, id: int) -> int {
+    fr id == MENU_MAIN {
+        fr gamemodeOf(gt) == doomdef.GM_COMMERCIAL {
+            bet 72      // MainDef.y += 8
+        }
+        bet 64
+    }
+    fr id == MENU_EPISODE {
+        bet 63
+    }
+    fr id == MENU_NEWGAME {
+        bet 63
+    }
+    fr id == MENU_OPTIONS {
+        bet 37
+    }
+    fr id == MENU_READ1 {
+        bet 185
+    }
+    fr id == MENU_READ2 {
+        bet 175
+    }
+    fr id == MENU_SOUND {
+        bet 64
+    }
+    bet 54              // LOAD / SAVE
+}
+
+// previous menu (BACKSPACE target); -1 == none (main).
+flex finna menuPrev(id: int) -> int {
+    fr id == MENU_MAIN {
+        bet -1
+    }
+    fr id == MENU_EPISODE {
+        bet MENU_MAIN
+    }
+    fr id == MENU_NEWGAME {
+        bet MENU_EPISODE
+    }
+    fr id == MENU_OPTIONS {
+        bet MENU_MAIN
+    }
+    fr id == MENU_READ1 {
+        bet MENU_MAIN
+    }
+    fr id == MENU_READ2 {
+        bet MENU_READ1
+    }
+    fr id == MENU_SOUND {
+        bet MENU_OPTIONS
+    }
+    bet MENU_MAIN       // LOAD / SAVE
+}
+
+// default lastOn for a fresh M_Init (NewDef starts on hurtme=2; all others 0).
+flex finna menuDefaultLastOn(id: int) -> int {
+    fr id == MENU_NEWGAME {
+        bet 2
+    }
+    bet 0
+}
+
+// item status: -1 spacer, 0 no cursor, 1 normal, 2 arrows.
+flex finna itemStatus(gt: tag gs.GameState, id: int, item: int) -> int {
+    fr id == MENU_OPTIONS {
+        fr item == 4 || item == 6 {
+            bet -1
+        }
+        fr item == OPT_SCRNSIZE || item == OPT_MOUSESENS {
+            bet 2
+        }
+        bet 1
+    }
+    fr id == MENU_SOUND {
+        fr item == 1 || item == 3 {
+            bet -1
+        }
+        bet 2           // sfx_vol / music_vol are thermos
+    }
+    bet 1               // every other menu: all normal
+}
+
+// item patch-lump name ("" == blank, e.g. load/save/read slots).
+flex finna itemName(gt: tag gs.GameState, id: int, item: int) -> str {
+    fr id == MENU_MAIN {
+        lowkey commercial = gamemodeOf(gt) == doomdef.GM_COMMERCIAL
+        fr item == 0 {
+            bet "M_NGAME"
+        }
+        fr item == 1 {
+            bet "M_OPTION"
+        }
+        fr item == 2 {
+            bet "M_LOADG"
+        }
+        fr item == 3 {
+            bet "M_SAVEG"
+        }
+        fr item == 4 {
+            fr commercial {
+                bet "M_QUITG"   // commercial folds readthis away, quit slides up
+            }
+            bet "M_RDTHIS"
+        }
+        bet "M_QUITG"
+    }
+    fr id == MENU_EPISODE {
+        fr item == 0 {
+            bet "M_EPI1"
+        }
+        fr item == 1 {
+            bet "M_EPI2"
+        }
+        fr item == 2 {
+            bet "M_EPI3"
+        }
+        bet "M_EPI4"
+    }
+    fr id == MENU_NEWGAME {
+        fr item == 0 {
+            bet "M_JKILL"
+        }
+        fr item == 1 {
+            bet "M_ROUGH"
+        }
+        fr item == 2 {
+            bet "M_HURT"
+        }
+        fr item == 3 {
+            bet "M_ULTRA"
+        }
+        bet "M_NMARE"
+    }
+    fr id == MENU_OPTIONS {
+        fr item == 0 {
+            bet "M_ENDGAM"
+        }
+        fr item == OPT_MESSAGES {
+            bet "M_MESSG"
+        }
+        fr item == OPT_DETAIL {
+            bet "M_DETAIL"
+        }
+        fr item == OPT_SCRNSIZE {
+            bet "M_SCRNSZ"
+        }
+        fr item == OPT_MOUSESENS {
+            bet "M_MSENS"
+        }
+        fr item == 7 {
+            bet "M_SVOL"
+        }
+        bet ""          // spacers 4,6
+    }
+    fr id == MENU_SOUND {
+        fr item == SND_SFXVOL {
+            bet "M_SFXVOL"
+        }
+        fr item == SND_MUSICVOL {
+            bet "M_MUSVOL"
+        }
+        bet ""          // spacers 1,3
+    }
+    bet ""              // READ1/READ2/LOAD/SAVE items are blank
+}
+
+// item hotkey (alphaKey) — used by the default nav-by-letter case.
+flex finna itemAlphaKey(id: int, item: int) -> int {
+    fr id == MENU_MAIN {
+        fr item == 0 {
+            bet 110     // 'n'
+        }
+        fr item == 1 {
+            bet 111     // 'o'
+        }
+        fr item == 2 {
+            bet 108     // 'l'
+        }
+        fr item == 3 {
+            bet 115     // 's'
+        }
+        fr item == 4 {
+            bet 114     // 'r'
+        }
+        bet 113         // 'q'
+    }
+    fr id == MENU_EPISODE {
+        fr item == 0 {
+            bet 107     // 'k'
+        }
+        fr item == 1 {
+            bet 116     // 't'
+        }
+        fr item == 2 {
+            bet 105     // 'i'
+        }
+        bet 116         // 't'
+    }
+    fr id == MENU_NEWGAME {
+        fr item == 0 {
+            bet 105     // 'i'
+        }
+        fr item == 1 {
+            bet 104     // 'h'
+        }
+        fr item == 2 {
+            bet 104     // 'h'
+        }
+        fr item == 3 {
+            bet 117     // 'u'
+        }
+        bet 110         // 'n'
+    }
+    fr id == MENU_OPTIONS {
+        fr item == 0 {
+            bet 101     // 'e'
+        }
+        fr item == OPT_MESSAGES {
+            bet 109     // 'm'
+        }
+        fr item == OPT_DETAIL {
+            bet 103     // 'g'
+        }
+        fr item == OPT_SCRNSIZE {
+            bet 115     // 's'
+        }
+        fr item == OPT_MOUSESENS {
+            bet 109     // 'm'
+        }
+        fr item == 7 {
+            bet 115     // 's'
+        }
+        bet 0
+    }
+    fr id == MENU_SOUND {
+        fr item == SND_SFXVOL {
+            bet 115     // 's'
+        }
+        fr item == SND_MUSICVOL {
+            bet 109     // 'm'
+        }
+        bet 0
+    }
+    fr id == MENU_LOAD || id == MENU_SAVE {
+        bet 49 + item   // '1'..'6'
+    }
+    bet 0
+}
+
+// ============================================================================================
+// menu-state accessors
+// ============================================================================================
+flex finna curMenu(gt: tag gs.GameState) -> int {
+    lowkey m = 0
+    holla g = gt in gs.gsc {
+        m = g.menu.currentMenu as int
+    } ghosted {
+        yeet("gs")
+    }
+    bet m
+}
+flex finna curItemOn(gt: tag gs.GameState) -> int {
+    lowkey it = 0
+    holla g = gt in gs.gsc {
+        it = g.menu.itemOn as int
+    } ghosted {
+        yeet("gs")
+    }
+    bet it
+}
+flex finna isMenuActive(gt: tag gs.GameState) -> bool {
+    lowkey a = cap
+    holla g = gt in gs.gsc {
+        a = g.menu.menuactive
+    } ghosted {
+        yeet("gs")
+    }
+    bet a
+}
+
+// set the console player's hint message.
+flex finna plrMessage(gt: tag gs.GameState, msg: str) {
+    holla g = gt in gs.gsc {
+        g.shell.players[g.shell.consoleplayer].message = msg
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// ============================================================================================
+// control-panel plumbing (M_StartControlPanel / M_ClearMenus / M_SetupNextMenu / messages)
+// ============================================================================================
+// M_SetupNextMenu — go to `id`, restoring its lastOn.
+flex finna setupNextMenu(gt: tag gs.GameState, id: int) {
+    holla g = gt in gs.gsc {
+        g.menu.currentMenu = id as i32
+        g.menu.itemOn = g.menu.menuLastOn[id]
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// M_ClearMenus — close the menu (mirrors g.shell.menuactive).
+flex finna clearMenus(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.menu.menuactive = cap
+        g.shell.menuactive = cap
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// M_StartControlPanel — pop up the main menu (idempotent while active).
+flex finna startControlPanel(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        fr !g.menu.menuactive {
+            g.menu.menuactive = nocap
+            g.shell.menuactive = nocap
+            g.menu.currentMenu = MENU_MAIN as i32
+            g.menu.itemOn = g.menu.menuLastOn[MENU_MAIN]
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// M_StartMessage — put up a message (input == true waits for y/n/space/esc); remembers the routine.
+flex finna startMessage(gt: tag gs.GameState, msg: str, routineId: int, input: bool) {
+    holla g = gt in gs.gsc {
+        g.menu.messageLastMenuActive = g.menu.menuactive
+        g.menu.messageToPrint = nocap
+        g.menu.messageString = msg
+        g.menu.messageRoutineId = routineId as i32
+        g.menu.messageNeedsInput = input
+        g.menu.menuactive = nocap
+        g.shell.menuactive = nocap
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// ============================================================================================
+// item routines (M_* action functions). Each opens its own hollas as needed and is called
+// from the responder OUTSIDE any open gsc holla.
+// ============================================================================================
+flex finna mNewGame(gt: tag gs.GameState) {
+    lowkey netgame = cap
+    lowkey demoplayback = cap
+    lowkey commercial = cap
+    holla g = gt in gs.gsc {
+        netgame = g.shell.netgame
+        demoplayback = g.shell.demoplayback
+        commercial = g.shell.gamemode as int == doomdef.GM_COMMERCIAL
+    } ghosted {
+        yeet("gs")
+    }
+    fr netgame && !demoplayback {
+        startMessage(gt, strings.NEWGAME, MRT_NONE, cap)
+        bet
+    }
+    fr commercial {
+        setupNextMenu(gt, MENU_NEWGAME)
+    } naw {
+        setupNextMenu(gt, MENU_EPISODE)
+    }
+}
+
+flex finna mEpisode(gt: tag gs.GameState, choice: int) {
+    lowkey gm = gamemodeOf(gt)
+    fr gm == doomdef.GM_SHAREWARE && choice != 0 {
+        startMessage(gt, strings.SWSTRING, MRT_NONE, cap)
+        setupNextMenu(gt, MENU_READ1)
+        bet
+    }
+    lowkey ch = choice
+    fr gm == doomdef.GM_REGISTERED && choice > 2 {
+        ch = 0          // 4th episode needs Ultimate DOOM
+    }
+    holla g = gt in gs.gsc {
+        g.menu.epi = ch as i32
+    } ghosted {
+        yeet("gs")
+    }
+    setupNextMenu(gt, MENU_NEWGAME)
+}
+
+// G_DeferedInitNew seam: stash skill/episode/map + queue GA_NEWGAME (P2.8 g_game consumes it).
+flex finna deferInitNew(gt: tag gs.GameState, skill: int, episode: int, map: int) {
+    holla g = gt in gs.gsc {
+        // SEAM: g_game (P2.8) — G_DeferedInitNew sets d_skill/d_episode/d_map + gameaction=ga_newgame.
+        g.shell.startskill = skill as i32
+        g.shell.startepisode = episode as i32
+        g.shell.startmap = map as i32
+        g.shell.gameaction = doomdef.GA_NEWGAME as i32
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna mChooseSkill(gt: tag gs.GameState, choice: int) {
+    fr choice == SKILL_NIGHTMARE {
+        startMessage(gt, strings.NIGHTMARE, MRT_NIGHTMARE, nocap)
+        bet
+    }
+    lowkey epi = 0
+    holla g = gt in gs.gsc {
+        epi = g.menu.epi as int
+    } ghosted {
+        yeet("gs")
+    }
+    deferInitNew(gt, choice, epi + 1, 1)
+    clearMenus(gt)
+}
+
+flex finna mOptions(gt: tag gs.GameState) {
+    setupNextMenu(gt, MENU_OPTIONS)
+}
+
+// M_ReadSaveStrings — (P2.11 seam) no savegame files yet, so every slot is EMPTYSTRING. Rebuild
+// the build-once vec (savegameStrings is append-only; replace the whole field).
+flex finna readSaveStrings(gt: tag gs.GameState) {
+    lowkey v = vec.new[str]()
+    lowkey i = 0
+    vibin i < LOAD_END {
+        v.stack(strings.EMPTYSTRING)
+        i = i + 1
+    }
+    holla g = gt in gs.gsc {
+        g.menu.savegameStrings = v
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna mLoadGame(gt: tag gs.GameState) {
+    lowkey netgame = cap
+    holla g = gt in gs.gsc {
+        netgame = g.shell.netgame
+    } ghosted {
+        yeet("gs")
+    }
+    fr netgame {
+        startMessage(gt, strings.LOADNET, MRT_NONE, cap)
+        bet
+    }
+    setupNextMenu(gt, MENU_LOAD)
+    readSaveStrings(gt)
+}
+
+flex finna mSaveGame(gt: tag gs.GameState) {
+    lowkey usergame = cap
+    lowkey atLevel = cap
+    holla g = gt in gs.gsc {
+        usergame = g.shell.usergame
+        atLevel = g.shell.gamestate as int == doomdef.GS_LEVEL
+    } ghosted {
+        yeet("gs")
+    }
+    fr !usergame {
+        startMessage(gt, strings.SAVEDEAD, MRT_NONE, cap)
+        bet
+    }
+    fr !atLevel {
+        bet
+    }
+    setupNextMenu(gt, MENU_SAVE)
+    readSaveStrings(gt)
+}
+
+// M_LoadSelect — G_LoadGame seam (P2.11), then close the menu.
+flex finna mLoadSelect(gt: tag gs.GameState, choice: int) {
+    // SEAM: p_saveg (P2.11) — G_LoadGame(name) with slot `choice`.
+    holla g = gt in gs.gsc {
+        g.shell.gameaction = doomdef.GA_LOADGAME as i32
+    } ghosted {
+        yeet("gs")
+    }
+    clearMenus(gt)
+}
+
+// M_SaveSelect — begin editing the slot's description (per-char editing is a P2.11 seam).
+flex finna mSaveSelect(gt: tag gs.GameState, choice: int) {
+    holla g = gt in gs.gsc {
+        g.menu.saveStringEnter = nocap
+        g.menu.saveSlot = choice as i32
+        g.menu.saveCharIndex = 0
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna mReadThis(gt: tag gs.GameState) {
+    setupNextMenu(gt, MENU_READ1)
+}
+flex finna mReadThis2(gt: tag gs.GameState) {
+    setupNextMenu(gt, MENU_READ2)
+}
+flex finna mFinishReadThis(gt: tag gs.GameState) {
+    setupNextMenu(gt, MENU_MAIN)
+}
+
+// M_QuitDOOM — endstring = QUITMSG + "\n\n(press y to quit)". (The 22-entry endmsg[] table is
+// deferred; QUITMSG == id's endmsg[0], the language!=english branch — deterministic here.)
+flex finna mQuitDOOM(gt: tag gs.GameState) {
+    lowkey endstring = cat2(strings.QUITMSG, cat2("\n\n", strings.DOSY))
+    startMessage(gt, endstring, MRT_QUIT, nocap)
+}
+
+flex finna mChangeMessages(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.menu.showMessages = (1 - g.menu.showMessages as int) as i32
+        fr g.menu.showMessages as int == 0 {
+            g.shell.players[g.shell.consoleplayer].message = strings.MSGOFF
+        } naw {
+            g.shell.players[g.shell.consoleplayer].message = strings.MSGON
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna mChangeDetail(gt: tag gs.GameState) {
+    // low-detail mode is n/a (as in id); toggle the flag only.
+    holla g = gt in gs.gsc {
+        g.menu.detailLevel = (1 - g.menu.detailLevel as int) as i32
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// M_SizeDisplay — screen size up/down (choice 0 down, 1 up); R_SetViewSize is a render seam.
+flex finna mSizeDisplay(gt: tag gs.GameState, choice: int) {
+    holla g = gt in gs.gsc {
+        fr choice == 0 {
+            fr g.menu.screenSize as int > 0 {
+                g.menu.screenblocks = g.menu.screenblocks - 1
+                g.menu.screenSize = g.menu.screenSize - 1
+            }
+        } naw {
+            fr g.menu.screenSize as int < 8 {
+                g.menu.screenblocks = g.menu.screenblocks + 1
+                g.menu.screenSize = g.menu.screenSize + 1
+            }
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    // SEAM: R_SetViewSize(screenblocks, detailLevel) — render window resize (P2.6/P2.8).
+}
+
+flex finna mChangeSensitivity(gt: tag gs.GameState, choice: int) {
+    holla g = gt in gs.gsc {
+        fr choice == 0 {
+            fr g.shell.mouseSensitivity as int > 0 {
+                g.shell.mouseSensitivity = g.shell.mouseSensitivity - 1
+            }
+        } naw {
+            fr g.shell.mouseSensitivity as int < 9 {
+                g.shell.mouseSensitivity = g.shell.mouseSensitivity + 1
+            }
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna mSound(gt: tag gs.GameState) {
+    setupNextMenu(gt, MENU_SOUND)
+}
+
+flex finna mSfxVol(gt: tag gs.GameState, choice: int) {
+    lowkey v = 0
+    holla g = gt in gs.gsc {
+        v = g.sound.sfxVolume as int
+        fr choice == 0 {
+            fr v != 0 {
+                v = v - 1
+            }
+        } naw fr choice == 1 {
+            fr v < 15 {
+                v = v + 1
+            }
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    ssnd.setSfxVolume(gt, v)
+}
+
+flex finna mMusicVol(gt: tag gs.GameState, choice: int) {
+    lowkey v = 0
+    holla g = gt in gs.gsc {
+        v = g.sound.musicVolume as int
+        fr choice == 0 {
+            fr v != 0 {
+                v = v - 1
+            }
+        } naw fr choice == 1 {
+            fr v < 15 {
+                v = v + 1
+            }
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    ssnd.setMusicVolume(gt, v)
+}
+
+flex finna mEndGame(gt: tag gs.GameState) {
+    lowkey usergame = cap
+    lowkey netgame = cap
+    holla g = gt in gs.gsc {
+        usergame = g.shell.usergame
+        netgame = g.shell.netgame
+    } ghosted {
+        yeet("gs")
+    }
+    fr !usergame {
+        menuSnd(gt, sounds.SFX_OOF)
+        bet
+    }
+    fr netgame {
+        startMessage(gt, strings.NETEND, MRT_NONE, cap)
+        bet
+    }
+    startMessage(gt, strings.ENDGAME, MRT_ENDGAME, nocap)
+}
+
+// ============================================================================================
+// message-response routines (dispatched by MRT id when a message with input resolves)
+// ============================================================================================
+flex finna respondQuit(gt: tag gs.GameState, ch: int) {
+    fr ch != 121 {          // 'y'
+        bet
+    }
+    // I_Quit: the main loop returns when quitRequested latches (no S_StartSound/I_WaitVBL seam
+    // needed for the headless smoke; sound is fire-and-forget).
+    holla g = gt in gs.gsc {
+        g.shell.quitRequested = nocap
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna respondEndGame(gt: tag gs.GameState, ch: int) {
+    fr ch != 121 {
+        bet
+    }
+    holla g = gt in gs.gsc {
+        g.menu.menuLastOn[g.menu.currentMenu as int] = g.menu.itemOn
+    } ghosted {
+        yeet("gs")
+    }
+    clearMenus(gt)
+    // SEAM: g_game (P2.8) — D_StartTitle(): gameaction=ga_nothing, gamestate=GS_DEMOSCREEN, advance demo.
+    holla g = gt in gs.gsc {
+        g.shell.gameaction = doomdef.GA_NOTHING as i32
+        g.shell.gamestate = doomdef.GS_DEMOSCREEN as i32
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna respondNightmare(gt: tag gs.GameState, ch: int) {
+    fr ch != 121 {
+        bet
+    }
+    lowkey epi = 0
+    holla g = gt in gs.gsc {
+        epi = g.menu.epi as int
+    } ghosted {
+        yeet("gs")
+    }
+    deferInitNew(gt, doomdef.SK_NIGHTMARE, epi + 1, 1)
+    clearMenus(gt)
+}
+
+// dispatch a resolved message response.
+flex finna dispatchResponse(gt: tag gs.GameState, routineId: int, ch: int) {
+    fr routineId == MRT_QUIT {
+        respondQuit(gt, ch)
+    } naw fr routineId == MRT_ENDGAME {
+        respondEndGame(gt, ch)
+    } naw fr routineId == MRT_NIGHTMARE {
+        respondNightmare(gt, ch)
+    }
+    // MRT_QUICKSAVE / MRT_QUICKLOAD: P2.11 seam (savegame layer).
+}
+
+// ============================================================================================
+// routeItem — the (menuId, item) -> action dispatch (replaces menuitem_t.routine). `choice` is
+// the arrow direction (0/1) for status-2 items, else the item index.
+// ============================================================================================
+flex finna routeItem(gt: tag gs.GameState, id: int, item: int, choice: int) {
+    fr id == MENU_MAIN {
+        lowkey commercial = gamemodeOf(gt) == doomdef.GM_COMMERCIAL
+        fr item == 0 {
+            mNewGame(gt)
+        } naw fr item == 1 {
+            mOptions(gt)
+        } naw fr item == 2 {
+            mLoadGame(gt)
+        } naw fr item == 3 {
+            mSaveGame(gt)
+        } naw fr item == 4 {
+            fr commercial {
+                mQuitDOOM(gt)
+            } naw {
+                mReadThis(gt)
+            }
+        } naw {
+            mQuitDOOM(gt)
+        }
+        bet
+    }
+    fr id == MENU_EPISODE {
+        mEpisode(gt, choice)
+        bet
+    }
+    fr id == MENU_NEWGAME {
+        mChooseSkill(gt, choice)
+        bet
+    }
+    fr id == MENU_OPTIONS {
+        fr item == 0 {
+            mEndGame(gt)
+        } naw fr item == OPT_MESSAGES {
+            mChangeMessages(gt)
+        } naw fr item == OPT_DETAIL {
+            mChangeDetail(gt)
+        } naw fr item == OPT_SCRNSIZE {
+            mSizeDisplay(gt, choice)
+        } naw fr item == OPT_MOUSESENS {
+            mChangeSensitivity(gt, choice)
+        } naw fr item == 7 {
+            mSound(gt)
+        }
+        bet
+    }
+    fr id == MENU_SOUND {
+        fr item == SND_SFXVOL {
+            mSfxVol(gt, choice)
+        } naw fr item == SND_MUSICVOL {
+            mMusicVol(gt, choice)
+        }
+        bet
+    }
+    fr id == MENU_READ1 {
+        fr gamemodeOf(gt) == doomdef.GM_COMMERCIAL {
+            mFinishReadThis(gt)
+        } naw {
+            mReadThis2(gt)
+        }
+        bet
+    }
+    fr id == MENU_READ2 {
+        mFinishReadThis(gt)
+        bet
+    }
+    fr id == MENU_LOAD {
+        mLoadSelect(gt, item)
+        bet
+    }
+    fr id == MENU_SAVE {
+        mSaveSelect(gt, item)
+        bet
+    }
+}
+
+// ============================================================================================
+// M_Init
+// ============================================================================================
+flex finna mInit(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.menu.currentMenu = MENU_MAIN as i32
+        g.menu.menuactive = cap
+        g.shell.menuactive = cap
+        g.menu.whichSkull = 0
+        g.menu.skullAnimCounter = 10
+        // screenSize = screenblocks - 3 (screenblocks defaults to 9 == full).
+        fr g.menu.screenblocks as int == 0 {
+            g.menu.screenblocks = 9
+        }
+        g.menu.screenSize = (g.menu.screenblocks as int - 3) as i32
+        g.menu.messageToPrint = cap
+        g.menu.messageString = ""
+        g.menu.messageRoutineId = MRT_NONE as i32
+        g.menu.messageLastMenuActive = g.menu.menuactive
+        g.menu.quickSaveSlot = -1
+        g.menu.showMessages = 1
+        // seed each menudef's lastOn (NewDef starts on hurtme=2).
+        lowkey i = 0
+        vibin i < 16 {
+            g.menu.menuLastOn[i] = 0
+            i = i + 1
+        }
+        g.menu.menuLastOn[MENU_NEWGAME] = 2
+        g.menu.itemOn = g.menu.menuLastOn[MENU_MAIN]
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// ============================================================================================
+// M_Ticker — animate the skull.
+// ============================================================================================
+flex finna mTicker(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.menu.skullAnimCounter = g.menu.skullAnimCounter - 1
+        fr g.menu.skullAnimCounter as int <= 0 {
+            g.menu.whichSkull = (g.menu.whichSkull as int ^ 1) as i32
+            g.menu.skullAnimCounter = 8
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// ============================================================================================
+// F11 gamma toggle + the P2.11 quicksave/quickload seams + save-string-entry key handling
+// ============================================================================================
+flex finna gammaToggle(gt: tag gs.GameState) {
+    lowkey palIndex = 0
+    holla g = gt in gs.gsc {
+        lowkey ug = g.vid.gammaIndex as int + 1
+        fr ug > 4 {
+            ug = 0
+        }
+        g.vid.gammaIndex = ug as i32
+        // gamma message strings (GAMMALVL0..4).
+        fr ug == 0 {
+            g.shell.players[g.shell.consoleplayer].message = strings.GAMMALVL0
+        } naw fr ug == 1 {
+            g.shell.players[g.shell.consoleplayer].message = strings.GAMMALVL1
+        } naw fr ug == 2 {
+            g.shell.players[g.shell.consoleplayer].message = strings.GAMMALVL2
+        } naw fr ug == 3 {
+            g.shell.players[g.shell.consoleplayer].message = strings.GAMMALVL3
+        } naw {
+            g.shell.players[g.shell.consoleplayer].message = strings.GAMMALVL4
+        }
+        palIndex = g.vid.paletteIndex as int
+    } ghosted {
+        yeet("gs")
+    }
+    iv.setPalette(gt, palIndex)         // I_SetPalette(PLAYPAL) with the new gamma row
+}
+
+// M_DoSave — G_SaveGame seam (P2.11); close the menu; adopt the quicksave slot.
+flex finna mDoSave(gt: tag gs.GameState, slot: int) {
+    // SEAM: p_saveg (P2.11) — G_SaveGame(slot, savegamestrings[slot]).
+    holla g = gt in gs.gsc {
+        g.shell.gameaction = doomdef.GA_SAVEGAME as i32
+        fr g.menu.quickSaveSlot as int == -2 {
+            g.menu.quickSaveSlot = slot as i32
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    clearMenus(gt)
+}
+
+flex finna mQuickSave(gt: tag gs.GameState) {
+    lowkey usergame = cap
+    lowkey atLevel = cap
+    lowkey qslot = 0
+    holla g = gt in gs.gsc {
+        usergame = g.shell.usergame
+        atLevel = g.shell.gamestate as int == doomdef.GS_LEVEL
+        qslot = g.menu.quickSaveSlot as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr !usergame {
+        menuSnd(gt, sounds.SFX_OOF)
+        bet
+    }
+    fr !atLevel {
+        bet
+    }
+    fr qslot < 0 {
+        startControlPanel(gt)
+        readSaveStrings(gt)
+        setupNextMenu(gt, MENU_SAVE)
+        holla g = gt in gs.gsc {
+            g.menu.quickSaveSlot = -2       // means: pick a slot now
+        } ghosted {
+            yeet("gs")
+        }
+        bet
+    }
+    // QSPROMPT carries a %s (the slot description); formatting is a P2.11 seam — send it plain.
+    startMessage(gt, strings.QSPROMPT, MRT_QUICKSAVE, nocap)
+}
+
+flex finna mQuickLoad(gt: tag gs.GameState) {
+    lowkey netgame = cap
+    lowkey qslot = 0
+    holla g = gt in gs.gsc {
+        netgame = g.shell.netgame
+        qslot = g.menu.quickSaveSlot as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr netgame {
+        startMessage(gt, strings.QLOADNET, MRT_NONE, cap)
+        bet
+    }
+    fr qslot < 0 {
+        startMessage(gt, strings.QSAVESPOT, MRT_NONE, cap)
+        bet
+    }
+    startMessage(gt, strings.QLPROMPT, MRT_QUICKLOAD, nocap)
+}
+
+// save-string entry: BACKSPACE/ESCAPE/ENTER handled; per-char text editing is a P2.11 seam (the
+// savegame description buffer is that layer's concern; mutating a vec[str] element isn't native-safe).
+flex finna handleSaveStringKey(gt: tag gs.GameState, ch: int) {
+    fr ch == doomdef.KEY_BACKSPACE {
+        holla g = gt in gs.gsc {
+            fr g.menu.saveCharIndex as int > 0 {
+                g.menu.saveCharIndex = g.menu.saveCharIndex - 1
+            }
+        } ghosted {
+            yeet("gs")
+        }
+        bet
+    }
+    fr ch == doomdef.KEY_ESCAPE {
+        holla g = gt in gs.gsc {
+            g.menu.saveStringEnter = cap    // cancel; restore-old-string is a P2.11 seam
+        } ghosted {
+            yeet("gs")
+        }
+        bet
+    }
+    fr ch == doomdef.KEY_ENTER {
+        lowkey slot = 0
+        holla g = gt in gs.gsc {
+            g.menu.saveStringEnter = cap
+            slot = g.menu.saveSlot as int
+        } ghosted {
+            yeet("gs")
+        }
+        mDoSave(gt, slot)
+        bet
+    }
+    // default: printable char insertion — P2.11 savegame-string seam.
+}
+
+// ============================================================================================
+// M_Responder — keyboard dispatch. `evType` is EV_KEYDOWN(0)/EV_KEYUP(1); joystick/mouse are
+// synthesized to keys by the driver (P2.8), so only keydown is handled here. Returns whether the
+// key was eaten.
+// ============================================================================================
+flex finna mResponder(gt: tag gs.GameState, evType: int, key: int) -> bool {
+    fr evType != 0 {
+        bet cap
+    }
+    lowkey ch = key
+
+    lowkey saveStringEnter = cap
+    lowkey messageToPrint = cap
+    lowkey messageNeedsInput = cap
+    lowkey messageRoutineId = 0
+    lowkey menuactive = cap
+    lowkey devparm = cap
+    lowkey automapactive = cap
+    lowkey chatOn = cap
+    lowkey gm = 0
+    holla g = gt in gs.gsc {
+        saveStringEnter = g.menu.saveStringEnter
+        messageToPrint = g.menu.messageToPrint
+        messageNeedsInput = g.menu.messageNeedsInput
+        messageRoutineId = g.menu.messageRoutineId as int
+        menuactive = g.menu.menuactive
+        devparm = g.shell.devparm
+        automapactive = g.shell.automapactive
+        chatOn = g.hud.chatOn
+        gm = g.shell.gamemode as int
+    } ghosted {
+        yeet("gs")
+    }
+
+    // save-game string input
+    fr saveStringEnter {
+        handleSaveStringKey(gt, ch)
+        bet nocap
+    }
+
+    // messages that need input
+    fr messageToPrint {
+        fr messageNeedsInput && !(ch == 32 || ch == 110 || ch == 121 || ch == doomdef.KEY_ESCAPE) {
+            bet cap
+        }
+        holla g = gt in gs.gsc {
+            g.menu.menuactive = g.menu.messageLastMenuActive
+            g.shell.menuactive = g.menu.messageLastMenuActive
+            g.menu.messageToPrint = cap
+        } ghosted {
+            yeet("gs")
+        }
+        dispatchResponse(gt, messageRoutineId, ch)
+        holla g = gt in gs.gsc {
+            g.menu.menuactive = cap
+            g.shell.menuactive = cap
+        } ghosted {
+            yeet("gs")
+        }
+        menuSnd(gt, sounds.SFX_SWTCHX)
+        bet nocap
+    }
+
+    // devparm screenshot
+    fr devparm && ch == doomdef.KEY_F1 {
+        holla g = gt in gs.gsc {
+            g.shell.gameaction = doomdef.GA_SCREENSHOT as i32   // SEAM: G_ScreenShot (P2.8)
+        } ghosted {
+            yeet("gs")
+        }
+        bet nocap
+    }
+
+    // F-keys (only when the menu is NOT active)
+    fr !menuactive {
+        fr ch == doomdef.KEY_MINUS {
+            fr automapactive || chatOn {
+                bet cap
+            }
+            mSizeDisplay(gt, 0)
+            menuSnd(gt, sounds.SFX_STNMOV)
+            bet nocap
+        }
+        fr ch == doomdef.KEY_EQUALS {
+            fr automapactive || chatOn {
+                bet cap
+            }
+            mSizeDisplay(gt, 1)
+            menuSnd(gt, sounds.SFX_STNMOV)
+            bet nocap
+        }
+        fr ch == doomdef.KEY_F1 {
+            startControlPanel(gt)
+            holla g = gt in gs.gsc {
+                fr gm == doomdef.GM_RETAIL {
+                    g.menu.currentMenu = MENU_READ2 as i32
+                } naw {
+                    g.menu.currentMenu = MENU_READ1 as i32
+                }
+                g.menu.itemOn = 0
+            } ghosted {
+                yeet("gs")
+            }
+            menuSnd(gt, sounds.SFX_SWTCHN)
+            bet nocap
+        }
+        fr ch == doomdef.KEY_F2 {
+            startControlPanel(gt)
+            menuSnd(gt, sounds.SFX_SWTCHN)
+            mSaveGame(gt)
+            bet nocap
+        }
+        fr ch == doomdef.KEY_F3 {
+            startControlPanel(gt)
+            menuSnd(gt, sounds.SFX_SWTCHN)
+            mLoadGame(gt)
+            bet nocap
+        }
+        fr ch == doomdef.KEY_F4 {
+            startControlPanel(gt)
+            holla g = gt in gs.gsc {
+                g.menu.currentMenu = MENU_SOUND as i32
+                g.menu.itemOn = SND_SFXVOL as i32
+            } ghosted {
+                yeet("gs")
+            }
+            menuSnd(gt, sounds.SFX_SWTCHN)
+            bet nocap
+        }
+        fr ch == doomdef.KEY_F5 {
+            mChangeDetail(gt)
+            menuSnd(gt, sounds.SFX_SWTCHN)
+            bet nocap
+        }
+        fr ch == doomdef.KEY_F6 {
+            menuSnd(gt, sounds.SFX_SWTCHN)
+            mQuickSave(gt)
+            bet nocap
+        }
+        fr ch == doomdef.KEY_F7 {
+            menuSnd(gt, sounds.SFX_SWTCHN)
+            mEndGame(gt)
+            bet nocap
+        }
+        fr ch == doomdef.KEY_F8 {
+            mChangeMessages(gt)
+            menuSnd(gt, sounds.SFX_SWTCHN)
+            bet nocap
+        }
+        fr ch == doomdef.KEY_F9 {
+            menuSnd(gt, sounds.SFX_SWTCHN)
+            mQuickLoad(gt)
+            bet nocap
+        }
+        fr ch == doomdef.KEY_F10 {
+            menuSnd(gt, sounds.SFX_SWTCHN)
+            mQuitDOOM(gt)
+            bet nocap
+        }
+        fr ch == doomdef.KEY_F11 {
+            gammaToggle(gt)
+            bet nocap
+        }
+    }
+
+    // pop-up trigger
+    fr !menuactive {
+        fr ch == doomdef.KEY_ESCAPE {
+            startControlPanel(gt)
+            menuSnd(gt, sounds.SFX_SWTCHN)
+            bet nocap
+        }
+        bet cap
+    }
+
+    // keys usable within the menu
+    lowkey id = 0
+    lowkey itemOn = 0
+    holla g = gt in gs.gsc {
+        id = g.menu.currentMenu as int
+        itemOn = g.menu.itemOn as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey numitems = menuNumItems(gt, id)
+
+    fr ch == doomdef.KEY_DOWNARROW {
+        vibin nocap {
+            fr itemOn + 1 > numitems - 1 {
+                itemOn = 0
+            } naw {
+                itemOn = itemOn + 1
+            }
+            menuSnd(gt, sounds.SFX_PSTOP)
+            fr itemStatus(gt, id, itemOn) != -1 {
+                dip
+            }
+        }
+        setItemOn(gt, itemOn)
+        bet nocap
+    }
+    fr ch == doomdef.KEY_UPARROW {
+        vibin nocap {
+            fr itemOn == 0 {
+                itemOn = numitems - 1
+            } naw {
+                itemOn = itemOn - 1
+            }
+            menuSnd(gt, sounds.SFX_PSTOP)
+            fr itemStatus(gt, id, itemOn) != -1 {
+                dip
+            }
+        }
+        setItemOn(gt, itemOn)
+        bet nocap
+    }
+    fr ch == doomdef.KEY_LEFTARROW {
+        fr itemStatus(gt, id, itemOn) == 2 {
+            menuSnd(gt, sounds.SFX_STNMOV)
+            routeItem(gt, id, itemOn, 0)
+        }
+        bet nocap
+    }
+    fr ch == doomdef.KEY_RIGHTARROW {
+        fr itemStatus(gt, id, itemOn) == 2 {
+            menuSnd(gt, sounds.SFX_STNMOV)
+            routeItem(gt, id, itemOn, 1)
+        }
+        bet nocap
+    }
+    fr ch == doomdef.KEY_ENTER {
+        lowkey st = itemStatus(gt, id, itemOn)
+        fr st != 0 {
+            setMenuLastOn(gt, id, itemOn)
+            fr st == 2 {
+                routeItem(gt, id, itemOn, 1)
+                menuSnd(gt, sounds.SFX_STNMOV)
+            } naw {
+                routeItem(gt, id, itemOn, itemOn)
+                menuSnd(gt, sounds.SFX_PISTOL)
+            }
+        }
+        bet nocap
+    }
+    fr ch == doomdef.KEY_ESCAPE {
+        setMenuLastOn(gt, id, itemOn)
+        clearMenus(gt)
+        menuSnd(gt, sounds.SFX_SWTCHX)
+        bet nocap
+    }
+    fr ch == doomdef.KEY_BACKSPACE {
+        setMenuLastOn(gt, id, itemOn)
+        lowkey prev = menuPrev(id)
+        fr prev != -1 {
+            setupNextMenu(gt, prev)
+            menuSnd(gt, sounds.SFX_SWTCHN)
+        }
+        bet nocap
+    }
+    // default — alphaKey jump (search below itemOn, then wrap to top through itemOn)
+    lowkey i = itemOn + 1
+    vibin i < numitems {
+        fr itemAlphaKey(id, i) == ch {
+            setItemOn(gt, i)
+            menuSnd(gt, sounds.SFX_PSTOP)
+            bet nocap
+        }
+        i = i + 1
+    }
+    i = 0
+    vibin i <= itemOn {
+        fr itemAlphaKey(id, i) == ch {
+            setItemOn(gt, i)
+            menuSnd(gt, sounds.SFX_PSTOP)
+            bet nocap
+        }
+        i = i + 1
+    }
+    bet cap
+}
+
+// small writers used by the responder.
+flex finna setItemOn(gt: tag gs.GameState, v: int) {
+    holla g = gt in gs.gsc {
+        g.menu.itemOn = v as i32
+    } ghosted {
+        yeet("gs")
+    }
+}
+flex finna setMenuLastOn(gt: tag gs.GameState, id: int, v: int) {
+    holla g = gt in gs.gsc {
+        g.menu.menuLastOn[id] = v as i32
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// ============================================================================================
+// draw helpers (thermometers, save/load border, the per-menu draw routines)
+// ============================================================================================
+flex finna drawThermo(gt: tag gs.GameState, x: int, y: int, thermWidth: int, thermDot: int) {
+    lowkey xx = x
+    vv.drawPatch(gt, xx, y, 0, wad.lumpNameOfs(gt, "M_THERML"))
+    xx = xx + 8
+    lowkey i = 0
+    vibin i < thermWidth {
+        vv.drawPatch(gt, xx, y, 0, wad.lumpNameOfs(gt, "M_THERMM"))
+        xx = xx + 8
+        i = i + 1
+    }
+    vv.drawPatch(gt, xx, y, 0, wad.lumpNameOfs(gt, "M_THERMR"))
+    vv.drawPatch(gt, x + 8 + thermDot * 8, y, 0, wad.lumpNameOfs(gt, "M_THERMO"))
+}
+
+flex finna drawSaveLoadBorder(gt: tag gs.GameState, x0: int, y: int) {
+    lowkey x = x0
+    vv.drawPatch(gt, x - 8, y + 7, 0, wad.lumpNameOfs(gt, "M_LSLEFT"))
+    lowkey i = 0
+    vibin i < 24 {
+        vv.drawPatch(gt, x, y + 7, 0, wad.lumpNameOfs(gt, "M_LSCNTR"))
+        x = x + 8
+        i = i + 1
+    }
+    vv.drawPatch(gt, x, y + 7, 0, wad.lumpNameOfs(gt, "M_LSRGHT"))
+}
+
+// read savegamestrings[i] (build-once vec; read-only).
+flex finna saveStr(gt: tag gs.GameState, i: int) -> str {
+    lowkey s = ""
+    holla g = gt in gs.gsc {
+        fr i < g.menu.savegameStrings.gang() {
+            s = g.menu.savegameStrings[i]
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    bet s
+}
+
+flex finna drawLoad(gt: tag gs.GameState, font: []i32) {
+    vv.drawPatch(gt, 72, 28, 0, wad.lumpNameOfs(gt, "M_LOADG"))
+    lowkey i = 0
+    vibin i < LOAD_END {
+        lowkey yy = 54 + LINEHEIGHT * i
+        drawSaveLoadBorder(gt, 80, yy)
+        writeText(gt, font, 80, yy, saveStr(gt, i))
+        i = i + 1
+    }
+}
+
+flex finna drawSave(gt: tag gs.GameState, font: []i32) {
+    vv.drawPatch(gt, 72, 28, 0, wad.lumpNameOfs(gt, "M_SAVEG"))
+    lowkey i = 0
+    vibin i < LOAD_END {
+        lowkey yy = 54 + LINEHEIGHT * i
+        drawSaveLoadBorder(gt, 80, yy)
+        writeText(gt, font, 80, yy, saveStr(gt, i))
+        i = i + 1
+    }
+    lowkey editing = cap
+    lowkey slot = 0
+    holla g = gt in gs.gsc {
+        editing = g.menu.saveStringEnter
+        slot = g.menu.saveSlot as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr editing {
+        lowkey w = stringWidth(gt, font, saveStr(gt, slot))
+        writeText(gt, font, 80 + w, 54 + LINEHEIGHT * slot, "_")
+    }
+}
+
+flex finna drawOptions(gt: tag gs.GameState, font: []i32) {
+    vv.drawPatch(gt, 108, 15, 0, wad.lumpNameOfs(gt, "M_OPTTTL"))
+    lowkey detailLevel = 0
+    lowkey showMessages = 0
+    lowkey mouseSensitivity = 0
+    lowkey screenSize = 0
+    holla g = gt in gs.gsc {
+        detailLevel = g.menu.detailLevel as int
+        showMessages = g.menu.showMessages as int
+        mouseSensitivity = g.shell.mouseSensitivity as int
+        screenSize = g.menu.screenSize as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey detailName = "M_GDHIGH"
+    fr detailLevel != 0 {
+        detailName = "M_GDLOW"
+    }
+    vv.drawPatch(gt, 60 + 175, 37 + LINEHEIGHT * OPT_DETAIL, 0, wad.lumpNameOfs(gt, detailName))
+    lowkey msgName = "M_MSGOFF"
+    fr showMessages != 0 {
+        msgName = "M_MSGON"
+    }
+    vv.drawPatch(gt, 60 + 120, 37 + LINEHEIGHT * OPT_MESSAGES, 0, wad.lumpNameOfs(gt, msgName))
+    drawThermo(gt, 60, 37 + LINEHEIGHT * (OPT_MOUSESENS + 1), 10, mouseSensitivity)
+    drawThermo(gt, 60, 37 + LINEHEIGHT * (OPT_SCRNSIZE + 1), 9, screenSize)
+}
+
+flex finna drawSound(gt: tag gs.GameState) {
+    vv.drawPatch(gt, 60, 38, 0, wad.lumpNameOfs(gt, "M_SVOL"))
+    lowkey sfxVol = 0
+    lowkey musVol = 0
+    holla g = gt in gs.gsc {
+        sfxVol = g.sound.sfxVolume as int
+        musVol = g.sound.musicVolume as int
+    } ghosted {
+        yeet("gs")
+    }
+    drawThermo(gt, 80, 64 + LINEHEIGHT * (SND_SFXVOL + 1), 16, sfxVol)
+    drawThermo(gt, 80, 64 + LINEHEIGHT * (SND_MUSICVOL + 1), 16, musVol)
+}
+
+// the per-menu draw routine (menu_t.routine).
+flex finna drawMenuExtras(gt: tag gs.GameState, id: int, font: []i32) {
+    lowkey gmode = gamemodeOf(gt)
+    fr id == MENU_MAIN {
+        vv.drawPatch(gt, 94, 2, 0, wad.lumpNameOfs(gt, "M_DOOM"))
+    } naw fr id == MENU_EPISODE {
+        vv.drawPatch(gt, 54, 38, 0, wad.lumpNameOfs(gt, "M_EPISOD"))
+    } naw fr id == MENU_NEWGAME {
+        vv.drawPatch(gt, 96, 14, 0, wad.lumpNameOfs(gt, "M_NEWG"))
+        vv.drawPatch(gt, 54, 38, 0, wad.lumpNameOfs(gt, "M_SKILL"))
+    } naw fr id == MENU_OPTIONS {
+        drawOptions(gt, font)
+    } naw fr id == MENU_READ1 {
+        holla g = gt in gs.gsc {
+            g.menu.inhelpscreens = nocap
+        } ghosted {
+            yeet("gs")
+        }
+        fr gmode == doomdef.GM_COMMERCIAL {
+            vv.drawPatch(gt, 0, 0, 0, wad.lumpNameOfs(gt, "HELP"))
+        } naw {
+            vv.drawPatch(gt, 0, 0, 0, wad.lumpNameOfs(gt, "HELP1"))
+        }
+    } naw fr id == MENU_READ2 {
+        holla g = gt in gs.gsc {
+            g.menu.inhelpscreens = nocap
+        } ghosted {
+            yeet("gs")
+        }
+        fr gmode == doomdef.GM_RETAIL || gmode == doomdef.GM_COMMERCIAL {
+            vv.drawPatch(gt, 0, 0, 0, wad.lumpNameOfs(gt, "CREDIT"))
+        } naw {
+            vv.drawPatch(gt, 0, 0, 0, wad.lumpNameOfs(gt, "HELP2"))
+        }
+    } naw fr id == MENU_SOUND {
+        drawSound(gt)
+    } naw fr id == MENU_LOAD {
+        drawLoad(gt, font)
+    } naw fr id == MENU_SAVE {
+        drawSave(gt, font)
+    }
+}
+
+// ============================================================================================
+// M_Drawer — called after the view renders, before blit. Draws the message prompt (centered) or
+// the active menu (title graphics + item patches + skull cursor).
+// ============================================================================================
+flex finna mDrawer(gt: tag gs.GameState) {
+    lowkey messageToPrint = cap
+    lowkey menuactive = cap
+    lowkey messageString = ""
+    lowkey id = 0
+    lowkey itemOn = 0
+    lowkey whichSkull = 0
+    holla g = gt in gs.gsc {
+        g.menu.inhelpscreens = cap
+        messageToPrint = g.menu.messageToPrint
+        menuactive = g.menu.menuactive
+        messageString = g.menu.messageString
+        id = g.menu.currentMenu as int
+        itemOn = g.menu.itemOn as int
+        whichSkull = g.menu.whichSkull as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey font = fontOfs(gt)
+
+    fr messageToPrint {
+        lowkey height = patchH(gt, font[0] as int)
+        lowkey y = 100 - stringHeight(gt, font, messageString) / 2
+        lowkey total = str.len(messageString)
+        lowkey start = 0
+        vibin start < total {
+            lowkey i = start
+            vibin i < total && str.at(messageString, i) != 10 {
+                i = i + 1
+            }
+            lowkey line = str.sub(messageString, start, i)
+            lowkey x = 160 - stringWidth(gt, font, line) / 2
+            writeText(gt, font, x, y, line)
+            y = y + height
+            start = i + 1
+        }
+        bet
+    }
+
+    fr !menuactive {
+        bet
+    }
+
+    drawMenuExtras(gt, id, font)
+
+    lowkey mx = menuX(id)
+    lowkey my = menuY(gt, id)
+    lowkey maxItems = menuNumItems(gt, id)
+    lowkey yy = my
+    lowkey i = 0
+    vibin i < maxItems {
+        lowkey nm = itemName(gt, id, i)
+        fr str.len(nm) > 0 {
+            vv.drawPatch(gt, mx, yy, 0, wad.lumpNameOfs(gt, nm))
+        }
+        yy = yy + LINEHEIGHT
+        i = i + 1
+    }
+
+    lowkey skullName = "M_SKULL1"
+    fr whichSkull == 1 {
+        skullName = "M_SKULL2"
+    }
+    vv.drawPatch(gt, mx + SKULLXOFF, my - 5 + itemOn * LINEHEIGHT, 0, wad.lumpNameOfs(gt, skullName))
+}

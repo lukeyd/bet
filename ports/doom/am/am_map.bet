@@ -1,0 +1,1327 @@
+// am/am_map.bet — the DOOM automap (linuxdoom-1.10 am_map.c): the overhead line map, its
+// fixed-point map<->frame view transform, Cohen-Sutherland line clipping, a Bresenham line
+// rasterizer into scr0, and the pan/zoom/follow/grid/mark responder + ticker.
+//
+// am_map.c's ~40 file-level statics (m_x/m_y/scale_mtof/f_w/… and the mark ring) don't lower as
+// mutable globals, so they are additive scalar fields on gs.AmState (see defs/gs.bet). The mark
+// ring — id's mutable markpoints[10] with in-place writes + clear-to-(-1) — is a pair of fixed
+// i32[10] arrays (markX/markY), since a `vec` can't be element-mutated in native codegen.
+//
+// The drawer writes straight into scr0 (id's `fb = screens[0]`) with the automap window origin
+// f_x=f_y=0, f_w=SCREENWIDTH(320), f_h=SCREENHEIGHT-32(168): PUTDOT(x,y) == scr0[y*320+x].
+//
+// PORTED: AM_Start/AM_Stop, AM_LevelInit, AM_initVariables, AM_findMinMaxBoundaries, the scale
+//   save/restore + activate/min/max, AM_addMark/AM_clearMarks, AM_Responder (pan/zoom/follow/grid/
+//   mark/clear + the iddt cheat), AM_Ticker (follow + zoom + pan), AM_Drawer (clearFB, grid, walls,
+//   players, things, crosshair, marks), the clip/rasterize/rotate/line-character primitives.
+// SEAMS: AM_loadPics/unloadPics (AMMNUM patches are loaded on demand in AM_drawMarks); the
+//   ST_Responder(ev_keyup, AM_MSGENTERED/EXITED) status-bar notify (st automap-header filter).
+pull "mem"
+pull "str"
+pull "../defs/gs" as gs
+pull "../defs/doomdef" as doomdef
+pull "../defs/fixed" as fixed
+pull "../defs/tables" as tables
+pull "../defs/strings" as strings
+pull "../defs/think" as think
+pull "../w/w_wad" as wad
+pull "../v/v_video" as vv
+pull "../util/m_cheat" as cheat
+
+// ---- automap colors (palette indices) -----------------------------------------------------
+flex facts REDS: int = 176            // 256-5*16
+flex facts REDRANGE: int = 16
+flex facts GREENS: int = 112          // 7*16
+flex facts GRAYS: int = 96            // 6*16
+flex facts BROWNS: int = 64           // 4*16
+flex facts YELLOWS: int = 231         // 256-32+7
+flex facts BLACK: int = 0
+flex facts WHITE: int = 209           // 256-47
+flex facts BACKGROUND: int = 0        // BLACK
+flex facts WALLCOLORS: int = 176      // REDS
+flex facts WALLRANGE: int = 16
+flex facts TSWALLCOLORS: int = 96     // GRAYS
+flex facts FDWALLCOLORS: int = 64     // BROWNS
+flex facts CDWALLCOLORS: int = 231    // YELLOWS
+flex facts THINGCOLORS: int = 112     // GREENS
+flex facts THINGRANGE: int = 16
+flex facts SECRETWALLCOLORS: int = 176
+flex facts GRIDCOLORS: int = 104      // GRAYS + GRAYSRANGE/2
+flex facts XHAIRCOLORS: int = 96      // GRAYS
+
+// ---- automap keys (id AM_*KEY) ------------------------------------------------------------
+flex facts AM_STARTKEY: int = 9       // KEY_TAB
+flex facts AM_ZOOMINKEY: int = 61     // '='
+flex facts AM_ZOOMOUTKEY: int = 45    // '-'
+flex facts AM_GOBIGKEY: int = 48      // '0'
+flex facts AM_FOLLOWKEY: int = 102    // 'f'
+flex facts AM_GRIDKEY: int = 103      // 'g'
+flex facts AM_MARKKEY: int = 109      // 'm'
+flex facts AM_CLEARMARKKEY: int = 99  // 'c'
+flex facts AM_NUMMARKPOINTS: int = 10
+
+// ---- scale / motion constants -------------------------------------------------------------
+flex facts F_PANINC: int = 4
+flex facts M_ZOOMIN: i32 = 66846      // (int)(1.02*FRACUNIT)
+flex facts M_ZOOMOUT: i32 = 64250     // (int)(FRACUNIT/1.02)
+flex facts INITSCALEMTOF: i32 = 13107 // (int)(0.2*FRACUNIT)
+flex facts PLAYERRADIUS: i32 = 1048576   // 16*FRACUNIT
+flex facts MAPBLOCKUNITS_FRAC: i32 = 8388608  // MAPBLOCKUNITS(128) << FRACBITS
+flex facts SEVENTENTHS: i32 = 45875   // (int)(0.7*FRACUNIT)
+flex facts LINE_NEVERSEE: int = 128   // ML_DONTDRAW
+
+// ---- outcode bits (Cohen-Sutherland) ------------------------------------------------------
+flex facts OC_LEFT: int = 1
+flex facts OC_RIGHT: int = 2
+flex facts OC_BOTTOM: int = 4
+flex facts OC_TOP: int = 8
+
+// ---- AmView: the per-frame view transform snapshot (read once, threaded to the primitives) -
+flex drip AmView {
+    flex mx: i32
+    flex my: i32
+    flex mx2: i32
+    flex my2: i32
+    flex fx: int
+    flex fy: int
+    flex fw: int
+    flex fh: int
+    flex scaleMtof: i32
+    flex lightlev: int
+}
+
+// ============================================================================================
+// fixed-point transforms (id's MTOF/FTOM/CXMTOF/CYMTOF macros)
+// ============================================================================================
+// MTOF(v) = FixedMul(v, scale_mtof) >> 16 — map distance -> frame pixels.
+flex finna mtofScale(v: i32, scaleMtof: i32) -> int {
+    bet (fixed.fixedMul(v, scaleMtof) as int) >> 16
+}
+// FTOM(v) = FixedMul(v<<16, scale_ftom) — frame distance -> map distance.
+flex finna ftomScale(v: i32, scaleFtom: i32) -> i32 {
+    bet fixed.fixedMul(v << 16, scaleFtom)
+}
+// CXMTOF(view, x) = f_x + MTOF(x - m_x).
+flex finna cxmtof(view: AmView, x: i32) -> int {
+    bet view.fx + mtofScale(x - view.mx, view.scaleMtof)
+}
+// CYMTOF(view, y) = f_y + (f_h - MTOF(y - m_y)).
+flex finna cymtof(view: AmView, y: i32) -> int {
+    bet view.fy + (view.fh - mtofScale(y - view.my, view.scaleMtof))
+}
+
+// ============================================================================================
+// AM_clipMline — Cohen-Sutherland clip of a map-coord segment into the frame window; returns
+// (ok, fax, fay, fbx, fby) in frame coords (ok == false when trivially/fully outside).
+// ============================================================================================
+flex finna doOutcode(mx: int, my: int, fw: int, fh: int) -> int {
+    lowkey oc = 0
+    fr my < 0 {
+        oc = oc | OC_TOP
+    } naw fr my >= fh {
+        oc = oc | OC_BOTTOM
+    }
+    fr mx < 0 {
+        oc = oc | OC_LEFT
+    } naw fr mx >= fw {
+        oc = oc | OC_RIGHT
+    }
+    bet oc
+}
+
+flex finna clipMline(view: AmView, ax: i32, ay: i32, bx: i32, by: i32) -> (bool, int, int, int, int) {
+    lowkey outcode1 = 0
+    lowkey outcode2 = 0
+    // trivial rejects on the map-coord y then x
+    fr ay > view.my2 {
+        outcode1 = OC_TOP
+    } naw fr ay < view.my {
+        outcode1 = OC_BOTTOM
+    }
+    fr by > view.my2 {
+        outcode2 = OC_TOP
+    } naw fr by < view.my {
+        outcode2 = OC_BOTTOM
+    }
+    fr (outcode1 & outcode2) != 0 {
+        bet cap, 0, 0, 0, 0
+    }
+    fr ax < view.mx {
+        outcode1 = outcode1 | OC_LEFT
+    } naw fr ax > view.mx2 {
+        outcode1 = outcode1 | OC_RIGHT
+    }
+    fr bx < view.mx {
+        outcode2 = outcode2 | OC_LEFT
+    } naw fr bx > view.mx2 {
+        outcode2 = outcode2 | OC_RIGHT
+    }
+    fr (outcode1 & outcode2) != 0 {
+        bet cap, 0, 0, 0, 0
+    }
+    // to frame coords
+    lowkey fax = cxmtof(view, ax)
+    lowkey fay = cymtof(view, ay)
+    lowkey fbx = cxmtof(view, bx)
+    lowkey fby = cymtof(view, by)
+    outcode1 = doOutcode(fax, fay, view.fw, view.fh)
+    outcode2 = doOutcode(fbx, fby, view.fw, view.fh)
+    fr (outcode1 & outcode2) != 0 {
+        bet cap, 0, 0, 0, 0
+    }
+    vibin (outcode1 | outcode2) != 0 {
+        lowkey outside = outcode1
+        fr outcode1 == 0 {
+            outside = outcode2
+        }
+        lowkey tmpx = 0
+        lowkey tmpy = 0
+        fr (outside & OC_TOP) != 0 {
+            lowkey dy = fay - fby
+            lowkey dx = fbx - fax
+            tmpx = fax + (dx * fay) / dy
+            tmpy = 0
+        } naw fr (outside & OC_BOTTOM) != 0 {
+            lowkey dy = fay - fby
+            lowkey dx = fbx - fax
+            tmpx = fax + (dx * (fay - view.fh)) / dy
+            tmpy = view.fh - 1
+        } naw fr (outside & OC_RIGHT) != 0 {
+            lowkey dy = fby - fay
+            lowkey dx = fbx - fax
+            tmpy = fay + (dy * (view.fw - 1 - fax)) / dx
+            tmpx = view.fw - 1
+        } naw {
+            lowkey dy = fby - fay
+            lowkey dx = fbx - fax
+            tmpy = fay + (dy * (0 - fax)) / dx
+            tmpx = 0
+        }
+        fr outside == outcode1 {
+            fax = tmpx
+            fay = tmpy
+            outcode1 = doOutcode(fax, fay, view.fw, view.fh)
+        } naw {
+            fbx = tmpx
+            fby = tmpy
+            outcode2 = doOutcode(fbx, fby, view.fw, view.fh)
+        }
+        fr (outcode1 & outcode2) != 0 {
+            bet cap, 0, 0, 0, 0
+        }
+    }
+    bet nocap, fax, fay, fbx, fby
+}
+
+// ============================================================================================
+// AM_drawFline — Bresenham line into scr0 (fb[(y)*f_w+(x)]). Skips lines with any endpoint out
+// of the window (id's debug clamp). fw is always 320 (== scr0 stride).
+// ============================================================================================
+flex finna drawFline(gt: tag gs.GameState, fw: int, fh: int, ax: int, ay: int, bx: int, by: int, color: int) {
+    fr ax < 0 || ax >= fw || ay < 0 || ay >= fh || bx < 0 || bx >= fw || by < 0 || by >= fh {
+        bet
+    }
+    lowkey dx = bx - ax
+    lowkey adx = dx
+    fr adx < 0 {
+        adx = 0 - adx
+    }
+    lowkey axx = 2 * adx
+    lowkey sx = 1
+    fr dx < 0 {
+        sx = -1
+    }
+    lowkey dy = by - ay
+    lowkey ady = dy
+    fr ady < 0 {
+        ady = 0 - ady
+    }
+    lowkey ayy = 2 * ady
+    lowkey sy = 1
+    fr dy < 0 {
+        sy = -1
+    }
+    lowkey x = ax
+    lowkey y = ay
+    lowkey col = (color & 255) as u8
+    holla g = gt in gs.gsc {
+        fr axx > ayy {
+            lowkey d = ayy - axx / 2
+            vibin nocap {
+                g.vid.scr0[y * fw + x] = col
+                fr x == bx {
+                    dip
+                }
+                fr d >= 0 {
+                    y = y + sy
+                    d = d - axx
+                }
+                x = x + sx
+                d = d + ayy
+            }
+        } naw {
+            lowkey d = axx - ayy / 2
+            vibin nocap {
+                g.vid.scr0[y * fw + x] = col
+                fr y == by {
+                    dip
+                }
+                fr d >= 0 {
+                    x = x + sx
+                    d = d - ayy
+                }
+                y = y + sy
+                d = d + axx
+            }
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// AM_drawMline — clip a map-coord segment, draw the visible part.
+flex finna drawMline(gt: tag gs.GameState, view: AmView, ax: i32, ay: i32, bx: i32, by: i32, color: int) {
+    lowkey ok, fax, fay, fbx, fby = clipMline(view, ax, ay, bx, by)
+    fr ok {
+        drawFline(gt, view.fw, view.fh, fax, fay, fbx, fby, color)
+    }
+}
+
+// ============================================================================================
+// AM_rotate — rotate a fixed-point point by angle `a` (finecosine[i] == finesine[i+2048]).
+// ============================================================================================
+flex finna amRotate(x: i32, y: i32, a: u32, finesine: []i32) -> (i32, i32) {
+    lowkey fi = (a >> 19) as int
+    lowkey sinv = finesine[fi]
+    lowkey cosv = finesine[fi + 2048]
+    lowkey nx = fixed.fixedMul(x, cosv) - fixed.fixedMul(y, sinv)
+    lowkey ny = fixed.fixedMul(x, sinv) + fixed.fixedMul(y, cosv)
+    bet nx, ny
+}
+
+// AM_drawLineCharacter — scale/rotate/translate a line-character (arrow/triangle) and draw it.
+// `lineData` is 4 ints per line (ax,ay,bx,by).
+flex finna drawLineCharacter(gt: tag gs.GameState, view: AmView, lineData: []i32, nlines: int, scale: i32, angle: u32, color: int, tx: i32, ty: i32, finesine: []i32) {
+    lowkey doScale = (scale as int) != 0
+    lowkey doRot = (angle as int) != 0
+    lowkey i = 0
+    vibin i < nlines {
+        lowkey ax = lineData[i * 4 + 0]
+        lowkey ay = lineData[i * 4 + 1]
+        lowkey bx = lineData[i * 4 + 2]
+        lowkey by = lineData[i * 4 + 3]
+        fr doScale {
+            ax = fixed.fixedMul(scale, ax)
+            ay = fixed.fixedMul(scale, ay)
+            bx = fixed.fixedMul(scale, bx)
+            by = fixed.fixedMul(scale, by)
+        }
+        fr doRot {
+            lowkey rax, ray = amRotate(ax, ay, angle, finesine)
+            ax = rax
+            ay = ray
+            lowkey rbx, rby = amRotate(bx, by, angle, finesine)
+            bx = rbx
+            by = rby
+        }
+        ax = ax + tx
+        ay = ay + ty
+        bx = bx + tx
+        by = by + ty
+        drawMline(gt, view, ax, ay, bx, by, color)
+        i = i + 1
+    }
+}
+
+// player_arrow (7 lines, 28 ints) built from R = (8*PLAYERRADIUS)/7 (id's macro-expanded coords).
+flex finna playerArrow() -> []i32 {
+    lowkey r: i32 = (8 * PLAYERRADIUS) / 7
+    lowkey r8: i32 = r / 8
+    lowkey r4: i32 = r / 4
+    lowkey r2: i32 = r / 2
+    lowkey r38: i32 = (3 * r) / 8
+    lowkey d = mem.slab[i32](28)
+    // { -R+R/8, 0 } -> { R, 0 }
+    d[0] = 0 - r + r8
+    d[1] = 0
+    d[2] = r
+    d[3] = 0
+    // { R, 0 } -> { R-R/2, R/4 }
+    d[4] = r
+    d[5] = 0
+    d[6] = r - r2
+    d[7] = r4
+    // { R, 0 } -> { R-R/2, -R/4 }
+    d[8] = r
+    d[9] = 0
+    d[10] = r - r2
+    d[11] = 0 - r4
+    // { -R+R/8, 0 } -> { -R-R/8, R/4 }
+    d[12] = 0 - r + r8
+    d[13] = 0
+    d[14] = 0 - r - r8
+    d[15] = r4
+    // { -R+R/8, 0 } -> { -R-R/8, -R/4 }
+    d[16] = 0 - r + r8
+    d[17] = 0
+    d[18] = 0 - r - r8
+    d[19] = 0 - r4
+    // { -R+3*R/8, 0 } -> { -R+R/8, R/4 }
+    d[20] = 0 - r + r38
+    d[21] = 0
+    d[22] = 0 - r + r8
+    d[23] = r4
+    // { -R+3*R/8, 0 } -> { -R+R/8, -R/4 }
+    d[24] = 0 - r + r38
+    d[25] = 0
+    d[26] = 0 - r + r8
+    d[27] = 0 - r4
+    bet d
+}
+
+// thintriangle_guy (3 lines) — R = FRACUNIT; used only when cheating==2 (AM_drawThings).
+flex finna thinTriangle() -> []i32 {
+    lowkey d = mem.slab[i32](12)
+    // { -.5R, -.7R } -> { R, 0 }
+    d[0] = -32768
+    d[1] = -45875
+    d[2] = 65536
+    d[3] = 0
+    // { R, 0 } -> { -.5R, .7R }
+    d[4] = 65536
+    d[5] = 0
+    d[6] = -32768
+    d[7] = 45875
+    // { -.5R, .7R } -> { -.5R, -.7R }
+    d[8] = -32768
+    d[9] = 45875
+    d[10] = -32768
+    d[11] = -45875
+    bet d
+}
+
+// ============================================================================================
+// scale save/restore/activate (AM_saveScaleAndLoc / restore / activateNewScale / min / max)
+// ============================================================================================
+flex finna saveScaleAndLoc(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.am.oldMx = g.am.mx
+        g.am.oldMy = g.am.my
+        g.am.oldMw = g.am.mw
+        g.am.oldMh = g.am.mh
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// AM_activateNewScale — recompute m_w/m_h from f_w/f_h at the current scale, re-center.
+flex finna activateNewScale(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.am.mx = g.am.mx + g.am.mw / 2
+        g.am.my = g.am.my + g.am.mh / 2
+        g.am.mw = ftomScale(g.am.fw as i32, g.am.ftom)
+        g.am.mh = ftomScale(g.am.fh as i32, g.am.ftom)
+        g.am.mx = g.am.mx - g.am.mw / 2
+        g.am.my = g.am.my - g.am.mh / 2
+        g.am.mx2 = g.am.mx + g.am.mw
+        g.am.my2 = g.am.my + g.am.mh
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna restoreScaleAndLoc(gt: tag gs.GameState) {
+    lowkey px = 0
+    lowkey py = 0
+    lowkey follow = cap
+    lowkey plrnum = 0
+    holla g = gt in gs.gsc {
+        follow = g.am.followplayer
+        plrnum = g.am.plrnum as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr follow {
+        lowkey rx, ry, rlive = playerPos(gt, plrnum)
+        px = rx
+        py = ry
+    }
+    holla g = gt in gs.gsc {
+        g.am.mw = g.am.oldMw
+        g.am.mh = g.am.oldMh
+        fr !g.am.followplayer {
+            g.am.mx = g.am.oldMx
+            g.am.my = g.am.oldMy
+        } naw {
+            g.am.mx = (px as i32) - g.am.mw / 2
+            g.am.my = (py as i32) - g.am.mh / 2
+        }
+        g.am.mx2 = g.am.mx + g.am.mw
+        g.am.my2 = g.am.my + g.am.mh
+        g.am.mScale = fixed.fixedDiv((g.am.fw as i32) << 16, g.am.mw)
+        g.am.ftom = fixed.fixedDiv(fixed.FRACUNIT, g.am.mScale)
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna minOutWindowScale(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.am.mScale = g.am.minScale
+        g.am.ftom = fixed.fixedDiv(fixed.FRACUNIT, g.am.mScale)
+    } ghosted {
+        yeet("gs")
+    }
+    activateNewScale(gt)
+}
+
+flex finna maxOutWindowScale(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.am.mScale = g.am.maxScale
+        g.am.ftom = fixed.fixedDiv(fixed.FRACUNIT, g.am.mScale)
+    } ghosted {
+        yeet("gs")
+    }
+    activateNewScale(gt)
+}
+
+// ============================================================================================
+// marks (AM_addMark / AM_clearMarks) — the fixed i32[10] ring (native-safe element writes)
+// ============================================================================================
+flex finna addMark(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        lowkey n = g.am.markpointnum as int
+        g.am.markX[n] = g.am.mx + g.am.mw / 2
+        g.am.markY[n] = g.am.my + g.am.mh / 2
+        g.am.markpointnum = ((n + 1) % AM_NUMMARKPOINTS) as i32
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna clearMarks(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        lowkey i = 0
+        vibin i < AM_NUMMARKPOINTS {
+            g.am.markX[i] = -1
+            i = i + 1
+        }
+        g.am.markpointnum = 0
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// ============================================================================================
+// player position helper — reads players[pnum].mo x/y (and whether the body exists).
+// ============================================================================================
+flex finna playerPos(gt: tag gs.GameState, pnum: int) -> (int, int, bool) {
+    lowkey x = 0
+    lowkey y = 0
+    lowkey live = cap
+    holla g = gt in gs.gsc {
+        holla m = g.shell.players[pnum].mo in gs.thinkers {
+            x = m.mobj.x as int
+            y = m.mobj.y as int
+            live = nocap
+        } ghosted {
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    bet x, y, live
+}
+
+flex finna playerAngle(gt: tag gs.GameState, pnum: int) -> u32 {
+    lowkey a: u32 = 0
+    holla g = gt in gs.gsc {
+        holla m = g.shell.players[pnum].mo in gs.thinkers {
+            a = m.mobj.angle
+        } ghosted {
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    bet a
+}
+
+// ============================================================================================
+// AM_findMinMaxBoundaries — level vertex bounds + zoom limits.
+// ============================================================================================
+flex finna findMinMaxBoundaries(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        lowkey minx: i32 = fixed.MAXINT
+        lowkey miny: i32 = fixed.MAXINT
+        lowkey maxx: i32 = 0 - fixed.MAXINT
+        lowkey maxy: i32 = 0 - fixed.MAXINT
+        lowkey n = g.level.numvertexes as int
+        lowkey i = 0
+        vibin i < n {
+            lowkey vx = g.level.vtxX[i]
+            lowkey vy = g.level.vtxY[i]
+            fr vx < minx {
+                minx = vx
+            } naw fr vx > maxx {
+                maxx = vx
+            }
+            fr vy < miny {
+                miny = vy
+            } naw fr vy > maxy {
+                maxy = vy
+            }
+            i = i + 1
+        }
+        g.am.minX = minx
+        g.am.minY = miny
+        g.am.maxX = maxx
+        g.am.maxY = maxy
+        g.am.maxW = maxx - minx
+        g.am.maxH = maxy - miny
+        lowkey a = fixed.fixedDiv((g.am.fw as i32) << 16, g.am.maxW)
+        lowkey b = fixed.fixedDiv((g.am.fh as i32) << 16, g.am.maxH)
+        fr a < b {
+            g.am.minScale = a
+        } naw {
+            g.am.minScale = b
+        }
+        g.am.maxScale = fixed.fixedDiv((g.am.fh as i32) << 16, 2 * PLAYERRADIUS)
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// AM_changeWindowLoc — apply the pan increment, clamp to the level bounds.
+flex finna changeWindowLoc(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        fr (g.am.panIncX as int) != 0 || (g.am.panIncY as int) != 0 {
+            g.am.followplayer = cap
+            g.am.oldLocX = fixed.MAXINT
+        }
+        g.am.mx = g.am.mx + g.am.panIncX
+        g.am.my = g.am.my + g.am.panIncY
+        fr g.am.mx + g.am.mw / 2 > g.am.maxX {
+            g.am.mx = g.am.maxX - g.am.mw / 2
+        } naw fr g.am.mx + g.am.mw / 2 < g.am.minX {
+            g.am.mx = g.am.minX - g.am.mw / 2
+        }
+        fr g.am.my + g.am.mh / 2 > g.am.maxY {
+            g.am.my = g.am.maxY - g.am.mh / 2
+        } naw fr g.am.my + g.am.mh / 2 < g.am.minY {
+            g.am.my = g.am.minY - g.am.mh / 2
+        }
+        g.am.mx2 = g.am.mx + g.am.mw
+        g.am.my2 = g.am.my + g.am.mh
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// ============================================================================================
+// AM_LevelInit / AM_initVariables / AM_Start / AM_Stop
+// ============================================================================================
+flex finna levelInit(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.am.leveljuststarted = 0
+        g.am.fx = 0
+        g.am.fy = 0
+        g.am.fw = doomdef.SCREENWIDTH as i32
+        g.am.fh = (doomdef.SCREENHEIGHT - 32) as i32
+    } ghosted {
+        yeet("gs")
+    }
+    clearMarks(gt)
+    findMinMaxBoundaries(gt)
+    holla g = gt in gs.gsc {
+        g.am.mScale = fixed.fixedDiv(g.am.minScale, SEVENTENTHS)
+        fr g.am.mScale > g.am.maxScale {
+            g.am.mScale = g.am.minScale
+        }
+        g.am.ftom = fixed.fixedDiv(fixed.FRACUNIT, g.am.mScale)
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna initVariables(gt: tag gs.GameState) {
+    // choose the player to center on (consoleplayer, else the first in-game player).
+    lowkey pnum = 0
+    holla g = gt in gs.gsc {
+        pnum = g.shell.consoleplayer as int
+        fr !g.shell.playeringame[pnum] {
+            lowkey p = 0
+            vibin p < doomdef.MAXPLAYERS {
+                fr g.shell.playeringame[p] {
+                    pnum = p
+                    dip
+                }
+                p = p + 1
+            }
+        }
+        g.am.active = nocap
+        g.shell.automapactive = nocap
+        g.am.oldLocX = fixed.MAXINT
+        g.am.amclock = 0
+        g.am.lightlev = 0
+        g.am.panIncX = 0
+        g.am.panIncY = 0
+        g.am.ftomZoom = fixed.FRACUNIT
+        g.am.mtofZoom = fixed.FRACUNIT
+        g.am.mw = ftomScale(g.am.fw as i32, g.am.ftom)
+        g.am.mh = ftomScale(g.am.fh as i32, g.am.ftom)
+        g.am.plrnum = pnum as i32
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey px, py, haveMo = playerPos(gt, pnum)
+    holla g = gt in gs.gsc {
+        g.am.mx = (px as i32) - g.am.mw / 2
+        g.am.my = (py as i32) - g.am.mh / 2
+    } ghosted {
+        yeet("gs")
+    }
+    changeWindowLoc(gt)
+    holla g = gt in gs.gsc {
+        g.am.oldMx = g.am.mx
+        g.am.oldMy = g.am.my
+        g.am.oldMw = g.am.mw
+        g.am.oldMh = g.am.mh
+    } ghosted {
+        yeet("gs")
+    }
+    // SEAM: ST_Responder(ev_keyup, AM_MSGENTERED) — status-bar automap-header notify (st filter).
+}
+
+// AM_Stop — leave the automap.
+flex finna amStop(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.am.active = cap
+        g.shell.automapactive = cap
+        g.am.stopped = nocap
+    } ghosted {
+        yeet("gs")
+    }
+    // SEAM: ST_Responder(ev_keyup, AM_MSGEXITED).
+}
+
+// AM_Start — (re)enter the automap; re-init geometry on a level change.
+flex finna amStart(gt: tag gs.GameState) {
+    lowkey wasStopped = cap
+    lowkey needInit = cap
+    holla g = gt in gs.gsc {
+        wasStopped = g.am.stopped
+        needInit = g.am.lastlevel as int != g.shell.gamemap as int || g.am.lastepisode as int != g.shell.gameepisode as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr !wasStopped {
+        amStop(gt)
+    }
+    holla g = gt in gs.gsc {
+        g.am.stopped = cap
+    } ghosted {
+        yeet("gs")
+    }
+    fr needInit {
+        levelInit(gt)
+        holla g = gt in gs.gsc {
+            g.am.lastlevel = g.shell.gamemap
+            g.am.lastepisode = g.shell.gameepisode
+        } ghosted {
+            yeet("gs")
+        }
+    }
+    initVariables(gt)
+    // AM_loadPics is a seam: the AMMNUM mark patches are looked up on demand in AM_drawMarks.
+}
+
+// ============================================================================================
+// AM_Responder — pan/zoom/follow/grid/mark keys + the iddt cheat. evType 0=keydown, 1=keyup.
+// ============================================================================================
+flex finna amCheatSeq() -> []u8 {
+    lowkey s = mem.slab[u8](5)
+    s[0] = 0xb2 as u8
+    s[1] = 0x26 as u8
+    s[2] = 0x26 as u8
+    s[3] = 0x2e as u8
+    s[4] = 0xff as u8
+    bet s
+}
+
+flex finna amResponder(gt: tag gs.GameState, evType: int, key: int) -> bool {
+    lowkey active = cap
+    lowkey follow = cap
+    lowkey deathmatch = 0
+    holla g = gt in gs.gsc {
+        active = g.am.active
+        follow = g.am.followplayer
+        deathmatch = g.shell.deathmatch as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey rc = cap
+
+    fr !active {
+        fr evType == 0 && key == AM_STARTKEY {
+            amStart(gt)
+            holla g = gt in gs.gsc {
+                g.shell.viewactive = cap
+            } ghosted {
+                yeet("gs")
+            }
+            rc = nocap
+        }
+        bet rc
+    }
+
+    fr evType == 0 {
+        rc = nocap
+        fr key == doomdef.KEY_RIGHTARROW {
+            fr !follow {
+                setPanIncX(gt, ftomInc(gt, F_PANINC))
+            } naw {
+                rc = cap
+            }
+        } naw fr key == doomdef.KEY_LEFTARROW {
+            fr !follow {
+                setPanIncX(gt, 0 - ftomInc(gt, F_PANINC))
+            } naw {
+                rc = cap
+            }
+        } naw fr key == doomdef.KEY_UPARROW {
+            fr !follow {
+                setPanIncY(gt, ftomInc(gt, F_PANINC))
+            } naw {
+                rc = cap
+            }
+        } naw fr key == doomdef.KEY_DOWNARROW {
+            fr !follow {
+                setPanIncY(gt, 0 - ftomInc(gt, F_PANINC))
+            } naw {
+                rc = cap
+            }
+        } naw fr key == AM_ZOOMOUTKEY {
+            setZoom(gt, M_ZOOMOUT, M_ZOOMIN)
+        } naw fr key == AM_ZOOMINKEY {
+            setZoom(gt, M_ZOOMIN, M_ZOOMOUT)
+        } naw fr key == AM_STARTKEY {          // AM_ENDKEY == AM_STARTKEY: leave
+            holla g = gt in gs.gsc {
+                g.am.bigstate = 0
+                g.shell.viewactive = nocap
+            } ghosted {
+                yeet("gs")
+            }
+            amStop(gt)
+        } naw fr key == AM_GOBIGKEY {
+            lowkey big = 0
+            holla g = gt in gs.gsc {
+                g.am.bigstate = (1 - g.am.bigstate as int) as i32
+                big = g.am.bigstate as int
+            } ghosted {
+                yeet("gs")
+            }
+            fr big != 0 {
+                saveScaleAndLoc(gt)
+                minOutWindowScale(gt)
+            } naw {
+                restoreScaleAndLoc(gt)
+            }
+        } naw fr key == AM_FOLLOWKEY {
+            lowkey nf = cap
+            holla g = gt in gs.gsc {
+                g.am.followplayer = !g.am.followplayer
+                nf = g.am.followplayer
+                g.am.oldLocX = fixed.MAXINT
+                fr g.am.followplayer {
+                    g.shell.players[g.shell.consoleplayer].message = strings.AMSTR_FOLLOWON
+                } naw {
+                    g.shell.players[g.shell.consoleplayer].message = strings.AMSTR_FOLLOWOFF
+                }
+            } ghosted {
+                yeet("gs")
+            }
+        } naw fr key == AM_GRIDKEY {
+            holla g = gt in gs.gsc {
+                g.am.grid = !g.am.grid
+                fr g.am.grid {
+                    g.shell.players[g.shell.consoleplayer].message = strings.AMSTR_GRIDON
+                } naw {
+                    g.shell.players[g.shell.consoleplayer].message = strings.AMSTR_GRIDOFF
+                }
+            } ghosted {
+                yeet("gs")
+            }
+        } naw fr key == AM_MARKKEY {
+            holla g = gt in gs.gsc {
+                g.shell.players[g.shell.consoleplayer].message = strings.AMSTR_MARKEDSPOT
+            } ghosted {
+                yeet("gs")
+            }
+            addMark(gt)
+        } naw fr key == AM_CLEARMARKKEY {
+            clearMarks(gt)
+            holla g = gt in gs.gsc {
+                g.shell.players[g.shell.consoleplayer].message = strings.AMSTR_MARKSCLEARED
+            } ghosted {
+                yeet("gs")
+            }
+        } naw {
+            rc = cap
+        }
+        // iddt cheat (deathmatch-gated): cycles cheating 0->1->2->0.
+        fr deathmatch == 0 {
+            lowkey pos = 0
+            holla g = gt in gs.gsc {
+                pos = g.am.amCheatPos as int
+            } ghosted {
+                yeet("gs")
+            }
+            lowkey res = cheat.checkCheat(amCheatSeq(), pos, key)
+            holla g = gt in gs.gsc {
+                g.am.amCheatPos = res.p as i32
+                fr res.rc == 1 {
+                    rc = cap
+                    g.am.cheating = ((g.am.cheating as int + 1) % 3) as i32
+                }
+            } ghosted {
+                yeet("gs")
+            }
+        }
+        bet rc
+    }
+
+    fr evType == 1 {
+        rc = cap
+        fr key == doomdef.KEY_RIGHTARROW || key == doomdef.KEY_LEFTARROW {
+            fr !follow {
+                setPanIncX(gt, 0)
+            }
+        } naw fr key == doomdef.KEY_UPARROW || key == doomdef.KEY_DOWNARROW {
+            fr !follow {
+                setPanIncY(gt, 0)
+            }
+        } naw fr key == AM_ZOOMOUTKEY || key == AM_ZOOMINKEY {
+            setZoom(gt, fixed.FRACUNIT, fixed.FRACUNIT)
+        }
+        bet rc
+    }
+
+    bet rc
+}
+
+// ftom of a small frame increment (FTOM(F_PANINC)) at the current scale.
+flex finna ftomInc(gt: tag gs.GameState, v: int) -> int {
+    lowkey f: i32 = 0
+    holla g = gt in gs.gsc {
+        f = g.am.ftom
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey vi: i32 = v as i32
+    bet ftomScale(vi, f) as int
+}
+flex finna setPanIncX(gt: tag gs.GameState, v: int) {
+    holla g = gt in gs.gsc {
+        g.am.panIncX = v as i32
+    } ghosted {
+        yeet("gs")
+    }
+}
+flex finna setPanIncY(gt: tag gs.GameState, v: int) {
+    holla g = gt in gs.gsc {
+        g.am.panIncY = v as i32
+    } ghosted {
+        yeet("gs")
+    }
+}
+flex finna setZoom(gt: tag gs.GameState, mtofZ: i32, ftomZ: i32) {
+    holla g = gt in gs.gsc {
+        g.am.mtofZoom = mtofZ
+        g.am.ftomZoom = ftomZ
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// ============================================================================================
+// AM_Ticker — follow / zoom / pan animation.
+// ============================================================================================
+flex finna changeWindowScale(gt: tag gs.GameState) {
+    lowkey below = cap
+    lowkey above = cap
+    holla g = gt in gs.gsc {
+        g.am.mScale = fixed.fixedMul(g.am.mScale, g.am.mtofZoom)
+        g.am.ftom = fixed.fixedDiv(fixed.FRACUNIT, g.am.mScale)
+        below = g.am.mScale < g.am.minScale
+        above = g.am.mScale > g.am.maxScale
+    } ghosted {
+        yeet("gs")
+    }
+    fr below {
+        minOutWindowScale(gt)
+    } naw fr above {
+        maxOutWindowScale(gt)
+    } naw {
+        activateNewScale(gt)
+    }
+}
+
+flex finna doFollowPlayer(gt: tag gs.GameState) {
+    lowkey plrnum = 0
+    holla g = gt in gs.gsc {
+        plrnum = g.am.plrnum as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey px, py, haveMo = playerPos(gt, plrnum)
+    holla g = gt in gs.gsc {
+        fr g.am.oldLocX as int != px || g.am.oldLocY as int != py {
+            // m_x = FTOM(MTOF(px)) - m_w/2 (snap to a frame-pixel grid)
+            g.am.mx = ftomScale(mtofScale(px as i32, g.am.mScale) as i32, g.am.ftom) - g.am.mw / 2
+            g.am.my = ftomScale(mtofScale(py as i32, g.am.mScale) as i32, g.am.ftom) - g.am.mh / 2
+            g.am.mx2 = g.am.mx + g.am.mw
+            g.am.my2 = g.am.my + g.am.mh
+            g.am.oldLocX = px as i32
+            g.am.oldLocY = py as i32
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna amTicker(gt: tag gs.GameState) {
+    lowkey active = cap
+    lowkey follow = cap
+    lowkey zooming = cap
+    lowkey panning = cap
+    holla g = gt in gs.gsc {
+        active = g.am.active
+    } ghosted {
+        yeet("gs")
+    }
+    fr !active {
+        bet
+    }
+    holla g = gt in gs.gsc {
+        g.am.amclock = g.am.amclock + 1
+        follow = g.am.followplayer
+        zooming = g.am.ftomZoom != fixed.FRACUNIT
+        panning = (g.am.panIncX as int) != 0 || (g.am.panIncY as int) != 0
+    } ghosted {
+        yeet("gs")
+    }
+    fr follow {
+        doFollowPlayer(gt)
+    }
+    fr zooming {
+        changeWindowScale(gt)
+    }
+    fr panning {
+        changeWindowLoc(gt)
+    }
+}
+
+// ============================================================================================
+// AM_Drawer + the sub-drawers
+// ============================================================================================
+// clear the automap window in scr0 to BACKGROUND.
+flex finna clearFB(gt: tag gs.GameState, color: int, fw: int, fh: int) {
+    lowkey c = (color & 255) as u8
+    holla g = gt in gs.gsc {
+        lowkey n = fw * fh
+        lowkey i = 0
+        vibin i < n {
+            g.vid.scr0[i] = c
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// AM_drawGrid — flat-aligned grid lines (id AM_drawGrid).
+flex finna drawGrid(gt: tag gs.GameState, view: AmView, color: int) {
+    lowkey bmapOrgX = 0
+    lowkey bmapOrgY = 0
+    holla g = gt in gs.gsc {
+        bmapOrgX = g.level.bmapOrgX as int
+        bmapOrgY = g.level.bmapOrgY as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey block = MAPBLOCKUNITS_FRAC as int
+    // vertical gridlines
+    lowkey start = view.mx as int
+    lowkey rem = (start - bmapOrgX) % block
+    fr rem != 0 {
+        start = start + (block - rem)
+    }
+    lowkey end = view.mx as int + fwMapW(view)
+    lowkey x = start
+    vibin x < end {
+        drawMline(gt, view, x as i32, view.my, x as i32, view.my2, color)
+        x = x + block
+    }
+    // horizontal gridlines
+    start = view.my as int
+    rem = (start - bmapOrgY) % block
+    fr rem != 0 {
+        start = start + (block - rem)
+    }
+    end = view.my as int + fhMapH(view)
+    lowkey y = start
+    vibin y < end {
+        drawMline(gt, view, view.mx, y as i32, view.mx2, y as i32, color)
+        y = y + block
+    }
+}
+
+// helpers so drawGrid can read m_w/m_h (== mx2-mx, my2-my) off the view.
+flex finna fwMapW(view: AmView) -> int {
+    bet (view.mx2 - view.mx) as int
+}
+flex finna fhMapH(view: AmView) -> int {
+    bet (view.my2 - view.my) as int
+}
+
+// AM_drawWalls — the linedef map (color by two-sided / secret / floor-diff / ceil-diff / teleport).
+flex finna drawWalls(gt: tag gs.GameState, view: AmView, cheating: int) {
+    lowkey numlines = 0
+    holla g = gt in gs.gsc {
+        numlines = g.level.numlines as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey lightlev = view.lightlev
+    lowkey i = 0
+    vibin i < numlines {
+        lowkey ax = 0
+        lowkey ay = 0
+        lowkey bx = 0
+        lowkey by = 0
+        lowkey flags = 0
+        lowkey special = 0
+        lowkey back = -1
+        lowkey front = -1
+        lowkey allmap = 0
+        lowkey backF = 0
+        lowkey frontF = 0
+        lowkey backC = 0
+        lowkey frontC = 0
+        holla g = gt in gs.gsc {
+            lowkey v1 = g.level.lineV1[i] as int
+            lowkey v2 = g.level.lineV2[i] as int
+            ax = g.level.vtxX[v1] as int
+            ay = g.level.vtxY[v1] as int
+            bx = g.level.vtxX[v2] as int
+            by = g.level.vtxY[v2] as int
+            flags = g.level.lineFlags[i] as int
+            special = g.level.lineSpecial[i] as int
+            back = g.level.lineBack[i] as int
+            front = g.level.lineFront[i] as int
+            allmap = g.shell.players[g.shell.consoleplayer].powers[doomdef.PW_ALLMAP] as int
+            fr back != -1 {
+                backF = g.level.secFloorH[back] as int
+                backC = g.level.secCeilH[back] as int
+            }
+            fr front != -1 {
+                frontF = g.level.secFloorH[front] as int
+                frontC = g.level.secCeilH[front] as int
+            }
+        } ghosted {
+            yeet("gs")
+        }
+        lowkey a = ax as i32
+        lowkey a2 = ay as i32
+        lowkey b = bx as i32
+        lowkey b2 = by as i32
+        fr cheating != 0 || (flags & doomdef.ML_MAPPED) != 0 {
+            fr (flags & LINE_NEVERSEE) != 0 && cheating == 0 {
+                // never-see line, not cheating: skip
+            } naw fr back == -1 {
+                drawMline(gt, view, a, a2, b, b2, WALLCOLORS + lightlev)
+            } naw fr special == 39 {
+                drawMline(gt, view, a, a2, b, b2, WALLCOLORS + WALLRANGE / 2)
+            } naw fr (flags & doomdef.ML_SECRET) != 0 {
+                fr cheating != 0 {
+                    drawMline(gt, view, a, a2, b, b2, SECRETWALLCOLORS + lightlev)
+                } naw {
+                    drawMline(gt, view, a, a2, b, b2, WALLCOLORS + lightlev)
+                }
+            } naw fr backF != frontF {
+                drawMline(gt, view, a, a2, b, b2, FDWALLCOLORS + lightlev)
+            } naw fr backC != frontC {
+                drawMline(gt, view, a, a2, b, b2, CDWALLCOLORS + lightlev)
+            } naw fr cheating != 0 {
+                drawMline(gt, view, a, a2, b, b2, TSWALLCOLORS + lightlev)
+            }
+        } naw fr allmap != 0 {
+            fr (flags & LINE_NEVERSEE) == 0 {
+                drawMline(gt, view, a, a2, b, b2, GRAYS + 3)
+            }
+        }
+        i = i + 1
+    }
+}
+
+// AM_drawPlayers — the player arrow(s). Single-player: one WHITE arrow at the console player.
+flex finna drawPlayers(gt: tag gs.GameState, view: AmView, cheating: int, finesine: []i32) {
+    lowkey plrnum = 0
+    lowkey netgame = cap
+    holla g = gt in gs.gsc {
+        plrnum = g.am.plrnum as int
+        netgame = g.shell.netgame
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey px, py, haveMo = playerPos(gt, plrnum)
+    lowkey ang = playerAngle(gt, plrnum)
+    fr !netgame {
+        lowkey arrow = playerArrow()
+        drawLineCharacter(gt, view, arrow, 7, 0, ang, WHITE, px as i32, py as i32, finesine)
+    }
+    // netgame per-player arrows omitted (single-player port).
+}
+
+// AM_drawThings — small triangles at every mobj (only when cheating==2).
+flex finna drawThings(gt: tag gs.GameState, view: AmView, colors: int, finesine: []i32) {
+    lowkey numsectors = 0
+    holla g = gt in gs.gsc {
+        numsectors = g.level.numsectors as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey tri = thinTriangle()
+    lowkey lightlev = view.lightlev
+    lowkey s = 0
+    vibin s < numsectors {
+        lowkey cur: tag think.Thinker = ghosted
+        holla g = gt in gs.gsc {
+            cur = g.level.secLinks[s].thinglist
+        } ghosted {
+            yeet("gs")
+        }
+        vibin !(cur == ghosted) {
+            lowkey tx = 0
+            lowkey ty = 0
+            lowkey ta: u32 = 0
+            lowkey nxt: tag think.Thinker = ghosted
+            holla g = gt in gs.gsc {
+                holla m = cur in gs.thinkers {
+                    tx = m.mobj.x as int
+                    ty = m.mobj.y as int
+                    ta = m.mobj.angle
+                    nxt = m.mobj.snext
+                } ghosted {
+                }
+            } ghosted {
+                yeet("gs")
+            }
+            drawLineCharacter(gt, view, tri, 3, 16 << 16, ta, colors + lightlev, tx as i32, ty as i32, finesine)
+            cur = nxt
+        }
+        s = s + 1
+    }
+}
+
+// AM_drawMarks — the AMMNUM patches at each live mark.
+flex finna drawMarks(gt: tag gs.GameState, view: AmView) {
+    lowkey i = 0
+    vibin i < AM_NUMMARKPOINTS {
+        lowkey mxv = 0
+        lowkey myv = 0
+        holla g = gt in gs.gsc {
+            mxv = g.am.markX[i] as int
+            myv = g.am.markY[i] as int
+        } ghosted {
+            yeet("gs")
+        }
+        fr mxv != -1 {
+            lowkey fx = cxmtof(view, mxv as i32)
+            lowkey fy = cymtof(view, myv as i32)
+            fr fx >= view.fx && fx <= view.fw - 5 && fy >= view.fy && fy <= view.fh - 6 {
+                lowkey ofs = wad.lumpNameOfs(gt, markName(i))
+                vv.drawPatch(gt, fx, fy, 0, ofs)
+            }
+        }
+        i = i + 1
+    }
+}
+
+// "AMMNUM<d>"
+flex finna markName(i: int) -> str {
+    lowkey buf = mem.slab[u8](7)
+    buf[0] = 65   // A
+    buf[1] = 77   // M
+    buf[2] = 77   // M
+    buf[3] = 78   // N
+    buf[4] = 85   // U
+    buf[5] = 77   // M
+    buf[6] = (48 + i % 10) as u8
+    bet str.fromBytesTrust(buf)
+}
+
+// AM_drawCrosshair — a single center dot.
+flex finna drawCrosshair(gt: tag gs.GameState, view: AmView, color: int) {
+    lowkey idx = (view.fw * (view.fh + 1)) / 2
+    lowkey c = (color & 255) as u8
+    holla g = gt in gs.gsc {
+        g.vid.scr0[idx] = c
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// snapshot the view transform.
+flex finna makeView(gt: tag gs.GameState) -> AmView {
+    lowkey v = AmView{ mx: 0, my: 0, mx2: 0, my2: 0, fx: 0, fy: 0, fw: 0, fh: 0, scaleMtof: 0, lightlev: 0 }
+    holla g = gt in gs.gsc {
+        v.mx = g.am.mx
+        v.my = g.am.my
+        v.mx2 = g.am.mx2
+        v.my2 = g.am.my2
+        v.fx = g.am.fx as int
+        v.fy = g.am.fy as int
+        v.fw = g.am.fw as int
+        v.fh = g.am.fh as int
+        v.scaleMtof = g.am.mScale
+        v.lightlev = g.am.lightlev as int
+    } ghosted {
+        yeet("gs")
+    }
+    bet v
+}
+
+flex finna amDrawer(gt: tag gs.GameState) {
+    lowkey active = cap
+    lowkey grid = cap
+    lowkey cheating = 0
+    holla g = gt in gs.gsc {
+        active = g.am.active
+        grid = g.am.grid
+        cheating = g.am.cheating as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr !active {
+        bet
+    }
+    lowkey view = makeView(gt)
+    lowkey finesine = mem.slab[i32](0)
+    holla g = gt in gs.gsc {
+        finesine = g.info.finesine
+    } ghosted {
+        yeet("gs")
+    }
+    clearFB(gt, BACKGROUND, view.fw, view.fh)
+    fr grid {
+        drawGrid(gt, view, GRIDCOLORS)
+    }
+    drawWalls(gt, view, cheating)
+    drawPlayers(gt, view, cheating, finesine)
+    fr cheating == 2 {
+        drawThings(gt, view, THINGCOLORS, finesine)
+    }
+    drawCrosshair(gt, view, XHAIRCOLORS)
+    drawMarks(gt, view)
+    vv.markRect(gt, view.fx, view.fy, view.fw, view.fh)
+}

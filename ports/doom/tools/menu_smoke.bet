@@ -1,0 +1,220 @@
+// tools/menu_smoke.bet — the P2.9b MENU + AUTOMAP proof. Cops a GameState, gsInit, fills the
+// generated tables, loads the shareware IWAD, HU_Init (menu font) + M_Init, then drives a scripted
+// key sequence through M_Responder / M_Drawer and crc32s scr0 at each menu state. Then R_InitData +
+// P_SetupLevel(E1M1) + AM_Start and crc32s the automap of E1M1 (fresh, and with the iddt cheat that
+// draws every wall). All CRCs are self-consistency baselines (deterministic given doom1.wad),
+// committed as goldens/menu.golden.
+//
+// Build+run NATIVE (headless — gg.play is a no-op; the interp clones arrays per element read at
+// WAD scale, intractable, like the other WAD smokes):
+//   export LLVM_SYS_180_PREFIX=/opt/homebrew/opt/llvm@18; export LIBRARY_PATH="/opt/homebrew/lib:$LIBRARY_PATH"
+//   cargo build -p driver --features llvm
+//   ./target/debug/bet build ports/doom/tools/menu_smoke.bet --runtime real -o /tmp/menu_smoke
+//   BET_GG_HEADLESS=1 /tmp/menu_smoke
+pull "spill"
+pull "mem"
+pull "str"
+pull "../defs/gs" as gs
+pull "../defs/info" as info
+pull "../defs/sounds" as sounds
+pull "../defs/tables" as tables
+pull "../defs/doomdef" as doomdef
+pull "../util/m_random" as rnd
+pull "../w/w_wad" as wad
+pull "../r/r_data" as rdata
+pull "../p/p_setup" as psetup
+pull "../s/s_sound" as ssnd
+pull "../hu/hu_stuff" as hu
+pull "../m/m_menu" as menu
+pull "../am/am_map" as am
+
+// ---- crc32 (IEEE reflected, poly 0xEDB88320) over scr0 (same as renderworld_smoke) ----------
+flex finna hex8(v: int) -> str {
+    lowkey val = v & 4294967295
+    lowkey buf = mem.slab[u8](8)
+    lowkey i = 0
+    vibin i < 8 {
+        lowkey nib = val >> 28 - i * 4 & 15
+        fr nib < 10 {
+            buf[i] = (48 + nib) as u8
+        } naw {
+            buf[i] = (87 + nib) as u8
+        }
+        i = i + 1
+    }
+    bet str.fromBytesTrust(buf)
+}
+
+flex finna crcTable() -> []i32 {
+    lowkey tbl = mem.slab[i32](256)
+    lowkey i = 0
+    vibin i < 256 {
+        lowkey c = i
+        lowkey k = 0
+        vibin k < 8 {
+            lowkey lsb = c & 1
+            c = c >> 1
+            fr lsb != 0 {
+                c = c ^ 3988292384
+            }
+            k = k + 1
+        }
+        tbl[i] = c as i32
+        i = i + 1
+    }
+    bet tbl
+}
+
+flex finna crc32Scr0(gt: tag gs.GameState, tbl: []i32) -> int {
+    lowkey crc = 4294967295
+    holla g = gt in gs.gsc {
+        lowkey i = 0
+        vibin i < 64000 {
+            lowkey byte = g.vid.scr0[i] as int
+            crc = crc >> 8 ^ tbl[(crc ^ byte) & 255] as int & 4294967295
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    bet (crc ^ 4294967295) & 4294967295
+}
+
+// clear scr0 to 0 (so a menu CRC reflects only the menu graphics, not stale render content).
+flex finna clearScr0(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        lowkey i = 0
+        vibin i < 64000 {
+            g.vid.scr0[i] = 0
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna countNonzero(gt: tag gs.GameState) -> int {
+    lowkey n = 0
+    holla g = gt in gs.gsc {
+        lowkey i = 0
+        vibin i < 64000 {
+            fr g.vid.scr0[i] as int != 0 {
+                n = n + 1
+            }
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    bet n
+}
+
+finna main() {
+    lowkey g0 = cop gs.GameState{} in gs.gsc
+    gs.gsInit(g0)
+
+    // generated data tables + RNG table (menu SFX go through S_StartSound -> M_Random pitch jitter).
+    holla g = g0 in gs.gsc {
+        info.initStatesAll(g.info.states)
+        info.initMobjinfoAll(g.info.mobjinfo)
+        sounds.initSfxAll(g.info.sfx)
+        g.info.finesine = tables.initFinesineAll(g.info.finesine)
+        g.info.finetangent = tables.initFinetangentAll(g.info.finetangent)
+        g.info.tantoangle = tables.initTantoangleAll(g.info.tantoangle)
+        g.tick.rndtable = rnd.initRndtable(g.tick.rndtable)
+        // single-player shareware shell
+        g.shell.gamemode = doomdef.GM_SHAREWARE as i32
+        g.shell.gameepisode = 1
+        g.shell.gamemap = 1
+        g.shell.consoleplayer = 0
+        g.shell.displayplayer = 0
+        g.shell.playeringame[0] = nocap
+        g.shell.netgame = cap
+        g.shell.deathmatch = 0
+        g.shell.nomonsters = cap
+        g.shell.gamestate = doomdef.GS_LEVEL as i32
+        g.shell.usergame = nocap
+        g.am.stopped = nocap
+        g.am.lastlevel = -1
+        g.am.lastepisode = -1
+    } ghosted {
+        yeet("gs")
+    }
+    rnd.clearRandom(g0)
+
+    wad.initWad(g0, "/Users/lukebaggett/Documents/bet/doom-reference/doom1.wad")
+    ssnd.sInit(g0, 8, 8)          // set the sfx/music volumes (menu nav plays UI sounds)
+    hu.huInit(g0)                 // load the HU_FONT (menu M_WriteText / message prompts)
+    menu.mInit(g0)
+
+    lowkey ctab = crcTable()
+
+    // ---- Phase A: menu navigation --------------------------------------------------------------
+    // open the control panel (ESC): main menu, skull on New Game.
+    menu.mResponder(g0, 0, doomdef.KEY_ESCAPE)
+    clearScr0(g0)
+    menu.mDrawer(g0)
+    lowkey crcMain = crc32Scr0(g0, ctab)
+    lowkey nzMain = countNonzero(g0)
+
+    // ENTER on New Game -> Episode select.
+    menu.mResponder(g0, 0, doomdef.KEY_ENTER)
+    clearScr0(g0)
+    menu.mDrawer(g0)
+    lowkey crcEpisode = crc32Scr0(g0, ctab)
+
+    // ENTER on Episode 1 -> Skill select (skull defaults to Hurt Me Plenty = item 2).
+    menu.mResponder(g0, 0, doomdef.KEY_ENTER)
+    clearScr0(g0)
+    menu.mDrawer(g0)
+    lowkey crcSkill = crc32Scr0(g0, ctab)
+
+    // DOWN from skill (wraps 2 -> 3 Ultra-Violence).
+    menu.mResponder(g0, 0, doomdef.KEY_DOWNARROW)
+    clearScr0(g0)
+    menu.mDrawer(g0)
+    lowkey crcSkillDown = crc32Scr0(g0, ctab)
+
+    // ESC closes the menu; F10 raises the QUIT message prompt (centered text, M_WriteText).
+    menu.mResponder(g0, 0, doomdef.KEY_ESCAPE)
+    menu.mResponder(g0, 0, doomdef.KEY_F10)
+    clearScr0(g0)
+    menu.mDrawer(g0)
+    lowkey crcQuit = crc32Scr0(g0, ctab)
+    lowkey nzQuit = countNonzero(g0)
+
+    // 'n' answers the prompt (no-quit): message clears, menu closes.
+    menu.mResponder(g0, 0, 110)
+
+    spill.f("MENU main=0x{} nz={} episode=0x{} skill=0x{} skillDown=0x{} quit=0x{} nzQuit={}\n",
+        hex8(crcMain), hex8(nzMain), hex8(crcEpisode), hex8(crcSkill), hex8(crcSkillDown), hex8(crcQuit), hex8(nzQuit))
+
+    // ---- Phase B: automap over real E1M1 geometry ----------------------------------------------
+    rdata.initData(g0)
+    psetup.setupLevel(g0, 1, 1, doomdef.SK_HARD)
+
+    // AM_Start + a fresh automap frame (crosshair + player arrow; no walls mapped yet).
+    am.amStart(g0)
+    am.amDrawer(g0)
+    lowkey crcAmFresh = crc32Scr0(g0, ctab)
+    lowkey nzAmFresh = countNonzero(g0)
+
+    // iddt: draw every wall with the full color logic.
+    holla g = g0 in gs.gsc {
+        g.am.cheating = 1
+    } ghosted {
+        yeet("gs")
+    }
+    am.amDrawer(g0)
+    lowkey crcAmIddt = crc32Scr0(g0, ctab)
+    lowkey nzAmIddt = countNonzero(g0)
+
+    // a few ticks of automap animation (follow player), then redraw — exercises AM_Ticker.
+    am.amTicker(g0)
+    am.amTicker(g0)
+    am.amDrawer(g0)
+    lowkey crcAmTick = crc32Scr0(g0, ctab)
+
+    spill.f("AUTOMAP fresh=0x{} nz={} iddt=0x{} nz={} tick=0x{}\n",
+        hex8(crcAmFresh), hex8(nzAmFresh), hex8(crcAmIddt), hex8(nzAmIddt), hex8(crcAmTick))
+}
