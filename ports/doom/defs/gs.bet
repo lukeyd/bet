@@ -805,6 +805,15 @@ flex drip AmState {
     flex markY: i32[10]          // mark ring y
 }
 
+// ---- WiState (wi_stuff intermission). -----------------------------------------------------
+// P2.9c amendment (additive, wi_stuff.c): the base fields (state/acceleratestage/cnt/bcnt/
+// cntTime/cntPar/cntTotal/spstate + cntKills/cntItems/cntSecret[MAXPLAYERS]) are id's
+// stateenum_t state / acceleratestage / cnt / bcnt / cnt_time / cnt_par / sp_state / cnt_*[].
+// The lower block adds the remaining wi_stuff.c file-statics (me/cnt_pause/dm_state/ng_state/
+// dofrags/snl_pointeron/cnt_frags/dm_frags/dm_totals), the per-anim mutable animation state
+// (mutable globals don't lower native; anim geometry is module data, see wi_stuff.bet), and the
+// loaded intermission graphics as byte offsets into g.wad.buf (set once by WI_loadData; the
+// []i32 handle tables are mem.slab-allocated there, null until then).
 flex drip WiState {
     flex state: i32
     flex acceleratestage: i32
@@ -817,13 +826,74 @@ flex drip WiState {
     flex cntKills: i32[4]
     flex cntItems: i32[4]
     flex cntSecret: i32[4]
+    // ---- P2.9c additive statics ------------------------------------------------------------
+    flex me: i32                   // wbs->pnum (this player index)
+    flex cntPause: i32             // cnt_pause
+    flex dmState: i32              // dm_state
+    flex ngState: i32              // ng_state
+    flex dofrags: i32              // dofrags (0/1)
+    flex snlPointeron: bool        // snl_pointeron (the "You Are Here" flash)
+    flex cntFrags: i32[4]          // cnt_frags[MAXPLAYERS]
+    flex dmFrags: i32[16]          // dm_frags[MAXPLAYERS][MAXPLAYERS] as [i*4 + j]
+    flex dmTotals: i32[4]          // dm_totals[MAXPLAYERS]
+    flex loaded: bool              // WI_loadData has run (graphics offsets valid)
+    // animated-background per-anim mutable state (MAXANIMS=10 across episodes 0-2). anim geometry
+    // (type/period/nanims/loc/data1) is module data in wi_stuff.bet; only the mutable ctr/nexttic/
+    // state/lastdrawn + the loaded frame patch offsets live here.
+    flex animNexttic: i32[10]
+    flex animCtr: i32[10]
+    flex animState: i32[10]
+    flex animLastdrawn: i32[10]
+    flex animP: i32[30]            // loaded frame patch offsets (10 anims * up to 3 frames)
+    // loaded graphics (byte offsets into g.wad.buf; set by WI_loadData)
+    flex bgOfs: i32                // WIMAP<epsd> background (drawn into scr1, slammed to scr0)
+    flex splatOfs: i32             // WISPLAT
+    flex percentOfs: i32           // WIPCNT
+    flex colonOfs: i32             // WICOLON
+    flex wiminusOfs: i32           // WIMINUS
+    flex finishedOfs: i32          // WIF "finished"
+    flex enteringOfs: i32          // WIENTER "entering"
+    flex spSecretOfs: i32          // WISCRT2 "secret"
+    flex killsOfs: i32             // WIOSTK
+    flex secretOfs: i32            // WIOSTS
+    flex itemsOfs: i32             // WIOSTI
+    flex fragsOfs: i32             // WIFRGS
+    flex timeOfs: i32              // WITIME
+    flex parOfs: i32               // WIPAR
+    flex sucksOfs: i32             // WISUCKS
+    flex killersOfs: i32           // WIKILRS
+    flex victimsOfs: i32           // WIVCTMS
+    flex totalOfs: i32             // WIMSTT
+    flex starOfs: i32              // STFST01 (your face)
+    flex bstarOfs: i32             // STFDEAD0 (dead face)
+    flex yahOfs: i32[2]            // WIURH0 / WIURH1 "You Are Here"
+    flex numOfs: []i32             // WINUM0..9 (10)
+    flex pOfs: []i32               // STPB0..3 (MAXPLAYERS)
+    flex bpOfs: []i32              // WIBP1..4 (MAXPLAYERS)
+    flex lnamesOfs: []i32          // WILV<epsd><m> level-name patches (NUMMAPS, or NUMCMAPS commercial)
 }
 
+// ---- FinaleState (f_finale). --------------------------------------------------------------
+// P2.9c amendment (additive, f_finale.c): stage/count/text = id's finalestage/finalecount/
+// finaletext; `flat` is finaleflat (the FLOOR flat name, re-cached each F_TextWrite). The cast*
+// block is the DOOM-II/registered character-cast state machine (F_StartCast..F_CastDrawer,
+// gated by gamemode==commercial / gameepisode==30); bunnyLaststage is F_BunnyScroll's static
+// laststage (gameepisode==3). textIndex is unused (kept from the frozen shape).
 flex drip FinaleState {
     flex stage: i32
     flex count: i32
     flex text: str
     flex textIndex: i32
+    // ---- P2.9c additive ---------------------------------------------------------------------
+    flex flat: str                 // finaleflat lump name
+    flex castNum: i32              // castnum
+    flex castTics: i32             // casttics
+    flex castStateIdx: i32         // caststate (state index into g.info.states)
+    flex castDeath: bool           // castdeath
+    flex castFrames: i32           // castframes
+    flex castOnMelee: i32          // castonmelee
+    flex castAttacking: bool       // castattacking
+    flex bunnyLaststage: i32       // F_BunnyScroll static laststage
 }
 
 flex drip WipeState {

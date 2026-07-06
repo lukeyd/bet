@@ -507,6 +507,12 @@ size = 5
 status = "doing"
 
 [[task]]
+slug = "doom-p29c"
+name = "Doom P2.9c: intermission (wi_stuff) + finale (f_finale) — stat-count state machine + episode-end text crawl / cast / bunny"
+size = 4
+status = "doing"
+
+[[task]]
 slug = "doom-p25"
 name = "Doom P2.5: level load (p_setup) — parse map WAD lumps into Level SoA + spawn things (P_SpawnMapThing/P_SpawnPlayer)"
 size = 4

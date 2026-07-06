@@ -1,0 +1,867 @@
+// f/f_finale.bet — the end-of-episode FINALE (linuxdoom-1.10 f_finale.c): the text crawl that
+// closes each episode, then (registered/DOOM-II) the art screen / bunny scroller / cast-of-
+// characters.
+//
+// Shareware scope (the exercised, CRC-proven path): F_StartFinale picks the E<n>TEXT crawl +
+// FLOOR flat per episode (E1 = E1TEXT + FLOOR4_8), F_Ticker advances finalecount, F_TextWrite
+// tiles the flat and reveals the text char-by-char through the HU_FONT (g.hud.huFontOfs, loaded by
+// HU_Init), F_Drawer draws it. The cast call (F_StartCast/F_CastTicker/F_CastResponder/
+// F_CastDrawer) and the E3 bunny scroller (F_BunnyScroll) are DOOM-II / registered — ported
+// structurally and gated by gamemode / gameepisode (never reached for shareware).
+//
+// State lives on gs.FinaleState (P2.9c amendment, additive): stage/count/text/flat +
+// castNum/castTics/castStateIdx/castDeath/castFrames/castOnMelee/castAttacking + bunnyLaststage.
+//
+// PORTED: F_StartFinale, F_Responder, F_Ticker, F_TextWrite, F_Drawer, F_StartCast, F_CastTicker
+//   (+ the sound-hack switch), F_CastResponder, F_CastPrint, F_CastDrawer, F_DrawPatchCol,
+//   F_BunnyScroll.
+// SKIPPED: nothing structural; the registered/retail art-screen patches (HELP2/CREDIT/VICTORY2/
+//   ENDPIC) are drawn via drawPatch when their episode-finale stage is reached.
+pull "mem"
+pull "str"
+pull "../defs/gs" as gs
+pull "../defs/doomdef" as doomdef
+pull "../defs/sounds" as sounds
+pull "../defs/info" as info
+pull "../defs/strings" as strings
+pull "../defs/think" as think
+pull "../util/bstream" as bstream
+pull "../w/w_wad" as wad
+pull "../v/v_video" as vv
+pull "../s/s_sound" as ssnd
+
+// ---- constants (f_finale.c) ----------------------------------------------------------------
+flex facts SCREENWIDTH: int = 320
+flex facts SCREENHEIGHT: int = 200
+flex facts TEXTSPEED: int = 3
+flex facts TEXTWAIT: int = 250
+flex facts HU_FONTSTART: int = 33
+flex facts HU_FONTSIZE: int = 63
+flex facts FF_FRAMEMASK: int = 32767
+flex facts MAXPLAYERS: int = 4
+
+// ============================================================================================
+// small helpers — null-origin sound, char case, patch width, info-table field reads.
+// ============================================================================================
+flex finna fSnd(gt: tag gs.GameState, sfx: int) {
+    lowkey nullOrigin: tag think.Thinker = ghosted
+    ssnd.startSound(gt, nullOrigin, sfx)
+}
+
+flex finna toUpper(c: int) -> int {
+    fr c >= 97 && c <= 122 {
+        bet c - 32
+    }
+    bet c
+}
+
+flex finna patchWidth(gt: tag gs.GameState, ofs: int) -> int {
+    lowkey w = 0
+    holla g = gt in gs.gsc {
+        w = bstream.rdU16(g.wad.buf, ofs)
+    } ghosted {
+        yeet("gs")
+    }
+    bet w
+}
+
+flex finna stTics(gt: tag gs.GameState, idx: int) -> int {
+    lowkey v = 0
+    holla g = gt in gs.gsc {
+        v = g.info.states[idx].tics as int
+    } ghosted {
+        yeet("gs")
+    }
+    bet v
+}
+
+flex finna stNext(gt: tag gs.GameState, idx: int) -> int {
+    lowkey v = 0
+    holla g = gt in gs.gsc {
+        v = g.info.states[idx].nextstate as int
+    } ghosted {
+        yeet("gs")
+    }
+    bet v
+}
+
+flex finna stSprite(gt: tag gs.GameState, idx: int) -> int {
+    lowkey v = 0
+    holla g = gt in gs.gsc {
+        v = g.info.states[idx].spriteIdx as int
+    } ghosted {
+        yeet("gs")
+    }
+    bet v
+}
+
+flex finna stFrame(gt: tag gs.GameState, idx: int) -> int {
+    lowkey v = 0
+    holla g = gt in gs.gsc {
+        v = g.info.states[idx].frame as int
+    } ghosted {
+        yeet("gs")
+    }
+    bet v
+}
+
+// mobjinfo[type] fields used by the cast (seestate/seesound/meleestate/missilestate/deathstate/
+// deathsound) — one accessor with a small selector to avoid six near-identical fns.
+flex facts MI_SEESTATE: int = 0
+flex facts MI_SEESOUND: int = 1
+flex facts MI_MELEESTATE: int = 2
+flex facts MI_MISSILESTATE: int = 3
+flex facts MI_DEATHSTATE: int = 4
+flex facts MI_DEATHSOUND: int = 5
+
+flex finna miField(gt: tag gs.GameState, mt: int, which: int) -> int {
+    lowkey v = 0
+    holla g = gt in gs.gsc {
+        lowkey mi = g.info.mobjinfo[mt]
+        fr which == MI_SEESTATE {
+            v = mi.seestate as int
+        } naw fr which == MI_SEESOUND {
+            v = mi.seesound as int
+        } naw fr which == MI_MELEESTATE {
+            v = mi.meleestate as int
+        } naw fr which == MI_MISSILESTATE {
+            v = mi.missilestate as int
+        } naw fr which == MI_DEATHSTATE {
+            v = mi.deathstate as int
+        } naw {
+            v = mi.deathsound as int
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    bet v
+}
+
+// ============================================================================================
+// castorder[] (f_finale.c): the 17 monsters shown, in order, + a trailing NULL sentinel.
+// ============================================================================================
+flex finna castType(n: int) -> int {
+    fr n == 0 { bet info.MT_POSSESSED }
+    fr n == 1 { bet info.MT_SHOTGUY }
+    fr n == 2 { bet info.MT_CHAINGUY }
+    fr n == 3 { bet info.MT_TROOP }
+    fr n == 4 { bet info.MT_SERGEANT }
+    fr n == 5 { bet info.MT_SKULL }
+    fr n == 6 { bet info.MT_HEAD }
+    fr n == 7 { bet info.MT_KNIGHT }
+    fr n == 8 { bet info.MT_BRUISER }
+    fr n == 9 { bet info.MT_BABY }
+    fr n == 10 { bet info.MT_PAIN }
+    fr n == 11 { bet info.MT_UNDEAD }
+    fr n == 12 { bet info.MT_FATSO }
+    fr n == 13 { bet info.MT_VILE }
+    fr n == 14 { bet info.MT_SPIDER }
+    fr n == 15 { bet info.MT_CYBORG }
+    bet info.MT_PLAYER
+}
+
+flex finna castName(n: int) -> str {
+    fr n == 0 { bet strings.CC_ZOMBIE }
+    fr n == 1 { bet strings.CC_SHOTGUN }
+    fr n == 2 { bet strings.CC_HEAVY }
+    fr n == 3 { bet strings.CC_IMP }
+    fr n == 4 { bet strings.CC_DEMON }
+    fr n == 5 { bet strings.CC_LOST }
+    fr n == 6 { bet strings.CC_CACO }
+    fr n == 7 { bet strings.CC_HELL }
+    fr n == 8 { bet strings.CC_BARON }
+    fr n == 9 { bet strings.CC_ARACH }
+    fr n == 10 { bet strings.CC_PAIN }
+    fr n == 11 { bet strings.CC_REVEN }
+    fr n == 12 { bet strings.CC_MANCU }
+    fr n == 13 { bet strings.CC_ARCH }
+    fr n == 14 { bet strings.CC_SPIDER }
+    fr n == 15 { bet strings.CC_CYBER }
+    bet strings.CC_HERO
+}
+
+// NUMCASTORDER = 17 (index 17 is the NULL sentinel that wraps castnum back to 0).
+flex facts NUMCASTORDER: int = 17
+
+// F_CastTicker sound hacks: the sfx for a given advance state (0 = none).
+flex finna castSfx(st: int) -> int {
+    fr st == info.S_PLAY_ATK1 { bet sounds.SFX_DSHTGN }
+    fr st == info.S_POSS_ATK2 { bet sounds.SFX_PISTOL }
+    fr st == info.S_SPOS_ATK2 { bet sounds.SFX_SHOTGN }
+    fr st == info.S_VILE_ATK2 { bet sounds.SFX_VILATK }
+    fr st == info.S_SKEL_FIST2 { bet sounds.SFX_SKESWG }
+    fr st == info.S_SKEL_FIST4 { bet sounds.SFX_SKEPCH }
+    fr st == info.S_SKEL_MISS2 { bet sounds.SFX_SKEATK }
+    fr st == info.S_FATT_ATK8 { bet sounds.SFX_FIRSHT }
+    fr st == info.S_FATT_ATK5 { bet sounds.SFX_FIRSHT }
+    fr st == info.S_FATT_ATK2 { bet sounds.SFX_FIRSHT }
+    fr st == info.S_CPOS_ATK2 { bet sounds.SFX_SHOTGN }
+    fr st == info.S_CPOS_ATK3 { bet sounds.SFX_SHOTGN }
+    fr st == info.S_CPOS_ATK4 { bet sounds.SFX_SHOTGN }
+    fr st == info.S_TROO_ATK3 { bet sounds.SFX_CLAW }
+    fr st == info.S_SARG_ATK2 { bet sounds.SFX_SGTATK }
+    fr st == info.S_BOSS_ATK2 { bet sounds.SFX_FIRSHT }
+    fr st == info.S_BOS2_ATK2 { bet sounds.SFX_FIRSHT }
+    fr st == info.S_HEAD_ATK2 { bet sounds.SFX_FIRSHT }
+    fr st == info.S_SKULL_ATK2 { bet sounds.SFX_SKLATK }
+    fr st == info.S_SPID_ATK2 { bet sounds.SFX_SHOTGN }
+    fr st == info.S_SPID_ATK3 { bet sounds.SFX_SHOTGN }
+    fr st == info.S_BSPI_ATK2 { bet sounds.SFX_PLASMA }
+    fr st == info.S_CYBER_ATK2 { bet sounds.SFX_RLAUNC }
+    fr st == info.S_CYBER_ATK4 { bet sounds.SFX_RLAUNC }
+    fr st == info.S_CYBER_ATK6 { bet sounds.SFX_RLAUNC }
+    fr st == info.S_PAIN_ATK3 { bet sounds.SFX_SKLATK }
+    bet 0
+}
+
+// ============================================================================================
+// F_StartFinale — set up the end-of-episode text + flat + music per gamemode/episode.
+// ============================================================================================
+flex finna startFinale(gt: tag gs.GameState) {
+    lowkey gamemode = 0
+    lowkey episode = 0
+    lowkey gmap = 0
+    holla g = gt in gs.gsc {
+        gamemode = g.shell.gamemode as int
+        episode = g.shell.gameepisode as int
+        gmap = g.shell.gamemap as int
+    } ghosted {
+        yeet("gs")
+    }
+
+    lowkey flat = "F_SKY1"
+    lowkey text = strings.C1TEXT
+    lowkey music = sounds.MUS_READ_M
+
+    fr gamemode != doomdef.GM_COMMERCIAL {
+        music = sounds.MUS_VICTOR
+        fr episode == 1 {
+            flat = "FLOOR4_8"
+            text = strings.E1TEXT
+        } naw fr episode == 2 {
+            flat = "SFLR6_1"
+            text = strings.E2TEXT
+        } naw fr episode == 3 {
+            flat = "MFLR8_4"
+            text = strings.E3TEXT
+        } naw fr episode == 4 {
+            flat = "MFLR8_3"
+            text = strings.E4TEXT
+        }
+    } naw {
+        music = sounds.MUS_READ_M
+        fr gmap == 6 {
+            flat = "SLIME16"
+            text = strings.C1TEXT
+        } naw fr gmap == 11 {
+            flat = "RROCK14"
+            text = strings.C2TEXT
+        } naw fr gmap == 20 {
+            flat = "RROCK07"
+            text = strings.C3TEXT
+        } naw fr gmap == 30 {
+            flat = "RROCK17"
+            text = strings.C4TEXT
+        } naw fr gmap == 15 {
+            flat = "RROCK13"
+            text = strings.C5TEXT
+        } naw fr gmap == 31 {
+            flat = "RROCK19"
+            text = strings.C6TEXT
+        }
+    }
+
+    holla g = gt in gs.gsc {
+        g.shell.gameaction = doomdef.GA_NOTHING as i32
+        g.shell.gamestate = doomdef.GS_FINALE as i32
+        g.shell.viewactive = cap
+        g.shell.automapactive = cap
+        g.finale.flat = flat
+        g.finale.text = text
+        g.finale.stage = 0
+        g.finale.count = 0
+    } ghosted {
+        yeet("gs")
+    }
+    ssnd.changeMusic(gt, music, 1)
+}
+
+// ============================================================================================
+// F_Responder — the cast responds to keys once the cast call is up; otherwise no-op.
+// ============================================================================================
+flex finna fResponder(gt: tag gs.GameState, evType: int, key: int) -> bool {
+    lowkey stage = 0
+    holla g = gt in gs.gsc {
+        stage = g.finale.stage as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr stage == 2 {
+        bet castResponder(gt, evType, key)
+    }
+    bet cap
+}
+
+// ============================================================================================
+// F_Ticker — advance the crawl; at end move to the art screen (or cast / bunny).
+// ============================================================================================
+flex finna fTicker(gt: tag gs.GameState) {
+    lowkey gamemode = 0
+    lowkey gmap = 0
+    lowkey count = 0
+    lowkey stage = 0
+    lowkey episode = 0
+    lowkey textLen = 0
+    holla g = gt in gs.gsc {
+        gamemode = g.shell.gamemode as int
+        gmap = g.shell.gamemap as int
+        count = g.finale.count as int
+        stage = g.finale.stage as int
+        episode = g.shell.gameepisode as int
+        textLen = str.len(g.finale.text)
+    } ghosted {
+        yeet("gs")
+    }
+
+    // commercial: after 50 tics, any button press advances to the next level / cast.
+    fr gamemode == doomdef.GM_COMMERCIAL && count > 50 {
+        lowkey anyButton = cap
+        holla g = gt in gs.gsc {
+            lowkey i = 0
+            vibin i < MAXPLAYERS {
+                fr (g.shell.players[i].cmd.buttons as int) != 0 {
+                    anyButton = nocap
+                }
+                i = i + 1
+            }
+        } ghosted {
+            yeet("gs")
+        }
+        fr anyButton {
+            fr gmap == 30 {
+                startCast(gt)
+            } naw {
+                holla g = gt in gs.gsc {
+                    g.shell.gameaction = doomdef.GA_WORLDDONE as i32
+                } ghosted {
+                    yeet("gs")
+                }
+            }
+        }
+    }
+
+    // advance animation
+    count = count + 1
+    holla g = gt in gs.gsc {
+        g.finale.count = count as i32
+    } ghosted {
+        yeet("gs")
+    }
+
+    fr stage == 2 {
+        castTicker(gt)
+        bet
+    }
+    fr gamemode == doomdef.GM_COMMERCIAL {
+        bet
+    }
+    fr stage == 0 && count > textLen * TEXTSPEED + TEXTWAIT {
+        holla g = gt in gs.gsc {
+            g.finale.count = 0
+            g.finale.stage = 1
+            g.shell.wipegamestate = -1        // force a wipe
+        } ghosted {
+            yeet("gs")
+        }
+        fr episode == 3 {
+            ssnd.startMusic(gt, sounds.MUS_BUNNY)
+        }
+    }
+}
+
+// ============================================================================================
+// F_TextWrite — tile the finale flat over scr0, then reveal the text char-by-char (HU_FONT).
+// ============================================================================================
+flex finna textWrite(gt: tag gs.GameState) {
+    lowkey flat = ""
+    lowkey text = ""
+    lowkey count = 0
+    holla g = gt in gs.gsc {
+        flat = g.finale.flat
+        text = g.finale.text
+        count = g.finale.count as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey flatOfs = wad.lumpNameOfs(gt, flat)
+
+    // erase the screen to the tiled 64x64 flat (SCREENWIDTH=320 is exactly 5 tiles wide).
+    holla g = gt in gs.gsc {
+        lowkey y = 0
+        vibin y < SCREENHEIGHT {
+            lowkey srcRow = flatOfs + (y & 63) * 64
+            lowkey x = 0
+            vibin x < SCREENWIDTH {
+                g.vid.scr0[y * SCREENWIDTH + x] = g.wad.buf[srcRow + (x & 63)]
+                x = x + 1
+            }
+            y = y + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+
+    // font offsets
+    lowkey fontOfs = mem.slab[i32](0)
+    holla g = gt in gs.gsc {
+        fontOfs = g.hud.huFontOfs
+    } ghosted {
+        yeet("gs")
+    }
+
+    // draw some of the text onto the screen (count = (finalecount-10)/TEXTSPEED chars)
+    lowkey cx = 10
+    lowkey cy = 10
+    lowkey n = (count - 10) / TEXTSPEED
+    fr n < 0 {
+        n = 0
+    }
+    lowkey i = 0
+    lowkey len = str.len(text)
+    vibin n > 0 && i < len {
+        lowkey c = str.at(text, i)
+        i = i + 1
+        n = n - 1
+        fr c == 10 {
+            // '\n'
+            cx = 10
+            cy = cy + 11
+        } naw {
+            lowkey ci = toUpper(c) - HU_FONTSTART
+            fr ci < 0 || ci > HU_FONTSIZE {
+                cx = cx + 4
+            } naw {
+                lowkey ofs = fontOfs[ci] as int
+                lowkey w = patchWidth(gt, ofs)
+                fr cx + w > SCREENWIDTH {
+                    dip
+                }
+                vv.drawPatch(gt, cx, cy, 0, ofs)
+                cx = cx + w
+            }
+        }
+    }
+}
+
+// ============================================================================================
+// F_StartCast / F_CastTicker / F_CastResponder / F_CastPrint / F_CastDrawer — the DOOM-II cast
+// call (gamemap == 30). Ported structurally; gated by F_Drawer/F_Ticker stage == 2.
+// ============================================================================================
+flex finna startCast(gt: tag gs.GameState) {
+    lowkey seest = miField(gt, castType(0), MI_SEESTATE)
+    lowkey t = stTics(gt, seest)
+    holla g = gt in gs.gsc {
+        g.shell.wipegamestate = -1
+        g.finale.castNum = 0
+        g.finale.castStateIdx = seest as i32
+        g.finale.castTics = t as i32
+        g.finale.castDeath = cap
+        g.finale.stage = 2
+        g.finale.castFrames = 0
+        g.finale.castOnMelee = 0
+        g.finale.castAttacking = cap
+    } ghosted {
+        yeet("gs")
+    }
+    ssnd.changeMusic(gt, sounds.MUS_EVIL, 1)
+}
+
+flex finna castTicker(gt: tag gs.GameState) {
+    lowkey castNum = 0
+    lowkey castTics = 0
+    lowkey castStateIdx = 0
+    lowkey castDeath = cap
+    lowkey castFrames = 0
+    lowkey castOnMelee = 0
+    lowkey castAttacking = cap
+    holla g = gt in gs.gsc {
+        castNum = g.finale.castNum as int
+        castTics = g.finale.castTics as int
+        castStateIdx = g.finale.castStateIdx as int
+        castDeath = g.finale.castDeath
+        castFrames = g.finale.castFrames as int
+        castOnMelee = g.finale.castOnMelee as int
+        castAttacking = g.finale.castAttacking
+    } ghosted {
+        yeet("gs")
+    }
+
+    castTics = castTics - 1
+    fr castTics > 0 {
+        holla g = gt in gs.gsc {
+            g.finale.castTics = castTics as i32
+        } ghosted {
+            yeet("gs")
+        }
+        bet                          // not time to change state yet
+    }
+
+    lowkey curTics = stTics(gt, castStateIdx)
+    lowkey curNext = stNext(gt, castStateIdx)
+    lowkey doStopattack = cap
+    fr curTics == -1 || curNext == info.S_NULL {
+        // switch from deathstate to the next monster
+        castNum = castNum + 1
+        castDeath = cap
+        fr castNum >= NUMCASTORDER {
+            castNum = 0
+        }
+        lowkey ss = miField(gt, castType(castNum), MI_SEESOUND)
+        fr ss != 0 {
+            fSnd(gt, ss)
+        }
+        castStateIdx = miField(gt, castType(castNum), MI_SEESTATE)
+        castFrames = 0
+    } naw {
+        // just advance to the next state in the animation
+        fr castStateIdx == info.S_PLAY_ATK1 {
+            doStopattack = nocap      // id's `goto stopattack`
+        } naw {
+            castStateIdx = curNext
+            castFrames = castFrames + 1
+            lowkey sfx = castSfx(castStateIdx)
+            fr sfx != 0 {
+                fSnd(gt, sfx)
+            }
+        }
+    }
+
+    fr !doStopattack {
+        fr castFrames == 12 {
+            // go into the attack frame
+            castAttacking = nocap
+            fr castOnMelee != 0 {
+                castStateIdx = miField(gt, castType(castNum), MI_MELEESTATE)
+            } naw {
+                castStateIdx = miField(gt, castType(castNum), MI_MISSILESTATE)
+            }
+            castOnMelee = castOnMelee ^ 1
+            fr castStateIdx == info.S_NULL {
+                fr castOnMelee != 0 {
+                    castStateIdx = miField(gt, castType(castNum), MI_MELEESTATE)
+                } naw {
+                    castStateIdx = miField(gt, castType(castNum), MI_MISSILESTATE)
+                }
+            }
+        }
+        fr castAttacking {
+            lowkey seest = miField(gt, castType(castNum), MI_SEESTATE)
+            fr castFrames == 24 || castStateIdx == seest {
+                doStopattack = nocap
+            }
+        }
+    }
+    fr doStopattack {
+        castAttacking = cap
+        castFrames = 0
+        castStateIdx = miField(gt, castType(castNum), MI_SEESTATE)
+    }
+
+    castTics = stTics(gt, castStateIdx)
+    fr castTics == -1 {
+        castTics = 15
+    }
+
+    holla g = gt in gs.gsc {
+        g.finale.castNum = castNum as i32
+        g.finale.castTics = castTics as i32
+        g.finale.castStateIdx = castStateIdx as i32
+        g.finale.castDeath = castDeath
+        g.finale.castFrames = castFrames as i32
+        g.finale.castOnMelee = castOnMelee as i32
+        g.finale.castAttacking = castAttacking
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna castResponder(gt: tag gs.GameState, evType: int, key: int) -> bool {
+    fr evType != 0 {           // ev_keydown only
+        bet cap
+    }
+    lowkey castNum = 0
+    lowkey castDeath = cap
+    holla g = gt in gs.gsc {
+        castNum = g.finale.castNum as int
+        castDeath = g.finale.castDeath
+    } ghosted {
+        yeet("gs")
+    }
+    fr castDeath {
+        bet nocap               // already dying
+    }
+    lowkey deathst = miField(gt, castType(castNum), MI_DEATHSTATE)
+    lowkey t = stTics(gt, deathst)
+    lowkey dsound = miField(gt, castType(castNum), MI_DEATHSOUND)
+    holla g = gt in gs.gsc {
+        g.finale.castDeath = nocap
+        g.finale.castStateIdx = deathst as i32
+        g.finale.castTics = t as i32
+        g.finale.castFrames = 0
+        g.finale.castAttacking = cap
+    } ghosted {
+        yeet("gs")
+    }
+    fr dsound != 0 {
+        fSnd(gt, dsound)
+    }
+    bet nocap
+}
+
+// F_CastPrint — draw `text` centered on the cast name row (y=180).
+flex finna castPrint(gt: tag gs.GameState, text: str) {
+    lowkey fontOfs = mem.slab[i32](0)
+    holla g = gt in gs.gsc {
+        fontOfs = g.hud.huFontOfs
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey len = str.len(text)
+    lowkey width = 0
+    lowkey i = 0
+    vibin i < len {
+        lowkey ci = toUpper(str.at(text, i)) - HU_FONTSTART
+        fr ci < 0 || ci > HU_FONTSIZE {
+            width = width + 4
+        } naw {
+            width = width + patchWidth(gt, fontOfs[ci] as int)
+        }
+        i = i + 1
+    }
+    lowkey cx = 160 - width / 2
+    i = 0
+    vibin i < len {
+        lowkey ci = toUpper(str.at(text, i)) - HU_FONTSTART
+        fr ci < 0 || ci > HU_FONTSIZE {
+            cx = cx + 4
+        } naw {
+            lowkey ofs = fontOfs[ci] as int
+            vv.drawPatch(gt, cx, 180, 0, ofs)
+            cx = cx + patchWidth(gt, ofs)
+        }
+        i = i + 1
+    }
+}
+
+// F_DrawPatchCol — blit one column `col` of a patch into scr0 at x (vertical posts). Used by the
+// bunny scroller.
+flex finna drawPatchCol(gt: tag gs.GameState, x: int, patchOfs: int, col: int) {
+    holla g = gt in gs.gsc {
+        lowkey cp = patchOfs + bstream.rdU32(g.wad.buf, patchOfs + 8 + col * 4)
+        vibin nocap {
+            lowkey topdelta = bstream.rdU8(g.wad.buf, cp)
+            fr topdelta == 255 {
+                dip
+            }
+            lowkey length = bstream.rdU8(g.wad.buf, cp + 1)
+            lowkey n = 0
+            vibin n < length {
+                lowkey destY = topdelta + n
+                fr x >= 0 && x < SCREENWIDTH && destY >= 0 && destY < SCREENHEIGHT {
+                    g.vid.scr0[destY * SCREENWIDTH + x] = g.wad.buf[cp + 3 + n]
+                }
+                n = n + 1
+            }
+            cp = cp + length + 4
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// drawPatchFlipped — V_DrawPatchFlipped: like drawPatch but the columns are mirrored L<->R.
+flex finna drawPatchFlipped(gt: tag gs.GameState, x: int, y: int, patchOfs: int) {
+    holla g = gt in gs.gsc {
+        lowkey width = bstream.rdU16(g.wad.buf, patchOfs)
+        lowkey leftofs = bstream.rdI16(g.wad.buf, patchOfs + 4)
+        lowkey topofs = bstream.rdI16(g.wad.buf, patchOfs + 6)
+        lowkey ox = x - leftofs
+        lowkey oy = y - topofs
+        lowkey col = 0
+        vibin col < width {
+            lowkey cp = patchOfs + bstream.rdU32(g.wad.buf, patchOfs + 8 + col * 4)
+            lowkey destX = ox + (width - 1 - col)
+            vibin nocap {
+                lowkey topdelta = bstream.rdU8(g.wad.buf, cp)
+                fr topdelta == 255 {
+                    dip
+                }
+                lowkey length = bstream.rdU8(g.wad.buf, cp + 1)
+                lowkey n = 0
+                vibin n < length {
+                    lowkey destY = oy + topdelta + n
+                    fr destX >= 0 && destX < SCREENWIDTH && destY >= 0 && destY < SCREENHEIGHT {
+                        g.vid.scr0[destY * SCREENWIDTH + destX] = g.wad.buf[cp + 3 + n]
+                    }
+                    n = n + 1
+                }
+                cp = cp + length + 4
+            }
+            col = col + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// F_CastDrawer — the BOSSBACK background + the cast name + the current sprite frame at (160,170).
+flex finna castDrawer(gt: tag gs.GameState) {
+    lowkey castNum = 0
+    lowkey castStateIdx = 0
+    holla g = gt in gs.gsc {
+        castNum = g.finale.castNum as int
+        castStateIdx = g.finale.castStateIdx as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey bossback = wad.lumpNameOfs(gt, "BOSSBACK")
+    vv.drawPatch(gt, 0, 0, 0, bossback)
+    castPrint(gt, castName(castNum))
+
+    lowkey spriteIdx = stSprite(gt, castStateIdx)
+    lowkey frame = stFrame(gt, castStateIdx) & FF_FRAMEMASK
+    lowkey lump = 0
+    lowkey flip = 0
+    lowkey firstSpr = 0
+    holla g = gt in gs.gsc {
+        lowkey base = (g.render.spriteFrameStart[spriteIdx] as int + frame) * 8
+        lump = g.render.spriteFrameLump[base] as int
+        flip = g.render.spriteFrameFlip[base] as int
+        firstSpr = g.render.firstSpriteLump as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey patchOfs = wad.lumpNum(gt, lump + firstSpr)
+    fr flip != 0 {
+        drawPatchFlipped(gt, 160, 170, patchOfs)
+    } naw {
+        vv.drawPatch(gt, 160, 170, 0, patchOfs)
+    }
+}
+
+// ============================================================================================
+// F_BunnyScroll — the E3 (Inferno) two-screen scroller + the "THE END" letters. Gated by
+// gameepisode == 3. Ported structurally.
+// ============================================================================================
+// cat3 — "BASE" + single digit.
+flex finna cat3(base: str, a: int) -> str {
+    lowkey n = str.len(base)
+    lowkey buf = mem.slab[u8](n + 1)
+    lowkey i = 0
+    vibin i < n {
+        buf[i] = str.at(base, i) as u8
+        i = i + 1
+    }
+    buf[n] = (48 + a % 10) as u8
+    bet str.fromBytesTrust(buf)
+}
+
+flex finna endName(stage: int) -> str {
+    bet cat3("END", stage)
+}
+
+flex finna bunnyScroll(gt: tag gs.GameState) {
+    lowkey count = 0
+    lowkey laststage = 0
+    holla g = gt in gs.gsc {
+        count = g.finale.count as int
+        laststage = g.finale.bunnyLaststage as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey p1 = wad.lumpNameOfs(gt, "PFUB2")
+    lowkey p2 = wad.lumpNameOfs(gt, "PFUB1")
+
+    lowkey scrolled = 320 - (count - 230) / 2
+    fr scrolled > 320 {
+        scrolled = 320
+    }
+    fr scrolled < 0 {
+        scrolled = 0
+    }
+    lowkey x = 0
+    vibin x < SCREENWIDTH {
+        fr x + scrolled < 320 {
+            drawPatchCol(gt, x, p1, x + scrolled)
+        } naw {
+            drawPatchCol(gt, x, p2, x + scrolled - 320)
+        }
+        x = x + 1
+    }
+
+    fr count < 1130 {
+        bet
+    }
+    fr count < 1180 {
+        lowkey end0 = wad.lumpNameOfs(gt, "END0")
+        vv.drawPatch(gt, (SCREENWIDTH - 13 * 8) / 2, (SCREENHEIGHT - 8 * 8) / 2, 0, end0)
+        holla g = gt in gs.gsc {
+            g.finale.bunnyLaststage = 0
+        } ghosted {
+            yeet("gs")
+        }
+        bet
+    }
+
+    lowkey stage = (count - 1180) / 5
+    fr stage > 6 {
+        stage = 6
+    }
+    fr stage > laststage {
+        fSnd(gt, sounds.SFX_PISTOL)
+        holla g = gt in gs.gsc {
+            g.finale.bunnyLaststage = stage as i32
+        } ghosted {
+            yeet("gs")
+        }
+    }
+    lowkey endp = wad.lumpNameOfs(gt, endName(stage))
+    vv.drawPatch(gt, (SCREENWIDTH - 13 * 8) / 2, (SCREENHEIGHT - 8 * 8) / 2, 0, endp)
+}
+
+// ============================================================================================
+// F_Drawer — the crawl (stage 0), the art screen / bunny (stage 1), or the cast call (stage 2).
+// ============================================================================================
+flex finna fDrawer(gt: tag gs.GameState) {
+    lowkey stage = 0
+    lowkey gamemode = 0
+    lowkey episode = 0
+    holla g = gt in gs.gsc {
+        stage = g.finale.stage as int
+        gamemode = g.shell.gamemode as int
+        episode = g.shell.gameepisode as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr stage == 2 {
+        castDrawer(gt)
+        bet
+    }
+    fr stage == 0 {
+        textWrite(gt)
+    } naw {
+        fr episode == 1 {
+            fr gamemode == doomdef.GM_RETAIL {
+                vv.drawPatch(gt, 0, 0, 0, wad.lumpNameOfs(gt, "CREDIT"))
+            } naw {
+                vv.drawPatch(gt, 0, 0, 0, wad.lumpNameOfs(gt, "HELP2"))
+            }
+        } naw fr episode == 2 {
+            vv.drawPatch(gt, 0, 0, 0, wad.lumpNameOfs(gt, "VICTORY2"))
+        } naw fr episode == 3 {
+            bunnyScroll(gt)
+        } naw fr episode == 4 {
+            vv.drawPatch(gt, 0, 0, 0, wad.lumpNameOfs(gt, "ENDPIC"))
+        }
+    }
+}

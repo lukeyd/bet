@@ -489,3 +489,59 @@ downstream noted in-line:
 **Regression baseline:** `tools/menu_smoke.bet` (native, headless) → `goldens/menu.golden`: crc32 of
 scr0 at the main/episode/skill/skill-down menus + the quit message prompt, and the E1M1 automap
 (fresh, iddt-all-walls, and after a follow-player tick). Native-only (WAD scale); `BET_GG_HEADLESS=1`.
+
+## P2.9c amendment (intermission + finale — additive to WiState / FinaleState ONLY)
+
+`wi/wi_stuff` (wi_stuff.c) + `f/f_finale` (f_finale.c) added fields to **two drips only** (`WiState`,
+`FinaleState`); no sibling drip changed. All are `cop`-zero-inited; the loaded-graphic byte offsets
+and the `[]i32` handle tables become valid only after `WI_Start`/`F_StartFinale` runs (matching id,
+where the graphics are cached at WI_Start / the flat is re-cached each F_TextWrite).
+
+- **`WiState`** += the wi_stuff.c file-statics that had no doomstat home: `me` (wbs->pnum),
+  `cntPause`/`dmState`/`ngState`/`dofrags`/`snlPointeron`, `cntFrags[4]`, `dmFrags[16]`
+  (dm_frags[4][4] as `[i*4+j]`), `dmTotals[4]`, `loaded`; the per-anim mutable animation state
+  (`animNexttic`/`animCtr`/`animState`/`animLastdrawn: i32[10]` = MAXANIMS across epsd 0-2) + the
+  loaded frame patch offsets `animP: i32[30]` (anim geometry is module DATA in wi_stuff.bet, not a
+  drip); and the loaded intermission graphics as byte offsets into `g.wad.buf`
+  (`bgOfs`/`splatOfs`/`percentOfs`/`colonOfs`/`wiminusOfs`/`finishedOfs`/`enteringOfs`/`spSecretOfs`/
+  `killsOfs`/`secretOfs`/`itemsOfs`/`fragsOfs`/`timeOfs`/`parOfs`/`sucksOfs`/`killersOfs`/
+  `victimsOfs`/`totalOfs`/`starOfs`/`bstarOfs`, `yahOfs: i32[2]`, and the `mem.slab`-allocated
+  `numOfs`/`pOfs`/`bpOfs`/`lnamesOfs: []i32`). The pre-existing `state`/`acceleratestage`/`cnt`/`bcnt`/
+  `cntTime`/`cntPar`/`cntTotal`/`spstate`/`cntKills`/`cntItems`/`cntSecret` are id's `state`/… statics.
+- **`FinaleState`** += `flat: str` (finaleflat, re-cached each F_TextWrite) + the DOOM-II/registered
+  cast machine `castNum`/`castTics`/`castStateIdx`/`castDeath`/`castFrames`/`castOnMelee`/
+  `castAttacking` and `bunnyLaststage` (F_BunnyScroll static). Pre-existing `stage`/`count`/`text` =
+  finalestage/finalecount/finaletext; `textIndex` stays unused.
+
+**How the intermission reads `wminfo`:** `WI_Start` is `wiStart(gt)` — the wbstart input is the
+canonical `g.shell.wminfo` (id's `WI_Start(&wminfo)`; the shell/P2.8 fills `g.shell.wminfo` in
+G_DoCompleted before calling). `WI_initVariables` clamps `wminfo.max{kills,items,secret}` to ≥1,
+captures `me = wminfo.pnum`, and applies the non-retail `epsd -= 3` wrap — all in place on
+`g.shell.wminfo`. Per-player stats are read as `wminfo.plyr[i].{skills,sitems,ssecret,stime,frags}`.
+
+**Flex API for d_main/g_game (P2.8) to drive:**
+- intermission (per tic / per frame / init): `wi_stuff.wiStart(gt)` (reads g.shell.wminfo) /
+  `wiTicker(gt)` / `wiDrawer(gt)` / `wiResponder(gt, evType, key) -> bool` (id's WI_Responder is a
+  no-op; skip buttons are polled in wiTicker for netgame timing). `wiTicker` kicks off `mus_inter`
+  at bcnt==1 and sets `g.shell.gameaction = GA_WORLDDONE` when NoState expires (G_WorldDone seam).
+- finale (init / per tic / per frame / on event): `f_finale.startFinale(gt)` (reads gameepisode/
+  gamemap; sets text+flat+music, gamestate=GS_FINALE) / `fTicker(gt)` / `fDrawer(gt)` /
+  `fResponder(gt, evType, key) -> bool`. At crawl-end `fTicker` forces a wipe (`wipegamestate=-1`)
+  and advances the stage; commercial map-30 → the cast call, E3 → bunny (mus_bunny).
+
+**shareware-only vs registered/DOOM-II gated:** the SP `WI_drawStats` path + the E<n>TEXT crawl are
+the exercised, CRC-proven paths. `WI_draw{Deathmatch,Netgame}Stats` (+ their init/update) are ported
+structurally, gated by `g.shell.deathmatch`/`g.shell.netgame`. The finale cast call
+(`startCast`/`castTicker`/`castResponder`/`castDrawer`, incl. a local `drawPatchFlipped`) and the E3
+`bunnyScroll` (with `drawPatchCol`) are ported structurally, gated by gamemode==commercial (map 30) /
+gameepisode==3; shareware only reaches the text screen (stage 0) + the HELP2 art screen (stage 1).
+**Faithful id bug reproduced:** `WI_drawAnimatedBack` opens `if (commercial) return;` in
+linuxdoom-1.10 where `commercial` is the enum constant (==2, always truthy), so the animated fire
+cels are never drawn — the port's `drawAnimatedBack` is a documented no-op (the cels are still loaded
++ ticked, so the RNG stream / bcnt animation state stays faithful).
+
+**Regression baseline:** `tools/finale_smoke.bet` (native, headless) → `goldens/finale.golden`: a
+faked E1M1→E1M2 single-player result (90%/90%/60% kills/items/secret, 90s time, 30s par) run through
+WI_Start + ~400 WI_Ticker tics to the final StatCount, `wiDrawer` → crc32(scr0); then F_StartFinale
+(E1) + the full E1TEXT crawl revealed (stage still 0), `fDrawer` → crc32(scr0). Native-only (WAD
+scale); `BET_GG_HEADLESS=1`.
