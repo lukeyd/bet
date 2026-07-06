@@ -341,7 +341,7 @@ flex finna evDoFloor(gt: tag gs.GameState, line: int, floortype: int) -> int {
             holla t = floorT in gs.thinkers {
                 t.sa.direction = 1
                 t.sa.speed = psu.FLOORSPEED
-                t.sa.floordestheight = (secFloor + minsize) as i32
+                t.sa.floordestheight = (secFloor as int + minsize) as i32
             } ghosted {
                 yeet("floor")
             }

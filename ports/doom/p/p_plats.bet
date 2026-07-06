@@ -165,7 +165,7 @@ flex finna evDoPlat(gt: tag gs.GameState, line: int, plattype: int, amount: int)
             }
             holla t = platT in gs.thinkers {
                 t.sa.speed = (psu.PLATSPEED / 2) as i32
-                t.sa.high = (secFloor + amount * 65536) as i32
+                t.sa.high = (secFloor as int + amount * 65536) as i32
                 t.sa.wait = 0
                 t.sa.status = psu.PLAT_UP as i32
             } ghosted {

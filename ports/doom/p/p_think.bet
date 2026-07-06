@@ -1,44 +1,7 @@
-// p/p_think.bet — the thinker list + state-action dispatch (linuxdoom-1.10 p_tick.c thinker
-// half: P_InitThinkers / P_AddThinker / P_RemoveThinker / P_RunThinkers, plus the action-fn
-// dispatch that p_mobj.setMobjState and p_pspr call). Signatures are FROZEN in
-// ports/doom/p-sigs.md ("p/p_think"). Every stateful fn takes `gt: tag gs.GameState` first.
-//
-// PORTED: P_InitThinkers, P_AddThinker, P_RemoveThinker, P_RunThinkers, plus runAction /
-//   runPsprAction (id inlines `st->action.acp1(mobj)` / `psp->state->action.acp2(...)`; here the
-//   fn pointer became info.State.actionId + the gs.Actions.a* fn-value fields, so dispatch is an
-//   explicit if-chain on the AID_* ordinal — bet has no integer switch).
-//
-// MODEL NOTES:
-//   * The thinker list is a doubly-linked ring of `tag think.Thinker` handles through the
-//     Thinker.prev/next fields, with a copped sentinel (funcId FUNC_CAP) at g.tick.thinkercap —
-//     mirroring id's static `thinkercap` whose &thinkercap is both head and tail.
-//   * P_RemoveThinker is lazy: it only stamps funcId = FUNC_REMOVED. The next P_RunThinkers pass
-//     unlinks the node and `evict`s its slot (gen bump -> any stale tag to it ghosts), replacing
-//     id's Z_Free.
-//   * runThinkers dispatches a FUNC_MOBJ node through the `g.hooks.mobjThink` forward slot
-//     (p_mobj.mobjThinker), NOT a direct call: the bet module loader rejects the p_think<->p_mobj
-//     import cycle, so the mobj thinker is wired in like the 7 movement hooks. See the gs.bet
-//     Hooks amendment. FUNC_DOOR/CEILING/FLOOR/PLAT/FLICKER/FLASH/STROBE/GLOW are P2.3's
-//     sector-effect thinkers — their dispatch arms are left as a documented slot below.
-//
-// SEAM: g.hooks.mobjThink       wired by the tick init (P2.4) / the smoke harness -> p_mobj.mobjThinker.
-// SEAM: g.actions.a*            wired by p_action (P2.4); runAction/runPsprAction call them. AID_NONE
-//                               is a no-op; a non-zero AID assumes its field is wired (the harness
-//                               installs no-op stubs). Native can't null-compare a fn-value, so the
-//                               dispatch calls the selected field unconditionally once matched.
-//
-// NATIVE is the correctness target. This module pulls only gs/think/info (no p_mobj), so it sits
-// UNDER p_mobj in the DAG; p_mobj pulls p_think for addThinker/removeThinker/runAction.
 pull "../defs/gs" as gs
 pull "../defs/think" as think
 pull "../defs/info" as info
 
-// ===========================================================================================
-// thinker list (p_tick.c)
-// ===========================================================================================
-
-// initThinkers — P_InitThinkers: cop the FUNC_CAP sentinel and point its prev/next at itself
-// (empty ring), storing it at g.tick.thinkercap.
 flex finna initThinkers(gt: tag gs.GameState) {
     lowkey capT = cop think.Thinker{ funcId: think.FUNC_CAP as i32 } in gs.thinkers
     holla c = capT in gs.thinkers {
@@ -54,8 +17,6 @@ flex finna initThinkers(gt: tag gs.GameState) {
     }
 }
 
-// addThinker — P_AddThinker: append `th` just before the sentinel (list tail).
-//   thinkercap.prev->next = th ; th->next = thinkercap ; th->prev = thinkercap.prev ; thinkercap.prev = th
 flex finna addThinker(gt: tag gs.GameState, th: tag think.Thinker) {
     lowkey capT: tag think.Thinker = ghosted
     holla g = gt in gs.gsc {
@@ -87,7 +48,6 @@ flex finna addThinker(gt: tag gs.GameState, th: tag think.Thinker) {
     }
 }
 
-// removeThinker — P_RemoveThinker: lazy free. Just stamp FUNC_REMOVED; runThinkers unlinks+evicts.
 flex finna removeThinker(gt: tag gs.GameState, th: tag think.Thinker) {
     holla t = th in gs.thinkers {
         t.funcId = think.FUNC_REMOVED as i32
@@ -96,15 +56,28 @@ flex finna removeThinker(gt: tag gs.GameState, th: tag think.Thinker) {
     }
 }
 
-// runThinkers — P_RunThinkers: walk the ring from thinkercap.next; for each node either
-//   (FUNC_REMOVED) unlink it from its neighbours and evict its slot, or dispatch its think fn.
-// The walk reads `next` BEFORE any evict, so eviction of the current node is safe.
 flex finna runThinkers(gt: tag gs.GameState) {
     lowkey capT: tag think.Thinker = ghosted
     lowkey mobjFn: finna(tag gs.GameState, tag think.Thinker) -> void = ghosted
+    lowkey doorFn: finna(tag gs.GameState, tag think.Thinker) -> void = ghosted
+    lowkey ceilingFn: finna(tag gs.GameState, tag think.Thinker) -> void = ghosted
+    lowkey floorFn: finna(tag gs.GameState, tag think.Thinker) -> void = ghosted
+    lowkey platFn: finna(tag gs.GameState, tag think.Thinker) -> void = ghosted
+    lowkey flickerFn: finna(tag gs.GameState, tag think.Thinker) -> void = ghosted
+    lowkey flashFn: finna(tag gs.GameState, tag think.Thinker) -> void = ghosted
+    lowkey strobeFn: finna(tag gs.GameState, tag think.Thinker) -> void = ghosted
+    lowkey glowFn: finna(tag gs.GameState, tag think.Thinker) -> void = ghosted
     holla g = gt in gs.gsc {
         capT = g.tick.thinkercap
         mobjFn = g.hooks.mobjThink
+        doorFn = g.hooks.doorThink
+        ceilingFn = g.hooks.ceilingThink
+        floorFn = g.hooks.floorThink
+        platFn = g.hooks.platThink
+        flickerFn = g.hooks.flickerThink
+        flashFn = g.hooks.flashThink
+        strobeFn = g.hooks.strobeThink
+        glowFn = g.hooks.glowThink
     } ghosted {
         yeet("gs")
     }
@@ -126,7 +99,6 @@ flex finna runThinkers(gt: tag gs.GameState) {
             yeet("cur")
         }
         fr fid == think.FUNC_REMOVED {
-            // time to remove it: next->prev = prev ; prev->next = next ; free the slot
             holla nn = nxt in gs.thinkers {
                 nn.prev = prv
             } ghosted {
@@ -137,25 +109,29 @@ flex finna runThinkers(gt: tag gs.GameState) {
             }
             evict cur in gs.thinkers
         } naw fr fid == think.FUNC_MOBJ {
-            // P_MobjThinker, via the forward slot (see header). Assumed wired.
             mobjFn(gt, cur)
+        } naw fr fid == think.FUNC_DOOR {
+            doorFn(gt, cur)
+        } naw fr fid == think.FUNC_CEILING {
+            ceilingFn(gt, cur)
+        } naw fr fid == think.FUNC_FLOOR {
+            floorFn(gt, cur)
+        } naw fr fid == think.FUNC_PLAT {
+            platFn(gt, cur)
+        } naw fr fid == think.FUNC_FLICKER {
+            flickerFn(gt, cur)
+        } naw fr fid == think.FUNC_FLASH {
+            flashFn(gt, cur)
+        } naw fr fid == think.FUNC_STROBE {
+            strobeFn(gt, cur)
+        } naw fr fid == think.FUNC_GLOW {
+            glowFn(gt, cur)
         } naw {
-            // SEAM: FUNC_DOOR / FUNC_CEILING / FUNC_FLOOR / FUNC_PLAT / FUNC_FLICKER /
-            // FUNC_FLASH / FUNC_STROBE / FUNC_GLOW — P2.3's sector-effect thinkers. Their
-            // dispatch arms slot in here (each via its own forward fn-value, mirroring
-            // mobjThink) once p_spec lands. Until then such nodes never exist.
         }
         cur = nxt
     }
 }
 
-// ===========================================================================================
-// action-fn dispatch (replaces id's `st->action.acp1(mobj)` / `psp->state->action.acp2(...)`)
-// ===========================================================================================
-
-// runAction — dispatch a MOBJ-signature action (info AID_*, the 52 fns taking mobj_t*). Reads
-// the matching gs.Actions field out of the crib, then calls it AFTER closing the holla (so the
-// action opens its own gs holla with no parent open). AID_NONE is a no-op.
 flex finna runAction(gt: tag gs.GameState, aid: int, actor: tag think.Thinker) {
     fr aid == info.AID_NONE {
         bet
@@ -328,8 +304,6 @@ flex finna runAction(gt: tag gs.GameState, aid: int, actor: tag think.Thinker) {
     }
 }
 
-// runPsprAction — dispatch a WEAPON/PSPRITE-signature action (the 22 fns taking
-// (player_t*, pspdef_t*)); playerIdx/pspIdx replace those pointers.
 flex finna runPsprAction(gt: tag gs.GameState, aid: int, playerIdx: int, pspIdx: int) {
     fr aid == info.AID_NONE {
         bet
