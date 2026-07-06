@@ -155,6 +155,14 @@ fn platform_layer_is_headless() {
         bet_gg_rect(0, 0, 10, 10, 0);
         bet_gg_flush();
         bet_gg_stop(0);
+
+        // gg relative mouse / retune / show / streaming audio — headless: no deltas, retune and
+        // show no-op, and the audio spec/backpressure report the documented fixed defaults.
+        assert_eq!(bet_gg_mouse_delta(), 0);
+        bet_gg_tune(0, 256, 128);
+        bet_gg_show(ptr::null(), 320, 200);
+        assert_eq!(bet_gg_audio_spec(), (48_000u64 << 32) | 2);
+        assert_eq!(bet_gg_pending(), 0);
     }
 }
 
