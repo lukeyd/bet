@@ -805,6 +805,15 @@ flex drip MenuState {
     flex detailLevel: i32
     flex showMessages: i32
     flex savegameStrings: vec[str]
+    // ---- P2.9b additive (m_menu) — menu routing/state that has no single doomstat home. Since
+    // bet has no fn-ptr menu tables, the per-menu lastOn (menu_t.lastOn, one per menudef) and the
+    // pending message-response routine (messageRoutine fn ptr) are modelled here. -------------
+    flex messageRoutineId: i32     // pending M_StartMessage response routine (MRT_* id; 0 = none)
+    flex messageLastMenuActive: bool  // menuactive snapshot restored by M_StopMessage
+    flex inhelpscreens: bool       // set by the ReadThis draw routines
+    flex epi: i32                  // M_Episode's chosen episode (id's static `epi`)
+    flex screenblocks: i32         // R_SetViewSize block count (screenSize == screenblocks-3)
+    flex menuLastOn: i32[16]       // per-menu lastOn, indexed by menu id (MENU_*); M_Init seeds it
 }
 
 // ---- HudState (hu_stuff). -----------------------------------------------------------------
@@ -865,19 +874,65 @@ flex drip StBarState {
 }
 
 // ---- AmState (am_map). --------------------------------------------------------------------
+// P2.9b: am_map.c keeps ~40 file-level statics (mutable globals don't lower native), so they are
+// modelled as additive scalar fields here (only this drip changed). Field map:
+//   mx/my/mw/mh = m_x/m_y/m_w/m_h (map coords); mScale = scale_mtof; ftom = scale_ftom;
+//   mtof is UNUSED (kept for back-compat). The zoom multipliers, save/restore slots, bounds,
+//   window rect, clocks, and mark ring are the remaining am_map statics.
+// Marks: id used a mutable 10-entry ring (markpoints[] with in-place x/y writes + clear-to-(-1)).
+// A `vec` can't be element-mutated in native codegen, so the ring is a pair of fixed i32[10]
+// arrays (markX/markY, native-safe element assign); the pre-existing `marks` vec is left unused.
 flex drip AmState {
     flex active: bool
     flex mx: i32
     flex my: i32
     flex mw: i32
     flex mh: i32
-    flex mScale: i32
-    flex ftom: i32
-    flex mtof: i32
+    flex mScale: i32              // scale_mtof
+    flex ftom: i32               // scale_ftom
+    flex mtof: i32               // (unused; kept for back-compat)
     flex followplayer: bool
     flex grid: bool
     flex leaveletter: i32
-    flex marks: vec[MapMark]
+    flex marks: vec[MapMark]     // (unused in P2.9b; ring is markX/markY below)
+    // ---- P2.9b additive statics ------------------------------------------------------------
+    flex mx2: i32                // m_x2 (m_x + m_w)
+    flex my2: i32                // m_y2 (m_y + m_h)
+    flex minX: i32               // level vertex bounds
+    flex minY: i32
+    flex maxX: i32
+    flex maxY: i32
+    flex maxW: i32               // max_x-min_x
+    flex maxH: i32               // max_y-min_y
+    flex minScale: i32           // min_scale_mtof (zoom-out stop)
+    flex maxScale: i32           // max_scale_mtof (zoom-in stop)
+    flex oldMx: i32              // AM_saveScaleAndLoc slots
+    flex oldMy: i32
+    flex oldMw: i32
+    flex oldMh: i32
+    flex oldLocX: i32            // f_oldloc (follow-player last pos; MAXINT = invalid)
+    flex oldLocY: i32
+    flex panIncX: i32            // m_paninc (map-coord pan velocity per tic)
+    flex panIncY: i32
+    flex mtofZoom: i32           // mtof_zoommul (per-tic zoom, FRACUNIT = none)
+    flex ftomZoom: i32           // ftom_zoommul
+    flex fx: i32                 // f_x window rect on screen
+    flex fy: i32
+    flex fw: i32                 // f_w (SCREENWIDTH)
+    flex fh: i32                 // f_h (SCREENHEIGHT-32)
+    flex amclock: i32
+    flex lightlev: i32
+    flex cheating: i32           // 0/1/2 (iddt states)
+    flex bigstate: i32           // AM_GOBIGKEY toggle
+    flex markpointnum: i32       // next mark ring slot
+    flex leveljuststarted: i32
+    flex stopped: bool
+    flex lastlevel: i32          // AM_Start's static level/episode cache
+    flex lastepisode: i32
+    flex plrnum: i32             // player represented by the arrow
+    flex amCheatPos: i32         // cheat_amap match position (m_cheat state)
+    flex markX: i32[10]          // AM_NUMMARKPOINTS mark ring x (-1 = empty)
+    flex markY: i32[10]          // mark ring y
 }
 
 // ---- WiState (wi_stuff intermission). -----------------------------------------------------
@@ -1063,6 +1118,14 @@ flex finna gsInit(gt: tag GameState) {
         // menu / automap
         g.menu.savegameStrings = vec.new[str]()
         g.am.marks = vec.new[MapMark]()
+        // am_map file-static initial values (id: followplayer=1, stopped=true, leveljuststarted=1,
+        // lastlevel/lastepisode=-1). markX/markY (the mark ring) are cop zero-inited; AM_Start's
+        // clearMarks sets them to -1 before first use.
+        g.am.followplayer = nocap
+        g.am.stopped = nocap
+        g.am.leveljuststarted = 1
+        g.am.lastlevel = -1
+        g.am.lastepisode = -1
         // wipe
         g.wipe.y = mem.slab[i32](320)
         g.wipe.scrStart = mem.slab[u8](64000)

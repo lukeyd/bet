@@ -439,3 +439,53 @@ means NULL; `0` = negonearray, `320` = screenheightarray, `>=640` = copied clip.
 (`colfunc`/`basecolfunc` = `drawColumn`, `fuzzcolfunc` = `drawFuzzColumn`, `transcolfunc` =
 `drawTranslatedColumn`, `spanfunc` = `drawSpan`). Low-detail (`detailshift != 0`) is SKIPPED, so the
 hot loops call the concrete high-detail fns directly (equivalent since `detailshift == 0` always).
+
+## P2.9b amendment (menus + automap — additive to MenuState / AmState ONLY)
+
+`m/m_menu` (m_menu.c) + `am/am_map` (am_map.c) touched **only two drips** (`MenuState`, `AmState`)
+plus the am file-static defaults in `gsInit`. No sibling drip changed.
+
+**`MenuState`** += the menu-routing state id kept as fn-ptr menu tables (bet has none): the pending
+message-response routine is an id, and each menudef's `lastOn` is an array (the menudef tables
+themselves are data if-chains in `m_menu`, not stored):
+- `messageRoutineId: i32` (MRT_* — 0 none / QUIT / ENDGAME / NIGHTMARE / QUICKSAVE / QUICKLOAD) ·
+  `messageLastMenuActive: bool` · `inhelpscreens: bool` · `epi: i32` (M_Episode's chosen episode) ·
+  `screenblocks: i32` (screenSize == screenblocks-3) · `menuLastOn: i32[16]` (per-menu-id lastOn,
+  seeded by M_Init; NewGame/skill starts on hurtme=2).
+
+**`AmState`** += the am_map.c file-level statics (mutable globals don't lower native). The existing
+`mx/my/mw/mh` = m_x/m_y/m_w/m_h; `mScale` = scale_mtof; `ftom` = scale_ftom; `mtof` is unused now.
+Added: `mx2/my2`, `minX/minY/maxX/maxY`, `maxW/maxH`, `minScale/maxScale`, `oldMx/oldMy/oldMw/oldMh`,
+`oldLocX/oldLocY` (f_oldloc), `panIncX/panIncY` (m_paninc), `mtofZoom/ftomZoom` (the per-tic zoom
+muls), `fx/fy/fw/fh` (window rect), `amclock`, `lightlev`, `cheating` (0/1/2 iddt), `bigstate`,
+`markpointnum`, `leveljuststarted`, `stopped`, `lastlevel/lastepisode`, `plrnum`, `amCheatPos`, and
+the **mark ring** `markX: i32[10]` / `markY: i32[10]`. id's `markpoints[10]` is a mutable ring with
+in-place x/y writes + clear-to-(-1); a `vec` can't be element-mutated in native codegen, so the ring
+is a pair of fixed i32 arrays (element assign lowers natively). The pre-existing `marks` vec is left
+unused. `gsInit` seeds the id file-static defaults (`followplayer=1`, `stopped=true`,
+`leveljuststarted=1`, `lastlevel=lastepisode=-1`).
+
+**Flex API for d_main/g_game (P2.8) to drive:**
+- menu (per tic / per frame / on event): `m_menu.mInit(gt)` / `mTicker(gt)` / `mDrawer(gt)` /
+  `mResponder(gt, evType, key) -> bool` (evType 0 = keydown; joystick/mouse are synthesized to keys
+  by the driver). `mStartControlPanel`/`mClearMenus` toggle `g.menu.menuactive` (mirrored to
+  `g.shell.menuactive`).
+- automap: `am_map.amStart(gt)` / `amStop(gt)` / `amTicker(gt)` / `amDrawer(gt)` /
+  `amResponder(gt, evType, key) -> bool` (evType 0 = keydown, 1 = keyup for pan-stop/zoom-stop).
+  `g.am.active` mirrors `g.shell.automapactive`. AM_Drawer writes into scr0 (window f_x=f_y=0,
+  f_w=320, f_h=168); the driver calls it *instead of* the 3D view when the automap is up.
+
+**Menu-action SEAMS left for P2.8 (g_game) / P2.11 (p_saveg)** — the field/gameaction is set, the
+downstream noted in-line:
+- New Game / skill / nightmare → `deferInitNew`: sets `g.shell.startskill/startepisode/startmap` +
+  `g.shell.gameaction = GA_NEWGAME` (G_DeferedInitNew).
+- End Game (yes) → `g.shell.gameaction = GA_NOTHING`, `g.shell.gamestate = GS_DEMOSCREEN` (D_StartTitle).
+- Load/Save select, DoSave, QuickSave/Load → set `g.shell.gameaction = GA_LOADGAME/GA_SAVEGAME`; the
+  actual G_LoadGame/G_SaveGame + per-char save-string editing is P2.11.
+- devparm F1 → `g.shell.gameaction = GA_SCREENSHOT` (G_ScreenShot). Size change leaves an
+  R_SetViewSize render seam. Quit-yes latches `g.shell.quitRequested` (I_Quit).
+- S_SetSfxVolume/S_SetMusicVolume (volume menus) and S_StartSound (UI nav sounds) ARE wired.
+
+**Regression baseline:** `tools/menu_smoke.bet` (native, headless) → `goldens/menu.golden`: crc32 of
+scr0 at the main/episode/skill/skill-down menus + the quit message prompt, and the E1M1 automap
+(fresh, iddt-all-walls, and after a follow-player tick). Native-only (WAD scale); `BET_GG_HEADLESS=1`.
