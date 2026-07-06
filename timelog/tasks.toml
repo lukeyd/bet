@@ -494,6 +494,12 @@ name = "Milestone 7.2: Doom port targeting gg — pixel-perfect vs demo-lump ora
 size = 34
 status = "doing"
 
+[[task]]
+slug = "doom-p29a"
+name = "Doom P2.9a: status bar + HUD (st_stuff/st_lib/hu_stuff/hu_lib) — face state machine, cheat matcher, ST/HU drawer"
+size = 5
+status = "doing"
+
 # ─────────────────────── Oregon Trail port + the language features it needs ───────────────────────
 # A faithful port of the 1978 MECC Oregon Trail BASIC listing (ports/oregon-trail/). It needs two
 # stdlib intrinsics the language lacked: a seedable RNG and interactive stdin. betfe is intentionally
