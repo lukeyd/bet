@@ -8,6 +8,7 @@ pull "../r/r_sky" as rsky
 pull "../r/r_draw" as rdraw
 pull "../r/r_plane" as rplane
 pull "../r/r_bsp" as rbsp
+pull "../r/r_things" as rthings
 
 flex facts SCREENWIDTH: int = 320
 flex facts SCREENHEIGHT: int = 200
@@ -276,4 +277,6 @@ flex finna renderPlayerView(gt: tag gs.GameState, playerIdx: int) {
     }
     rbsp.renderBSPNode(gt, numnodes - 1)
     rplane.drawPlanes(gt)
+    // SEAM: R_DrawMasked — composite sprites + player weapon sprites over walls+floors (P2.7).
+    rthings.drawMasked(gt)
 }
