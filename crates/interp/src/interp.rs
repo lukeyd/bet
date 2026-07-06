@@ -1799,16 +1799,16 @@ impl<'p> Interp<'p> {
             {
                 let (w, h) = (*w as u32, *h as u32);
                 let off = *off as usize;
-                let bytes = marshal_ints(pixels, |i| i as u8).ok_or_else(|| {
+                let need = (w as usize) * (h as usize) * 4;
+                // Marshal ONLY the `need`-byte window at `off`, never the whole buffer: an asset
+                // pack can be hundreds of MB while the backend reads just `w * h * 4` bytes, and
+                // the compiled path likewise reads only `[off, off + w*h*4)` (a `base + off`
+                // pointer). `marshal_ints_window` clamps to the array bounds, so an out-of-range
+                // window yields the in-range part (empty past the end) instead of panicking.
+                let window = marshal_ints_window(pixels, off, need, |i| i as u8).ok_or_else(|| {
                     RunError::Type("`gg.tex` needs an array of pixel bytes".into())
                 })?;
-                let need = (w as usize) * (h as usize) * 4;
-                let slice: &[u8] = if off <= bytes.len() {
-                    &bytes[off..off.saturating_add(need).min(bytes.len())]
-                } else {
-                    &[]
-                };
-                let id = gg_backend::tex(slice, w, h);
+                let id = gg_backend::tex(&window, w, h);
                 Ok(vec![Value::Int(i64::from(id))])
             }
             ("tex", _) => Err(RunError::Type(
@@ -1890,20 +1890,13 @@ impl<'p> Interp<'p> {
                     Value::Int(rate),
                 ],
             ) if *off >= 0 && *len >= 0 && *ch >= 0 && *rate >= 0 => {
-                let pcm = marshal_ints(samples, |i| i as i16).ok_or_else(|| {
+                // Serialize ONLY the samples spanning the `[off, off + len)` byte window instead
+                // of the whole (possibly hundreds-of-MB) buffer; `sound_le_window` produces bytes
+                // identical to marshalling everything and slicing, but touches just the window.
+                let win = sound_le_window(samples, *off as usize, *len as usize).ok_or_else(|| {
                     RunError::Type("`gg.sound` needs an array of sample integers".into())
                 })?;
-                let mut all = Vec::with_capacity(pcm.len() * 2);
-                for s in &pcm {
-                    all.extend_from_slice(&s.to_le_bytes());
-                }
-                let off = *off as usize;
-                let slice: &[u8] = if off <= all.len() {
-                    &all[off..off.saturating_add(*len as usize).min(all.len())]
-                } else {
-                    &[]
-                };
-                let id = gg_backend::sound(slice, *ch as u32, *rate as u32);
+                let id = gg_backend::sound(&win, *ch as u32, *rate as u32);
                 Ok(vec![Value::Int(i64::from(id))])
             }
             ("sound", _) => Err(RunError::Type(
@@ -2017,6 +2010,58 @@ fn marshal_ints<T>(v: &Value, conv: impl Fn(i64) -> T) -> Option<Vec<T>> {
         }
     }
     Some(out)
+}
+
+/// Marshal a contiguous element window `[start, start + count)` of a `gg` pixel/sample array
+/// `Value` into a `Vec<T>` via `conv`, clamping the range to the array's bounds (an out-of-range
+/// window yields only the in-range part, empty when `start` is past the end). Unlike
+/// [`marshal_ints`], it walks ONLY the requested window — never the whole array — so a
+/// hundreds-of-MB asset buffer is not copied end-to-end on every `gg.tex` / `gg.sound` call.
+/// Returns `None` if the value is not an array of integers (only the windowed elements are
+/// inspected).
+fn marshal_ints_window<T>(
+    v: &Value,
+    start: usize,
+    count: usize,
+    conv: impl Fn(i64) -> T,
+) -> Option<Vec<T>> {
+    let Value::Array(xs) = v else {
+        return None;
+    };
+    let start = start.min(xs.len());
+    let end = start.saturating_add(count).min(xs.len());
+    let mut out = Vec::with_capacity(end - start);
+    for e in &xs[start..end] {
+        match e {
+            Value::Int(i) => out.push(conv(*i)),
+            Value::Byte(b) => out.push(conv(i64::from(*b))),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Serialize the `[off, off + len)` BYTE window of a `[]i16` sample array — viewed as interleaved
+/// little-endian bytes, mirroring the compiled path's raw byte view — WITHOUT serializing the
+/// whole buffer. Only the samples spanning the window (`off / 2 ..= (off + len - 1) / 2`) are
+/// marshaled, so an asset-pack-sized buffer is not walked end-to-end. The result is byte-for-byte
+/// identical to marshalling every sample and slicing `[off, off + len)`. Returns `None` if
+/// `samples` is not an integer array.
+fn sound_le_window(samples: &Value, off: usize, len: usize) -> Option<Vec<u8>> {
+    let first = off / 2; // first sample whose bytes fall in the window
+    let byte_end = off.saturating_add(len); // exclusive byte bound
+    let count = byte_end.div_ceil(2).saturating_sub(first); // samples spanning the window
+    let pcm = marshal_ints_window(samples, first, count, |i| i as i16)?;
+    let mut bytes = Vec::with_capacity(pcm.len() * 2);
+    for s in &pcm {
+        bytes.extend_from_slice(&s.to_le_bytes());
+    }
+    // `bytes` starts at byte `2 * first`; carve out the requested `[off, byte_end)` sub-range,
+    // clamped to what the array actually provided (an out-of-range window yields fewer bytes).
+    let base = 2 * first;
+    let lo = off.saturating_sub(base).min(bytes.len());
+    let hi = byte_end.saturating_sub(base).min(bytes.len());
+    Some(bytes[lo..hi].to_vec())
 }
 
 fn exactly_one(mut vals: Vec<Value>) -> Result<Value, RunError> {
@@ -2275,4 +2320,123 @@ fn format_str(fmt: &str, args: &[Value]) -> Result<String, RunError> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod gg_marshal_tests {
+    use super::*;
+
+    fn ints(xs: &[i64]) -> Value {
+        Value::Array(xs.iter().map(|&i| Value::Int(i)).collect())
+    }
+
+    // Oracles: the OLD whole-buffer behavior, kept verbatim to prove the windowed fix is
+    // byte-identical to marshalling everything and slicing.
+    fn old_tex_window(pixels: &Value, off: usize, need: usize) -> Vec<u8> {
+        let bytes = marshal_ints(pixels, |i| i as u8).unwrap();
+        if off <= bytes.len() {
+            bytes[off..off.saturating_add(need).min(bytes.len())].to_vec()
+        } else {
+            Vec::new()
+        }
+    }
+    fn old_sound_window(samples: &Value, off: usize, len: usize) -> Vec<u8> {
+        let pcm = marshal_ints(samples, |i| i as i16).unwrap();
+        let mut all = Vec::with_capacity(pcm.len() * 2);
+        for s in &pcm {
+            all.extend_from_slice(&s.to_le_bytes());
+        }
+        if off <= all.len() {
+            all[off..off.saturating_add(len).min(all.len())].to_vec()
+        } else {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn window_marshal_clamps_and_slices() {
+        let v = ints(&[10, 20, 30, 40, 50]);
+        assert_eq!(
+            marshal_ints_window(&v, 1, 3, |i| i as u8),
+            Some(vec![20u8, 30, 40])
+        );
+        // window running past the end clamps to what exists
+        assert_eq!(
+            marshal_ints_window(&v, 3, 10, |i| i as u8),
+            Some(vec![40u8, 50])
+        );
+        // start past the end -> empty
+        assert_eq!(
+            marshal_ints_window(&v, 9, 4, |i| i as u8),
+            Some(Vec::<u8>::new())
+        );
+        // count 0 -> empty
+        assert_eq!(
+            marshal_ints_window(&v, 2, 0, |i| i as u8),
+            Some(Vec::<u8>::new())
+        );
+    }
+
+    #[test]
+    fn window_marshal_accepts_bytes_and_rejects_others() {
+        let bytes = Value::Array(vec![Value::Byte(1), Value::Byte(2), Value::Byte(3)]);
+        assert_eq!(
+            marshal_ints_window(&bytes, 0, 2, |i| i as u8),
+            Some(vec![1u8, 2])
+        );
+        // not an array
+        assert_eq!(marshal_ints_window(&Value::Int(5), 0, 1, |i| i as u8), None);
+        // a non-int element INSIDE the window rejects
+        let mixed = Value::Array(vec![Value::Int(1), Value::Str("x".into())]);
+        assert_eq!(marshal_ints_window(&mixed, 0, 2, |i| i as u8), None);
+        // ... but a bad element OUTSIDE the window is never inspected
+        assert_eq!(
+            marshal_ints_window(&mixed, 0, 1, |i| i as u8),
+            Some(vec![1u8])
+        );
+    }
+
+    #[test]
+    fn tex_window_matches_full_marshal() {
+        // a []u8-style buffer (each element is one byte 0..64)
+        let v = ints(&(0..64).collect::<Vec<_>>());
+        for &(off, need) in &[
+            (0usize, 16usize),
+            (4, 16),
+            (8, 40),
+            (60, 16),
+            (70, 8),
+            (0, 64),
+            (64, 4),
+        ] {
+            assert_eq!(
+                marshal_ints_window(&v, off, need, |i| i as u8).unwrap(),
+                old_tex_window(&v, off, need),
+                "tex off={off} need={need}"
+            );
+        }
+    }
+
+    #[test]
+    fn sound_window_matches_full_marshal() {
+        let v = ints(&[0x1234, -1, 0x0055, 32767, -32768, 100, 200, 300]);
+        // even/odd offsets, out-of-range window, zero length
+        for &(off, len) in &[
+            (0usize, 4usize),
+            (2, 6),
+            (1, 3),
+            (3, 5),
+            (0, 16),
+            (10, 6),
+            (14, 10),
+            (30, 4),
+            (6, 0),
+        ] {
+            assert_eq!(
+                sound_le_window(&v, off, len).unwrap(),
+                old_sound_window(&v, off, len),
+                "sound off={off} len={len}"
+            );
+        }
+    }
 }
