@@ -341,6 +341,46 @@ flex drip RenderState {
     flex rw_angle1: i32
     flex sscount: i32
     flex skyflatnum: i32
+    // ---- P1.4 RenderState amendment (r/r_data + r/r_sky) — texture/flat/sprite/sky tables.
+    // Composited wall textures live in ONE []u8 arena (texArena); render regs reference a
+    // column by a byte offset. See CONTRACTS.md "P1.4 RenderState amendment". --------------
+    // textures (r_data R_InitTextures / R_GenerateLookup+Composite)
+    flex texArena: []u8               // all composited (multi-patch) columns, packed
+    flex texArenaLen: int
+    flex numTextures: i32
+    flex textureWidth: []i32          // per texture, pixel width
+    flex textureHeight: []i32         // per texture, fixed_t (height<<FRACBITS)
+    flex textureWidthMask: []i32      // per texture, column mask (2^k - 1)
+    flex textureComposite: []i32      // per texture, base ofs into texArena, -1 if all single-patch
+    flex textureColumnStart: []i32    // per texture, base index into textureColumn{Lump,Ofs}
+    flex textureColumnLump: []i32     // per column: patch lump (>0) or -1 (composite in texArena)
+    flex textureColumnOfs: []i32      // per column: in-lump byte ofs (single) or in-arena-block ofs
+    flex texNameToNum: stash[str, int]
+    flex textureTranslation: []i32    // global animation identity map
+    // flats (r_data R_InitFlats)
+    flex firstFlat: i32
+    flex numFlats: i32
+    flex flatNameToNum: stash[str, int]
+    flex flatTranslation: []i32
+    // sprite lumps (r_data R_InitSpriteLumps)
+    flex firstSpriteLump: i32
+    flex numSpriteLumps: i32
+    flex spriteWidth: []i32           // fixed_t
+    flex spriteOffset: []i32          // fixed_t (leftoffset)
+    flex spriteTopOffset: []i32       // fixed_t (topoffset)
+    // sprite frame tables (r_data R_InitSpriteDefs). SoA layout: per sprite, numframes +
+    // frame-start index; per frame, rotate flag + 8 rotation lumps + 8 flip flags.
+    flex numSprites: i32
+    flex spriteNumFrames: []i32       // per sprite
+    flex spriteFrameStart: []i32      // per sprite, base index into spriteFrame{Rotate,Lump,Flip}
+    flex spriteFrameRotate: []i32     // per frame: 0 = single view, 1 = 8 rotations
+    flex spriteFrameLump: []i32       // per frame: 8 sprite-lump indices (frame*8 + rot)
+    flex spriteFrameFlip: []i32       // per frame: 8 flip flags (frame*8 + rot)
+    // colormap byte length (colormaps arena reserved by P1.1)
+    flex colormapsBytes: int
+    // sky (r_sky R_InitSkyMap); skyflatnum above is set by the loader
+    flex skytexture: i32
+    flex skytexturemid: i32           // fixed_t
     // draw-function vtable
     flex colfunc: finna(tag GameState) -> void
     flex basecolfunc: finna(tag GameState) -> void

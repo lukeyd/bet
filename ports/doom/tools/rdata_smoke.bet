@@ -1,0 +1,104 @@
+// tools/rdata_smoke.bet — the P1.4 RENDER-DATA proof. Cops a GameState, gsInit, loads the
+// shareware IWAD, runs R_InitData (textures/flats/sprites/colormaps), and prints the shareware
+// counts plus two deterministic CRC-32s: the composited texture arena and the COLORMAP slab.
+// The CRCs are a self-consistency regression baseline (committed as ports/doom/goldens/
+// rdata.golden) — deterministic given the WAD.
+//
+// Build+run NATIVE (headless); interp is intractable at WAD scale (it clones an array per
+// element read):
+//   cargo build -p driver --features llvm
+//   bet build ports/doom/tools/rdata_smoke.bet --runtime real -o /tmp/rdata_smoke
+//   /tmp/rdata_smoke
+pull "spill"
+pull "mem"
+pull "str"
+pull "../defs/gs" as gs
+pull "../w/w_wad" as wad
+pull "../r/r_data" as rdata
+
+// crc32 (IEEE-802.3 reflected, poly 0xEDB88320, init/xorout 0xFFFFFFFF) — the pipeline crc,
+// specialized to a []u8 stream (same as tools/video_smoke.bet + goldens.bet).
+flex finna hex8(v: int) -> str {
+    lowkey val = v & 4294967295
+    lowkey buf = mem.slab[u8](8)
+    lowkey i = 0
+    vibin i < 8 {
+        lowkey nib = (val >> (28 - i * 4)) & 15
+        fr nib < 10 {
+            buf[i] = (48 + nib) as u8
+        } naw {
+            buf[i] = (87 + nib) as u8
+        }
+        i = i + 1
+    }
+    bet str.fromBytesTrust(buf)
+}
+
+flex finna crcTable() -> []i32 {
+    lowkey tbl = mem.slab[i32](256)
+    lowkey i = 0
+    vibin i < 256 {
+        lowkey c = i
+        lowkey k = 0
+        vibin k < 8 {
+            lowkey lsb = c & 1
+            c = c >> 1
+            fr lsb != 0 {
+                c = c ^ 3988292384
+            }
+            k = k + 1
+        }
+        tbl[i] = c as i32
+        i = i + 1
+    }
+    bet tbl
+}
+
+flex finna crc32U8(tbl: []i32, t: []u8, n: int) -> int {
+    lowkey crc = 4294967295
+    lowkey i = 0
+    vibin i < n {
+        lowkey byte = t[i] as int
+        crc = (crc >> 8) ^ ((tbl[((crc ^ byte) & 255)] as int) & 4294967295)
+        i = i + 1
+    }
+    bet (crc ^ 4294967295) & 4294967295
+}
+
+finna main() {
+    lowkey g0 = cop gs.GameState{} in gs.gsc
+    gs.gsInit(g0)
+    wad.initWad(g0, "/Users/lukebaggett/Documents/bet/doom-reference/doom1.wad")
+    rdata.initData(g0)
+
+    lowkey ctab = crcTable()
+    lowkey numTex = 0
+    lowkey numFlats = 0
+    lowkey numSpriteLumps = 0
+    lowkey numSprites = 0
+    lowkey cmapBytes = 0
+    lowkey arenaLen = 0
+    lowkey texCrc = 0
+    lowkey cmapCrc = 0
+    holla g = g0 in gs.gsc {
+        numTex = g.render.numTextures as int
+        numFlats = g.render.numFlats as int
+        numSpriteLumps = g.render.numSpriteLumps as int
+        numSprites = g.render.numSprites as int
+        cmapBytes = g.render.colormapsBytes
+        arenaLen = g.render.texArenaLen
+        texCrc = crc32U8(ctab, g.render.texArena, g.render.texArenaLen)
+        cmapCrc = crc32U8(ctab, g.render.colormaps, g.render.colormapsBytes)
+    } ghosted {
+        yeet("gs")
+    }
+
+    spill.f("numTextures={}\n", numTex)
+    spill.f("numFlats={}\n", numFlats)
+    spill.f("numSpriteLumps={}\n", numSpriteLumps)
+    spill.f("numSprites={}\n", numSprites)
+    spill.f("colormapBytes={}\n", cmapBytes)
+    spill.f("texArenaLen={}\n", arenaLen)
+    spill.f("texArenaCrc=0x{}\n", hex8(texCrc))
+    spill.f("colormapCrc=0x{}\n", hex8(cmapCrc))
+}

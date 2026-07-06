@@ -1,0 +1,15 @@
+// r/r_sky.bet — sky mapping setup (linuxdoom-1.10 r_sky.c). The DOOM sky is a wall texture
+// wrapping 360 degrees; R_InitSkyMap fixes the vertical texture offset. In id's shipped source
+// the skyflatnum line is commented out (skyflatnum/skytexture are set at level load, p_setup
+// P2.5), so R_InitSkyMap only sets skytexturemid = 100*FRACUNIT.
+pull "../defs/gs" as gs
+pull "../defs/fixed" as fixed
+
+// R_InitSkyMap — called whenever the view size changes; sets the sky column's mid offset.
+flex finna initSkyMap(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.render.skytexturemid = 100 * fixed.FRACUNIT
+    } ghosted {
+        yeet("gs")
+    }
+}
