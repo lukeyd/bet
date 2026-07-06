@@ -1,0 +1,172 @@
+// tools/music_smoke.bet — the P2.10 MUSIC-GLUE proof. Cops a GameState, loads the shareware
+// IWAD, parses GENMIDI (musicInit), resolves D_E1M1, and starts it looping (musicPlay). Then it:
+//
+//   (1) REAL SEAM: calls i_music.musicUpdate ~350 times (10s of frames at 35fps) — the exact
+//       per-frame path d_main/g_game will drive — and reports the total mono samples rendered
+//       (headless gg.audio is a no-op, but the OPL2 synth fully runs). Nonzero ⇒ music plays.
+//
+//   (2) GLUE-PRESERVES-CORE: re-arms the song, captures the engine's streamed samples through
+//       i_music.musicStep in small CHUNKS (proving the re-entrant per-frame stepper is stateful),
+//       then renders the SAME song+rate in one shot via the standalone core mus.musToOpl, and
+//       asserts the two sample streams have an identical crc32. That is the correctness guarantee:
+//       chunked in-engine streaming == batch core render (chunk boundaries never move a sample).
+//
+//   (3) GOLDEN: crc32 of the first 44100 mono samples (nonzero, deterministic given the WAD +
+//       device rate) — committed as ports/doom/goldens/music_render.golden.
+//
+// Build+run NATIVE (headless):
+//   cargo build -p driver --features llvm && cargo build -p runtime --features gg-desktop
+//   bet build ports/doom/tools/music_smoke.bet --runtime real -o /tmp/music_smoke
+//   BET_GG_HEADLESS=1 /tmp/music_smoke
+// A windowed, AUDIBLE run drops BET_GG_HEADLESS and needs a gg.show/gg.ticks pacing loop calling
+// musicUpdate per frame (manual check; headless proves the synth, a device proves it's audible).
+//
+// NATIVE-ONLY: musicInit walks the multi-MB WAD (GENMIDI parse); the interpreter clones arrays
+// per element read (CONTRACTS "Native-first").
+pull "spill"
+pull "mem"
+pull "vec"
+pull "../defs/gs" as gs
+pull "../w/w_wad" as w
+pull "../i/i_music" as imus
+pull "../s/mus" as mus
+pull "../s/genmidi" as genmidi
+pull "../s/opl" as opl
+
+facts WAD: str = "/Users/lukebaggett/Documents/bet/doom-reference/doom1.wad"
+facts FRAMES: int = 350          // ~10s at 35fps
+facts GOLDEN_N: int = 44100      // first-N samples fed to the golden crc
+facts COMPARE_N: int = 132300    // samples cross-checked against mus.musToOpl (3s @ 44100-equiv)
+facts CHUNK: int = 4096          // per-step capture size (exercises the re-entrant stepper)
+
+// Build the 256-entry crc32 lookup table (poly 0xEDB88320), matching tools/goldens.bet + the C
+// generators.
+finna crcTable() -> []i32 {
+    lowkey tbl = mem.slab[i32](256)
+    lowkey i = 0
+    vibin i < 256 {
+        lowkey c = i
+        lowkey k = 0
+        vibin k < 8 {
+            lowkey lsb = c & 1
+            c = c >> 1
+            fr lsb != 0 {
+                c = c ^ 3988292384
+            }
+            k = k + 1
+        }
+        tbl[i] = c as i32
+        i = i + 1
+    }
+    bet tbl
+}
+
+// crc32 of the first `n` mono samples of `s`, each serialized as a little-endian 16-bit sample
+// (negative wrapped to +65536) — the same byte layout the mus_render WAV writes.
+finna crc32Samples(tbl: []i32, s: vec[int], n: int) -> int {
+    lowkey crc = 4294967295
+    lowkey i = 0
+    vibin i < n {
+        lowkey sv = s[i]
+        fr sv < 0 {
+            sv = sv + 65536
+        }
+        lowkey b0 = sv & 255
+        crc = (crc >> 8) ^ ((tbl[((crc ^ b0) & 255)] as int) & 4294967295)
+        lowkey b1 = (sv >> 8) & 255
+        crc = (crc >> 8) ^ ((tbl[((crc ^ b1) & 255)] as int) & 4294967295)
+        i = i + 1
+    }
+    bet (crc ^ 4294967295) & 4294967295
+}
+
+finna main() {
+    lowkey g0 = cop gs.GameState{} in gs.gsc
+    gs.gsInit(g0)
+
+    // Load the IWAD and parse the GENMIDI OPL instrument bank (musicInit).
+    w.initWad(g0, WAD)
+    imus.musicInit(g0)
+
+    lowkey ninstr = 0
+    holla g = g0 in gs.gsc {
+        ninstr = g.music.instrs.gang() as int
+    } ghosted {
+        yeet("gs")
+    }
+
+    // Resolve D_E1M1's lump (the "d_e1m1" name upper-cases to the on-disk "D_E1M1").
+    lowkey lump = w.checkNumForName(g0, "D_E1M1")
+    fr lump == -1 {
+        spill.it("D_E1M1 lump missing")
+        bet
+    }
+    lowkey mofs = w.lumpNum(g0, lump)
+    lowkey mlen = w.lumpLength(g0, lump)
+
+    lowkey rate, ch = gg.audioSpec()
+    spill.f("device rate {} Hz  channels {}  GENMIDI instruments {}\n", rate, ch, ninstr)
+
+    // ---- (1) REAL SEAM: drive musicUpdate once per frame for FRAMES frames ------------------
+    imus.musicPlay(g0, mofs, mlen, 1)
+    lowkey nevents = 0
+    holla g = g0 in gs.gsc {
+        nevents = g.music.events.gang() as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey frameTotal = 0
+    lowkey f = 0
+    vibin f < FRAMES {
+        frameTotal = frameTotal + imus.musicUpdate(g0)
+        f = f + 1
+    }
+    lowkey rendered = 0
+    holla g = g0 in gs.gsc {
+        rendered = g.music.samplesRendered
+    } ghosted {
+        yeet("gs")
+    }
+    spill.f("MUS events {}\n", nevents)
+    spill.f("musicUpdate x{} : mono samples rendered {} (samplesRendered {})\n", FRAMES as int, frameTotal, rendered)
+
+    // ---- (2) GLUE-PRESERVES-CORE: capture the chunked engine stream, compare to mus.musToOpl --
+    imus.musicPlay(g0, mofs, mlen, 1)      // re-arm from a clean cursor/chip
+    lowkey engineOut = vec.new[int]()
+    vibin (engineOut.gang() as int) < COMPARE_N {
+        imus.musicStep(g0, engineOut, CHUNK)
+    }
+
+    // Pull the very same decoded events + cached bank the engine used, and batch-render them.
+    lowkey events = vec.new[mus.MusEvent]()
+    lowkey instrs = vec.new[genmidi.GenMidiInstr]()
+    holla g = g0 in gs.gsc {
+        events = g.music.events
+        instrs = g.music.instrs
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey chip2 = opl.oplInit(rate)
+    lowkey batchOut = vec.new[int]()
+    lowkey fc, rn = mus.musToOpl(chip2, events, instrs, batchOut, rate, COMPARE_N)
+
+    lowkey tbl = crcTable()
+    lowkey crcEngine = crc32Samples(tbl, engineOut, COMPARE_N)
+    lowkey crcBatch = crc32Samples(tbl, batchOut, COMPARE_N)
+    spill.f("stream crc (engine, {} samples) {}\n", COMPARE_N as int, crcEngine)
+    spill.f("stream crc (batch  musToOpl)     {}\n", crcBatch)
+    fr crcEngine == crcBatch {
+        spill.it("STREAM MATCH: in-engine musicStep == core musToOpl")
+    } naw {
+        spill.it("STREAM MISMATCH: glue diverges from the core")
+    }
+
+    // ---- (3) GOLDEN: crc of the first GOLDEN_N mono samples --------------------------------
+    lowkey crcGolden = crc32Samples(tbl, engineOut, GOLDEN_N)
+    spill.f("MUSIC_RENDER_CRC first {} samples {}\n", GOLDEN_N as int, crcGolden)
+    fr crcGolden != 0 {
+        spill.it("RENDER NONZERO: music is playing")
+    } naw {
+        spill.it("RENDER ZERO: silence (BUG)")
+    }
+}

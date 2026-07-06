@@ -311,3 +311,45 @@ Six mutated-in-place `vec` fields were therefore converted to fixed arrays + an 
 - Build-once-read vecs are UNCHANGED (still `vec`): `Wad.lumpName`, `TickState.anims`,
   `InfoTables.states/mobjinfo/sfx`, `GameShell.savegameStrings`, `AmState.marks`. Never
   element-mutate these — only `.stack` (append) then read `v[i]`.
+
+## P2.10 MusicState amendment (i/i_music synth persistence)
+
+The music glue (`i/i_music`) wires the OPL2/MUS DSP core (`s/opl`, `s/mus`, `s/genmidi`) into the
+game. The synth is stateful and must survive between frames, so its live handle is persisted in
+`g.music` (the ONLY drip touched). Module-level state is unusable (mutable globals don't lower
+native), so the chip/sequencer are threaded through `g.music`: read the value out of the crib,
+thread it through a chunk of samples (mutators return the value, caller rebinds — the music core's
+`chip = oplWriteReg(chip, …)` pattern), write it back. This round-trips natively (verified by
+`tools/music_smoke` + `tools/sound_smoke`; whole-drip crib load/store is distinct from the
+`vec[i] = …` element-assign that the section above forbids — a drip's `vec` fields are Rc handles
+that copy fine, only their ELEMENTS can't be assigned natively).
+
+**Additive fields on `MusicState`** (`defs/gs.bet`; the existing transport fields
+`musId/musicPlaying/musicPaused/musLumpOfs/musLumpLen/genmidiOfs` are unchanged, owned by
+`s/s_sound`):
+
+| field | type | meaning |
+|---|---|---|
+| `chip` | `opl.OplChip` | the OPL2 chip — read-only tables (vec handles) + threaded op/chan fixed-array state. Built by `opl.oplInit(rate)` at `musicPlay`. |
+| `seq` | `mus.SeqState` | sequencer voice-alloc + per-MUS-channel patch/volume/pitch (fixed int arrays). Reset by `mus.newSeq()` at `musicPlay`. |
+| `events` | `vec[mus.MusEvent]` | decoded MUS event stream of the current song (build-once-read; decoded at `musicPlay`). |
+| `instrs` | `vec[genmidi.GenMidiInstr]` | cached GENMIDI OPL bank (build-once-read; parsed ONCE by `musicInit`). |
+| `seqCursor` | `int` | index of the NEXT MUS event to apply (streaming position). |
+| `delaySamples` | `int` | mono samples still to render before that event fires (`event.delay * rate/140` countdown). |
+| `musRate` | `i32` | device sample rate captured from `gg.audioSpec()` at `musicPlay`. |
+| `looping` | `i32` | 1 = restart the sequencer at score-end. |
+| `samplesRendered` | `int` | running total mono samples rendered (diagnostic). |
+| `musInitted` | `bool` | GENMIDI parsed into `instrs` (guards the one-time bank parse). |
+
+`defs/gs.bet` therefore now `pull`s `../s/opl`, `../s/mus`, `../s/genmidi` — acyclic, since those
+music-core modules never pull `defs/gs`. `gsInit` allocates `events`/`instrs` as empty vecs and
+`seq` via `mus.newSeq()`; `chip` stays zero-inited until `musicPlay` builds it at the device rate.
+
+**Seam / DAG:** `s/s_sound → i/i_sound → i/i_music → {s/opl, s/mus, s/genmidi, w/w_wad, defs/gs}`.
+`i_sound`'s five music hooks forward to `i_music` (`iInitMusic→musicInit`, `iPlaySong→musicPlay`
+with `g.music.musLumpOfs/Len`, `iStopSong→musicStop`, `iPauseSong→musicPause`,
+`iResumeSong→musicResume`); `i_music` depends on `i_sound`'s *dependencies* but never on `i_sound`,
+so the edge is acyclic (no inversion needed). **New per-frame seam (P2.8):** the main loop
+(`d_main`/`g_game`) must call `i_music.musicUpdate(gt)` ONCE PER FRAME to top up the raw audio ring
+(backpressure via `gg.pending()`; mono→stereo into `gg.audio`), in addition to `s_sound.updateSounds`
+for SFX. This is the only new call site the shell must add for music.

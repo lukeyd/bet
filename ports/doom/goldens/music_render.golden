@@ -1,0 +1,8 @@
+device rate 48000 Hz  channels 2  GENMIDI instruments 175
+MUS events 5826
+musicUpdate x350 : mono samples rendered 959700 (samplesRendered 959700)
+stream crc (engine, 132300 samples) 976700428
+stream crc (batch  musToOpl)     976700428
+STREAM MATCH: in-engine musicStep == core musToOpl
+MUSIC_RENDER_CRC first 44100 samples 2182918021
+RENDER NONZERO: music is playing

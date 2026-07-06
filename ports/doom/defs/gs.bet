@@ -18,6 +18,13 @@ pull "player"
 pull "mem"
 pull "vec"
 pull "stash"
+// P2.10 (i_music): MusicState now persists live synth state — the OPL2 chip, the decoded MUS
+// event stream, the sequencer voice/channel tables, and the cached GENMIDI bank. These are the
+// music-core value types (build-then-thread; no back-edge to gs), so pulling them here is
+// acyclic (opl/mus/genmidi never pull defs/gs). See CONTRACTS.md "P2.10 MusicState amendment".
+pull "../s/opl" as opl
+pull "../s/mus" as mus
+pull "../s/genmidi" as genmidi
 
 // ---- sizes (vanilla static limits kept) --------------------------------------------------
 flex facts NUMTHINKERS: int = 4096
@@ -644,7 +651,8 @@ flex drip SoundState {
     flex nextcleanup: i32
 }
 
-// ---- MusicState: MUS sequencer + OPL synth placeholders (P2.10 fills the synth). ----------
+// ---- MusicState: MUS sequencer + OPL synth. s_sound owns the transport bookkeeping (musId,
+// paused/playing, lump ofs/len); i/i_music (P2.10) owns the synth persistence below. ----------
 flex drip MusicState {
     flex musId: i32
     flex musicPlaying: bool
@@ -655,6 +663,17 @@ flex drip MusicState {
     flex musDelay: i32
     flex oplRegOfs: []i32        // OPL register scratch
     flex genmidiOfs: int        // GENMIDI lump byte offset in wad.buf
+    // ---- P2.10 synth persistence (i/i_music) — the live handle threaded per frame ----------
+    flex chip: opl.OplChip                  // OPL2 chip: read-only tables + threaded op/chan state
+    flex seq: mus.SeqState                  // sequencer voice-alloc + per-channel patch/vol/pitch
+    flex events: vec[mus.MusEvent]          // decoded MUS event stream of the current song
+    flex instrs: vec[genmidi.GenMidiInstr]  // cached GENMIDI bank (parsed once by musicInit)
+    flex seqCursor: int                     // index of the NEXT MUS event to apply
+    flex delaySamples: int                  // mono samples still to render before that event fires
+    flex musRate: i32                       // device sample rate captured at musicPlay (Hz)
+    flex looping: i32                       // 1 = restart the sequencer at score-end
+    flex samplesRendered: int               // running total mono samples rendered (diagnostic)
+    flex musInitted: bool                   // GENMIDI parsed into `instrs`
 }
 
 // ---- VidState: 8-bit screens + present buffer + palette (i_video/v_video). ---------------
@@ -900,8 +919,13 @@ flex finna gsInit(gt: tag GameState) {
         g.sound.sfxHandle = mem.slab[i32](256)
         g.sound.sfxLenTics = mem.slab[i32](256)
         g.sound.numChannels = 8
-        // music
+        // music — the synth handles start empty; musicInit parses the GENMIDI bank and musicPlay
+        // builds the chip + decodes the song (i/i_music). The chip stays zero-inited here (its
+        // read-only tables are filled by opl.oplInit at the device rate, which isn't known yet).
         g.music.oplRegOfs = mem.slab[i32](512)
+        g.music.events = vec.new[mus.MusEvent]()
+        g.music.instrs = vec.new[genmidi.GenMidiInstr]()
+        g.music.seq = mus.newSeq()
         // menu / automap
         g.menu.savegameStrings = vec.new[str]()
         g.am.marks = vec.new[MapMark]()
