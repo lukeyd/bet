@@ -1225,7 +1225,15 @@ impl<'a> Parser<'a> {
 
     fn cop_init(&mut self) -> PResult<CopInit> {
         let lo = self.lo();
-        let name = self.ident()?;
+        let mut name = self.ident()?;
+        // A namespace-qualified head (`cop state.GameState{..}` / `cop shapes.Circle(..)`)
+        // keeps the dotted name as one string, exactly like a qualified struct literal or
+        // type — the module resolver splits on the dot.
+        if self.check(&Token::Dot) && matches!(self.peek2(), Some(Token::Ident(_))) {
+            self.pos += 1;
+            let member = self.ident()?;
+            name = format!("{name}.{member}");
+        }
         let generics = self.maybe_generic_args()?;
         if self.check(&Token::LBrace) {
             let sl = self.struct_lit_body(name, generics, lo)?;

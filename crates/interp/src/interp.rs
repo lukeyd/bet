@@ -773,30 +773,79 @@ impl<'p> Interp<'p> {
         }
     }
 
-    /// A mutable borrow of the place denoted by `expr` (names and `.field` chains only).
-    fn place_mut<'e>(&self, env: &'e mut Env, expr: &Expr) -> Result<&'e mut Value, RunError> {
-        match &expr.kind {
-            ExprKind::Name { name, .. } => env
-                .get_mut(name)
-                .ok_or_else(|| RunError::Undefined(name.clone())),
-            ExprKind::Field { base, name, .. } => {
-                let base = self.place_mut(env, base)?;
-                match base {
+    /// A mutable borrow of the place denoted by `expr`: a name root followed by any mix of
+    /// `.field` and `[index]` projections (`g.players[1].score` — the doom pattern). Index
+    /// expressions are evaluated in a pre-pass while flattening the chain, so the mutable
+    /// walk itself never re-enters the evaluator. A `vec` element mid-chain is not a place
+    /// (it lives behind a runtime handle), matching the compiled path's restriction.
+    fn place_mut<'e>(&mut self, env: &'e mut Env, expr: &Expr) -> Result<&'e mut Value, RunError> {
+        enum Step<'a> {
+            Field(&'a str),
+            Index(usize),
+        }
+        // Flatten leaf-to-root, evaluating each index now.
+        let mut steps: Vec<Step> = Vec::new();
+        let mut cur = expr;
+        let root = loop {
+            match &cur.kind {
+                ExprKind::Name { name, .. } => break name,
+                ExprKind::Field { base, name, .. } => {
+                    steps.push(Step::Field(name));
+                    cur = base;
+                }
+                ExprKind::Index { base, index } => {
+                    let i = match self.eval_expr(env, index)? {
+                        Value::Int(i) if i >= 0 => i as usize,
+                        other => {
+                            return Err(RunError::Type(format!(
+                                "index must be a non-negative int, got {}",
+                                other.type_name()
+                            )));
+                        }
+                    };
+                    steps.push(Step::Index(i));
+                    cur = base;
+                }
+                _ => return Err(RunError::Type("invalid place expression".into())),
+            }
+        };
+        let mut place: &'e mut Value = env
+            .get_mut(root)
+            .ok_or_else(|| RunError::Undefined(root.clone()))?;
+        for step in steps.iter().rev() {
+            place = match step {
+                Step::Field(name) => match place {
                     Value::Struct { ty, fields } => {
                         let ty = ty.clone();
-                        fields.get_mut(name).ok_or(RunError::UnknownField {
+                        fields.get_mut(*name).ok_or(RunError::UnknownField {
                             ty,
-                            field: name.clone(),
-                        })
+                            field: (*name).to_string(),
+                        })?
                     }
-                    other => Err(RunError::Type(format!(
-                        "cannot reach field `{name}` through {}",
-                        other.type_name()
-                    ))),
-                }
-            }
-            _ => Err(RunError::Type("invalid place expression".into())),
+                    other => {
+                        return Err(RunError::Type(format!(
+                            "cannot reach field `{name}` through {}",
+                            other.type_name()
+                        )));
+                    }
+                },
+                Step::Index(i) => match place {
+                    Value::Array(xs) => {
+                        let len = xs.len();
+                        xs.get_mut(*i).ok_or_else(|| {
+                            RunError::Type(format!("index {i} out of bounds (len {len})"))
+                        })?
+                    }
+                    other => {
+                        return Err(RunError::Type(format!(
+                            "cannot reach an element place through {}",
+                            other.type_name()
+                        )));
+                    }
+                },
+            };
         }
+        Ok(place)
     }
 
     /// Evaluate the right-hand side of a binding: pairwise, or a spread multi-value call.
