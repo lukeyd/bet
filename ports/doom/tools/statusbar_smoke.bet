@@ -1,0 +1,238 @@
+// tools/statusbar_smoke.bet — the P2.9a STATUS-BAR + HUD proof. Cops a GameState, gsInit, loads
+// the shareware IWAD, ST_Init + HU_Init (load all the bar/font graphics), FAKES a plausible
+// console-player state, promotes a HUD message, runs one ST_Ticker (face pick) then ST_Drawer +
+// HU_Drawer into scr0, and crc32's the status-bar region (rows 168..199 x 320). The CRC is a
+// self-consistency baseline, committed as ports/doom/goldens/statusbar.golden (the definitive
+// check is the W3 oracle frame-diff). It then traces ST_Ticker's face-selection across a few
+// synthetic health/damage states, and wires the cheat matcher (idkfa) to confirm it sets the
+// expected player fields.
+//
+// Build+run NATIVE (headless); interp is intractable at WAD scale:
+//   cargo build -p driver --features llvm
+//   bet build ports/doom/tools/statusbar_smoke.bet --runtime real -o /tmp/statusbar_smoke
+//   BET_GG_HEADLESS=1 /tmp/statusbar_smoke
+pull "spill"
+pull "mem"
+pull "str"
+pull "../defs/gs" as gs
+pull "../defs/doomdef" as doomdef
+pull "../defs/player" as player
+pull "../w/w_wad" as wad
+pull "../i/i_system" as isys
+pull "../i/i_video" as iv
+pull "../st/st_stuff" as st
+pull "../hu/hu_stuff" as hu
+
+// ---- crc32 (IEEE-802.3 reflected; same as tools/goldens.bet + video_smoke.bet) -------------
+flex finna hex8(v: int) -> str {
+    lowkey val = v & 4294967295
+    lowkey buf = mem.slab[u8](8)
+    lowkey i = 0
+    vibin i < 8 {
+        lowkey nib = (val >> (28 - i * 4)) & 15
+        fr nib < 10 {
+            buf[i] = (48 + nib) as u8
+        } naw {
+            buf[i] = (87 + nib) as u8
+        }
+        i = i + 1
+    }
+    bet str.fromBytesTrust(buf)
+}
+
+flex finna crcTable() -> []i32 {
+    lowkey tbl = mem.slab[i32](256)
+    lowkey i = 0
+    vibin i < 256 {
+        lowkey c = i
+        lowkey k = 0
+        vibin k < 8 {
+            lowkey lsb = c & 1
+            c = c >> 1
+            fr lsb != 0 {
+                c = c ^ 3988292384
+            }
+            k = k + 1
+        }
+        tbl[i] = c as i32
+        i = i + 1
+    }
+    bet tbl
+}
+
+flex finna crc32U8(tbl: []i32, t: []u8, n: int) -> int {
+    lowkey crc = 4294967295
+    lowkey i = 0
+    vibin i < n {
+        lowkey byte = t[i] as int
+        crc = (crc >> 8) ^ ((tbl[((crc ^ byte) & 255)] as int) & 4294967295)
+        i = i + 1
+    }
+    bet (crc ^ 4294967295) & 4294967295
+}
+
+// setFace — reset the face priority/counter then re-evaluate for the current player state,
+// returning the chosen face index (used by the deterministic trace).
+flex finna setFace(gt: tag gs.GameState) -> int {
+    holla g = gt in gs.gsc {
+        g.stbar.priority = 0
+        g.stbar.faceCount = 0
+    } ghosted {
+        yeet("gs")
+    }
+    st.stTicker(gt)
+    lowkey fi = 0
+    holla g = gt in gs.gsc {
+        fi = g.stbar.faceIndex as int
+    } ghosted {
+        yeet("gs")
+    }
+    bet fi
+}
+
+finna main() {
+    lowkey g0 = cop gs.GameState{} in gs.gsc
+    gs.gsInit(g0)
+    isys.initTime(g0)
+    wad.initWad(g0, "/Users/lukebaggett/Documents/bet/doom-reference/doom1.wad")
+    iv.initGraphics(g0)
+    st.stInit(g0)
+    hu.huInit(g0)
+
+    // ---- FAKE a plausible console-player state ----
+    holla g = g0 in gs.gsc {
+        g.shell.consoleplayer = 0
+        g.shell.displayplayer = 0
+        g.shell.deathmatch = 0
+        g.shell.gamemode = doomdef.GM_SHAREWARE
+        g.shell.playeringame[0] = nocap
+        g.shell.players[0].health = 75
+        g.shell.players[0].armorpoints = 100
+        g.shell.players[0].armortype = 1
+        g.shell.players[0].readyweapon = doomdef.WP_PISTOL
+        g.shell.players[0].ammo[0] = 42
+        g.shell.players[0].ammo[1] = 8
+        g.shell.players[0].ammo[2] = 20
+        g.shell.players[0].ammo[3] = 3
+        g.shell.players[0].maxammo[0] = 200
+        g.shell.players[0].maxammo[1] = 50
+        g.shell.players[0].maxammo[2] = 300
+        g.shell.players[0].maxammo[3] = 50
+        g.shell.players[0].weaponowned[doomdef.WP_FIST] = nocap
+        g.shell.players[0].weaponowned[doomdef.WP_PISTOL] = nocap
+        g.shell.players[0].weaponowned[doomdef.WP_SHOTGUN] = nocap
+        g.shell.players[0].cards[doomdef.IT_BLUECARD] = nocap
+        g.shell.players[0].cards[doomdef.IT_REDCARD] = nocap
+        g.shell.players[0].message = "ENTERING THE STATUS BAR"
+    } ghosted {
+        yeet("gs")
+    }
+
+    st.stStart(g0)
+    hu.huTicker(g0)          // promote the player message onto the HUD line
+    st.stTicker(g0)          // pick the face for health=75
+    st.stDrawer(g0, cap, nocap)   // fullscreen=false => bar visible; refresh=true
+    hu.huDrawer(g0)
+
+    // ---- crc32 the status-bar region (rows 168..199 x 320 = 10240 bytes) ----
+    lowkey ctab = crcTable()
+    lowkey region = mem.slab[u8](10240)
+    holla g = g0 in gs.gsc {
+        lowkey i = 0
+        vibin i < 10240 {
+            region[i] = g.vid.scr0[53760 + i]
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey crc = crc32U8(ctab, region, 10240)
+    spill.f("statusbar_region_crc=0x{}\n", hex8(crc))
+
+    // ---- deterministic ST_Ticker face-selection trace ----
+    // normal (health 100), pain buckets (75, 40, 10), dead (0), then god mode.
+    setPlayerHealth(g0, 100)
+    spill.f("face_normal_h100={}\n", setFace(g0))
+    setPlayerHealth(g0, 75)
+    spill.f("face_h75={}\n", setFace(g0))
+    setPlayerHealth(g0, 40)
+    spill.f("face_h40={}\n", setFace(g0))
+    setPlayerHealth(g0, 10)
+    spill.f("face_h10={}\n", setFace(g0))
+    // self-inflicted damage (rampage/ouch path)
+    setPlayerDamage(g0, 50, 5)
+    spill.f("face_hurt_h50={}\n", setFace(g0))
+    // dead
+    setPlayerHealth(g0, 0)
+    spill.f("face_dead={}\n", setFace(g0))
+    // god mode
+    setPlayerHealth(g0, 100)
+    setGod(g0)
+    spill.f("face_god={}\n", setFace(g0))
+
+    // ---- cheat matcher wiring: feed 'idkfa' and confirm the arsenal fields ----
+    clearGod(g0)
+    feedCheat(g0, "idkfa")
+    lowkey armor = 0
+    lowkey atype = 0
+    lowkey w6 = cap
+    lowkey card0 = cap
+    lowkey ammo0 = 0
+    holla g = g0 in gs.gsc {
+        armor = g.shell.players[0].armorpoints as int
+        atype = g.shell.players[0].armortype as int
+        w6 = g.shell.players[0].weaponowned[doomdef.WP_BFG]
+        card0 = g.shell.players[0].cards[0]
+        ammo0 = g.shell.players[0].ammo[0] as int
+    } ghosted {
+        yeet("gs")
+    }
+    spill.f("idkfa armor={} type={} bfg={} card0={} ammo0={}\n", armor, atype, w6, card0, ammo0)
+}
+
+// ---- smoke helpers -------------------------------------------------------------------------
+flex finna setPlayerHealth(gt: tag gs.GameState, h: int) {
+    holla g = gt in gs.gsc {
+        g.shell.players[0].health = h as i32
+        g.shell.players[0].damagecount = 0
+        g.shell.players[0].attackdown = cap
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna setPlayerDamage(gt: tag gs.GameState, h: int, dmg: int) {
+    holla g = gt in gs.gsc {
+        g.shell.players[0].health = h as i32
+        g.shell.players[0].damagecount = dmg as i32
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna setGod(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.shell.players[0].cheats = g.shell.players[0].cheats | (player.CF_GODMODE as i32)
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna clearGod(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.shell.players[0].cheats = 0
+        g.shell.players[0].health = 75
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// feedCheat — type each character of `code` through ST_Responder (EV_KEYDOWN).
+flex finna feedCheat(gt: tag gs.GameState, code: str) {
+    lowkey i = 0
+    lowkey n = str.len(code)
+    vibin i < n {
+        st.stResponder(gt, 0, str.at(code, i))
+        i = i + 1
+    }
+}

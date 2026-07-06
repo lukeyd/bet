@@ -1,0 +1,9 @@
+statusbar_region_crc=0x89071103
+face_normal_h100=0
+face_h75=8
+face_h40=16
+face_h10=32
+face_hurt_h50=21
+face_dead=41
+face_god=40
+idkfa armor=200 type=2 bfg=nocap card0=nocap ammo0=200
