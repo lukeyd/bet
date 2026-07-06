@@ -31,6 +31,22 @@ match 1:1, so the field **fills the whole window** and gains real detail as you 
 maximize it. Paddle/ball/speed are derived from the current size, so the whole board scales with
 the window.
 
+## Source layout
+
+`pong.bet` is the entry; it pulls three sibling modules (`bet`'s multi-file `pull` — only
+`flex` items cross a file boundary, referenced qualified, e.g. `game.step(...)`, the type
+`dims.Dims`, `consts.WHITE`):
+
+| file | responsibility |
+|------|----------------|
+| `consts.bet` | colors, keycodes, event kinds, and audio params |
+| `dims.bet`   | per-frame geometry: the `Dims` struct, `dimsFor`, `clampPaddle` |
+| `game.bet`   | the `Game` state + the pure physics/AI `step` (pulls `dims`) |
+| `pong.bet`   | **entry** — `main` owns the platform loop and **all rendering** |
+
+Rendering is deliberately **not** split into a module: every framebuffer write must stay
+inline in `main` (see the memory/value note below), so only the pure simulation is modularized.
+
 ## Controls
 
 | key            | action                    |

@@ -15,6 +15,26 @@ target/debug/bet build ports/oregon-trail/oregon.bet -o oregon
 ./oregon
 ```
 
+## Source layout
+
+The game is split across sibling files that the entry `oregon.bet` pulls in as namespaced
+modules (`bet`'s multi-file `pull`; only `flex` items cross a file boundary, referenced
+qualified — e.g. `combat.shoot(s, g)`, the type `state.Trip`). The dependency layering is a
+strict DAG (`state`, `util` → `combat` → `perils`; `setup`; `turn` → the `oregon` entry):
+
+| file | responsibility |
+|------|----------------|
+| `state.bet`  | the value-threaded `Trip` game-state struct |
+| `util.bet`   | stdin / number / date helpers: `parseInt`, `readNum`, `atLeastZero`, `buyPrompt`, `spendAtFort`, `dateStr` |
+| `combat.bet` | the shared `shoot` shot primitive + `hunt` + `riders` |
+| `perils.bet` | `illness`, the 15-entry random `events` table, and the `mountains` / `blizzard` passes |
+| `setup.bet`  | the intro `instructions`, `askSkill`, and the $700 `initialPurchases` outfitting |
+| `turn.bet`   | one turn: `showStatus`, `fort`, `chooseAction`, `eat`, and the `oneTurn` orchestrator |
+| `oregon.bet` | **entry** — `main`, the game loop, and the `funeral` / `victory` endings |
+
+`bet run` / `bet build` are given only the entry `oregon.bet`; the loader discovers the
+pulled files relative to it.
+
 You steer a wagon 2040 miles from Independence, Missouri to Oregon City in 1847: buy oxen,
 food, ammunition, clothing, and supplies with $700; then each two-week turn you stop at forts,
 hunt, eat, fight off riders, and survive random misfortune, broken axles, illness, snakebite,
