@@ -1,0 +1,133 @@
+// w/w_wad.bet — WAD header, directory, and lump I/O (linuxdoom-1.10 w_wad.c).
+//
+// No-purgeable-cache model: the whole IWAD is fs.peep'd once into `g.wad.buf` (a []u8), and
+// every reader gets a BYTE OFFSET into that buffer (via `lumpNum`) which it decodes with
+// `util/bstream`. This REPLACES id's W_CacheLumpNum/W_CacheLumpName (which returned malloc'd
+// pointers into a zone allocator). Zone/Reload/Profile are SKIPPED (see w_wad.c markers).
+//
+// ============================ FROZEN PUBLIC API (P1.3 i_sound + P1.4 r_data depend on these —
+// do NOT change these names/signatures without a CONTRACTS.md amendment) =====================
+//   flex finna initWad(gt, path: str) -> void        // W_InitMultipleFiles/W_AddFile, one IWAD
+//   flex finna checkNumForName(gt, name: str) -> int // W_CheckNumForName: -1 if absent
+//   flex finna getNumForName(gt, name: str) -> int   // W_GetNumForName: yeet if absent
+//   flex finna lumpLength(gt, lump: int) -> int      // W_LumpLength
+//   flex finna lumpNum(gt, lump: int) -> int         // byte offset of lump `lump` into g.wad.buf
+//   flex finna lumpNameOfs(gt, name: str) -> int     // lumpNum(getNumForName(name))
+// =============================================================================================
+//
+// The name searcher (getNumForName) in id scans the directory BACKWARD so a later duplicate
+// name overrides an earlier one. We replicate that by populating `g.wad.nameToLump` in FORWARD
+// order with an overwriting `.put`: the LAST lump of a given name wins the stash slot.
+pull "spill"
+pull "fs"
+pull "mem"
+pull "str"
+pull "../defs/gs" as gs
+pull "../util/bstream" as bstream
+
+// initWad — W_InitMultipleFiles + W_AddFile specialized to one IWAD/PWAD file:
+//   * fs.peep the whole file into g.wad.buf
+//   * parse the 12-byte wadinfo_t header: magic[4] ("IWAD"/"PWAD"), numlumps i32le@4,
+//     infotableofs i32le@8
+//   * read `numlumps` 16-byte filelump_t dir entries (filepos i32le, size i32le, name 8 bytes)
+//     into lumpOfs / lumpLen / lumpName + the nameToLump index
+// yeet on bad magic (I_Error "doesn't have IWAD or PWAD id").
+flex finna initWad(gt: tag gs.GameState, path: str) {
+    holla g = gt in gs.gsc {
+        g.wad.buf = fs.peep(path)
+        // wadinfo_t.identification: 'I'|'P', 'W', 'A', 'D'. (Reading buf[0..12] faults on an
+        // empty buffer — a missing WAD is an I_Error condition either way.)
+        lowkey m0 = g.wad.buf[0] as int
+        lowkey okMagic = (m0 == 73 || m0 == 80) && g.wad.buf[1] as int == 87
+        okMagic = okMagic && g.wad.buf[2] as int == 65 && g.wad.buf[3] as int == 68
+        fr !okMagic {
+            spill.it("W_AddFile: WAD file doesn't have IWAD or PWAD id")
+            yeet("wad-magic")
+        }
+        lowkey numlumps = bstream.rdI32(g.wad.buf, 4)
+        lowkey infotableofs = bstream.rdI32(g.wad.buf, 8)
+        g.wad.numLumps = numlumps as i32
+        g.wad.lumpOfs = mem.slab[i32](numlumps)
+        g.wad.lumpLen = mem.slab[i32](numlumps)
+        // g.wad.lumpName (vec[str]) and g.wad.nameToLump (stash) were newed by gsInit.
+        // Track the maximum byte extent so bufLen is exact without a slice-length intrinsic
+        // (native has none): max over lump ends and the directory end.
+        lowkey maxEnd = infotableofs + numlumps * 16
+        lowkey i = 0
+        vibin i < numlumps {
+            lowkey entry = infotableofs + i * 16
+            lowkey filepos = bstream.rdI32(g.wad.buf, entry)
+            lowkey size = bstream.rdI32(g.wad.buf, entry + 4)
+            lowkey name = bstream.name8(g.wad.buf, entry + 8)
+            g.wad.lumpOfs[i] = filepos as i32
+            g.wad.lumpLen[i] = size as i32
+            g.wad.lumpName.stack(name)
+            g.wad.nameToLump.put(name, i)   // forward order + overwrite => last duplicate wins
+            fr filepos + size > maxEnd {
+                maxEnd = filepos + size
+            }
+            i = i + 1
+        }
+        g.wad.bufLen = maxEnd
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// checkNumForName — W_CheckNumForName. Returns the lump index for `name`, or -1 if absent.
+// Names are compared upper-case (id strupr's both sides); the stash keys were upper-cased at
+// load by bstream.name8, so we upper-case the query here too.
+flex finna checkNumForName(gt: tag gs.GameState, name: str) -> int {
+    lowkey key = str.glow(name)
+    lowkey res = -1
+    holla g = gt in gs.gsc {
+        lowkey v, ok = g.wad.nameToLump.peep(key)
+        fr ok {
+            res = v
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    bet res
+}
+
+// getNumForName — W_GetNumForName. Like checkNumForName but I_Error (yeet) if the lump is
+// absent, so callers of required lumps never see -1.
+flex finna getNumForName(gt: tag gs.GameState, name: str) -> int {
+    lowkey i = checkNumForName(gt, name)
+    fr i == -1 {
+        spill.it("W_GetNumForName: lump not found")
+        yeet("wad-missing-lump")
+    }
+    bet i
+}
+
+// lumpLength — W_LumpLength: the byte size of lump `lump`.
+flex finna lumpLength(gt: tag gs.GameState, lump: int) -> int {
+    lowkey n = 0
+    holla g = gt in gs.gsc {
+        n = g.wad.lumpLen[lump] as int
+    } ghosted {
+        yeet("gs")
+    }
+    bet n
+}
+
+// lumpNum — the BYTE OFFSET of lump `lump`'s data into g.wad.buf. This is the no-cache
+// replacement for W_CacheLumpNum: instead of a pointer to zone-loaded bytes, callers get the
+// offset and bstream-read from g.wad.buf directly (the buffer never moves).
+flex finna lumpNum(gt: tag gs.GameState, lump: int) -> int {
+    lowkey ofs = 0
+    holla g = gt in gs.gsc {
+        ofs = g.wad.lumpOfs[lump] as int
+    } ghosted {
+        yeet("gs")
+    }
+    bet ofs
+}
+
+// lumpNameOfs — convenience: lumpNum(getNumForName(name)). The byte offset of a required lump
+// looked up by name (the common W_CacheLumpName call site).
+flex finna lumpNameOfs(gt: tag gs.GameState, name: str) -> int {
+    bet lumpNum(gt, getNumForName(gt, name))
+}

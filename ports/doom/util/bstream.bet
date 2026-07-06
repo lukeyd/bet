@@ -19,9 +19,10 @@ flex finna rdI8(buf: []u8, ofs: int) -> int {
     bet v
 }
 
-// unsigned 16-bit LE
+// unsigned 16-bit LE. `bytes.readU16le` yields a narrow u16; widen to `int` (i64) so native's
+// strict return-width check passes (interp is width-lenient, so this is a no-op there).
 flex finna rdU16(buf: []u8, ofs: int) -> int {
-    bet bytes.readU16le(buf, ofs)
+    bet bytes.readU16le(buf, ofs) as int
 }
 
 // signed 16-bit LE
@@ -29,14 +30,15 @@ flex finna rdI16(buf: []u8, ofs: int) -> int {
     bet bytes.readI16le(buf, ofs)
 }
 
-// unsigned 32-bit LE
+// unsigned 32-bit LE. Widen the narrow u32 to `int` (i64) for native's return-width check.
 flex finna rdU32(buf: []u8, ofs: int) -> int {
-    bet bytes.readU32le(buf, ofs)
+    bet bytes.readU32le(buf, ofs) as int
 }
 
-// signed 32-bit LE (readU32le then two's-complement fold)
+// signed 32-bit LE (readU32le then two's-complement fold). The `as int` widens the narrow u32
+// before the fold so both the compare and the returns are i64 (native strict; interp lenient).
 flex finna rdI32(buf: []u8, ofs: int) -> int {
-    lowkey v = bytes.readU32le(buf, ofs)
+    lowkey v = bytes.readU32le(buf, ofs) as int
     fr v >= 2147483648 {
         bet v - 4294967296
     }
