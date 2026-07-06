@@ -1,0 +1,354 @@
+pull "spill"
+pull "../defs/gs" as gs
+pull "../defs/fixed" as fixed
+pull "../defs/tables" as tables
+pull "../r/r_draw" as rdraw
+pull "../r/r_data" as rdata
+
+flex facts SCREENWIDTH: int = 320
+flex facts SCREENHEIGHT: int = 200
+flex facts LIGHTLEVELS: int = 16
+flex facts LIGHTSEGSHIFT: int = 4
+flex facts LIGHTZSHIFT: int = 20
+flex facts MAXLIGHTZ: int = 128
+flex facts ANGLETOSKYSHIFT: int = 22
+
+flex finna clearPlanes(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        lowkey i = 0
+        vibin i < g.render.viewwidth as int {
+            g.render.floorclip[i] = g.render.viewheight as i16
+            g.render.ceilingclip[i] = -1
+            i = i + 1
+        }
+        g.render.lastvisplane = 0
+        g.render.lastopening = 640
+        i = 0
+        vibin i < SCREENHEIGHT {
+            g.render.cachedheight[i] = 0
+            i = i + 1
+        }
+        lowkey angle: int = (g.render.viewangle - tables.ANG90 >> 19) as int
+        g.render.basexscale = fixed.fixedDiv(g.info.finesine[angle + 2048], g.render.centerxfrac)
+        g.render.baseyscale = 0 - fixed.fixedDiv(g.info.finesine[angle], g.render.centerxfrac)
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna mapPlane(gt: tag gs.GameState, y: int, x1: int, x2: int) {
+    holla g = gt in gs.gsc {
+        lowkey distance: i32 = 0
+        fr g.render.planeheight != g.render.cachedheight[y] {
+            g.render.cachedheight[y] = g.render.planeheight
+            distance = fixed.fixedMul(g.render.planeheight, g.render.yslope[y])
+            g.render.cacheddistance[y] = distance
+            g.render.ds_xstep = fixed.fixedMul(distance, g.render.basexscale)
+            g.render.cachedxstep[y] = g.render.ds_xstep
+            g.render.ds_ystep = fixed.fixedMul(distance, g.render.baseyscale)
+            g.render.cachedystep[y] = g.render.ds_ystep
+        } naw {
+            distance = g.render.cacheddistance[y]
+            g.render.ds_xstep = g.render.cachedxstep[y]
+            g.render.ds_ystep = g.render.cachedystep[y]
+        }
+        lowkey length: i32 = fixed.fixedMul(distance, g.render.distscale[x1])
+        lowkey angle: int = (g.render.viewangle + g.render.xtoviewangle[x1] >> 19) as int
+        g.render.ds_xfrac = g.render.viewx + fixed.fixedMul(g.info.finesine[angle + 2048], length)
+        g.render.ds_yfrac = 0 - g.render.viewy - fixed.fixedMul(g.info.finesine[angle], length)
+        fr g.render.fixedcolormapOfs != -1 {
+            g.render.ds_colormapOfs = g.render.fixedcolormapOfs
+        } naw {
+            lowkey index: int = (distance >> 20) as int
+            fr index >= MAXLIGHTZ {
+                index = MAXLIGHTZ - 1
+            }
+            g.render.ds_colormapOfs = g.render.zlight[g.render.planezlightOfs as int + index]
+        }
+        g.render.ds_y = y as i32
+        g.render.ds_x1 = x1 as i32
+        g.render.ds_x2 = x2 as i32
+    } ghosted {
+        yeet("gs")
+    }
+    rdraw.drawSpan(gt)
+}
+
+flex finna findPlane(gt: tag gs.GameState, heightIn: i32, picnumIn: int, lightlevelIn: int) -> int {
+    lowkey res: int = 0
+    holla g = gt in gs.gsc {
+        lowkey height = heightIn
+        lowkey picnum = picnumIn
+        lowkey lightlevel = lightlevelIn
+        fr picnum == g.render.skyflatnum as int {
+            height = 0
+            lightlevel = 0
+        }
+        lowkey check = 0
+        vibin check < g.render.lastvisplane as int {
+            fr height == g.render.vpHeight[check] && picnum == g.render.vpPicnum[check] as int && lightlevel == g.render.vpLight[check] as int {
+                dip
+            }
+            check = check + 1
+        }
+        fr check < g.render.lastvisplane as int {
+            res = check
+        } naw {
+            fr g.render.lastvisplane as int == gs.MAXVISPLANES {
+                yeet("R_FindPlane: no more visplanes")
+            }
+            g.render.lastvisplane = g.render.lastvisplane + 1
+            g.render.vpHeight[check] = height
+            g.render.vpPicnum[check] = picnum as i32
+            g.render.vpLight[check] = lightlevel as i32
+            g.render.vpMinX[check] = SCREENWIDTH as i32
+            g.render.vpMaxX[check] = -1
+            lowkey base = check * gs.VPSTRIDE
+            lowkey k = 0
+            vibin k < gs.VPSTRIDE {
+                g.render.vpTop[base + k] = 255
+                k = k + 1
+            }
+            res = check
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    bet res
+}
+
+flex finna checkPlane(gt: tag gs.GameState, pl: int, start: int, stop: int) -> int {
+    lowkey res: int = pl
+    holla g = gt in gs.gsc {
+        lowkey intrl = 0
+        lowkey intrh = 0
+        lowkey unionl = 0
+        lowkey unionh = 0
+        lowkey plMinx = g.render.vpMinX[pl] as int
+        lowkey plMaxx = g.render.vpMaxX[pl] as int
+        fr start < plMinx {
+            intrl = plMinx
+            unionl = start
+        } naw {
+            unionl = plMinx
+            intrl = start
+        }
+        fr stop > plMaxx {
+            intrh = plMaxx
+            unionh = stop
+        } naw {
+            unionh = plMaxx
+            intrh = stop
+        }
+        lowkey base = pl * gs.VPSTRIDE + 1
+        lowkey x = intrl
+        vibin x <= intrh {
+            fr g.render.vpTop[base + x] as int != 255 {
+                dip
+            }
+            x = x + 1
+        }
+        fr x > intrh {
+            g.render.vpMinX[pl] = unionl as i32
+            g.render.vpMaxX[pl] = unionh as i32
+            res = pl
+        } naw {
+            lowkey nv = g.render.lastvisplane as int
+            g.render.vpHeight[nv] = g.render.vpHeight[pl]
+            g.render.vpPicnum[nv] = g.render.vpPicnum[pl]
+            g.render.vpLight[nv] = g.render.vpLight[pl]
+            g.render.lastvisplane = g.render.lastvisplane + 1
+            g.render.vpMinX[nv] = start as i32
+            g.render.vpMaxX[nv] = stop as i32
+            lowkey nbase = nv * gs.VPSTRIDE
+            lowkey k = 0
+            vibin k < gs.VPSTRIDE {
+                g.render.vpTop[nbase + k] = 255
+                k = k + 1
+            }
+            res = nv
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    bet res
+}
+
+flex finna makeSpans(gt: tag gs.GameState, x: int, t1i: int, b1i: int, t2i: int, b2i: int) {
+    lowkey t1 = t1i
+    lowkey b1 = b1i
+    lowkey t2 = t2i
+    lowkey b2 = b2i
+    vibin t1 < t2 && t1 <= b1 {
+        lowkey ss = spanStart(gt, t1)
+        mapPlane(gt, t1, ss, x - 1)
+        t1 = t1 + 1
+    }
+    vibin b1 > b2 && b1 >= t1 {
+        lowkey ss = spanStart(gt, b1)
+        mapPlane(gt, b1, ss, x - 1)
+        b1 = b1 - 1
+    }
+    vibin t2 < t1 && t2 <= b2 {
+        setSpanStart(gt, t2, x)
+        t2 = t2 + 1
+    }
+    vibin b2 > b1 && b2 >= t2 {
+        setSpanStart(gt, b2, x)
+        b2 = b2 - 1
+    }
+}
+
+flex finna spanStart(gt: tag gs.GameState, y: int) -> int {
+    lowkey v = 0
+    holla g = gt in gs.gsc {
+        v = g.render.spanstart[y] as int
+    } ghosted {
+        yeet("gs")
+    }
+    bet v
+}
+
+flex finna setSpanStart(gt: tag gs.GameState, y: int, x: int) {
+    holla g = gt in gs.gsc {
+        g.render.spanstart[y] = x as i32
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna drawPlanes(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        fr g.render.dsP as int > gs.MAXDRAWSEGS {
+            yeet("R_DrawPlanes: drawsegs overflow")
+        }
+        fr g.render.lastvisplane as int > gs.MAXVISPLANES {
+            yeet("R_DrawPlanes: visplane overflow")
+        }
+        fr g.render.lastopening as int > gs.MAXOPENINGS {
+            yeet("R_DrawPlanes: opening overflow")
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey nplanes = 0
+    holla g = gt in gs.gsc {
+        nplanes = g.render.lastvisplane as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey pl = 0
+    vibin pl < nplanes {
+        drawOnePlane(gt, pl)
+        pl = pl + 1
+    }
+}
+
+flex finna drawOnePlane(gt: tag gs.GameState, pl: int) {
+    lowkey isSky = cap
+    lowkey minx = 0
+    lowkey maxx = 0
+    holla g = gt in gs.gsc {
+        minx = g.render.vpMinX[pl] as int
+        maxx = g.render.vpMaxX[pl] as int
+        fr g.render.vpPicnum[pl] as int == g.render.skyflatnum as int {
+            isSky = nocap
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    fr minx > maxx {
+        bet
+    }
+    fr isSky {
+        drawSkyPlane(gt, pl, minx, maxx)
+        bet
+    }
+    holla g = gt in gs.gsc {
+        lowkey picnum = g.render.vpPicnum[pl] as int
+        lowkey flat = g.render.firstFlat as int + g.render.flatTranslation[picnum] as int
+        g.render.ds_sourceOfs = g.wad.lumpOfs[flat]
+        lowkey ph = g.render.vpHeight[pl] - g.render.viewz
+        fr ph < 0 {
+            ph = 0 - ph
+        }
+        g.render.planeheight = ph
+        lowkey light = (g.render.vpLight[pl] as int >> 4) + g.render.extralight as int
+        fr light >= LIGHTLEVELS {
+            light = LIGHTLEVELS - 1
+        }
+        fr light < 0 {
+            light = 0
+        }
+        g.render.planezlightOfs = (light * MAXLIGHTZ) as i32
+        lowkey base = pl * gs.VPSTRIDE + 1
+        g.render.vpTop[base + (maxx + 1)] = 255
+        g.render.vpTop[base + (minx - 1)] = 255
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey stop = maxx + 1
+    lowkey x = minx
+    vibin x <= stop {
+        lowkey t0 = 0
+        lowkey b0 = 0
+        lowkey t1 = 0
+        lowkey b1 = 0
+        holla g = gt in gs.gsc {
+            lowkey base = pl * gs.VPSTRIDE + 1
+            t0 = g.render.vpTop[base + (x - 1)] as int
+            b0 = g.render.vpBottom[base + (x - 1)] as int
+            t1 = g.render.vpTop[base + x] as int
+            b1 = g.render.vpBottom[base + x] as int
+        } ghosted {
+            yeet("gs")
+        }
+        makeSpans(gt, x, t0, b0, t1, b1)
+        x = x + 1
+    }
+}
+
+flex finna drawSkyPlane(gt: tag gs.GameState, pl: int, minx: int, maxx: int) {
+    lowkey x = minx
+    vibin x <= maxx {
+        lowkey yl = 0
+        lowkey yh = 0
+        holla g = gt in gs.gsc {
+            lowkey base = pl * gs.VPSTRIDE + 1
+            yl = g.render.vpTop[base + x] as int
+            yh = g.render.vpBottom[base + x] as int
+        } ghosted {
+            yeet("gs")
+        }
+        fr yl <= yh {
+            lowkey angle = 0
+            lowkey skytex = 0
+            holla g = gt in gs.gsc {
+                angle = (g.render.viewangle + g.render.xtoviewangle[x] >> 22) as int
+                skytex = g.render.skytexture as int
+                g.render.dc_iscale = g.render.pspriteiscale
+                g.render.dc_colormapOfs = 0
+                g.render.dc_texturemid = g.render.skytexturemid
+                g.render.dc_yl = yl as i32
+                g.render.dc_yh = yh as i32
+                g.render.dc_x = x as i32
+            } ghosted {
+                yeet("gs")
+            }
+            lowkey colOfs = rdata.getColumn(gt, skytex, angle)
+            lowkey colBuf = rdata.columnLumpOf(gt, skytex, angle)
+            holla g = gt in gs.gsc {
+                g.render.dc_sourceOfs = colOfs as i32
+                fr colBuf > 0 {
+                    g.render.dc_sourceBuf = 1
+                } naw {
+                    g.render.dc_sourceBuf = 0
+                }
+            } ghosted {
+                yeet("gs")
+            }
+            rdraw.drawColumn(gt)
+        }
+        x = x + 1
+    }
+}
