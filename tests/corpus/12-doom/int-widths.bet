@@ -1,0 +1,44 @@
+// int-widths — the sized-integer idioms the doom port leans on, written so the interpreter's
+// uniform i64 domain and the compiled path's true widths agree: every wrap is forced through
+// an EXPLICIT cast (`(x) as u32` — the 09-bit-math lesson: implicit width-wrapping arithmetic
+// diverges, explicit casts do not).
+pull "spill"
+pull "mem"
+
+finna main() {
+    // i8 sign-extension idiom: a raw byte reinterpreted as signed (finesine table bytes).
+    lowkey raw = 240
+    spill.it((raw as i8) as int)     // -16
+
+    // u8 slab elements (the framebuffer): store, read back, print unsigned.
+    lowkey fb = mem.slab[u8](2)
+    fb[0] = 200
+    fb[1] = ((fb[0] + 100) as u8)    // 300 wraps to 44 at u8 width
+    spill.it(fb[0])                  // 200
+    spill.it(fb[1])                  // 44
+
+    // i16 slab elements (PCM samples): negative values round-trip sign-extending.
+    lowkey pcm = mem.slab[i16](2)
+    pcm[0] = -12345
+    pcm[1] = 32767
+    spill.it(pcm[0])                 // -12345
+    spill.it(pcm[1])                 // 32767
+
+    // u32 slab elements (BAM angles): full 32-bit range, wrap via explicit cast.
+    lowkey ang = mem.slab[u32](2)
+    ang[0] = 3735928559              // 0xDEADBEEF
+    ang[1] = ((ang[0] + 1094795585) as u32)    // + 0x41414141 wraps mod 2^32
+    spill.it(ang[0])                 // 3735928559
+    spill.it(ang[1])                 // 535756848
+
+    // Casts across i32 <-> i64 <-> u32.
+    lowkey n: i32 = -1000
+    spill.it(n as i64)               // -1000       (sign-extend up)
+    spill.it((n as u32) as int)      // 4294966296  (same-width reinterpret, zero-extend up)
+    lowkey wide: i64 = 81985529216486895        // 0x0123456789ABCDEF
+    spill.it((wide as i32) as int)   // -1985229329 (truncate to the low 32 bits, signed)
+    spill.it((wide as u32) as int)   // 2309737967  (the same bits, unsigned)
+
+    // Arithmetic `>>` on a negative i32 keeps the sign (the fixed-point division idiom).
+    spill.it((n >> 3) as int)        // -125
+}

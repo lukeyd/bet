@@ -31,7 +31,7 @@
 # Helper files pulled by a multi-file program's entry (a top-level manifest key, so it must
 # precede the `[features]` table). They are dependencies, not standalone programs: exempt from
 # the `.expected` pairing and never run on their own.
-aux = ["14-modules/geometry"]
+aux = ["14-modules/geometry", "12-doom/state", "12-doom/sub/mod", "12-doom/arena"]
 
 [features]
 all = [
@@ -68,6 +68,9 @@ all = [
   "concurrency.slide",
   # 14 modules (multi-file source via `pull`)
   "modules.pull", "modules.qualified", "modules.visibility",
+  # 12 doom (the doom-port language package: one-crib game state, per-slot evict,
+  # file writes, callbacks, sized-int idioms)
+  "doom.gamestate", "doom.evict-slot", "doom.fs-drop", "doom.fn-param", "doom.int-widths",
 ]
 
 # --- 01 basics --------------------------------------------------------------
@@ -469,5 +472,50 @@ compiled = "pass"
 [[program]]
 path = "14-modules/modules"
 covers = ["modules.pull", "modules.qualified", "modules.visibility"]
+interp = "pass"
+compiled = "pass"
+
+# --- 12 doom (the doom-port language package) ---------------------------------
+# The whole doom GameState design in miniature: ONE module-level `flex crib gsc: GameState[1]`
+# (in aux `12-doom/state`, with a second `mobjs` crib), copped zero-default, handle fields
+# (slab/vec/stash/fn-value) assigned after the cop, and mutated cross-module — including from
+# the subdirectory module `12-doom/sub/mod` via `pull "sub/mod" as m` — through qualified holla.
+[[program]]
+path = "12-doom/gamestate-crib"
+covers = ["doom.gamestate", "memory.crib", "modules.pull", "modules.qualified"]
+interp = "pass"
+compiled = "pass"
+
+# Per-slot evict (`evict tag in crib`): freed tag ghosts, others untouched, forced slot reuse
+# at a bumped generation, stale double-evict no-op — against the aux `12-doom/arena` module's
+# crib, both qualified (entry file) and unqualified (inside the module).
+[[program]]
+path = "12-doom/evict-slot"
+covers = ["doom.evict-slot", "memory.generation-reuse"]
+interp = "pass"
+compiled = "pass"
+
+# `fs.drop(path, data) -> bool`: write bytes, read them back with fs.peep, overwrite-truncate,
+# and a failing destination reported as `cap`. The scratch file is repo-root-relative (the
+# fs-peep convention) and gitignored.
+[[program]]
+path = "12-doom/fs-drop"
+covers = ["doom.fs-drop", "stdlib.fs"]
+interp = "pass"
+compiled = "pass"
+
+# Fn values as function parameters (the thinker-iteration callback pattern).
+[[program]]
+path = "12-doom/fn-param"
+covers = ["doom.fn-param", "functions.first-class"]
+interp = "pass"
+compiled = "pass"
+
+# Sized-int idioms (i8 sign-extension, u8/i16/u32 slab elements, i32<->i64<->u32 casts, `>>`
+# on a negative i32). Every wrap goes through an EXPLICIT cast, which both paths honor — the
+# 09-bit-math lesson: only implicit width-wrapping arithmetic diverges from the interpreter.
+[[program]]
+path = "12-doom/int-widths"
+covers = ["doom.int-widths", "values.casts", "values.numeric-tower"]
 interp = "pass"
 compiled = "pass"

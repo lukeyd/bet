@@ -1,0 +1,20 @@
+// arena — an `aux` module owning a small typed crib, for the cross-module per-slot-evict
+// oracle. `free` exercises the unqualified `evict tag in crib` form from inside the owning
+// module; the entry file evicts the same crib through its qualified name.
+flex drip Node {
+    flex id: int
+}
+
+flex crib pool: Node[3]
+
+flex finna idOf(t: tag Node) -> int {
+    holla n = t in pool {
+        bet n.id
+    } ghosted {
+        bet -1
+    }
+}
+
+flex finna free(t: tag Node) {
+    evict t in pool
+}

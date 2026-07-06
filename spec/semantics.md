@@ -31,6 +31,17 @@
    boundary (§6, spec §7.5). Assignment through a place (`p.field = v`, `xs[i] = v`) mutates in
    place.
 
+2a. **Struct-literal zero-defaults.** A struct literal (bare `T{…}` or `cop T{…} in c`) may
+   omit any subset of fields; each omitted field takes its type's **zero value**: integers `0`,
+   floats `0.0`, `bool` `cap`, `str` `""`, nested drips recursively zeroed, fixed arrays
+   element-wise zeroed, `tag T` the null tag (always ghosted under `holla`, §3.4), slices the
+   empty `{ null, 0 }` fat value, and handle-shaped fields (fn values, `vec`, `stash`, `rng`,
+   `rawptr`, `crib`) the null handle — safe to hold and to overwrite with a real handle later; a
+   *use* before that (calling / pushing / indexing) is a crash, exactly like a zeroed handle in
+   C. A `moods` field has no zero value and must be initialized explicitly. `cop` writes every
+   declared field into the fresh slot (given or defaulted), so a reused slot never leaks its
+   previous occupant's bytes. `12-doom/gamestate-crib` pins the whole rule.
+
 3. **Short-circuit `&&` / `||`.** Logical operators short-circuit and therefore desugar to
    control flow, not to a binary operator (this is why `midir` has bitwise `BitAnd`/`BitOr`
    but **no** logical binop — it lowers these to `Branch`):
@@ -133,6 +144,23 @@ evict c           (typed crib c)
 Bumping every generation is the whole trick: it is O(1), and it makes **every tag handed out
 before the evict stale** (§3.4) without touching those tags. For a bump crib, `evict` resets
 `offset := 0`.
+
+### 3.3a `evict tag in crib` — per-slot free
+
+The single-slot form (the operation Doom performs every time a mobj dies):
+
+```text
+evict t in c      (typed crib c)
+  fr valid(c, t):   occ_{t.slot} := false ;  gen_{t.slot} := gen_{t.slot} + 1  (mod 2^32)
+  naw:              no-op                                        [rt-abi bet_evict_slot]
+```
+
+Guarded by the same `valid` rule as `holla` (§3.4), so it is **idempotent and alias-safe**: a
+stale tag, the null tag, an already-freed slot, and a double evict are all no-ops, and evicting
+through one copy of a tag ghosts every other copy (the generation bump). The freed slot returns
+to the crib's free pool, so a later `cop` reuses it — at the **new** generation, which is why
+the stale tag can never resolve to the slot's next occupant (`12-doom/evict-slot` pins this).
+On a bump crib the statement is a no-op (bump allocations are freed only en masse).
 
 ### 3.4 `holla` / `ghosted` — checked access
 
@@ -289,6 +317,7 @@ The chain each dynamic construct travels, for cross-referencing:
 |---|---|---|
 | `cop v in c` | `Rvalue::Cop` | `bet_cop` (+ write) / `bet_bump_alloc` |
 | `evict c` | `Stmt::Evict` | `bet_evict` |
+| `evict t in c` | `Stmt::EvictSlot` | `bet_evict_slot` |
 | `holla x = t in c {…} ghosted {…}` | `Terminator::HollaCheck` | `bet_holla_check` |
 | `t.trust() in c` | `Rvalue::Trust` | `bet_slot_ptr` (release) |
 | `mem.scratch()` | — | `bet_scratch` / `bet_scratch_reset` |

@@ -1,0 +1,21 @@
+// sub/mod — a subdirectory module (`pull "sub/mod" as m`) that mutates the game-state crib
+// declared in `../state` through a qualified holla: the doom cross-module pattern (P_Ticker
+// living in a different translation unit from the state). Every mutation lands in the crib
+// slot itself, so the caller observes it through its own later holla.
+pull "../state"
+
+flex finna advance(gs: tag state.GameState, n: int) {
+    holla g = gs in state.gsc {
+        g.tic = g.tic + n
+        g.world.tic = g.world.tic + 1
+        g.world.area.depth = g.world.area.depth + 2
+        g.world.area.origin.x = g.world.area.origin.x + 3
+        g.players[1].score = g.players[1].score + 50
+        g.players[1].active = nocap
+        g.keys[3] = nocap
+        g.vbuf[0] = g.vbuf[0] + 10
+        g.angles[1] = ((g.angles[1] + 7) as u32)
+        g.log.stack(g.tic)
+    } ghosted {
+    }
+}

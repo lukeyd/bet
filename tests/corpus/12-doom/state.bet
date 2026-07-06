@@ -1,0 +1,67 @@
+// state — the DOOM GameState design in miniature (an `aux` module). ALL game state lives in
+// ONE module-level `flex crib gsc: GameState[1]`, reachable cross-module via qualified holla
+// (`holla g = gs in state.gsc`). The drip mixes every field shape the real port needs:
+// `mem.slab` byte/word buffers, runtime handles (`vec`/`stash`), drips nested three deep,
+// fixed arrays of drips and bools, `tag` fields into a second crib, and fn-value fields with
+// two and three parameters. A `cop state.GameState{ tic: .. }` zero-defaults everything else.
+flex drip Vec2 {
+    flex x: int
+    flex y: int
+}
+
+flex drip Area {
+    flex depth: int
+    flex origin: Vec2
+}
+
+flex drip World {
+    flex tic: int
+    flex area: Area
+}
+
+flex drip Mobj {
+    flex id: int
+    flex hp: int
+    flex think: finna(tag Mobj, int) -> void
+}
+
+flex drip Player {
+    flex active: bool
+    flex score: int
+    flex target: tag Mobj
+}
+
+flex drip GameState {
+    flex tic: int
+    flex vbuf: []u8
+    flex angles: []u32
+    flex samples: []i16
+    flex log: vec[int]
+    flex names: stash[str, int]
+    flex world: World
+    flex players: Player[4]
+    flex keys: bool[8]
+    flex hero: tag Mobj
+    flex calc: finna(int, int) -> int
+    flex blend: finna(int, int, int) -> int
+}
+
+flex crib gsc: GameState[1]
+flex crib mobjs: Mobj[8]
+
+flex finna addmul(a: int, b: int) -> int {
+    bet a * 10 + b
+}
+
+flex finna blend3(a: int, b: int, c: int) -> int {
+    bet a * 100 + b * 10 + c
+}
+
+// A think action (the doom-thinker pattern): dispatched through a fn-value field via a tag
+// stored inside the game state.
+flex finna hurt(self: tag Mobj, dmg: int) {
+    holla mo = self in mobjs {
+        mo.hp = mo.hp - dmg
+    } ghosted {
+    }
+}

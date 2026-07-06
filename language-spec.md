@@ -66,7 +66,7 @@ A compiled, statically typed, general-purpose programming language whose keyword
 |---|---|---|
 | declare an arena | `crib` | where your data lives |
 | allocate into an arena | `cop` | `cop Player{...} in frameCrib` |
-| free an entire arena (O(1)) | `evict` | everyone out at once |
+| free an entire arena (O(1)) | `evict` | everyone out at once; `evict <tag> in <crib>` evicts one slot |
 | per-frame scratch arena | `scratch` | built in, auto-evicted each frame |
 | generational handle type | `tag` | `tag Enemy` — a name you can call out |
 | checked handle access | `holla` | call out; either they answer or you're ghosted |
@@ -184,8 +184,9 @@ lowkey p = cop Player{ hp: 100 } in frameCrib
 evict frameCrib                     // O(1) mass free
 ```
 
-- `cop ... in <crib>` allocates into a crib.
+- `cop ... in <crib>` allocates into a crib. A struct literal with omitted fields zero-defaults them (ints `0`, bools `cap`, strs `""`, nested drips/arrays zeroed, `tag` fields the null tag, handle fields null) — `cop GameState{}` is a valid whole-state initializer.
 - `evict <crib>` frees everything at once and **bumps every slot generation**, so all outstanding tags into it safely become ghosted (see 7.4). O(1) mass-free *with* use-after-free safety.
+- `evict <tag> in <crib>` frees **one slot** (Doom's per-mobj free): iff the tag is still live, the slot is marked free and *its* generation bumped — the tag and every copy of it ghost, and the slot is reused by a later `cop` at the new generation. A stale/null tag is a safe no-op.
 - `mem.scratch()` is a built-in per-frame arena, auto-evicted at frame end — maps directly onto game loops (per-frame allocations are free to clean up).
 - **Allocator context (Odin-inspired):** functions implicitly receive the current allocator so libraries respect the caller's memory strategy. (**Open question:** exact mechanism — implicit parameter vs. context struct.)
 

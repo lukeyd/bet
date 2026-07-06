@@ -218,7 +218,8 @@ hollaStmt  = "holla" ident "=" expr "in" expr block "ghosted" block ; (* §7.4  
 sheeshStmt = "sheesh" block [ "naw" ident block ] ;   (* recover boundary; rare, *)
                                                       (* binding form provisional *)
 
-evictStmt  = "evict" expr ;                           (* O(1) mass free, §7.2    *)
+evictStmt  = "evict" expr [ "in" expr ] ;             (* "evict crib": O(1) mass free, §7.2; *)
+                                                      (* "evict tag in crib": free ONE slot  *)
 slideStmt  = "slide" expr ;                           (* spawn task, §8          *)
 
 betStmt    = "bet" [ exprList ] ;                     (* return; 0..n values     *)

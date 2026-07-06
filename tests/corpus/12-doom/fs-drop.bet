@@ -1,0 +1,35 @@
+// fs-drop — file writes (`fs.drop(path, data) -> bool`), doom's savegame/sync-dump primitive:
+// write a []u8, read it back byte-identical with fs.peep, prove overwrite-truncates, and get
+// `cap` (not a crash) for an unwritable destination. The scratch path is repo-root-relative
+// (the corpus runner convention, like 10-stdlib/fs-peep) and gitignored.
+pull "spill"
+pull "fs"
+pull "mem"
+pull "str"
+
+facts SCRATCH: str = "tests/corpus/12-doom/.scratch.sav"
+
+finna main() {
+    lowkey save = mem.slab[u8](4)
+    save[0] = 68                       // D
+    save[1] = 79                       // O
+    save[2] = 79                       // O
+    save[3] = 77                       // M
+    spill.it(fs.drop(SCRATCH, save))   // nocap
+
+    lowkey back = fs.peep(SCRATCH)
+    lowkey text = str.fromBytesTrust(back)
+    spill.it(str.len(text))            // 4
+    spill.it(text)                     // DOOM
+    spill.it(back[3])                  // 77
+
+    // Overwrite truncates: a shorter second drop fully replaces the first.
+    lowkey tiny: []u8 = [88]           // X
+    spill.it(fs.drop(SCRATCH, tiny))   // nocap
+    lowkey back2 = fs.peep(SCRATCH)
+    spill.it(str.len(str.fromBytesTrust(back2)))    // 1
+    spill.it(back2[0])                 // 88
+
+    // A missing parent directory is an error, reported as `cap` — never a crash.
+    spill.it(fs.drop("tests/corpus/12-doom/no-such-dir/x.sav", tiny))    // cap
+}

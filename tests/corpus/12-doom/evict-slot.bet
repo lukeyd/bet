@@ -1,0 +1,35 @@
+// evict-slot — per-slot free (`evict tag in crib`), the operation doom leans on every time a
+// mobj dies: the freed tag (and every copy) ghosts, other slots are untouched, the slot goes
+// back to the free pool and is reused by the next cop AT A NEWER GENERATION (so the stale tag
+// never sees the new occupant), and evicting a stale tag is a safe no-op. The crib lives in a
+// pulled module and is evicted both through its qualified name (here) and unqualified inside
+// the owning module (`arena.free`). The crib is kept exactly full before each evict so slot
+// reuse is forced identically in every runtime.
+pull "spill"
+pull "arena"
+
+finna main() {
+    lowkey a = cop arena.Node{ id: 1 } in arena.pool
+    lowkey b = cop arena.Node{ id: 2 } in arena.pool
+    lowkey c = cop arena.Node{ id: 3 } in arena.pool
+    spill.it(arena.idOf(b))    // 2
+
+    evict b in arena.pool      // qualified single-slot evict, cross-module
+    spill.it(arena.idOf(b))    // -1  (freed tag ghosts)
+    spill.it(arena.idOf(a))    // 1   (other slots untouched)
+    spill.it(arena.idOf(c))    // 3
+
+    // b's slot is the only free one: the next cop must reuse it — at the new generation.
+    lowkey d = cop arena.Node{ id: 4 } in arena.pool
+    spill.it(arena.idOf(d))    // 4
+    spill.it(arena.idOf(b))    // -1  (generation bumped: stale tag never sees the newcomer)
+
+    evict b in arena.pool      // double-evict of a stale tag: a safe no-op
+    spill.it(arena.idOf(d))    // 4   (the reused slot's occupant survives)
+
+    arena.free(d)              // unqualified evict inside the owning module
+    spill.it(arena.idOf(d))    // -1
+    lowkey e = cop arena.Node{ id: 5 } in arena.pool
+    spill.it(arena.idOf(e))    // 5
+    spill.it(arena.idOf(a))    // 1
+}

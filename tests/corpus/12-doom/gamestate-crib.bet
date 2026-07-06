@@ -1,0 +1,102 @@
+// gamestate-crib — the DOOM GameState oracle: the whole game state in ONE module-level
+// crib slot (`state.gsc`), copped zero-default, its handle fields assigned afterwards, and
+// mutated cross-module from a subdirectory module (`sub/mod`) via qualified holla. Proves,
+// compiled-native: cop zero-defaults (ints/bools/strs/nested drips/fixed arrays/null tags),
+// slab + vec + stash + fn-value fields living inside a crib-resident drip, 3-deep nested
+// field writes through a holla ref, tags stored in (and resolved out of) the state, and the
+// doom-thinker fn-field dispatch — all across module boundaries.
+pull "spill"
+pull "mem"
+pull "vec"
+pull "stash"
+pull "state"
+pull "sub/mod" as m
+
+finna main() {
+    // One cop, one field given — the other eleven zero-default (spec §5).
+    lowkey gs = cop state.GameState{ tic: 100 } in state.gsc
+
+    holla g = gs in state.gsc {
+        spill.it(g.tic)                  // 100
+        spill.it(g.world.tic)            // 0     (nested drip zeroed)
+        spill.it(g.world.area.depth)     // 0     (two deep)
+        spill.it(g.world.area.origin.x)  // 0     (three deep)
+        spill.it(g.players[1].score)     // 0     (fixed array of drips zeroed)
+        spill.it(g.players[1].active)    // cap
+        spill.it(g.keys[3])              // cap   (fixed bool array zeroed)
+        holla h = g.hero in state.mobjs {
+            spill.it("hero?!")
+        } ghosted {
+            spill.it("no hero yet")      // zero-defaulted tag is null -> ghosted
+        }
+    } ghosted {
+        spill.it("gs gone")
+    }
+
+    // Assign the handle-shaped fields: slabs, vec, stash, and fn values from the state module.
+    holla g = gs in state.gsc {
+        g.vbuf = mem.slab[u8](8)
+        g.angles = mem.slab[u32](4)
+        g.samples = mem.slab[i16](4)
+        g.log = vec.new[int]()
+        g.names = stash.new[str, int]()
+        g.calc = state.addmul
+        g.blend = state.blend3
+        g.angles[0] = 3735928559         // 0xDEADBEEF — full u32 range
+        g.samples[1] = -12345            // negative i16 round-trip
+        g.names.put("mode", 7)
+    } ghosted {
+    }
+
+    // A mobj in the second crib; its tag is stored INSIDE the game state.
+    lowkey hero = cop state.Mobj{ id: 9, hp: 80, think: state.hurt } in state.mobjs
+    holla g = gs in state.gsc {
+        g.hero = hero
+        g.players[1].target = hero
+    } ghosted {
+    }
+
+    // Cross-module mutation from the subdirectory module.
+    m.advance(gs, 5)
+    m.advance(gs, 6)
+
+    // doom-thinker dispatch: hurt the hero through its stored think pointer.
+    holla mo = hero in state.mobjs {
+        mo.think(hero, 25)
+        mo.think(hero, 30)
+    } ghosted {
+    }
+
+    // Observe every mutation through a fresh holla on the state crib.
+    holla g = gs in state.gsc {
+        spill.it(g.tic)                  // 111   (100 + 5 + 6)
+        spill.it(g.world.tic)            // 2
+        spill.it(g.world.area.depth)     // 4
+        spill.it(g.world.area.origin.x)  // 6
+        spill.it(g.players[1].score)     // 100
+        spill.it(g.players[1].active)    // nocap
+        spill.it(g.keys[3])              // nocap
+        spill.it(g.vbuf[0])              // 20    (0 + 10 + 10)
+        spill.it(g.angles[0])            // 3735928559
+        spill.it(g.angles[1])            // 14    (0 + 7 + 7)
+        spill.it(g.samples[1])           // -12345
+        spill.it(g.log.gang())           // 2     (one entry per advance)
+        spill.it(g.log[0])               // 105
+        spill.it(g.log[1])               // 111
+        lowkey v, ok = g.names.peep("mode")
+        fr ok {
+            spill.it(v)                  // 7
+        } naw {
+            spill.it("miss")
+        }
+        spill.it(g.calc(4, 2))           // 42    (fn-value field, 2 params)
+        spill.it(g.blend(1, 2, 3))       // 123   (fn-value field, 3 params)
+        holla t = g.players[1].target in state.mobjs {
+            spill.it(t.hp)               // 25    (80 - 25 - 30, via think dispatch)
+        } ghosted {
+            spill.it("target lost")
+        }
+    } ghosted {
+        spill.it("gs gone")
+    }
+}

@@ -1,0 +1,41 @@
+// fn-param — fn values as function PARAMETERS (the iterator-callback pattern doom uses for
+// thinker iteration and BLOCKMAP traversal): a fold that calls its callback per step, named
+// functions and fn-typed locals passed interchangeably, and a four-parameter callback.
+pull "spill"
+
+finna add(acc: int, x: int) -> int {
+    bet acc + x
+}
+
+finna mul(acc: int, x: int) -> int {
+    bet acc * x
+}
+
+finna wsum(a: int, b: int, c: int, d: int) -> int {
+    bet a * 1000 + b * 100 + c * 10 + d
+}
+
+// The iterator: fold [lo, hi) into seed through the callback.
+finna fold(lo: int, hi: int, seed: int, f: finna(int, int) -> int) -> int {
+    lowkey acc = seed
+    lowkey i = lo
+    vibin i < hi {
+        acc = f(acc, i)
+        i = i + 1
+    }
+    bet acc
+}
+
+finna spread(f: finna(int, int, int, int) -> int, x: int) -> int {
+    bet f(x, x, x, x)
+}
+
+finna main() {
+    spill.it(fold(1, 5, 0, add))    // 10   (0+1+2+3+4)
+    spill.it(fold(1, 5, 1, mul))    // 24   (1*1*2*3*4)
+
+    lowkey f: finna(int, int) -> int = add
+    spill.it(fold(0, 3, 100, f))    // 103  (a fn-typed local rides the same parameter)
+
+    spill.it(spread(wsum, 7))       // 7777 (four-parameter callback)
+}
