@@ -425,6 +425,11 @@ unsafe extern "C" {
     /// Blit texture `tex` (from [`bet_gg_tex`]) onto the canvas at `(dx, dy)` with premultiplied
     /// src-over alpha, clipped to the canvas. A `0`/unknown id is ignored. Backs `gg.sprite`.
     pub fn bet_gg_sprite(tex: u32, dx: i32, dy: i32);
+    /// Blit the source sub-rectangle `(sx, sy, sw, sh)` of texture `tex` onto the canvas at
+    /// `(dx, dy)` with premultiplied src-over alpha — the same blit math as [`bet_gg_sprite`],
+    /// windowed to the source rect and clipped to both the texture bounds and the canvas. A
+    /// `0`/unknown id is ignored. The glyph-blit primitive behind bitmap text. Backs `gg.spriteSub`.
+    pub fn bet_gg_sprite_sub(tex: u32, sx: i32, sy: i32, sw: u32, sh: u32, dx: i32, dy: i32);
     /// Fill a `w * h` rectangle at `(dx, dy)` with `argb` (`0xAARR_GGBB`) using src-over alpha,
     /// clipped to the canvas. Backs `gg.rect`.
     pub fn bet_gg_rect(dx: i32, dy: i32, w: u32, h: u32, argb: u32);

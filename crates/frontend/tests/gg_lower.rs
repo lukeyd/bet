@@ -81,11 +81,12 @@ fn gg_tex_uploads_texture() {
 fn gg_frame_sprite_rect_flush_lower() {
     let src = "finna main() {\n lowkey px = mem.slab[u8](64)\n \
                lowkey id = gg.tex(px, 0, 4, 4)\n gg.frame(320, 240, 0)\n \
-               gg.sprite(id, 10, 20)\n gg.rect(0, 0, 8, 8, 0)\n gg.flush() }";
+               gg.sprite(id, 10, 20)\n gg.spriteSub(id, 0, 0, 2, 2, 30, 40)\n                gg.rect(0, 0, 8, 8, 0)\n gg.flush() }";
     let text = mir(src);
     for sym in [
         "bet_gg_frame",
         "bet_gg_sprite",
+        "bet_gg_sprite_sub",
         "bet_gg_rect",
         "bet_gg_flush",
     ] {

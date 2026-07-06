@@ -29,6 +29,9 @@ the framebuffer, a mixer above the raw audio ring, and mouse position/buttons:
 - `gg.frame(w, h, color)` — begin a frame: (re)size a fixed **logical canvas** and clear it to
   `0x00RRGGBB`. (`bet_gg_frame`)
 - `gg.sprite(tex, x, y)` — premultiplied src-over blit of a texture, clipped. (`bet_gg_sprite`)
+- `gg.spriteSub(tex, sx, sy, sw, sh, dx, dy)` — premultiplied src-over blit of a texture's source
+  sub-rectangle `(sx, sy, sw, sh)` to `(dx, dy)`, clipped; the glyph-blit primitive behind
+  bitmap-font text (score/status/menu). (`bet_gg_sprite_sub`)
 - `gg.rect(x, y, w, h, color)` — src-over rectangle fill (`0xAARRGGBB`). (`bet_gg_rect`)
 - `gg.flush()` — present the composited canvas, **aspect-fit + letterboxed** into the window,
   and pump input. (`bet_gg_flush`)

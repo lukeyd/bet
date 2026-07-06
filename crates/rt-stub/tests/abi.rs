@@ -151,6 +151,7 @@ fn platform_layer_is_headless() {
         assert_eq!(bet_gg_mouse(), 0);
         bet_gg_frame(320, 240, 0);
         bet_gg_sprite(0, 0, 0);
+        bet_gg_sprite_sub(0, 0, 0, 4, 4, 0, 0);
         bet_gg_rect(0, 0, 10, 10, 0);
         bet_gg_flush();
         bet_gg_stop(0);

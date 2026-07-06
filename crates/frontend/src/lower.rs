@@ -3936,6 +3936,38 @@ impl LowerCtx {
                 let ext = self.get_extern("bet_gg_sprite", vec![u32t, i32t, i32t], vec![]);
                 self.emit_extern_call(ext, &[], vec![t, x, y])
             }
+            // `gg.spriteSub(tex, sx, sy, sw, sh, dx, dy)` — src-over blit of a texture's source
+            // sub-rectangle to `(dx, dy)`. The glyph-blit primitive behind bitmap text. Void.
+            ("gg", "spriteSub") => {
+                if args.len() != 7 {
+                    return Err(
+                        "`gg.spriteSub` takes a texture id, a source x, y, w, h, and a dest x, y"
+                            .into(),
+                    );
+                }
+                let u32t = self.m.t_u32();
+                let i32t = self.m.t_int(IntWidth::W32, true);
+                let (t, tty) = self.lower_expr(&args[0].value, Some(u32t))?;
+                let t = self.coerce_int(t, tty, u32t);
+                let (sx, sxty) = self.lower_expr(&args[1].value, Some(i32t))?;
+                let sx = self.coerce_int(sx, sxty, i32t);
+                let (sy, syty) = self.lower_expr(&args[2].value, Some(i32t))?;
+                let sy = self.coerce_int(sy, syty, i32t);
+                let (sw, swty) = self.lower_expr(&args[3].value, Some(u32t))?;
+                let sw = self.coerce_int(sw, swty, u32t);
+                let (sh, shty) = self.lower_expr(&args[4].value, Some(u32t))?;
+                let sh = self.coerce_int(sh, shty, u32t);
+                let (dx, dxty) = self.lower_expr(&args[5].value, Some(i32t))?;
+                let dx = self.coerce_int(dx, dxty, i32t);
+                let (dy, dyty) = self.lower_expr(&args[6].value, Some(i32t))?;
+                let dy = self.coerce_int(dy, dyty, i32t);
+                let ext = self.get_extern(
+                    "bet_gg_sprite_sub",
+                    vec![u32t, i32t, i32t, u32t, u32t, i32t, i32t],
+                    vec![],
+                );
+                self.emit_extern_call(ext, &[], vec![t, sx, sy, sw, sh, dx, dy])
+            }
             // `gg.rect(x, y, w, h, color)` — src-over fill with `color` (`0xAARRGGBB`). Void.
             ("gg", "rect") => {
                 if args.len() != 5 {

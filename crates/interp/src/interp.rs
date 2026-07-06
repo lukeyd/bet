@@ -1830,6 +1830,29 @@ impl<'p> Interp<'p> {
             ("sprite", _) => Err(RunError::Type(
                 "`gg.sprite(tex, x, y)` takes a texture id and an x, y position".into(),
             )),
+            // `gg.spriteSub(tex, sx, sy, sw, sh, dx, dy)` blits `tex`'s source sub-rectangle.
+            (
+                "spriteSub",
+                [
+                    Value::Int(t),
+                    Value::Int(sx),
+                    Value::Int(sy),
+                    Value::Int(sw),
+                    Value::Int(sh),
+                    Value::Int(dx),
+                    Value::Int(dy),
+                ],
+            ) => {
+                gg_backend::sprite_sub(
+                    *t as u32, *sx as i32, *sy as i32, *sw as u32, *sh as u32, *dx as i32,
+                    *dy as i32,
+                );
+                Ok(Vec::new())
+            }
+            ("spriteSub", _) => Err(RunError::Type(
+                "`gg.spriteSub(tex, sx, sy, sw, sh, dx, dy)` takes a texture id and source/dest                  rects"
+                    .into(),
+            )),
             // `gg.rect(x, y, w, h, color)` fills a rectangle with `color` (0xAARRGGBB).
             (
                 "rect",

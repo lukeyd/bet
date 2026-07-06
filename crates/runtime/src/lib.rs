@@ -1026,6 +1026,19 @@ pub unsafe extern "C" fn bet_gg_sprite(_tex: u32, _dx: i32, _dy: i32) {}
 
 #[cfg(not(feature = "gg-desktop"))]
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_sprite_sub(
+    _tex: u32,
+    _sx: i32,
+    _sy: i32,
+    _sw: u32,
+    _sh: u32,
+    _dx: i32,
+    _dy: i32,
+) {
+}
+
+#[cfg(not(feature = "gg-desktop"))]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn bet_gg_rect(_dx: i32, _dy: i32, _w: u32, _h: u32, _argb: u32) {}
 
 #[cfg(not(feature = "gg-desktop"))]
@@ -1119,6 +1132,20 @@ pub unsafe extern "C" fn bet_gg_frame(w: u32, h: u32, clear_argb: u32) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bet_gg_sprite(tex: u32, dx: i32, dy: i32) {
     gg_backend::sprite(tex, dx, dy);
+}
+
+#[cfg(feature = "gg-desktop")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_sprite_sub(
+    tex: u32,
+    sx: i32,
+    sy: i32,
+    sw: u32,
+    sh: u32,
+    dx: i32,
+    dy: i32,
+) {
+    gg_backend::sprite_sub(tex, sx, sy, sw, sh, dx, dy);
 }
 
 #[cfg(feature = "gg-desktop")]

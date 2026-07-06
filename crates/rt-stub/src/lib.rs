@@ -864,6 +864,18 @@ pub unsafe extern "C" fn bet_gg_frame(_w: u32, _h: u32, _clear_argb: u32) {}
 pub unsafe extern "C" fn bet_gg_sprite(_tex: u32, _dx: i32, _dy: i32) {}
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_sprite_sub(
+    _tex: u32,
+    _sx: i32,
+    _sy: i32,
+    _sw: u32,
+    _sh: u32,
+    _dx: i32,
+    _dy: i32,
+) {
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn bet_gg_rect(_dx: i32, _dy: i32, _w: u32, _h: u32, _argb: u32) {}
 
 #[unsafe(no_mangle)]

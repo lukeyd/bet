@@ -169,6 +169,14 @@ pub fn sprite(tex: u32, dx: i32, dy: i32) {
     imp::sprite(tex, dx, dy);
 }
 
+/// Blit the source sub-rectangle `(sx, sy, sw, sh)` of texture `tex` to `(dx, dy)` with
+/// premultiplied src-over alpha — the same blit math as [`sprite`], windowed to the source rect
+/// and clipped to both the texture and the canvas. Headless: a no-op.
+#[allow(clippy::too_many_arguments)]
+pub fn sprite_sub(tex: u32, sx: i32, sy: i32, sw: u32, sh: u32, dx: i32, dy: i32) {
+    imp::sprite_sub(tex, sx, sy, sw, sh, dx, dy);
+}
+
 /// Fill a `w * h` rectangle at `(dx, dy)` with `argb` (`0xAARR_GGBB`), src-over, clipped.
 /// Headless: a no-op.
 pub fn rect(dx: i32, dy: i32, w: u32, h: u32, argb: u32) {
@@ -229,6 +237,18 @@ mod imp {
     pub(super) fn frame(_w: u32, _h: u32, _clear_argb: u32) {}
 
     pub(super) fn sprite(_tex: u32, _dx: i32, _dy: i32) {}
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn sprite_sub(
+        _tex: u32,
+        _sx: i32,
+        _sy: i32,
+        _sw: u32,
+        _sh: u32,
+        _dx: i32,
+        _dy: i32,
+    ) {
+    }
 
     pub(super) fn rect(_dx: i32, _dy: i32, _w: u32, _h: u32, _argb: u32) {}
 
@@ -596,6 +616,18 @@ mod imp {
 
         /// Premultiplied src-over blit of texture `tex` at `(dx, dy)`, clipped to the canvas.
         fn sprite(&mut self, tex: u32, dx: i32, dy: i32) {
+            let (tw, th) = match self.textures.get((tex.wrapping_sub(1)) as usize) {
+                Some(t) => (t.w as i32, t.h as i32),
+                None => return, // `tex == 0` wraps to u32::MAX; both miss and no-op.
+            };
+            self.blit_sub(tex, 0, 0, tw, th, dx, dy);
+        }
+
+        /// Premultiplied src-over blit of the source sub-rectangle `(sx, sy, sw, sh)` of `tex` to
+        /// `(dx, dy)`, clipped to both the texture and the canvas. The shared blit core: `sprite`
+        /// is this over the whole texture, `sprite_sub` over an arbitrary source window.
+        #[allow(clippy::too_many_arguments)]
+        fn blit_sub(&mut self, tex: u32, sx: i32, sy: i32, sw: i32, sh: i32, dx: i32, dy: i32) {
             if tex == 0 || tex as usize > self.textures.len() {
                 return;
             }
@@ -609,17 +641,22 @@ mod imp {
             let t = &textures[(tex - 1) as usize];
             let tw = t.w as i32;
             let th = t.h as i32;
-            for tyi in 0..th {
-                let y = dy + tyi;
+            // Clip the source window to the texture; each source pixel maps to a dest offset.
+            let sx0 = sx.max(0);
+            let sy0 = sy.max(0);
+            let sx1 = sx.saturating_add(sw).min(tw);
+            let sy1 = sy.saturating_add(sh).min(th);
+            for syi in sy0..sy1 {
+                let y = dy + (syi - sy);
                 if y < 0 || y >= ch {
                     continue;
                 }
-                for txi in 0..tw {
-                    let x = dx + txi;
+                for sxi in sx0..sx1 {
+                    let x = dx + (sxi - sx);
                     if x < 0 || x >= cw {
                         continue;
                     }
-                    let src = t.px[(tyi as usize) * (t.w as usize) + txi as usize];
+                    let src = t.px[(syi as usize) * (t.w as usize) + sxi as usize];
                     let a = src >> 24;
                     if a == 0 {
                         continue;
@@ -640,6 +677,12 @@ mod imp {
                     canvas[di] = (or << 16) | (og << 8) | ob;
                 }
             }
+        }
+
+        /// Premultiplied src-over blit of the source sub-rectangle `(sx, sy, sw, sh)` of `tex`.
+        #[allow(clippy::too_many_arguments)]
+        fn sprite_sub(&mut self, tex: u32, sx: i32, sy: i32, sw: u32, sh: u32, dx: i32, dy: i32) {
+            self.blit_sub(tex, sx, sy, sw as i32, sh as i32, dx, dy);
         }
 
         /// Src-over fill of a rectangle with a straight (non-premultiplied) `0xAARR_GGBB` color.
@@ -1004,6 +1047,11 @@ mod imp {
 
     pub(super) fn sprite(tex: u32, dx: i32, dy: i32) {
         with_state(|st| st.sprite(tex, dx, dy));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn sprite_sub(tex: u32, sx: i32, sy: i32, sw: u32, sh: u32, dx: i32, dy: i32) {
+        with_state(|st| st.sprite_sub(tex, sx, sy, sw, sh, dx, dy));
     }
 
     pub(super) fn rect(dx: i32, dy: i32, w: u32, h: u32, argb: u32) {
