@@ -1,0 +1,929 @@
+// p/p_setup.bet — LEVEL LOAD: parse a map's WAD lumps into the Level SoA slabs + spawn its
+// things (linuxdoom-1.10 p_setup.c, plus P_SpawnMapThing / P_SpawnPlayer from p_mobj.c).
+//
+// PORTED: P_SetupLevel, P_LoadVertexes, P_LoadSectors, P_LoadSideDefs, P_LoadLineDefs,
+//   P_LoadSubsectors, P_LoadNodes, P_LoadSegs, P_LoadThings, P_LoadBlockMap, P_LoadReject,
+//   P_GroupLines, P_SpawnMapThing, P_SpawnPlayer.
+//
+// The map lumps are little-endian on-disk structs (doomdata.h) read via util/bstream from
+// g.wad.buf at the byte offset w_wad.lumpNum(gt, mapLumpNum + ML_<X>). The map marker lump
+// ("E1M<n>" / "MAP<nn>") is a directory separator; its data lumps THINGS..BLOCKMAP follow it
+// in directory order at lumpnum + ML_THINGS(1) .. ML_BLOCKMAP(10).
+//
+// SLAB MODEL: every r_defs.h runtime array is a parallel-indexed []i32/[]u32 slab on
+// gs.Level (index = the C array index). Sized here at load via mem.slab; tag-valued head refs
+// (soundtarget/thinglist/specialdata/block-chain) live in the fixed *Links arrays. See
+// ports/doom/CONTRACTS.md "r_defs.h runtime structs -> Level SoA slabs".
+//
+// BLOCKMAP CONTRACT (imposed by p/p_maputl, P2.1): g.level.blockmap is ONE []i32 =
+//   [ offset table: bmapWidth*bmapHeight ] ++ [ per-block linedef lists ]. Entry [y*bw+x] is the
+//   START INDEX (into this same array) of that block's list; a list runs to a -1 terminator.
+//   The on-disk BLOCKMAP has a 4-short header (origx/origy/w/h) that the iterator does NOT see, so
+//   the on-disk offsets (which count shorts from the lump start) are REBASED by -4 into this array.
+//   Vanilla's leading-0 list padding is kept verbatim (the iterator runs offset..-1, which is
+//   vanilla-faithful — block[y*bw+x]'s first entry is linedef 0 exactly as in id).
+//
+// NATIVE-SAFETY caps (W1-integration amendment): yeet if numsectors > MAXSECTORS(2048),
+//   numlines > MAXLINES(8192), or bmapWidth*bmapHeight > MAXBLOCKS(32768). Shareware maps are far
+//   under; this only guards oversized PWADs (the *Links fixed arrays are sized to these caps).
+//
+// HOLLA DISCIPLINE: name-resolving loaders (sectors/sidedefs) call r_data.flat/textureNumForName,
+//   which open their OWN gs holla, so those loaders read the raw record (+ 8-byte names via the
+//   pure bstream.name8) inside one holla, CLOSE it, resolve the name, then reopen a holla to write
+//   — never a nested gsc holla. Pure-geometry loaders do the whole fill in one holla (bstream is a
+//   pure fn on the passed []u8, safe to call while the holla is open). Spawns (P_SpawnMobj) also
+//   open hollas, so they are always called with no parent gsc holla open.
+//
+// SEAMS (not this package's scope — left as documented stubs so the level still loads):
+//   * S_Start()               — s/s_sound level-audio reset. Consumes NO play-RNG (prndindex), so
+//                               skipping it does not perturb demo-sync. The tick/d_main (P2.8) owns it.
+//   * P_SpawnSpecials()       — p/p_spec (P2.3): sector-effect thinkers + special-line setup.
+//   * G_DeathMatchSpawnPlayer  / G_PlayerReborn — g/g_game (P2.8) deathmatch/reborn spawns.
+//   * P_SetupPsprites / ST_Start / HU_Start — p_pspr(P2.4) + st/hu (wired by the tick). None affect
+//                               the spawned player mobj's typeIdx/x/y/angle (what W3 diffs).
+//
+// NATIVE is the correctness target (WAD-scale; the interpreter clones an array per element read —
+// intractable here, exactly like r_data). Proven by tools/setup_smoke.bet (goldens/e1m1_setup.golden).
+pull "mem"
+pull "str"
+pull "../defs/gs" as gs
+pull "../defs/think" as think
+pull "../defs/fixed" as fixed
+pull "../defs/tables" as tables
+pull "../defs/doomdef" as doomdef
+pull "../defs/info" as info
+pull "../defs/player" as pdef
+pull "../util/bstream" as bstream
+pull "../util/m_bbox" as m_bbox
+pull "../w/w_wad" as wad
+pull "../r/r_data" as rdata
+pull "../p/p_mobj" as pmobj
+pull "../p/p_think" as pthink
+pull "../util/m_random" as rnd
+
+// ---- constants (p_local.h / p_setup.c) ----------------------------------------------------
+flex facts MAXRADIUS: i32 = 2097152        // 32*FRACUNIT (P_GroupLines block-box slop)
+flex facts MAPBLOCKSHIFT: i32 = 23         // FRACBITS + 7 (mirrors p_maputl; local to avoid the dep)
+flex facts VIEWHEIGHT: i32 = 2686976       // 41*FRACUNIT (P_SpawnPlayer p->viewheight)
+flex facts MAXPLAYERS: int = 4
+// slopetype_t ordinals (r_defs.h) — same values p/p_maputl uses for lineSlopetype.
+flex facts ST_HORIZONTAL: i32 = 0
+flex facts ST_VERTICAL: i32 = 1
+flex facts ST_POSITIVE: i32 = 2
+flex facts ST_NEGATIVE: i32 = 3
+
+// ===========================================================================================
+// map-lump loaders (id's load order in P_SetupLevel is: blockmap, vertexes, sectors, sidedefs,
+// linedefs, subsectors, nodes, segs — "most of this ordering is important")
+// ===========================================================================================
+
+// P_LoadVertexes — mapvertex_t (4 bytes: x i16, y i16). Convert to fixed (<<FRACBITS).
+flex finna loadVertexes(gt: tag gs.GameState, lump: int) {
+    lowkey ofs = wad.lumpNum(gt, lump)
+    lowkey num = wad.lumpLength(gt, lump) / 4
+    holla g = gt in gs.gsc {
+        g.level.numvertexes = num as i32
+        g.level.vtxX = mem.slab[i32](num)
+        g.level.vtxY = mem.slab[i32](num)
+        lowkey i = 0
+        vibin i < num {
+            lowkey e = ofs + i * 4
+            g.level.vtxX[i] = (bstream.rdI16(g.wad.buf, e) << 16) as i32
+            g.level.vtxY[i] = (bstream.rdI16(g.wad.buf, e + 2) << 16) as i32
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// P_LoadSectors — mapsector_t (26 bytes: floorh/ceilh i16, floorpic/ceilpic 8-byte flat names,
+// light/special/tag i16). Flat names -> flat numbers via R_FlatNumForName; thinglist/etc cleared.
+flex finna loadSectors(gt: tag gs.GameState, lump: int) {
+    lowkey ofs = wad.lumpNum(gt, lump)
+    lowkey num = wad.lumpLength(gt, lump) / 26
+    fr num > gs.MAXSECTORS {
+        yeet("P_LoadSectors: too many sectors")
+    }
+    holla g = gt in gs.gsc {
+        g.level.numsectors = num as i32
+        g.level.secFloorH = mem.slab[i32](num)
+        g.level.secCeilH = mem.slab[i32](num)
+        g.level.secFloorPic = mem.slab[i32](num)
+        g.level.secCeilPic = mem.slab[i32](num)
+        g.level.secLight = mem.slab[i32](num)
+        g.level.secSpecial = mem.slab[i32](num)
+        g.level.secTag = mem.slab[i32](num)
+        g.level.secSoundTrav = mem.slab[i32](num)
+        g.level.secValid = mem.slab[i32](num)
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey i = 0
+    vibin i < num {
+        lowkey fh = 0
+        lowkey ch = 0
+        lowkey light = 0
+        lowkey special = 0
+        lowkey tg = 0
+        lowkey floorName = ""
+        lowkey ceilName = ""
+        holla g = gt in gs.gsc {
+            lowkey e = ofs + i * 26
+            fh = bstream.rdI16(g.wad.buf, e)
+            ch = bstream.rdI16(g.wad.buf, e + 2)
+            floorName = bstream.name8(g.wad.buf, e + 4)
+            ceilName = bstream.name8(g.wad.buf, e + 12)
+            light = bstream.rdI16(g.wad.buf, e + 20)
+            special = bstream.rdI16(g.wad.buf, e + 22)
+            tg = bstream.rdI16(g.wad.buf, e + 24)
+        } ghosted {
+            yeet("gs")
+        }
+        lowkey fpic = rdata.flatNumForName(gt, floorName)
+        lowkey cpic = rdata.flatNumForName(gt, ceilName)
+        holla g = gt in gs.gsc {
+            g.level.secFloorH[i] = (fh << 16) as i32
+            g.level.secCeilH[i] = (ch << 16) as i32
+            g.level.secFloorPic[i] = fpic as i32
+            g.level.secCeilPic[i] = cpic as i32
+            g.level.secLight[i] = light as i32
+            g.level.secSpecial[i] = special as i32
+            g.level.secTag[i] = tg as i32
+            g.level.secSoundTrav[i] = 0
+            g.level.secValid[i] = 0
+            g.level.secLinks[i].thinglist = ghosted
+            g.level.secLinks[i].soundtarget = ghosted
+            g.level.secLinks[i].specialT = ghosted
+        } ghosted {
+            yeet("gs")
+        }
+        i = i + 1
+    }
+}
+
+// P_LoadSideDefs — mapsidedef_t (30 bytes: texofs/rowofs i16, top/bot/mid 8-byte tex names,
+// sector i16). Texture names -> numbers via R_TextureNumForName ("-"/absent handled there).
+flex finna loadSideDefs(gt: tag gs.GameState, lump: int) {
+    lowkey ofs = wad.lumpNum(gt, lump)
+    lowkey num = wad.lumpLength(gt, lump) / 30
+    holla g = gt in gs.gsc {
+        g.level.numsides = num as i32
+        g.level.sdTexOfs = mem.slab[i32](num)
+        g.level.sdRowOfs = mem.slab[i32](num)
+        g.level.sdTopTex = mem.slab[i32](num)
+        g.level.sdBotTex = mem.slab[i32](num)
+        g.level.sdMidTex = mem.slab[i32](num)
+        g.level.sdSector = mem.slab[i32](num)
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey i = 0
+    vibin i < num {
+        lowkey texofs = 0
+        lowkey rowofs = 0
+        lowkey secnum = 0
+        lowkey topName = ""
+        lowkey botName = ""
+        lowkey midName = ""
+        holla g = gt in gs.gsc {
+            lowkey e = ofs + i * 30
+            texofs = bstream.rdI16(g.wad.buf, e)
+            rowofs = bstream.rdI16(g.wad.buf, e + 2)
+            topName = bstream.name8(g.wad.buf, e + 4)
+            botName = bstream.name8(g.wad.buf, e + 12)
+            midName = bstream.name8(g.wad.buf, e + 20)
+            secnum = bstream.rdI16(g.wad.buf, e + 28)
+        } ghosted {
+            yeet("gs")
+        }
+        lowkey topT = rdata.textureNumForName(gt, topName)
+        lowkey botT = rdata.textureNumForName(gt, botName)
+        lowkey midT = rdata.textureNumForName(gt, midName)
+        holla g = gt in gs.gsc {
+            g.level.sdTexOfs[i] = (texofs << 16) as i32
+            g.level.sdRowOfs[i] = (rowofs << 16) as i32
+            g.level.sdTopTex[i] = topT as i32
+            g.level.sdBotTex[i] = botT as i32
+            g.level.sdMidTex[i] = midT as i32
+            g.level.sdSector[i] = secnum as i32
+        } ghosted {
+            yeet("gs")
+        }
+        i = i + 1
+    }
+}
+
+// P_LoadLineDefs — maplinedef_t (14 bytes: v1/v2/flags/special/tag i16, sidenum[2] i16). Derives
+// dx/dy, slopetype, bbox, and front/back sector from the sidedefs (sidenum -1 => one-sided).
+flex finna loadLineDefs(gt: tag gs.GameState, lump: int) {
+    lowkey ofs = wad.lumpNum(gt, lump)
+    lowkey num = wad.lumpLength(gt, lump) / 14
+    fr num > gs.MAXLINES {
+        yeet("P_LoadLineDefs: too many lines")
+    }
+    holla g = gt in gs.gsc {
+        g.level.numlines = num as i32
+        g.level.lineV1 = mem.slab[i32](num)
+        g.level.lineV2 = mem.slab[i32](num)
+        g.level.lineDx = mem.slab[i32](num)
+        g.level.lineDy = mem.slab[i32](num)
+        g.level.lineFlags = mem.slab[i32](num)
+        g.level.lineSpecial = mem.slab[i32](num)
+        g.level.lineTag = mem.slab[i32](num)
+        g.level.lineSide0 = mem.slab[i32](num)
+        g.level.lineSide1 = mem.slab[i32](num)
+        g.level.lineBBox = mem.slab[i32](num * 4)
+        g.level.lineSlopetype = mem.slab[i32](num)
+        g.level.lineFront = mem.slab[i32](num)
+        g.level.lineBack = mem.slab[i32](num)
+        g.level.lineValid = mem.slab[i32](num)
+        lowkey i = 0
+        vibin i < num {
+            lowkey e = ofs + i * 14
+            lowkey v1 = bstream.rdI16(g.wad.buf, e) as int
+            lowkey v2 = bstream.rdI16(g.wad.buf, e + 2) as int
+            lowkey flags = bstream.rdI16(g.wad.buf, e + 4) as int
+            lowkey special = bstream.rdI16(g.wad.buf, e + 6) as int
+            lowkey tg = bstream.rdI16(g.wad.buf, e + 8) as int
+            lowkey s0 = bstream.rdI16(g.wad.buf, e + 10) as int
+            lowkey s1 = bstream.rdI16(g.wad.buf, e + 12) as int
+            g.level.lineV1[i] = v1 as i32
+            g.level.lineV2[i] = v2 as i32
+            g.level.lineFlags[i] = flags as i32
+            g.level.lineSpecial[i] = special as i32
+            g.level.lineTag[i] = tg as i32
+            g.level.lineSide0[i] = s0 as i32
+            g.level.lineSide1[i] = s1 as i32
+            lowkey v1x = g.level.vtxX[v1]
+            lowkey v1y = g.level.vtxY[v1]
+            lowkey v2x = g.level.vtxX[v2]
+            lowkey v2y = g.level.vtxY[v2]
+            lowkey dx = v2x - v1x
+            lowkey dy = v2y - v1y
+            g.level.lineDx[i] = dx
+            g.level.lineDy[i] = dy
+            fr dx == 0 {
+                g.level.lineSlopetype[i] = ST_VERTICAL
+            } naw fr dy == 0 {
+                g.level.lineSlopetype[i] = ST_HORIZONTAL
+            } naw {
+                fr fixed.fixedDiv(dy, dx) > 0 {
+                    g.level.lineSlopetype[i] = ST_POSITIVE
+                } naw {
+                    g.level.lineSlopetype[i] = ST_NEGATIVE
+                }
+            }
+            fr v1x < v2x {
+                g.level.lineBBox[i * 4 + m_bbox.BOXLEFT] = v1x
+                g.level.lineBBox[i * 4 + m_bbox.BOXRIGHT] = v2x
+            } naw {
+                g.level.lineBBox[i * 4 + m_bbox.BOXLEFT] = v2x
+                g.level.lineBBox[i * 4 + m_bbox.BOXRIGHT] = v1x
+            }
+            fr v1y < v2y {
+                g.level.lineBBox[i * 4 + m_bbox.BOXBOTTOM] = v1y
+                g.level.lineBBox[i * 4 + m_bbox.BOXTOP] = v2y
+            } naw {
+                g.level.lineBBox[i * 4 + m_bbox.BOXBOTTOM] = v2y
+                g.level.lineBBox[i * 4 + m_bbox.BOXTOP] = v1y
+            }
+            fr s0 != -1 {
+                g.level.lineFront[i] = g.level.sdSector[s0]
+            } naw {
+                g.level.lineFront[i] = -1
+            }
+            fr s1 != -1 {
+                g.level.lineBack[i] = g.level.sdSector[s1]
+            } naw {
+                g.level.lineBack[i] = -1
+            }
+            g.level.lineValid[i] = 0
+            g.level.lineLinks[i].specialT = ghosted
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// P_LoadSubsectors — mapsubsector_t (4 bytes: numsegs i16, firstseg i16). ssSector is filled by
+// P_GroupLines (allocated here).
+flex finna loadSubsectors(gt: tag gs.GameState, lump: int) {
+    lowkey ofs = wad.lumpNum(gt, lump)
+    lowkey num = wad.lumpLength(gt, lump) / 4
+    holla g = gt in gs.gsc {
+        g.level.numsubsectors = num as i32
+        g.level.ssSector = mem.slab[i32](num)
+        g.level.ssNumLines = mem.slab[i32](num)
+        g.level.ssFirstLine = mem.slab[i32](num)
+        lowkey i = 0
+        vibin i < num {
+            lowkey e = ofs + i * 4
+            g.level.ssNumLines[i] = bstream.rdU16(g.wad.buf, e) as i32
+            g.level.ssFirstLine[i] = bstream.rdU16(g.wad.buf, e + 2) as i32
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// P_LoadNodes — mapnode_t (28 bytes: x/y/dx/dy i16->fixed, bbox[2][4] i16->fixed, children[2]
+// u16). The NF_SUBSECTOR (0x8000) leaf bit is KEPT in the child value (read unsigned).
+flex finna loadNodes(gt: tag gs.GameState, lump: int) {
+    lowkey ofs = wad.lumpNum(gt, lump)
+    lowkey num = wad.lumpLength(gt, lump) / 28
+    holla g = gt in gs.gsc {
+        g.level.numnodes = num as i32
+        g.level.nodeX = mem.slab[i32](num)
+        g.level.nodeY = mem.slab[i32](num)
+        g.level.nodeDx = mem.slab[i32](num)
+        g.level.nodeDy = mem.slab[i32](num)
+        g.level.nodeBBox = mem.slab[i32](num * 8)
+        g.level.nodeChild0 = mem.slab[i32](num)
+        g.level.nodeChild1 = mem.slab[i32](num)
+        lowkey i = 0
+        vibin i < num {
+            lowkey e = ofs + i * 28
+            g.level.nodeX[i] = (bstream.rdI16(g.wad.buf, e) << 16) as i32
+            g.level.nodeY[i] = (bstream.rdI16(g.wad.buf, e + 2) << 16) as i32
+            g.level.nodeDx[i] = (bstream.rdI16(g.wad.buf, e + 4) << 16) as i32
+            g.level.nodeDy[i] = (bstream.rdI16(g.wad.buf, e + 6) << 16) as i32
+            lowkey j = 0
+            vibin j < 8 {
+                g.level.nodeBBox[i * 8 + j] = (bstream.rdI16(g.wad.buf, e + 8 + j * 2) << 16) as i32
+                j = j + 1
+            }
+            g.level.nodeChild0[i] = bstream.rdU16(g.wad.buf, e + 24) as i32
+            g.level.nodeChild1[i] = bstream.rdU16(g.wad.buf, e + 26) as i32
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// P_LoadSegs — mapseg_t (12 bytes: v1/v2/angle/linedef/side/offset i16). Derives the sidedef,
+// front/back sector, angle (u32<<16) and offset (fixed) from the linedef the seg belongs to.
+flex finna loadSegs(gt: tag gs.GameState, lump: int) {
+    lowkey ofs = wad.lumpNum(gt, lump)
+    lowkey num = wad.lumpLength(gt, lump) / 12
+    holla g = gt in gs.gsc {
+        g.level.numsegs = num as i32
+        g.level.segV1 = mem.slab[i32](num)
+        g.level.segV2 = mem.slab[i32](num)
+        g.level.segOffset = mem.slab[i32](num)
+        g.level.segAngle = mem.slab[u32](num)
+        g.level.segSide = mem.slab[i32](num)
+        g.level.segLine = mem.slab[i32](num)
+        g.level.segFront = mem.slab[i32](num)
+        g.level.segBack = mem.slab[i32](num)
+        lowkey i = 0
+        vibin i < num {
+            lowkey e = ofs + i * 12
+            lowkey v1 = bstream.rdI16(g.wad.buf, e) as int
+            lowkey v2 = bstream.rdI16(g.wad.buf, e + 2) as int
+            lowkey angRaw = bstream.rdI16(g.wad.buf, e + 4) as int
+            lowkey ldnum = bstream.rdI16(g.wad.buf, e + 6) as int
+            lowkey side = bstream.rdI16(g.wad.buf, e + 8) as int
+            lowkey offRaw = bstream.rdI16(g.wad.buf, e + 10) as int
+            g.level.segV1[i] = v1 as i32
+            g.level.segV2[i] = v2 as i32
+            g.level.segAngle[i] = (angRaw << 16) as u32
+            g.level.segOffset[i] = (offRaw << 16) as i32
+            g.level.segLine[i] = ldnum as i32
+            lowkey sdIdx = 0
+            fr side == 0 {
+                sdIdx = g.level.lineSide0[ldnum] as int
+            } naw {
+                sdIdx = g.level.lineSide1[ldnum] as int
+            }
+            g.level.segSide[i] = sdIdx as i32
+            g.level.segFront[i] = g.level.sdSector[sdIdx]
+            fr ((g.level.lineFlags[ldnum] as int) & doomdef.ML_TWOSIDED) != 0 {
+                lowkey otherIdx = 0
+                fr side == 0 {
+                    otherIdx = g.level.lineSide1[ldnum] as int
+                } naw {
+                    otherIdx = g.level.lineSide0[ldnum] as int
+                }
+                fr otherIdx != -1 {
+                    g.level.segBack[i] = g.level.sdSector[otherIdx]
+                } naw {
+                    g.level.segBack[i] = -1
+                }
+            } naw {
+                g.level.segBack[i] = -1
+            }
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// P_LoadBlockMap — rebuild the raw BLOCKMAP lump (i16 header origx/origy/w/h, then the u16 offset
+// table, then packed linedef lists terminated by -1) into P2.1's single []i32 contract: drop the
+// 4-short header, keep the offset table (rebased -4) then the lists. Alloc/clear blockLinks.
+flex finna loadBlockMap(gt: tag gs.GameState, lump: int) {
+    lowkey ofs = wad.lumpNum(gt, lump)
+    lowkey count = wad.lumpLength(gt, lump) / 2
+    holla g = gt in gs.gsc {
+        lowkey origx = bstream.rdI16(g.wad.buf, ofs)
+        lowkey origy = bstream.rdI16(g.wad.buf, ofs + 2)
+        lowkey width = bstream.rdI16(g.wad.buf, ofs + 4)
+        lowkey height = bstream.rdI16(g.wad.buf, ofs + 6)
+        g.level.bmapOrgX = (origx << 16) as i32
+        g.level.bmapOrgY = (origy << 16) as i32
+        g.level.bmapWidth = width as i32
+        g.level.bmapHeight = height as i32
+        lowkey cells = width * height
+        fr cells > gs.MAXBLOCKS {
+            yeet("P_LoadBlockMap: too many blocks")
+        }
+        lowkey arrLen = count - 4
+        g.level.blockmap = mem.slab[i32](arrLen)
+        // offset table: on-disk offsets count shorts from the lump start (past the 4-short header),
+        // so rebase by -4 into the header-less array.
+        lowkey i = 0
+        vibin i < cells {
+            lowkey o = bstream.rdI16(g.wad.buf, ofs + (4 + i) * 2)
+            g.level.blockmap[i] = (o - 4) as i32
+            i = i + 1
+        }
+        // per-block linedef lists: copy the lump tail (index 4+cells..count-1) to array[i-4],
+        // preserving the leading-0 padding and the -1 terminators (0xFFFF -> -1 via rdI16).
+        i = 4 + cells
+        vibin i < count {
+            g.level.blockmap[i - 4] = bstream.rdI16(g.wad.buf, ofs + i * 2) as i32
+            i = i + 1
+        }
+        // clear the per-block mobj chains (P_SetupLevel memsets blocklinks).
+        lowkey k = 0
+        vibin k < cells {
+            g.level.blockLinks[k].t = ghosted
+            k = k + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// P_LoadReject — the REJECT LUT is read in place from g.wad.buf; just record its byte offset+len.
+flex finna loadReject(gt: tag gs.GameState, lump: int) {
+    lowkey ofs = wad.lumpNum(gt, lump)
+    lowkey len = wad.lumpLength(gt, lump)
+    holla g = gt in gs.gsc {
+        g.level.rejectOfs = ofs
+        g.level.rejectLen = len
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// P_GroupLines — build subsector->sector, each sector's line list (secLineOfs/Count/secLinesList),
+// its sound-origin (bbox midpoint) and its block-box (bbox in mapblock units, clamped).
+flex finna groupLines(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        lowkey nsub = g.level.numsubsectors as int
+        lowkey nlines = g.level.numlines as int
+        lowkey nsec = g.level.numsectors as int
+        // 1) subsector sector number = segs[firstline].sidedef->sector
+        lowkey i = 0
+        vibin i < nsub {
+            lowkey fseg = g.level.ssFirstLine[i] as int
+            lowkey sd = g.level.segSide[fseg] as int
+            g.level.ssSector[i] = g.level.sdSector[sd]
+            i = i + 1
+        }
+        // 2) grand total of (sector,line) memberships: each line once for its front, plus once
+        //    more for a distinct back sector.
+        lowkey total = 0
+        i = 0
+        vibin i < nlines {
+            total = total + 1
+            lowkey fsec = g.level.lineFront[i] as int
+            lowkey bsec = g.level.lineBack[i] as int
+            fr bsec != -1 && bsec != fsec {
+                total = total + 1
+            }
+            i = i + 1
+        }
+        // 3) per-sector line lists + bbox-derived soundorg/blockbox
+        g.level.secLineOfs = mem.slab[i32](nsec)
+        g.level.secLineCount = mem.slab[i32](nsec)
+        g.level.secLinesList = mem.slab[i32](total)
+        g.level.secBlockBox = mem.slab[i32](nsec * 4)
+        g.level.secSoundOrgX = mem.slab[i32](nsec)
+        g.level.secSoundOrgY = mem.slab[i32](nsec)
+        g.level.secSoundOrgZ = mem.slab[i32](nsec)
+        lowkey bbox = mem.slab[i32](4)
+        lowkey pos = 0
+        lowkey s = 0
+        vibin s < nsec {
+            m_bbox.clearBox(bbox, 0)
+            lowkey startPos = pos
+            g.level.secLineOfs[s] = pos as i32
+            lowkey j = 0
+            vibin j < nlines {
+                fr (g.level.lineFront[j] as int) == s || (g.level.lineBack[j] as int) == s {
+                    g.level.secLinesList[pos] = j as i32
+                    pos = pos + 1
+                    lowkey v1 = g.level.lineV1[j] as int
+                    lowkey v2 = g.level.lineV2[j] as int
+                    m_bbox.addToBox(bbox, 0, g.level.vtxX[v1], g.level.vtxY[v1])
+                    m_bbox.addToBox(bbox, 0, g.level.vtxX[v2], g.level.vtxY[v2])
+                }
+                j = j + 1
+            }
+            g.level.secLineCount[s] = (pos - startPos) as i32
+            // soundorg = middle of the bbox
+            g.level.secSoundOrgX[s] = ((bbox[m_bbox.BOXRIGHT] + bbox[m_bbox.BOXLEFT]) / 2) as i32
+            g.level.secSoundOrgY[s] = ((bbox[m_bbox.BOXTOP] + bbox[m_bbox.BOXBOTTOM]) / 2) as i32
+            g.level.secSoundOrgZ[s] = 0
+            // blockbox = bbox in mapblock units, clamped to the grid
+            lowkey blk = (bbox[m_bbox.BOXTOP] - g.level.bmapOrgY + MAXRADIUS) >> MAPBLOCKSHIFT
+            fr blk >= g.level.bmapHeight {
+                blk = g.level.bmapHeight - 1
+            }
+            g.level.secBlockBox[s * 4 + m_bbox.BOXTOP] = blk
+            blk = (bbox[m_bbox.BOXBOTTOM] - g.level.bmapOrgY - MAXRADIUS) >> MAPBLOCKSHIFT
+            fr blk < 0 {
+                blk = 0
+            }
+            g.level.secBlockBox[s * 4 + m_bbox.BOXBOTTOM] = blk
+            blk = (bbox[m_bbox.BOXRIGHT] - g.level.bmapOrgX + MAXRADIUS) >> MAPBLOCKSHIFT
+            fr blk >= g.level.bmapWidth {
+                blk = g.level.bmapWidth - 1
+            }
+            g.level.secBlockBox[s * 4 + m_bbox.BOXRIGHT] = blk
+            blk = (bbox[m_bbox.BOXLEFT] - g.level.bmapOrgX - MAXRADIUS) >> MAPBLOCKSHIFT
+            fr blk < 0 {
+                blk = 0
+            }
+            g.level.secBlockBox[s * 4 + m_bbox.BOXLEFT] = blk
+            s = s + 1
+        }
+        fr pos != total {
+            yeet("P_GroupLines: miscounted")
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// ===========================================================================================
+// thing spawning (P_LoadThings + P_SpawnMapThing + P_SpawnPlayer from p_mobj.c)
+// ===========================================================================================
+
+// isCommercialThing — the DOOM II-only monster doomednums that P_LoadThings refuses (and STOPS
+// loading at) when gamemode != commercial.
+flex finna isCommercialThing(t: int) -> bool {
+    fr t == 68 || t == 64 || t == 88 || t == 89 || t == 69 {
+        bet nocap
+    }
+    fr t == 67 || t == 71 || t == 65 || t == 66 || t == 84 {
+        bet nocap
+    }
+    bet cap
+}
+
+// P_LoadThings — mapthing_t (10 bytes: x/y/angle/type/options i16). Each spawns via P_SpawnMapThing
+// (in directory order — the thinker-list / spawn order). A commercial-only monster in a non-
+// commercial game STOPS the load at that thing (id's `break`).
+flex finna loadThings(gt: tag gs.GameState, lump: int) {
+    lowkey ofs = wad.lumpNum(gt, lump)
+    lowkey num = wad.lumpLength(gt, lump) / 10
+    lowkey gm = 0
+    holla g = gt in gs.gsc {
+        g.level.numthings = num as i32
+        gm = g.shell.gamemode as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey i = 0
+    lowkey stop = cap
+    vibin i < num && !stop {
+        lowkey x = 0
+        lowkey y = 0
+        lowkey ang = 0
+        lowkey typ = 0
+        lowkey opt = 0
+        holla g = gt in gs.gsc {
+            lowkey e = ofs + i * 10
+            x = bstream.rdI16(g.wad.buf, e)
+            y = bstream.rdI16(g.wad.buf, e + 2)
+            ang = bstream.rdI16(g.wad.buf, e + 4)
+            typ = bstream.rdI16(g.wad.buf, e + 6)
+            opt = bstream.rdI16(g.wad.buf, e + 8)
+        } ghosted {
+            yeet("gs")
+        }
+        fr gm != doomdef.GM_COMMERCIAL && isCommercialThing(typ) {
+            stop = nocap
+        } naw {
+            spawnMapThing(gt, x, y, ang, typ, opt)
+            i = i + 1
+        }
+    }
+}
+
+// P_SpawnPlayer — spawn the player's MT_PLAYER mobj at the (raw) map spot and reset the player
+// struct. Called by P_SpawnMapThing for type<=4 in single-player.
+flex finna spawnPlayer(gt: tag gs.GameState, mx: int, my: int, mangle: int, mtype: int) {
+    lowkey pnum = mtype - 1
+    lowkey pig = cap
+    holla g = gt in gs.gsc {
+        pig = g.shell.playeringame[pnum]
+    } ghosted {
+        yeet("gs")
+    }
+    fr !pig {
+        bet
+    }
+    // SEAM: if players[pnum].playerstate == PST_REBORN { G_PlayerReborn(pnum) } — g/g_game (P2.8).
+    lowkey fx = (mx << 16) as i32
+    lowkey fy = (my << 16) as i32
+    lowkey mo = pmobj.spawnMobj(gt, fx, fy, think.ONFLOORZ, info.MT_PLAYER)
+    lowkey ph = 0
+    holla g = gt in gs.gsc {
+        ph = g.shell.players[pnum].health as int
+        g.shell.players[pnum].mo = mo
+        g.shell.players[pnum].playerstate = pdef.PST_LIVE as i32
+        g.shell.players[pnum].refire = 0
+        g.shell.players[pnum].message = ""
+        g.shell.players[pnum].damagecount = 0
+        g.shell.players[pnum].bonuscount = 0
+        g.shell.players[pnum].extralight = 0
+        g.shell.players[pnum].fixedcolormap = 0
+        g.shell.players[pnum].viewheight = VIEWHEIGHT
+    } ghosted {
+        yeet("gs")
+    }
+    holla t = mo in gs.thinkers {
+        fr mtype > 1 {
+            t.mobj.flags = ((t.mobj.flags as int) | ((mtype - 1) << think.MF_TRANSSHIFT)) as i32
+        }
+        t.mobj.angle = tables.ANG45 * ((mangle / 45) as u32)
+        t.mobj.player = pnum as i32
+        t.mobj.health = ph as i32
+    } ghosted {
+        yeet("mo")
+    }
+    // SEAM: P_SetupPsprites(p) [p_pspr / P2.4]; deathmatch card-give [single-player skip];
+    //       if pnum == consoleplayer { ST_Start(); HU_Start(); } [st/hu, wired by the tick].
+}
+
+// P_SpawnMapThing — filter a THINGS entry by kind (deathmatch start / player start / skill+flag
+// gate) then spawn the matching mobjtype via P_SpawnMobj. mx/my/mangle are the raw map shorts.
+flex finna spawnMapThing(gt: tag gs.GameState, mx: int, my: int, mangle: int, mtype: int, moptions: int) {
+    // deathmatch start position
+    fr mtype == 11 {
+        holla g = gt in gs.gsc {
+            lowkey dp = g.shell.deathmatchP as int
+            fr dp < gs.MAX_DM_STARTS {
+                g.shell.deathmatchstarts[dp].x = mx as i32
+                g.shell.deathmatchstarts[dp].y = my as i32
+                g.shell.deathmatchstarts[dp].angle = mangle as i32
+                g.shell.deathmatchstarts[dp].typ = mtype as i32
+                g.shell.deathmatchstarts[dp].options = moptions as i32
+                g.shell.deathmatchP = (dp + 1) as i32
+            }
+        } ghosted {
+            yeet("gs")
+        }
+        bet
+    }
+    // player start (1..4): save the spot; spawn now unless deathmatch
+    fr mtype <= 4 {
+        holla g = gt in gs.gsc {
+            lowkey pn = mtype - 1
+            g.shell.playerstarts[pn].x = mx as i32
+            g.shell.playerstarts[pn].y = my as i32
+            g.shell.playerstarts[pn].angle = mangle as i32
+            g.shell.playerstarts[pn].typ = mtype as i32
+            g.shell.playerstarts[pn].options = moptions as i32
+        } ghosted {
+            yeet("gs")
+        }
+        lowkey dm = 0
+        holla g = gt in gs.gsc {
+            dm = g.shell.deathmatch as int
+        } ghosted {
+            yeet("gs")
+        }
+        fr dm == 0 {
+            spawnPlayer(gt, mx, my, mangle, mtype)
+        }
+        bet
+    }
+    // skill / single-player / flag gate
+    lowkey netgame = cap
+    lowkey deathmatch = 0
+    lowkey gameskill = 0
+    lowkey nomonsters = cap
+    holla g = gt in gs.gsc {
+        netgame = g.shell.netgame
+        deathmatch = g.shell.deathmatch as int
+        gameskill = g.shell.gameskill as int
+        nomonsters = g.shell.nomonsters
+    } ghosted {
+        yeet("gs")
+    }
+    // 16 == MTF_NOTSINGLE (not defined in doomdef; id hard-codes the literal here)
+    fr !netgame && (moptions & 16) != 0 {
+        bet
+    }
+    lowkey bit = 0
+    fr gameskill == doomdef.SK_BABY {
+        bit = 1
+    } naw fr gameskill == doomdef.SK_NIGHTMARE {
+        bit = 4
+    } naw {
+        bit = 1 << (gameskill - 1)
+    }
+    fr (moptions & bit) == 0 {
+        bet
+    }
+    // find which mobjtype has this doomednum (first match; id I_Errors on none)
+    lowkey numtypes = 0
+    holla g = gt in gs.gsc {
+        numtypes = g.info.mobjinfo.gang() as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey found = -1
+    lowkey ii = 0
+    lowkey searching = nocap
+    vibin ii < numtypes && searching {
+        lowkey den = 0
+        holla g = gt in gs.gsc {
+            den = g.info.mobjinfo[ii].doomednum as int
+        } ghosted {
+            yeet("gs")
+        }
+        fr den == mtype {
+            found = ii
+            searching = cap
+        } naw {
+            ii = ii + 1
+        }
+    }
+    fr found == -1 {
+        yeet("P_SpawnMapThing: Unknown type")
+    }
+    lowkey flags = 0
+    holla g = gt in gs.gsc {
+        flags = g.info.mobjinfo[found].flags as int
+    } ghosted {
+        yeet("gs")
+    }
+    // no keycards/players in deathmatch; no monsters if -nomonsters
+    fr deathmatch != 0 && (flags & think.MF_NOTDMATCH) != 0 {
+        bet
+    }
+    fr nomonsters && (found == info.MT_SKULL || (flags & think.MF_COUNTKILL) != 0) {
+        bet
+    }
+    // spawn it
+    lowkey fx = (mx << 16) as i32
+    lowkey fy = (my << 16) as i32
+    lowkey z: i32 = think.ONFLOORZ
+    fr (flags & think.MF_SPAWNCEILING) != 0 {
+        z = think.ONCEILINGZ
+    }
+    lowkey mo = pmobj.spawnMobj(gt, fx, fy, z, found)
+    lowkey tics0 = 0
+    holla t = mo in gs.thinkers {
+        t.mobj.spawnpoint.x = mx as i32
+        t.mobj.spawnpoint.y = my as i32
+        t.mobj.spawnpoint.angle = mangle as i32
+        t.mobj.spawnpoint.typ = mtype as i32
+        t.mobj.spawnpoint.options = moptions as i32
+        tics0 = t.mobj.tics as int
+    } ghosted {
+        yeet("mo")
+    }
+    // stagger the start frame (consumes one P_Random, in spawn order — demo-sync critical)
+    fr tics0 > 0 {
+        lowkey r = rnd.pRandom(gt)
+        holla t = mo in gs.thinkers {
+            t.mobj.tics = (1 + (r % tics0)) as i32
+        } ghosted {
+            yeet("mo")
+        }
+    }
+    holla g = gt in gs.gsc {
+        fr (flags & think.MF_COUNTKILL) != 0 {
+            g.shell.totalkills = ((g.shell.totalkills as int) + 1) as i32
+        }
+        fr (flags & think.MF_COUNTITEM) != 0 {
+            g.shell.totalitems = ((g.shell.totalitems as int) + 1) as i32
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    holla t = mo in gs.thinkers {
+        t.mobj.angle = tables.ANG45 * ((mangle / 45) as u32)
+        fr (moptions & doomdef.MTF_AMBUSH) != 0 {
+            t.mobj.flags = ((t.mobj.flags as int) | think.MF_AMBUSH) as i32
+        }
+    } ghosted {
+        yeet("mo")
+    }
+}
+
+// ===========================================================================================
+// P_SetupLevel — the level-load driver
+// ===========================================================================================
+
+// mapLumpName — id's map-marker lump name: "E<episode>M<map>" (Doom) or "MAP<nn>" (commercial).
+flex finna mapLumpName(gamemode: int, episode: int, map: int) -> str {
+    fr gamemode == doomdef.GM_COMMERCIAL {
+        lowkey nm = mem.slab[u8](5)
+        nm[0] = 77                       // 'M'
+        nm[1] = 65                       // 'A'
+        nm[2] = 80                       // 'P'
+        nm[3] = (48 + (map / 10)) as u8
+        nm[4] = (48 + (map % 10)) as u8
+        bet str.fromBytesTrust(nm)
+    }
+    lowkey nm = mem.slab[u8](4)
+    nm[0] = 69                           // 'E'
+    nm[1] = (48 + episode) as u8
+    nm[2] = 77                           // 'M'
+    nm[3] = (48 + map) as u8
+    bet str.fromBytesTrust(nm)
+}
+
+// setupLevel — P_SetupLevel: reset the tick/score state, find the map marker lump, load every map
+// lump in id's order, group the lines, then spawn the map things (+ the player).
+flex finna setupLevel(gt: tag gs.GameState, episode: int, map: int, skill: int) {
+    // reset kill/item/secret + per-player counters + POV height + the clock
+    holla g = gt in gs.gsc {
+        g.shell.totalkills = 0
+        g.shell.totalitems = 0
+        g.shell.totalsecret = 0
+        g.shell.wminfo.maxfrags = 0
+        g.shell.wminfo.partime = 180
+        lowkey i = 0
+        vibin i < MAXPLAYERS {
+            g.shell.players[i].killcount = 0
+            g.shell.players[i].secretcount = 0
+            g.shell.players[i].itemcount = 0
+            i = i + 1
+        }
+        g.shell.players[g.shell.consoleplayer as int].viewz = 1
+        g.tick.leveltime = 0
+    } ghosted {
+        yeet("gs")
+    }
+    // SEAM: S_Start() — stop level sounds / start music (s/s_sound). No play-RNG; the tick owns it.
+    // Set the sky flat (G_DoLoadLevel sets skyflatnum just before P_SetupLevel).
+    lowkey skyfn = rdata.flatNumForName(gt, "F_SKY1")
+    holla g = gt in gs.gsc {
+        g.render.skyflatnum = skyfn as i32
+    } ghosted {
+        yeet("gs")
+    }
+    // reset the thinker list (evicts nothing here; a fresh list for the new level)
+    pthink.initThinkers(gt)
+    // find the map marker lump
+    lowkey gm = 0
+    holla g = gt in gs.gsc {
+        gm = g.shell.gamemode as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey lumpnum = wad.getNumForName(gt, mapLumpName(gm, episode, map))
+    // load the map lumps (id's order — most of it is important)
+    loadBlockMap(gt, lumpnum + doomdef.ML_BLOCKMAP)
+    loadVertexes(gt, lumpnum + doomdef.ML_VERTEXES)
+    loadSectors(gt, lumpnum + doomdef.ML_SECTORS)
+    loadSideDefs(gt, lumpnum + doomdef.ML_SIDEDEFS)
+    loadLineDefs(gt, lumpnum + doomdef.ML_LINEDEFS)
+    loadSubsectors(gt, lumpnum + doomdef.ML_SSECTORS)
+    loadNodes(gt, lumpnum + doomdef.ML_NODES)
+    loadSegs(gt, lumpnum + doomdef.ML_SEGS)
+    loadReject(gt, lumpnum + doomdef.ML_REJECT)
+    groupLines(gt)
+    // reset spawn queues + deathmatch-start cursor
+    holla g = gt in gs.gsc {
+        g.tick.bodyqueslot = 0
+        g.shell.deathmatchP = 0
+    } ghosted {
+        yeet("gs")
+    }
+    loadThings(gt, lumpnum + doomdef.ML_THINGS)
+    // SEAM: if deathmatch { for each playeringame: players[i].mo = NULL; G_DeathMatchSpawnPlayer(i) }
+    //       — g/g_game (P2.8). deathmatch is 0 in single-player, so no spawn is skipped here.
+    holla g = gt in gs.gsc {
+        g.tick.iquehead = 0
+        g.tick.iquetail = 0
+    } ghosted {
+        yeet("gs")
+    }
+    // SEAM: P_SpawnSpecials() — p/p_spec (P2.3): sector-effect thinkers + special-line world state.
+    // SEAM: if precache { R_PrecacheLevel() } — no-op under the whole-IWAD no-cache model.
+}
