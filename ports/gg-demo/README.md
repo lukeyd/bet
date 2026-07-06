@@ -1,12 +1,12 @@
-# gg-demo — the compositor + mixer + mouse shakeout
+# gg-demo — the platform-layer shakeout (DOOM-raise edition)
 
-A small `bet` program that exercises the **new** `gg` platform primitives — textured/alpha
-sprite compositing, a voice-mixing audio path, and mouse input/position — added in
-`plan-amendment-03.md` (the deliberate raise of the amendment-02 SP0.4 ceiling). Where
-[Pong](../pong/README.md) software-renders a 32-bit framebuffer with the original five
-primitives, `gg-demo` drives the higher-level compositor directly: it uploads a sprite once,
-pre-renders a tone once, then each frame clears a fixed logical canvas, draws a translucent
-rectangle and the sprite at the cursor, and presents.
+A small `bet` program that exercises the **newest** `gg` platform surface — relative mouse,
+per-voice stereo pan, fixed-canvas presentation, streaming-audio backpressure, the extended
+keycode table, and the `BET_GG_HEADLESS` CI switch — on top of the amendment-03 mixer. Where
+[Pong](../pong/README.md) software-renders at the live window size (`gg.blit` + `gg.size`),
+`gg-demo` renders a **fixed 320×200 logical framebuffer** (DOOM's resolution) and presents it
+with `gg.show`: `gg.blit`'s input model with `gg.flush`'s scaling — integer nearest-neighbor
+aspect-fit upscale, centered with black letterbox bars.
 
 ## Run it
 
@@ -24,65 +24,75 @@ cargo build -p runtime --features gg-desktop     # the windowed runtime (librunt
 target/debug/bet build ports/gg-demo/gg-demo.bet --runtime real -o gg-demo
 ./gg-demo
 
-# --- interpreter (same window, quick iteration) ---
+# --- headless (CI): the SAME binary, no window, no audio device ---
+BET_GG_HEADLESS=1 ./gg-demo                      # runs its 600 frames and exits cleanly
+
+# --- interpreter (same window, quick iteration; render-bound, so it paces below 60fps) ---
 cargo run -p driver --features "llvm,gg-desktop" -- run ports/gg-demo/gg-demo.bet
 ```
 
-A window opens onto a fixed **320×240 logical canvas**. Unlike Pong's dynamic resolution, the
-canvas is a fixed size and is **aspect-fit** into the window at `gg.flush()` — nearest-neighbor
-upscaled by an integer factor and centered with black letterbox bars — so the sprite stays crisp
-at any window size. `gg.mouse()` reports the cursor already mapped back into logical-canvas
-coordinates.
+The demo **self-terminates after 600 frames (~10s)** — or on `Esc` / window close — which is
+what lets the headless CI invocation run to completion unattended. It prints the audio device
+spec at startup, the raw-ring backpressure once a second, and a final state line.
 
-## Controls
+## Controls / what you see
 
-| input          | action                                   |
-|----------------|------------------------------------------|
-| mouse move     | the sprite + box follow the cursor       |
-| left click     | play the 440Hz tone (a mixer voice)      |
-| `Esc` / close  | quit (prints the click count)            |
+| input               | on screen                                                        |
+|---------------------|------------------------------------------------------------------|
+| move the mouse      | the cyan square integrates **`gg.mouseDelta()`** (relative mouse) |
+| (automatic)         | the white bar sweeps with the tone's **`gg.tune`** stereo pan     |
+| hold `Ctrl`         | red rect (keycodes 260/261 — the new modifier block)             |
+| hold `F1`           | green rect (keycode 280 — the new F-key block)                   |
+| hold `Tab`          | yellow rect (keycode 9 — ASCII printables)                       |
+| `Esc` / close       | quit early                                                       |
 
-## What it exercises (the `gg` surface)
+The looping 440Hz tone pans full-left → full-right and back every ~8.5s. Pan is linear:
+left gain `vol·(255−pan)/255`, right gain `vol·pan/255` (0 = full left, 128 = center,
+255 = full right).
 
-`gg-demo.bet` uses the compositor/mixer/mouse primitives added in amendment-03, plus `gg.poll`
-and `gg.ticks` from the original set:
+## What it exercises (the new `gg` surface)
 
-| bet call                              | primitive              | rt-abi symbol     |
-|---------------------------------------|------------------------|-------------------|
-| `gg.tex(buf, off, w, h) -> int`       | upload RGBA8 texture   | `bet_gg_tex`      |
-| `gg.frame(w, h, color)`               | begin/clear canvas     | `bet_gg_frame`    |
-| `gg.sprite(tex, x, y)`                | alpha sprite blit      | `bet_gg_sprite`   |
-| `gg.rect(x, y, w, h, color)`          | translucent fill       | `bet_gg_rect`     |
-| `gg.flush()`                          | present + pump input   | `bet_gg_flush`    |
-| `gg.sound(buf, off, len, ch, rate) -> int` | register PCM sound | `bet_gg_sound`    |
-| `gg.play(sound, loop, vol) -> int`    | start a mixer voice    | `bet_gg_play`     |
-| `gg.stop(voice)`                      | stop a voice           | `bet_gg_stop`     |
-| `gg.mouse() -> (x, y)`                | cursor position        | `bet_gg_mouse`    |
-| `gg.poll() -> (kind, code)`           | input (incl. mouse)    | `bet_gg_poll`     |
-| `gg.ticks() -> int`                   | timing (ns)            | `bet_gg_ticks`    |
+| bet call                        | primitive                                  | rt-abi symbol        |
+|---------------------------------|--------------------------------------------|----------------------|
+| `gg.show(fb, w, h)`             | fixed-canvas present (aspect-fit, letterbox) | `bet_gg_show`      |
+| `gg.mouseDelta() -> (dx, dy)`   | relative mouse (signed, drained per call)  | `bet_gg_mouse_delta` |
+| `gg.tune(voice, vol, pan)`      | live per-voice volume + stereo pan         | `bet_gg_tune`        |
+| `gg.audioSpec() -> (rate, ch)`  | audio device output config                 | `bet_gg_audio_spec`  |
+| `gg.pending() -> int`           | raw `gg.audio` ring depth (backpressure)   | `bet_gg_pending`     |
 
-Mouse buttons arrive through `gg.poll()` as `MOUSE_DOWN` (kind 5) / `MOUSE_UP` (kind 6) with
-`code` 0 = left, 1 = right; the cursor **position** comes from `gg.mouse()`.
+…plus `gg.sound`/`gg.play`/`gg.stop`, `gg.poll`, and `gg.ticks` from the existing set. The
+extended keycode table (Ctrl/Shift/Alt pairs 260–265, Pause 266, F1–F12 280–291, Tab/Backspace
+and the punctuation keys at their ASCII codes) is documented in `crates/gg-backend/src/lib.rs`'s
+`mod key` — the values are contractual.
+
+## Headless mode (`BET_GG_HEADLESS=1`)
+
+Set once in the environment (checked at the first gg call), a **desktop-featured** build runs
+fully headless: no window opens and no audio device is touched. `gg.poll` always reports NONE,
+`gg.show`/`gg.blit`/`gg.flush` discard, `gg.ticks` stays real (so frame pacing still paces),
+`gg.audioSpec` reports the fixed `(48000, 2)` default, and `gg.pending` reports `0` (instant
+drain). This is how CI runs a compiled gg game to completion.
 
 ## How it works (bet's memory/value model)
 
-- **Sprite + tone buffers are `mem.slab[T](n)` heap `[]T` buffers**, built once inline in `main`.
-  The RGBA sprite is a 16×16 soft-edged circle written a channel at a time; the tone is a 440Hz
-  square wave written a sample at a time.
-- **`gg.tex` / `gg.sound` take a byte offset** into the buffer. The demo passes `0`; the compiled
-  path converts the byte offset to an element index (`byteOff / sizeof(T)`) since midir indexes
-  element-granularly, and the interpreter serializes its `[]i16` tone to interleaved little-endian
-  bytes to mirror the compiled path's raw byte view.
-- **All buffer writes stay inline in `main`.** A slice shares its backing pointer when compiled but
-  is deep-copied in the interpreter, so passing a buffer to a mutating helper would diverge the two
+- **The framebuffer, tone, and keystate are `mem.slab[T](n)` heap `[]T` buffers**, and ALL
+  buffer writes stay inline in `main`: a slice shares its backing pointer when compiled but is
+  deep-copied in the interpreter, so passing a buffer to a mutating helper would diverge the two
   paths (same discipline as Pong).
-- **The mixer** resamples each sound to the audio device's rate/channels once, then sums active
-  voices (plus Pong's raw `gg.audio` ring) in the cpal callback. The mixer lives behind its own
-  lock, separate from the window/input state, so the audio callback never blocks the game loop.
+- **`gg.mouseDelta` drains** — each call returns the raw window-pixel deltas accumulated since
+  the previous call (sign-preserving; sub-pixel remainders carry over) and resets the
+  accumulator. minifb has no pointer lock, so deltas clamp once the cursor pins a window edge.
+- **`gg.tune` retargets a playing voice** — the mixer reads each voice's volume/pan per sample,
+  so a sweep is click-free. Voices start at pan 128 (center).
+- **`gg.pending` reads the raw `gg.audio` ring** (Pong's path), not the mixer; this demo plays
+  through the mixer, so it prints 0. A streaming music synth submits with `gg.audio` and uses
+  `pending` to pace itself against the device.
 
 ## Fidelity / platform notes
 
-- **Not in the golden corpus.** A live window is non-deterministic (real time + input), so — like
-  Pong and the Oregon Trail port — `gg-demo` lives in `ports/` and is run manually, not gated in CI.
-- **macOS** is the validated target (same backend crates as Pong: minifb + cpal). Linux would need
-  the X11/ALSA link libraries wired into `crates/driver/src/link.rs`.
+- **Not in the golden corpus.** A live window is non-deterministic (real time + input), so —
+  like Pong and the Oregon Trail port — `gg-demo` lives in `ports/` and is run manually, not
+  gated in CI. (The headless mode exists precisely so a future CI job CAN run compiled gg
+  binaries deterministically enough to smoke-test them.)
+- **macOS** is the validated target (same backend crates as Pong: minifb + cpal). Linux would
+  need the X11/ALSA link libraries wired into `crates/driver/src/link.rs`.

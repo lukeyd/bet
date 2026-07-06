@@ -944,6 +944,32 @@ pub unsafe extern "C" fn bet_gg_mouse() -> u64 {
     0
 }
 
+// gg relative mouse / voice retune / fixed-canvas present / streaming audio — headless: no
+// mouse to move, no voices to retune, nothing to present; `bet_gg_audio_spec` reports the same
+// fixed `(48000, 2)` default as `gg-backend`'s headless `imp`, and `bet_gg_pending` drains
+// instantly (`0`).
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_mouse_delta() -> u64 {
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_tune(_voice: u32, _vol_q8: u32, _pan_q8: u32) {}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_show(_pixels: *const u32, _w: u32, _h: u32) {}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_audio_spec() -> u64 {
+    (48_000u64 << 32) | 2
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_pending() -> u64 {
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

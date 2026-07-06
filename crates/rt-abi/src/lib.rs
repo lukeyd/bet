@@ -180,6 +180,8 @@ pub mod event_kind {
     pub const KEY_DOWN: u32 = 1;
     pub const KEY_UP: u32 = 2;
     pub const MOUSE_MOVE: u32 = 3;
+    /// The window was closed. Esc is NOT a QUIT — it arrives as a normal
+    /// [`KEY_DOWN`]/[`KEY_UP`] (code 27) so games can drive menus with it.
     pub const QUIT: u32 = 4;
     /// A mouse button was pressed. [`Event::code`] is the button (`0` = left, `1` = right).
     pub const MOUSE_DOWN: u32 = 5;
@@ -466,6 +468,35 @@ unsafe extern "C" {
     /// The current mouse position in logical-canvas coordinates, packed as
     /// `(x as u32) << 32 | (y as u32)` (clamped into the canvas). Backs `gg.mouse`.
     pub fn bet_gg_mouse() -> u64;
+
+    // --- gg relative mouse / voice retune / fixed-canvas present / streaming audio (the
+    //     DOOM-motivated platform raise; ADDITIVE — headless no-ops in rt-stub) ---
+
+    /// Drain the raw mouse movement accumulated since the previous call: a sign-preserving
+    /// `(dx, dy)` pair of `i32`s packed `(dx as u32) << 32 | (dy as u32)` — each half is the
+    /// two's-complement bit pattern, so unpack by truncating to 32 bits and sign-extending.
+    /// Deltas are in window pixels, accumulated at every input pump (present/flush/show).
+    /// Headless: always `0`. Backs `gg.mouseDelta`.
+    pub fn bet_gg_mouse_delta() -> u64;
+    /// Update a PLAYING voice's volume (`vol_q8`, Q8: `256` = unity) and stereo pan (`pan_q8`:
+    /// `0` = full left, `128` = center, `255` = full right). Linear pan law: left gain =
+    /// `vol_q8 * (255 - pan) / 255`, right gain = `vol_q8 * pan / 255` (a mono device applies
+    /// plain `vol_q8`). Unknown or finished voice ids are ignored. Voices start at pan 128.
+    /// Backs `gg.tune`.
+    pub fn bet_gg_tune(voice: u32, vol_q8: u32, pan_q8: u32);
+    /// Present a tightly packed `w * h` framebuffer (`0x00RR_GGBB`, stride == `w`) with the
+    /// compositor's presentation: integer nearest-neighbor aspect-fit upscale, centered with
+    /// black letterbox bars, into the live window — [`bet_gg_present`]'s input model with
+    /// [`bet_gg_flush`]'s scaling — then pump input. Backs `gg.show`.
+    pub fn bet_gg_show(pixels: *const u32, w: u32, h: u32);
+    /// The audio device's output config, packed `rate << 32 | channels`. Opens the output
+    /// stream on first use (like [`bet_gg_play`]); a headless build — or no usable device —
+    /// reports the fixed default `(48000, 2)`. Backs `gg.audioSpec`.
+    pub fn bet_gg_audio_spec() -> u64;
+    /// The number of interleaved `i16` samples currently queued in the raw [`bet_gg_audio`]
+    /// ring (submitted but not yet consumed by the device callback) — the backpressure signal
+    /// for streaming music synths. Headless: always `0` (instant drain). Backs `gg.pending`.
+    pub fn bet_gg_pending() -> u64;
 }
 
 #[cfg(test)]

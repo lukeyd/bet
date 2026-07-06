@@ -1,96 +1,92 @@
-// gg-demo.bet — the shakeout for the `gg` platform layer's compositor + mixer + mouse (the
-// amendment-03 raise of the SP0.4 ceiling). Where Pong software-renders a framebuffer, this demo
-// drives the higher-level primitives directly:
-//   * gg.tex     — upload a 16x16 RGBA sprite (a soft-edged circle) once
-//   * gg.sound   — pre-render a 440Hz tone into a []i16 buffer and register it once
-//   * gg.frame   — begin/clear a fixed 320x240 logical canvas (aspect-fit + letterboxed at flush)
-//   * gg.sprite  — blit the sprite at the cursor (premultiplied src-over alpha)
-//   * gg.rect    — a translucent square around the cursor
-//   * gg.flush   — present the canvas and pump input
-//   * gg.mouse   — the cursor position in logical-canvas coordinates
-//   * gg.poll    — drain input; MOUSE_DOWN plays the tone (gg.play), Esc/close/quit exits
-//   * gg.play / gg.stop — start/stop mixer voices
+// gg-demo.bet — the shakeout for the `gg` platform layer's DOOM-raise surface (relative mouse,
+// per-voice stereo pan, fixed-canvas present, streaming-audio backpressure, extended keys) on
+// top of the amendment-03 compositor/mixer primitives. Each frame it software-renders a FIXED
+// 320x200 framebuffer and presents it with `gg.show` (aspect-fit integer upscale + letterbox):
+//   * gg.audioSpec — print the audio device's (rate, channels) once at startup
+//   * gg.sound / gg.play — pre-render a 440Hz tone and start it as a LOOPING voice
+//   * gg.tune     — sweep that voice's stereo pan left<->right (the white bar tracks it)
+//   * gg.mouseDelta — relative mouse: the cyan square integrates raw deltas (not the cursor)
+//   * gg.show     — present the fixed 320x200 buffer (blit's input model, flush's scaling)
+//   * gg.pending  — print the raw `gg.audio` ring depth once a second (0 here: mixer-only)
+//   * gg.poll     — extended keycodes: hold Ctrl / F1 / Tab to light the colored rects
+//
+// The demo exits on Esc / window close, or by itself after 600 frames (~10s) — which is what
+// lets the SAME binary run to completion headlessly under CI with BET_GG_HEADLESS=1.
 //
 // Runs on the interpreter (`bet run`) and compiles native (`bet build`); both drive the same
 // windowed backend through the shared `gg-backend` crate — see ports/gg-demo/README.md.
 //
 // Design notes (bet's memory/value model), mirroring Pong:
-//   * The sprite and tone buffers are heap `[]T` from `mem.slab[T](n)`; ALL buffer writes stay
-//     INLINE in `main` (a slice shares its backing pointer when compiled but is deep-copied in the
-//     interpreter, so passing a buffer to a mutating helper would diverge the two paths).
+//   * The framebuffer / tone / keystate are heap `[]T` from `mem.slab[T](n)`; ALL buffer writes
+//     stay INLINE in `main` (a slice shares its backing pointer when compiled but is deep-copied
+//     in the interpreter, so passing a buffer to a mutating helper would diverge the two paths).
 //   * Integer math only; unary minus is `0 - x`; one statement per line.
 pull "spill"
 
-// canvas / sprite geometry
+// the fixed logical canvas gg.show presents (DOOM's 320x200)
 facts CW: int = 320
-facts CH: int = 240
-facts TS: int = 16          // sprite is TS x TS pixels
-facts BG: u32 = 0x00202830  // canvas clear color (0x00RRGGBB)
+facts CH: int = 200
+facts BG: u32 = 0x00202830   // clear color (0x00RRGGBB)
+facts CURSOR: u32 = 0x0050DCFF
+facts PANBAR: u32 = 0x00FFFFFF
+facts CTRLBOX: u32 = 0x00FF5050
+facts F1BOX: u32 = 0x0050FF50
+facts TABBOX: u32 = 0x00FFD050
 
-// a translucent white square (0xAARRGGBB): 0x60 alpha
-facts BOX: u32 = 0x60FFFFFF
-
-// audio: a short 440Hz mono tone
+// audio: a 440Hz mono tone, looped, pan-swept via gg.tune
 facts SR: int = 44100
-facts TONE_FRAMES: int = 8820   // ~0.2s mono
+facts TONE_FRAMES: int = 44100  // 1s mono (loops)
+facts VOL: int = 256            // Q8 unity gain
 
 // event kinds (rt-abi event_kind)
 facts EV_NONE: int = 0
 facts EV_KEYDOWN: int = 1
+facts EV_KEYUP: int = 2
 facts EV_QUIT: int = 4
-facts EV_MOUSEDOWN: int = 5
-facts EV_MOUSEUP: int = 6
 
+// keycodes (gg-backend `mod key` — contractual values)
 facts KEY_ESC: int = 27
-facts VOL: int = 256        // Q8 unity gain
+facts KEY_TAB: int = 9
+facts KEY_LCTRL: int = 260
+facts KEY_RCTRL: int = 261
+facts KEY_F1: int = 280
+
+// self-terminate after ~10s at 60fps, so BET_GG_HEADLESS=1 CI runs finish on their own
+facts FRAMES: int = 600
 
 finna main() {
-    // ---- build a 16x16 RGBA sprite (a soft-edged cyan circle) inline ----
-    lowkey pixels = mem.slab[u8](TS * TS * 4)
-    lowkey py = 0
-    vibin py < TS {
-        lowkey px = 0
-        vibin px < TS {
-            // distance^2 from the center (7.5, 7.5), scaled by 4 to stay integer
-            lowkey dx = px * 2 - 15
-            lowkey dy = py * 2 - 15
-            lowkey d2 = dx * dx + dy * dy
-            // radius 7.5 => (2r)^2 = 225; inner solid at (2*6.5)^2 = 169
-            lowkey a = 0
-            fr d2 <= 169 {
-                a = 255
-            } naw fr d2 <= 225 {
-                a = 128
-            }
-            lowkey base = (py * TS + px) * 4
-            pixels[base] = 80         // R
-            pixels[base + 1] = 220    // G
-            pixels[base + 2] = 255    // B
-            pixels[base + 3] = a      // A
-            px = px + 1
-        }
-        py = py + 1
-    }
-    lowkey sprite = gg.tex(pixels, 0, TS, TS)
+    // ---- report the audio device's output config once ----
+    lowkey rate, chans = gg.audioSpec()
+    spill.f("audioSpec: {} Hz, {} channels\n", rate, chans)
 
-    // ---- pre-render a 440Hz square-wave tone (mono i16) inline ----
+    // ---- pre-render a 440Hz square-wave tone (mono i16), register it, loop it ----
     lowkey tone = mem.slab[i16](TONE_FRAMES)
     lowkey period = SR / 440
     lowkey si = 0
     vibin si < TONE_FRAMES {
         lowkey phase = si - (si / period) * period
-        lowkey amp = 0 - 6000
+        lowkey amp = 0 - 5000
         fr phase * 2 < period {
-            amp = 6000
+            amp = 5000
         }
         tone[si] = amp
         si = si + 1
     }
-    // byteLen = TONE_FRAMES samples * 2 bytes/sample; mono, 44100Hz
+    // byteLen = TONE_FRAMES samples * 2 bytes/sample; mono, 44100Hz; loop=1
     lowkey sound = gg.sound(tone, 0, TONE_FRAMES * 2, 1, SR)
+    lowkey voice = gg.play(sound, 1, VOL)
 
-    lowkey clicks = 0
-    lowkey lastVoice = 0
+    // ---- the fixed 320x200 framebuffer gg.show presents ----
+    lowkey fb = mem.slab[u32](CW * CH)
+
+    // key-held state, indexed by keycode (covers the new 260..291 block)
+    lowkey keydown = mem.slab[int](512)
+
+    // the cyan square's position: pure gg.mouseDelta() integration (relative mouse)
+    lowkey cx = CW / 2
+    lowkey cy = CH / 2
+
+    lowkey frame = 0
     lowkey running = nocap
     lowkey last = gg.ticks()
     vibin running {
@@ -106,30 +102,123 @@ finna main() {
             } naw fr kind == EV_KEYDOWN {
                 fr code == KEY_ESC {
                     running = cap
+                } naw fr code < 512 {
+                    keydown[code] = 1
                 }
-            } naw fr kind == EV_MOUSEDOWN {
-                clicks = clicks + 1
-                lastVoice = gg.play(sound, 0, VOL)
+            } naw fr kind == EV_KEYUP {
+                fr code < 512 {
+                    keydown[code] = 0
+                }
             }
         }
 
-        // ---- read the cursor, in logical-canvas coordinates ----
-        lowkey mx, my = gg.mouse()
+        // ---- relative mouse: integrate the raw deltas into the square's position ----
+        lowkey dx, dy = gg.mouseDelta()
+        cx = cx + dx
+        cy = cy + dy
+        fr cx < 5 {
+            cx = 5
+        }
+        fr cx > CW - 6 {
+            cx = CW - 6
+        }
+        fr cy < 5 {
+            cy = 5
+        }
+        fr cy > CH - 6 {
+            cy = CH - 6
+        }
 
-        // ---- draw: clear, translucent box, then the sprite at the cursor ----
-        gg.frame(CW, CH, BG)
-        gg.rect(mx - 20, my - 20, 40, 40, BOX)
-        gg.sprite(sprite, mx - TS / 2, my - TS / 2)
-        gg.flush()
+        // ---- sweep the looping voice's pan with a 512-frame triangle wave ----
+        lowkey ph = frame - (frame / 512) * 512
+        lowkey pan = ph
+        fr ph > 255 {
+            pan = 511 - ph
+        }
+        gg.tune(voice, VOL, pan)
 
-        // ---- pace to ~60fps (16.6ms) ----
+        // ---- software-render the frame ----
+        // clear
+        lowkey i = 0
+        vibin i < CW * CH {
+            fb[i] = BG
+            i = i + 1
+        }
+        // the pan bar: a 16x8 white block whose x tracks the current pan (0=left, 255=right)
+        lowkey bx = pan * (CW - 16) / 255
+        lowkey ry = 0
+        vibin ry < 8 {
+            lowkey rx = 0
+            vibin rx < 16 {
+                fb[(4 + ry) * CW + bx + rx] = PANBAR
+                rx = rx + 1
+            }
+            ry = ry + 1
+        }
+        // the mouse-delta square (10x10 cyan, centered on the integrated position)
+        ry = 0
+        vibin ry < 10 {
+            lowkey rx = 0
+            vibin rx < 10 {
+                fb[(cy - 5 + ry) * CW + cx - 5 + rx] = CURSOR
+                rx = rx + 1
+            }
+            ry = ry + 1
+        }
+        // held-key indicators along the bottom: Ctrl (red), F1 (green), Tab (yellow)
+        fr keydown[KEY_LCTRL] + keydown[KEY_RCTRL] > 0 {
+            ry = 0
+            vibin ry < 14 {
+                lowkey rx = 0
+                vibin rx < 30 {
+                    fb[(CH - 18 + ry) * CW + 4 + rx] = CTRLBOX
+                    rx = rx + 1
+                }
+                ry = ry + 1
+            }
+        }
+        fr keydown[KEY_F1] > 0 {
+            ry = 0
+            vibin ry < 14 {
+                lowkey rx = 0
+                vibin rx < 30 {
+                    fb[(CH - 18 + ry) * CW + 40 + rx] = F1BOX
+                    rx = rx + 1
+                }
+                ry = ry + 1
+            }
+        }
+        fr keydown[KEY_TAB] > 0 {
+            ry = 0
+            vibin ry < 14 {
+                lowkey rx = 0
+                vibin rx < 30 {
+                    fb[(CH - 18 + ry) * CW + 76 + rx] = TABBOX
+                    rx = rx + 1
+                }
+                ry = ry + 1
+            }
+        }
+
+        // ---- present the fixed canvas (aspect-fit integer upscale + letterbox) ----
+        gg.show(fb, CW, CH)
+
+        // ---- once a second: the raw-ring backpressure (0 here — the mixer owns the tone) ----
+        fr frame - (frame / 60) * 60 == 0 {
+            spill.f("frame {}: pending {} samples\n", frame, gg.pending())
+        }
+
+        // ---- pace to ~60fps (16.6ms), and self-terminate for headless CI runs ----
         lowkey target = last + 16600000
         vibin gg.ticks() < target {
         }
         last = gg.ticks()
+        frame = frame + 1
+        fr frame >= FRAMES {
+            running = cap
+        }
     }
 
-    // stop any voice still playing on the way out, and report
-    gg.stop(lastVoice)
-    spill.f("clicks: {}\n", clicks)
+    gg.stop(voice)
+    spill.f("done: {} frames, square at ({}, {})\n", frame, cx, cy)
 }

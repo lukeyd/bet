@@ -118,3 +118,41 @@ fn gg_mouse_returns_xy_tuple() {
         "mouse should build a tuple:\n{text}"
     );
 }
+
+#[test]
+fn gg_show_presents_fixed_framebuffer() {
+    let src = "finna main() {\n lowkey fb = mem.slab[u32](64000)\n gg.show(fb, 320, 200) }";
+    let text = mir(src);
+    assert!(text.contains("bet_gg_show"), "show extern missing:\n{text}");
+}
+
+#[test]
+fn gg_mouse_delta_returns_signed_tuple() {
+    let src = "finna main() { lowkey dx, dy = gg.mouseDelta()\n spill.it(dx)\n spill.it(dy) }";
+    let text = mir(src);
+    assert!(
+        text.contains("bet_gg_mouse_delta"),
+        "mouse_delta extern missing:\n{text}"
+    );
+    assert!(
+        text.contains("tuple("),
+        "mouseDelta should build a tuple:\n{text}"
+    );
+    // The halves are SIGNED: each must sign-extend (sext) after the 32-bit truncation, unlike
+    // gg.mouse/gg.size whose halves zero-extend.
+    assert!(
+        text.contains("sext"),
+        "mouseDelta halves should sign-extend:\n{text}"
+    );
+}
+
+#[test]
+fn gg_tune_audio_spec_pending_lower() {
+    let src = "finna main() {\n gg.tune(1, 256, 128)\n \
+               lowkey rate, ch = gg.audioSpec()\n spill.it(rate)\n spill.it(ch)\n \
+               lowkey queued = gg.pending()\n spill.it(queued) }";
+    let text = mir(src);
+    for sym in ["bet_gg_tune", "bet_gg_audio_spec", "bet_gg_pending"] {
+        assert!(text.contains(sym), "{sym} missing:\n{text}");
+    }
+}

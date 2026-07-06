@@ -21,6 +21,14 @@
 //! [`Event::code`] values are defined by [`mod@key`] and are STABLE — the ports depend on the
 //! exact numbers (letters are ASCII-uppercase, arrows are 256..=259, etc.). The `desktop`
 //! backend maps `minifb::Key` onto them.
+//!
+//! ## `BET_GG_HEADLESS`
+//!
+//! Setting `BET_GG_HEADLESS=1` in the environment makes a `desktop`-featured build run fully
+//! headless — no window, no audio device — behaving exactly like the default headless build
+//! ([`poll`] ⇒ NONE, presents/audio discarded, [`ticks`] stays real, [`audio_spec`] reports the
+//! fixed `(48000, 2)` default, [`pending`] reports `0`). The switch is read once at gg init
+//! (the first gg call) and lets CI run a compiled gg game to completion.
 
 // The desktop singleton stores a `minifb::Window` and a `cpal::Stream`, neither of which is
 // `Send`. We keep them in a process-global `Mutex` and force `Send` on the wrapper: `gg` is a
@@ -31,8 +39,10 @@
 use rt_abi::{Event, event_kind};
 
 /// Stable [`Event::code`] keycodes. The ports reference these by value, so the numbers are
-/// part of the contract, not an implementation detail. Letters map to ASCII uppercase, digits
-/// to ASCII `'0'..='9'`, and the arrow keys to a private 256..=259 block above ASCII.
+/// part of the contract, not an implementation detail. Printable keys map to their (unshifted,
+/// US-layout) ASCII code — letters ASCII uppercase, digits `'0'..='9'`, punctuation its symbol —
+/// and non-printable keys to a private block above ASCII: arrows 256..=259, modifiers/Pause
+/// 260..=266, F1..=F12 at 280..=291.
 pub mod key {
     // Letters A..=Z → ASCII uppercase (so `W == 87`, `S == 83`, ...).
     pub const A: u32 = b'A' as u32;
@@ -78,13 +88,66 @@ pub mod key {
     pub const SPACE: u32 = b' ' as u32;
     /// Enter / Return. `10` (`\n`), matching the ASCII line feed.
     pub const ENTER: u32 = 10;
-    /// Escape (ASCII 27). The `desktop` backend also treats this as a QUIT request.
+    /// Escape (ASCII 27). Delivered as a normal KEY_DOWN/KEY_UP like every other key — games
+    /// with menus need to see Esc presses. QUIT (kind 4) is reserved for actual window close.
     pub const ESC: u32 = 27;
+    /// Backspace (ASCII 8).
+    pub const BACKSPACE: u32 = 8;
+    /// Tab (ASCII 9, `\t`).
+    pub const TAB: u32 = 9;
+
+    // Punctuation → the key's unshifted ASCII code (US layout), like letters/digits.
+    /// `'` (ASCII 39).
+    pub const APOSTROPHE: u32 = b'\'' as u32;
+    /// `,` (ASCII 44).
+    pub const COMMA: u32 = b',' as u32;
+    /// `-` (ASCII 45).
+    pub const MINUS: u32 = b'-' as u32;
+    /// `.` (ASCII 46).
+    pub const PERIOD: u32 = b'.' as u32;
+    /// `/` (ASCII 47).
+    pub const SLASH: u32 = b'/' as u32;
+    /// `;` (ASCII 59).
+    pub const SEMICOLON: u32 = b';' as u32;
+    /// `=` (ASCII 61).
+    pub const EQUALS: u32 = b'=' as u32;
+    /// `[` (ASCII 91).
+    pub const LBRACKET: u32 = b'[' as u32;
+    /// `\` (ASCII 92).
+    pub const BACKSLASH: u32 = b'\\' as u32;
+    /// `]` (ASCII 93).
+    pub const RBRACKET: u32 = b']' as u32;
+    /// `` ` `` (ASCII 96).
+    pub const BACKTICK: u32 = b'`' as u32;
+
     /// Arrow keys — a private block just above ASCII so they never collide with letters/digits.
     pub const UP: u32 = 256;
     pub const DOWN: u32 = 257;
     pub const LEFT: u32 = 258;
     pub const RIGHT: u32 = 259;
+
+    // Modifiers + Pause — the non-printable block continues straight after the arrows.
+    pub const LCTRL: u32 = 260;
+    pub const RCTRL: u32 = 261;
+    pub const LSHIFT: u32 = 262;
+    pub const RSHIFT: u32 = 263;
+    pub const LALT: u32 = 264;
+    pub const RALT: u32 = 265;
+    pub const PAUSE: u32 = 266;
+
+    // Function keys — F1..=F12 at 280..=291 (267..=279 stay reserved for future non-printables).
+    pub const F1: u32 = 280;
+    pub const F2: u32 = 281;
+    pub const F3: u32 = 282;
+    pub const F4: u32 = 283;
+    pub const F5: u32 = 284;
+    pub const F6: u32 = 285;
+    pub const F7: u32 = 286;
+    pub const F8: u32 = 287;
+    pub const F9: u32 = 288;
+    pub const F10: u32 = 289;
+    pub const F11: u32 = 290;
+    pub const F12: u32 = 291;
 }
 
 /// The empty-queue sentinel returned by [`poll`].
@@ -100,6 +163,12 @@ const NONE_EVENT: Event = Event {
 /// two headless paths stay byte-identical.
 pub const DEFAULT_W: u32 = 960;
 pub const DEFAULT_H: u32 = 640;
+
+/// The audio output config `audio_spec()` reports when there is no real device — a headless
+/// build, `BET_GG_HEADLESS=1`, or a desktop build that failed to open an output stream. Kept in
+/// sync with `rt-stub`'s `bet_gg_audio_spec` so the headless paths stay byte-identical.
+pub const DEFAULT_AUDIO_RATE: u32 = 48_000;
+pub const DEFAULT_AUDIO_CHANNELS: u32 = 2;
 
 /// Pack a `(width, height)` into the `u64` the `bet_gg_size` ABI returns (`w << 32 | h`).
 const fn pack_size(w: u32, h: u32) -> u64 {
@@ -210,6 +279,48 @@ pub fn mouse() -> u64 {
     imp::mouse()
 }
 
+// ---------------------------------------------------------------------------
+// gg relative mouse / voice retune / fixed-canvas present / streaming audio (the DOOM-motivated
+// platform raise). Additive: nothing above changes shape.
+// ---------------------------------------------------------------------------
+
+/// Drain the raw mouse movement accumulated since the previous call, as a sign-preserving
+/// `(dx, dy)` pair of `i32`s packed `(dx as u32) << 32 | (dy as u32)`. Deltas are in window
+/// pixels, accumulated at every input pump (present/flush/show); the fractional sub-pixel
+/// remainder carries over to the next call. Headless: always `0`.
+pub fn mouse_delta() -> u64 {
+    imp::mouse_delta()
+}
+
+/// Update a PLAYING voice's volume (`vol_q8`, Q8: `256` = unity) and stereo pan (`pan_q8`:
+/// `0` = full left, `128` = center, `255` = full right; see the mixer's linear pan law).
+/// Unknown or finished voice ids are ignored. Headless: a no-op.
+pub fn tune(voice: u32, vol_q8: u32, pan_q8: u32) {
+    imp::tune(voice, vol_q8, pan_q8);
+}
+
+/// Present a tightly packed `w * h` framebuffer (`0x00RR_GGBB`, stride == `w`) with the
+/// compositor's presentation — integer nearest-neighbor aspect-fit upscale, centered with black
+/// letterbox bars — into the live window, then pump input. [`present`]'s input model with
+/// [`flush`]'s scaling. Headless: a no-op.
+pub fn show(pixels: *const u32, width: u32, height: u32) {
+    imp::show(pixels, width, height);
+}
+
+/// The audio device's output config, packed `rate << 32 | channels`. Opens the output stream on
+/// first use (like [`play`]); headless — or no usable device — reports the fixed
+/// ([`DEFAULT_AUDIO_RATE`], [`DEFAULT_AUDIO_CHANNELS`]) default.
+pub fn audio_spec() -> u64 {
+    imp::audio_spec()
+}
+
+/// The number of interleaved `i16` samples currently queued in the raw [`audio`] ring
+/// (submitted but not yet consumed by the device callback) — streaming backpressure.
+/// Headless: always `0` (instant drain).
+pub fn pending() -> u64 {
+    imp::pending()
+}
+
 // ===========================================================================
 // Headless implementation (default: `desktop` OFF). Zero heavy dependencies.
 // ===========================================================================
@@ -267,6 +378,22 @@ mod imp {
     pub(super) fn mouse() -> u64 {
         0
     }
+
+    pub(super) fn mouse_delta() -> u64 {
+        0
+    }
+
+    pub(super) fn tune(_voice: u32, _vol_q8: u32, _pan_q8: u32) {}
+
+    pub(super) fn show(_pixels: *const u32, _width: u32, _height: u32) {}
+
+    pub(super) fn audio_spec() -> u64 {
+        super::pack_size(super::DEFAULT_AUDIO_RATE, super::DEFAULT_AUDIO_CHANNELS)
+    }
+
+    pub(super) fn pending() -> u64 {
+        0
+    }
 }
 
 // ===========================================================================
@@ -284,8 +411,8 @@ mod imp {
     /// Cap the audio ring so a program that outruns the audio callback can't grow it forever.
     const RING_CAP: usize = 1 << 20;
 
-    /// `minifb::Key` → keycode pairs used to diff the down-key set each frame. `Escape` is
-    /// handled separately (it maps to QUIT), so it is intentionally absent here.
+    /// `minifb::Key` → keycode pairs used to diff the down-key set each frame. `Escape` is a
+    /// normal key here (KEY_DOWN/KEY_UP code 27); QUIT is emitted only for window close.
     const KEY_TABLE: &[(minifb::Key, u32)] = &[
         (minifb::Key::A, key::A),
         (minifb::Key::B, key::B),
@@ -325,10 +452,43 @@ mod imp {
         (minifb::Key::Key9, key::D9),
         (minifb::Key::Space, key::SPACE),
         (minifb::Key::Enter, key::ENTER),
+        (minifb::Key::Escape, key::ESC),
+        (minifb::Key::Backspace, key::BACKSPACE),
+        (minifb::Key::Tab, key::TAB),
+        (minifb::Key::Apostrophe, key::APOSTROPHE),
+        (minifb::Key::Comma, key::COMMA),
+        (minifb::Key::Minus, key::MINUS),
+        (minifb::Key::Period, key::PERIOD),
+        (minifb::Key::Slash, key::SLASH),
+        (minifb::Key::Semicolon, key::SEMICOLON),
+        (minifb::Key::Equal, key::EQUALS),
+        (minifb::Key::LeftBracket, key::LBRACKET),
+        (minifb::Key::Backslash, key::BACKSLASH),
+        (minifb::Key::RightBracket, key::RBRACKET),
+        (minifb::Key::Backquote, key::BACKTICK),
         (minifb::Key::Up, key::UP),
         (minifb::Key::Down, key::DOWN),
         (minifb::Key::Left, key::LEFT),
         (minifb::Key::Right, key::RIGHT),
+        (minifb::Key::LeftCtrl, key::LCTRL),
+        (minifb::Key::RightCtrl, key::RCTRL),
+        (minifb::Key::LeftShift, key::LSHIFT),
+        (minifb::Key::RightShift, key::RSHIFT),
+        (minifb::Key::LeftAlt, key::LALT),
+        (minifb::Key::RightAlt, key::RALT),
+        (minifb::Key::Pause, key::PAUSE),
+        (minifb::Key::F1, key::F1),
+        (minifb::Key::F2, key::F2),
+        (minifb::Key::F3, key::F3),
+        (minifb::Key::F4, key::F4),
+        (minifb::Key::F5, key::F5),
+        (minifb::Key::F6, key::F6),
+        (minifb::Key::F7, key::F7),
+        (minifb::Key::F8, key::F8),
+        (minifb::Key::F9, key::F9),
+        (minifb::Key::F10, key::F10),
+        (minifb::Key::F11, key::F11),
+        (minifb::Key::F12, key::F12),
     ];
 
     /// An uploaded texture: premultiplied `0xAARR_GGBB` pixels, row-major `w * h`.
@@ -348,11 +508,16 @@ mod imp {
         resampled: Option<Vec<i16>>,
     }
 
-    /// A playing voice: a cursor into `sounds[sound].resampled` plus its gain and loop flag.
+    /// A playing voice: a cursor into `sounds[sound].resampled` plus its gain, stereo pan, and
+    /// loop flag. `vol_q8`/`pan_q8` are live-updatable via `tune` (the mixer reads them per
+    /// sample), with the linear pan law documented on [`mix_sample`].
     struct Voice {
         sound: usize,
         pos: usize,
         vol_q8: u32,
+        /// Stereo pan: `0` = full left, `128` = center, `255` = full right. `play` starts every
+        /// voice at 128.
+        pan_q8: u32,
         looping: bool,
         active: bool,
     }
@@ -398,6 +563,13 @@ mod imp {
         /// The last known mouse position, in logical-canvas coordinates.
         mouse_x: i32,
         mouse_y: i32,
+        /// The last raw window-pixel cursor position, for relative-mouse delta accumulation
+        /// (`None` until the cursor is first seen).
+        last_win_mouse: Option<(f32, f32)>,
+        /// Raw mouse deltas accumulated since the last `mouse_delta()` drain, in window pixels.
+        /// Kept as `f32` so the sub-pixel remainder carries across drains.
+        acc_dx: f32,
+        acc_dy: f32,
         /// Debounced mouse-button state, for MOUSE_DOWN / MOUSE_UP edge detection.
         mouse_left: bool,
         mouse_right: bool,
@@ -431,6 +603,9 @@ mod imp {
                 off_y: 0,
                 mouse_x: 0,
                 mouse_y: 0,
+                last_win_mouse: None,
+                acc_dx: 0.0,
+                acc_dy: 0.0,
                 mouse_left: false,
                 mouse_right: false,
                 mixer: Arc::new(Mutex::new(Mixer {
@@ -466,13 +641,15 @@ mod imp {
         }
 
         /// Diff the current key state against the previous frame, enqueueing KEY_DOWN/KEY_UP
-        /// edges, and enqueue a single QUIT when the window is closed or Esc is pressed.
+        /// edges, and enqueue a single QUIT when the window is CLOSED. Esc is deliberately NOT
+        /// a quit: it arrives as a normal key event (code 27, via `KEY_TABLE`) so games can
+        /// drive pause/settings menus with it — only window close means "the player left".
         fn pump_input(&mut self) {
             let Some(window) = self.window.as_ref() else {
                 return;
             };
 
-            if !self.quit_sent && (!window.is_open() || window.is_key_down(minifb::Key::Escape)) {
+            if !self.quit_sent && !window.is_open() {
                 self.events.push_back(Event {
                     kind: event_kind::QUIT,
                     code: 0,
@@ -507,6 +684,19 @@ mod imp {
                 }
             }
             self.down = now_down;
+
+            // Relative mouse: accumulate raw window-pixel deltas between pumps, drained by
+            // `mouse_delta()`. minifb exposes only absolute positions (no pointer lock), so the
+            // deltas are position differences and clamp once the cursor pins a window edge.
+            // NB: the MOUSE_MOVE event kind stays reserved and unemitted — movement is polled
+            // via `gg.mouse()` (absolute) / `gg.mouseDelta()` (relative), never event-queued.
+            if let Some((wx, wy)) = window.get_mouse_pos(minifb::MouseMode::Pass) {
+                if let Some((lx, ly)) = self.last_win_mouse {
+                    self.acc_dx += wx - lx;
+                    self.acc_dy += wy - ly;
+                }
+                self.last_win_mouse = Some((wx, wy));
+            }
 
             // Mouse: track the cursor in logical-canvas coords, and synthesize MOUSE_DOWN/UP
             // edges for the two buttons (code 0 = left, 1 = right). Position via `gg.mouse()`.
@@ -730,12 +920,39 @@ mod imp {
         fn flush(&mut self) {
             let cw = self.canvas_w as usize;
             let ch = self.canvas_h as usize;
-            if cw == 0 || ch == 0 {
-                // Nothing to present yet, but still pump input so quit/keys are observed.
+            if cw == 0 || ch == 0 || self.canvas.len() != cw * ch {
+                // Nothing to present yet (or a `show` retargeted the logical size and no `frame`
+                // has rebuilt the canvas), but still pump input so quit/keys are observed.
                 self.pump_input();
                 return;
             }
-            // 1. Ensure the window (default ~2x the canvas), read its live size, end that borrow.
+            // Move the canvas out to split the borrow (`present_scaled` reads the source but
+            // writes the window/scale fields), then put it back.
+            let canvas = std::mem::take(&mut self.canvas);
+            self.present_scaled(&canvas, cw, ch);
+            self.canvas = canvas;
+        }
+
+        /// Present an app-owned, tightly packed `w * h` framebuffer with the very same scaler as
+        /// [`Self::flush`] — `present`'s input model with `flush`'s presentation. Adopts `w * h`
+        /// as the logical size so `gg.mouse()` maps into the shown frame (a later `frame` call
+        /// simply re-sizes the compositor canvas if the two are mixed).
+        fn show(&mut self, buf: &[u32], w: usize, h: usize) {
+            if w == 0 || h == 0 {
+                self.pump_input();
+                return;
+            }
+            self.canvas_w = w as u32;
+            self.canvas_h = h as u32;
+            self.present_scaled(buf, w, h);
+        }
+
+        /// The shared presentation core behind [`Self::flush`] and [`Self::show`]: aspect-fit
+        /// `src` (a tightly packed `cw * ch` logical frame) into the live window by an integer
+        /// nearest-neighbor upscale, centered with black letterbox bars; record the
+        /// window→logical mapping for the mouse; pump input.
+        fn present_scaled(&mut self, src: &[u32], cw: usize, ch: usize) {
+            // 1. Ensure the window (default ~2x the frame), read its live size, end that borrow.
             let window = self.window.get_or_insert_with(|| {
                 let opts = minifb::WindowOptions {
                     resize: true,
@@ -766,7 +983,7 @@ mod imp {
                     if px_out < 0 || px_out >= win_w as i32 {
                         continue;
                     }
-                    present[row + px_out as usize] = self.canvas[sy * cw + x / scale];
+                    present[row + px_out as usize] = src[sy * cw + x / scale];
                 }
             }
             // 3. Re-borrow the window and present the upscaled buffer.
@@ -825,6 +1042,7 @@ mod imp {
                 sound: idx,
                 pos: 0,
                 vol_q8,
+                pan_q8: 128, // center — `tune` moves it
                 looping: loop_ != 0,
                 active: true,
             });
@@ -842,10 +1060,66 @@ mod imp {
             }
         }
 
+        /// Live-update voice `voice`'s volume and stereo pan (see [`Voice::pan_q8`] and the pan
+        /// law on [`mix_sample`]). Unknown or finished ids are ignored, so retuning a voice that
+        /// already ended is safe.
+        fn tune(&mut self, voice: u32, vol_q8: u32, pan_q8: u32) {
+            if voice == 0 {
+                return;
+            }
+            let mut mixer = self.mixer.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(v) = mixer.voices.get_mut((voice - 1) as usize) {
+                v.vol_q8 = vol_q8;
+                v.pan_q8 = pan_q8.min(255);
+            }
+        }
+
         /// The mouse position in logical-canvas coordinates, packed `x << 32 | y`.
         fn mouse(&self) -> u64 {
             ((self.mouse_x as u32 as u64) << 32) | (self.mouse_y as u32 as u64)
         }
+
+        /// Drain the accumulated raw mouse delta as a sign-preserving `(dx, dy)` `i32` pair
+        /// packed `(dx as u32) << 32 | (dy as u32)`. Truncates toward zero; the fractional
+        /// sub-pixel remainder stays accumulated for the next drain.
+        fn mouse_delta(&mut self) -> u64 {
+            let dx = self.acc_dx as i32;
+            let dy = self.acc_dy as i32;
+            self.acc_dx -= dx as f32;
+            self.acc_dy -= dy as f32;
+            ((dx as u32 as u64) << 32) | (dy as u32 as u64)
+        }
+
+        /// The audio device's output config, packed `rate << 32 | channels`. Opens the output
+        /// stream on first use (like `play`) so a music synth can size itself before submitting
+        /// any samples; no usable device ⇒ the fixed headless default.
+        fn audio_spec(&mut self) -> u64 {
+            self.ensure_stream();
+            if self.stream.is_some() {
+                let m = self.mixer.lock().unwrap_or_else(|e| e.into_inner());
+                if m.device_rate != 0 && m.device_channels != 0 {
+                    return super::pack_size(m.device_rate, u32::from(m.device_channels));
+                }
+            }
+            super::pack_size(super::DEFAULT_AUDIO_RATE, super::DEFAULT_AUDIO_CHANNELS)
+        }
+
+        /// Interleaved `i16` samples currently queued in the raw `audio` ring (submitted but not
+        /// yet consumed by the device callback) — the streaming backpressure signal.
+        fn pending(&self) -> u64 {
+            self.ring.lock().unwrap_or_else(|e| e.into_inner()).len() as u64
+        }
+    }
+
+    /// The `BET_GG_HEADLESS` switch: when the env var is set to anything but `""`/`"0"`, this
+    /// desktop-featured build runs fully headless — the singleton is never created, so no
+    /// window opens and no audio device is touched — matching the default headless build's
+    /// behavior exactly (see the crate docs). Checked once at gg init (the first gg call).
+    fn headless() -> bool {
+        static HEADLESS: OnceLock<bool> = OnceLock::new();
+        *HEADLESS.get_or_init(|| {
+            std::env::var("BET_GG_HEADLESS").is_ok_and(|v| !v.is_empty() && v != "0")
+        })
     }
 
     /// The process-global singleton. `Mutex<GgState>: Sync` holds because we force `GgState:
@@ -877,6 +1151,9 @@ mod imp {
             m.device_channels = config.channels;
         }
         let err_fn = |_err| { /* best-effort audio: ignore stream errors */ };
+        // Interleaved-slot → channel index for the pan law: cpal hands whole frames, so slot `i`
+        // is channel `i % channels`.
+        let channels = usize::from(config.channels).max(1);
 
         let stream = match sample_format {
             cpal::SampleFormat::I16 => {
@@ -888,8 +1165,8 @@ mod imp {
                         move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
                             let mut ring = ring.lock().unwrap_or_else(|e| e.into_inner());
                             let mut mixer = mixer.lock().unwrap_or_else(|e| e.into_inner());
-                            for s in data.iter_mut() {
-                                *s = mix_sample(&mut ring, &mut mixer);
+                            for (i, s) in data.iter_mut().enumerate() {
+                                *s = mix_sample(&mut ring, &mut mixer, i % channels);
                             }
                         },
                         err_fn,
@@ -906,8 +1183,8 @@ mod imp {
                         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                             let mut ring = ring.lock().unwrap_or_else(|e| e.into_inner());
                             let mut mixer = mixer.lock().unwrap_or_else(|e| e.into_inner());
-                            for s in data.iter_mut() {
-                                let v = mix_sample(&mut ring, &mut mixer);
+                            for (i, s) in data.iter_mut().enumerate() {
+                                let v = mix_sample(&mut ring, &mut mixer, i % channels);
                                 *s = f32::from(v) / 32768.0;
                             }
                         },
@@ -963,11 +1240,22 @@ mod imp {
         out
     }
 
-    /// Produce one output sample: the raw ring (kept 1:1 for `gg.audio` / Pong) plus every active
+    /// Produce one output sample for channel `chan` (the slot's index within its interleaved
+    /// frame): the raw ring (kept 1:1 and unpanned for `gg.audio` / Pong) plus every active
     /// mixer voice, summed and clipped to `i16`. Advances each voice's `pos`; a one-shot voice
     /// deactivates at its end, a looping voice wraps.
-    fn mix_sample(ring: &mut VecDeque<i16>, mixer: &mut Mixer) -> i16 {
+    ///
+    /// Per-voice stereo pan (linear law): with `vol = vol_q8` and `pan = pan_q8` (0 = full left,
+    /// 128 = center, 255 = full right),
+    ///   * even channels (left)  get gain `vol * (255 - pan) / 255`,
+    ///   * odd  channels (right) get gain `vol * pan / 255`,
+    ///   * a mono device applies the plain unpanned `vol`.
+    ///
+    /// Center is therefore ~half gain per side (127/255 and 128/255), the standard linear
+    /// halving that keeps a hard-panned voice at unity on its side.
+    fn mix_sample(ring: &mut VecDeque<i16>, mixer: &mut Mixer, chan: usize) -> i16 {
         let mut acc = i32::from(ring.pop_front().unwrap_or(0));
+        let mono = mixer.device_channels <= 1;
         let Mixer { sounds, voices, .. } = mixer;
         for v in voices.iter_mut() {
             if !v.active {
@@ -980,7 +1268,15 @@ mod imp {
                     continue;
                 }
             };
-            acc += (i32::from(res[v.pos]) * v.vol_q8 as i32) >> 8;
+            let vol = v.vol_q8 as i32;
+            let gain = if mono {
+                vol
+            } else if chan.is_multiple_of(2) {
+                vol * (255 - v.pan_q8 as i32) / 255
+            } else {
+                vol * v.pan_q8 as i32 / 255
+            };
+            acc += (i32::from(res[v.pos]) * gain) >> 8;
             v.pos += 1;
             if v.pos >= res.len() {
                 if v.looping {
@@ -993,7 +1289,14 @@ mod imp {
         acc.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
     }
 
+    // Every wrapper below short-circuits under `BET_GG_HEADLESS` to the same value the default
+    // headless build returns, BEFORE touching the singleton — so headless runs never open a
+    // window or audio device.
+
     pub(super) fn present(pixels: *const u32, width: u32, height: u32, stride: u32) {
+        if headless() {
+            return;
+        }
         let (w, h, stride) = (width as usize, height as usize, stride as usize);
         if w == 0 || h == 0 {
             return;
@@ -1015,17 +1318,23 @@ mod imp {
     }
 
     pub(super) fn audio(samples: &[i16]) {
-        if samples.is_empty() {
+        if headless() || samples.is_empty() {
             return;
         }
         with_state(|st| st.push_audio(samples));
     }
 
     pub(super) fn poll() -> Event {
+        if headless() {
+            return NONE_EVENT;
+        }
         with_state(|st| st.events.pop_front().unwrap_or(NONE_EVENT))
     }
 
     pub(super) fn size() -> u64 {
+        if headless() {
+            return super::pack_size(super::DEFAULT_W, super::DEFAULT_H);
+        }
         with_state(|st| match st.window.as_ref() {
             // `get_size` is the live window size — it tracks user resizes, driving dynamic
             // resolution. Before the first `present` there's no window yet: report the default.
@@ -1038,43 +1347,120 @@ mod imp {
     }
 
     pub(super) fn tex(rgba: &[u8], w: u32, h: u32) -> u32 {
+        if headless() {
+            return 0;
+        }
         with_state(|st| st.tex(rgba, w, h))
     }
 
     pub(super) fn frame(w: u32, h: u32, clear_argb: u32) {
+        if headless() {
+            return;
+        }
         with_state(|st| st.frame(w, h, clear_argb));
     }
 
     pub(super) fn sprite(tex: u32, dx: i32, dy: i32) {
+        if headless() {
+            return;
+        }
         with_state(|st| st.sprite(tex, dx, dy));
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sprite_sub(tex: u32, sx: i32, sy: i32, sw: u32, sh: u32, dx: i32, dy: i32) {
+        if headless() {
+            return;
+        }
         with_state(|st| st.sprite_sub(tex, sx, sy, sw, sh, dx, dy));
     }
 
     pub(super) fn rect(dx: i32, dy: i32, w: u32, h: u32, argb: u32) {
+        if headless() {
+            return;
+        }
         with_state(|st| st.rect(dx, dy, w, h, argb));
     }
 
     pub(super) fn flush() {
+        if headless() {
+            return;
+        }
         with_state(|st| st.flush());
     }
 
     pub(super) fn sound(pcm: &[u8], channels: u32, rate: u32) -> u32 {
+        if headless() {
+            return 0;
+        }
         with_state(|st| st.sound(pcm, channels, rate))
     }
 
     pub(super) fn play(sound: u32, loop_: u32, vol_q8: u32) -> u32 {
+        if headless() {
+            return 0;
+        }
         with_state(|st| st.play(sound, loop_, vol_q8))
     }
 
     pub(super) fn stop(voice: u32) {
+        if headless() {
+            return;
+        }
         with_state(|st| st.stop(voice));
     }
 
     pub(super) fn mouse() -> u64 {
+        if headless() {
+            return 0;
+        }
         with_state(|st| st.mouse())
+    }
+
+    pub(super) fn mouse_delta() -> u64 {
+        if headless() {
+            return 0;
+        }
+        with_state(|st| st.mouse_delta())
+    }
+
+    pub(super) fn tune(voice: u32, vol_q8: u32, pan_q8: u32) {
+        if headless() {
+            return;
+        }
+        with_state(|st| st.tune(voice, vol_q8, pan_q8));
+    }
+
+    pub(super) fn show(pixels: *const u32, width: u32, height: u32) {
+        if headless() {
+            return;
+        }
+        let (w, h) = (width as usize, height as usize);
+        if pixels.is_null() || w == 0 || h == 0 {
+            return;
+        }
+        // Copy the tightly packed source up front (stride == w), mirroring `present`, so the
+        // raw-pointer read is confined to here.
+        let mut buf = vec![0u32; w * h];
+        // SAFETY: the caller guarantees `pixels` addresses `w * h` readable `u32`s (the
+        // `bet_gg_show` contract).
+        unsafe {
+            std::ptr::copy_nonoverlapping(pixels, buf.as_mut_ptr(), w * h);
+        }
+        with_state(|st| st.show(&buf, w, h));
+    }
+
+    pub(super) fn audio_spec() -> u64 {
+        if headless() {
+            return super::pack_size(super::DEFAULT_AUDIO_RATE, super::DEFAULT_AUDIO_CHANNELS);
+        }
+        with_state(|st| st.audio_spec())
+    }
+
+    pub(super) fn pending() -> u64 {
+        if headless() {
+            return 0;
+        }
+        with_state(|st| st.pending())
     }
 }

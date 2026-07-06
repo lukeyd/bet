@@ -1244,3 +1244,44 @@ pub unsafe extern "C" fn bet_gg_size() -> u64 {
 pub unsafe extern "C" fn bet_gg_mouse() -> u64 {
     gg_backend::mouse()
 }
+
+// --- gg relative mouse / voice retune / fixed-canvas present / streaming audio. None are
+// cfg-split (mirroring `bet_gg_size`/`bet_gg_mouse`): gg-backend itself is headless without
+// its `desktop` feature, so each call below is a real backend call under `gg-desktop` and the
+// documented headless default otherwise. ---
+
+/// `bet_gg_mouse_delta` — drain the accumulated raw mouse `(dx, dy)`, packed
+/// `(dx as u32) << 32 | (dy as u32)` (sign-preserving `i32` halves). Headless: `0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_mouse_delta() -> u64 {
+    gg_backend::mouse_delta()
+}
+
+/// `bet_gg_tune` — live-update a playing voice's volume (Q8) and stereo pan (0 = left,
+/// 128 = center, 255 = right). Headless: a no-op.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_tune(voice: u32, vol_q8: u32, pan_q8: u32) {
+    gg_backend::tune(voice, vol_q8, pan_q8);
+}
+
+/// `bet_gg_show` — present a tightly packed `w * h` framebuffer aspect-fit (integer
+/// nearest-neighbor upscale, centered letterbox) into the live window. Headless: a no-op.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_show(pixels: *const u32, w: u32, h: u32) {
+    // Null/zero-size guarding happens inside gg-backend (mirrors its `present`).
+    gg_backend::show(pixels, w, h);
+}
+
+/// `bet_gg_audio_spec` — the audio device's output config, packed `rate << 32 | channels`.
+/// Headless (or no usable device): the fixed `(48000, 2)` default.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_audio_spec() -> u64 {
+    gg_backend::audio_spec()
+}
+
+/// `bet_gg_pending` — interleaved `i16` samples still queued in the raw `bet_gg_audio` ring.
+/// Headless: `0` (instant drain).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_pending() -> u64 {
+    gg_backend::pending()
+}

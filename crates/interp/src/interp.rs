@@ -2122,6 +2122,60 @@ impl<'p> Interp<'p> {
                 ])
             }
             ("mouse", _) => Err(RunError::Type("`gg.mouse` takes no arguments".into())),
+            // `gg.mouseDelta()` drains the raw mouse movement accumulated since the previous
+            // call as a signed `(dx, dy)` pair. The ABI packs the two i32s
+            // `(dx as u32) << 32 | (dy as u32)`, so each half truncates then sign-extends
+            // (unlike `gg.mouse`/`gg.size`, whose halves are non-negative).
+            ("mouseDelta", []) => {
+                let v = gg_backend::mouse_delta();
+                Ok(vec![
+                    Value::Int(i64::from((v >> 32) as u32 as i32)),
+                    Value::Int(i64::from(v as u32 as i32)),
+                ])
+            }
+            ("mouseDelta", _) => Err(RunError::Type("`gg.mouseDelta` takes no arguments".into())),
+            // `gg.tune(voiceId, volume, pan)` live-updates a playing voice's Q8 volume and
+            // stereo pan (0 = full left, 128 = center, 255 = full right).
+            ("tune", [Value::Int(v), Value::Int(vol), Value::Int(pan)])
+                if *v >= 0 && *vol >= 0 && *pan >= 0 =>
+            {
+                gg_backend::tune(*v as u32, *vol as u32, *pan as u32);
+                Ok(Vec::new())
+            }
+            ("tune", _) => Err(RunError::Type(
+                "`gg.tune(voiceId, volume, pan)` takes a voice id, a volume, and a pan".into(),
+            )),
+            // `gg.show(pixels, w, h)` presents a tightly packed fixed-logical-size `w * h`
+            // framebuffer, aspect-fit (integer nearest-neighbor, centered letterbox) into the
+            // window — `gg.blit`'s input model with `gg.flush`'s scaling.
+            ("show", [pixels, Value::Int(w), Value::Int(h)]) if *w >= 0 && *h >= 0 => {
+                let (w, h) = (*w as u32, *h as u32);
+                let mut buf = marshal_ints(pixels, |i| i as u32).ok_or_else(|| {
+                    RunError::Type("`gg.show` needs an array of pixel integers".into())
+                })?;
+                // Never let the backend read past the marshaled buffer: pad short frames to w*h.
+                buf.resize((w as usize) * (h as usize), 0);
+                gg_backend::show(buf.as_ptr(), w, h);
+                Ok(Vec::new())
+            }
+            ("show", _) => Err(RunError::Type(
+                "`gg.show(pixels, w, h)` takes a pixel array and two non-negative int dimensions"
+                    .into(),
+            )),
+            // `gg.audioSpec()` returns the audio device's output `(rate, channels)`; the ABI
+            // packs `rate << 32 | channels` (like `gg.size`).
+            ("audioSpec", []) => {
+                let v = gg_backend::audio_spec();
+                Ok(vec![
+                    Value::Int((v >> 32) as i64),
+                    Value::Int((v & 0xFFFF_FFFF) as i64),
+                ])
+            }
+            ("audioSpec", _) => Err(RunError::Type("`gg.audioSpec` takes no arguments".into())),
+            // `gg.pending()` returns the interleaved i16 samples still queued in the raw
+            // `gg.audio` ring — the streaming-synth backpressure signal.
+            ("pending", []) => Ok(vec![Value::Int(gg_backend::pending() as i64)]),
+            ("pending", _) => Err(RunError::Type("`gg.pending` takes no arguments".into())),
             (other, _) => Err(RunError::Unsupported(format!("gg.{other}"))),
         }
     }

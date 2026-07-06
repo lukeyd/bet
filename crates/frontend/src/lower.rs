@@ -4225,6 +4225,129 @@ impl LowerCtx {
                 );
                 Ok((Operand::Copy(Place::local(tup)), tuple_ty))
             }
+            // `gg.mouseDelta()` -> (int, int) — the raw mouse movement accumulated since the
+            // previous call. The ABI packs two SIGNED i32s `(dx as u32) << 32 | (dy as u32)`, so
+            // unlike `gg.mouse`/`gg.size` each half truncates to `i32` and then SIGN-extends to
+            // `int` (a negative delta must survive the round trip).
+            ("gg", "mouseDelta") => {
+                if !args.is_empty() {
+                    return Err("`gg.mouseDelta` takes no arguments".into());
+                }
+                let u64t = self.m.t_int(IntWidth::W64, false);
+                let i32t = self.m.t_int(IntWidth::W32, true);
+                let i64t = self.m.t_i64();
+                let ext = self.get_extern("bet_gg_mouse_delta", vec![], vec![u64t]);
+                let raw = self.new_local(u64t);
+                self.fb()
+                    .assign(Place::local(raw), Rvalue::Call(Callee::Extern(ext), vec![]));
+                // dx = sext(trunc32(raw >> 32))
+                let xsh = self.new_local(u64t);
+                self.fb().assign(
+                    Place::local(xsh),
+                    Rvalue::BinOp(
+                        BinOp::Shr,
+                        Operand::Copy(Place::local(raw)),
+                        Operand::Const(Const::Int(32, u64t)),
+                        ArithMode::Na,
+                    ),
+                );
+                let dx_i32 = self.coerce_int(Operand::Copy(Place::local(xsh)), u64t, i32t);
+                let dx = self.coerce_int(dx_i32, i32t, i64t);
+                // dy = sext(trunc32(raw))
+                let dy_i32 = self.coerce_int(Operand::Copy(Place::local(raw)), u64t, i32t);
+                let dy = self.coerce_int(dy_i32, i32t, i64t);
+                let tuple_ty = self.m.intern_ty(TyKind::Tuple(vec![i64t, i64t]));
+                let tup = self.new_local(tuple_ty);
+                self.fb().assign(
+                    Place::local(tup),
+                    Rvalue::Aggregate(AggKind::Tuple, vec![dx, dy]),
+                );
+                Ok((Operand::Copy(Place::local(tup)), tuple_ty))
+            }
+            // `gg.tune(voiceId, volume, pan)` — live-update a playing voice's Q8 volume and
+            // stereo pan (0 = full left, 128 = center, 255 = full right). Void statement.
+            ("gg", "tune") => {
+                if args.len() != 3 {
+                    return Err("`gg.tune` takes a voice id, a volume, and a pan".into());
+                }
+                let u32t = self.m.t_u32();
+                let (v, vty) = self.lower_expr(&args[0].value, Some(u32t))?;
+                let v = self.coerce_int(v, vty, u32t);
+                let (vol, volty) = self.lower_expr(&args[1].value, Some(u32t))?;
+                let vol = self.coerce_int(vol, volty, u32t);
+                let (pan, panty) = self.lower_expr(&args[2].value, Some(u32t))?;
+                let pan = self.coerce_int(pan, panty, u32t);
+                let ext = self.get_extern("bet_gg_tune", vec![u32t, u32t, u32t], vec![]);
+                self.emit_extern_call(ext, &[], vec![v, vol, pan])
+            }
+            // `gg.show(pixels, w, h)` — present a tightly packed fixed-logical-size `w * h`
+            // framebuffer, aspect-fit (integer nearest-neighbor upscale, centered letterbox)
+            // into the live window: `gg.blit`'s input model with `gg.flush`'s scaling. Unlike
+            // `gg.blit` there is no stride, so the ABI takes the base pointer + dims directly
+            // (no `FrameBuffer` struct). Void statement.
+            ("gg", "show") => {
+                if args.len() != 3 {
+                    return Err("`gg.show` takes a pixel buffer, a width, and a height".into());
+                }
+                let rawptr = self.m.intern_ty(TyKind::RawPtr);
+                let u32t = self.m.t_u32();
+                let pixels = self.buffer_base_ptr(&args[0].value)?;
+                let (w, wty) = self.lower_expr(&args[1].value, Some(u32t))?;
+                let w = self.coerce_int(w, wty, u32t);
+                let (h, hty) = self.lower_expr(&args[2].value, Some(u32t))?;
+                let h = self.coerce_int(h, hty, u32t);
+                let ext = self.get_extern("bet_gg_show", vec![rawptr, u32t, u32t], vec![]);
+                self.emit_extern_call(ext, &[], vec![pixels, w, h])
+            }
+            // `gg.audioSpec()` -> (int, int) — the audio device's output `(rate, channels)`.
+            // The ABI packs `rate << 32 | channels`; unpack exactly like `gg.size`.
+            ("gg", "audioSpec") => {
+                if !args.is_empty() {
+                    return Err("`gg.audioSpec` takes no arguments".into());
+                }
+                let u64t = self.m.t_int(IntWidth::W64, false);
+                let u32t = self.m.t_u32();
+                let i64t = self.m.t_i64();
+                let ext = self.get_extern("bet_gg_audio_spec", vec![], vec![u64t]);
+                let raw = self.new_local(u64t);
+                self.fb()
+                    .assign(Place::local(raw), Rvalue::Call(Callee::Extern(ext), vec![]));
+                let rsh = self.new_local(u64t);
+                self.fb().assign(
+                    Place::local(rsh),
+                    Rvalue::BinOp(
+                        BinOp::Shr,
+                        Operand::Copy(Place::local(raw)),
+                        Operand::Const(Const::Int(32, u64t)),
+                        ArithMode::Na,
+                    ),
+                );
+                let rate = self.coerce_int(Operand::Copy(Place::local(rsh)), u64t, i64t);
+                let ch_u32 = self.coerce_int(Operand::Copy(Place::local(raw)), u64t, u32t);
+                let ch = self.coerce_int(ch_u32, u32t, i64t);
+                let tuple_ty = self.m.intern_ty(TyKind::Tuple(vec![i64t, i64t]));
+                let tup = self.new_local(tuple_ty);
+                self.fb().assign(
+                    Place::local(tup),
+                    Rvalue::Aggregate(AggKind::Tuple, vec![rate, ch]),
+                );
+                Ok((Operand::Copy(Place::local(tup)), tuple_ty))
+            }
+            // `gg.pending()` -> int — interleaved i16 samples still queued in the raw `gg.audio`
+            // ring (streaming backpressure), presented as `int` like `gg.ticks`.
+            ("gg", "pending") => {
+                if !args.is_empty() {
+                    return Err("`gg.pending` takes no arguments".into());
+                }
+                let u64t = self.m.t_int(IntWidth::W64, false);
+                let i64t = self.m.t_i64();
+                let ext = self.get_extern("bet_gg_pending", vec![], vec![u64t]);
+                let raw = self.new_local(u64t);
+                self.fb()
+                    .assign(Place::local(raw), Rvalue::Call(Callee::Extern(ext), vec![]));
+                let v = self.coerce_int(Operand::Copy(Place::local(raw)), u64t, i64t);
+                Ok((v, i64t))
+            }
             ("spill", _) => {
                 Err("`spill.*` is a statement-level print, not a value expression".into())
             }
