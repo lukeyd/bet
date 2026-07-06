@@ -1,0 +1,128 @@
+// tools/video_det.bet — the CROSS-BACKEND DETERMINISM twin for the patch blitter. Unlike
+// video_smoke (which loads the 4MB IWAD and is native-only — the interpreter clones a
+// Value::Array on every element read, so WAD-scale reads take hours), this builds a TINY 8×8
+// synthetic patch entirely in memory, draws it with the SAME v_video.drawPatch, and crc32's an
+// 8×8 region of scr0. It runs fast on BOTH backends and MUST print the identical crc:
+//
+//   bet run   ports/doom/tools/video_det.bet                 # interpreter
+//   bet build ports/doom/tools/video_det.bet --runtime real -o /tmp/video_det && \
+//     BET_GG_HEADLESS=1 /tmp/video_det                        # native
+//
+// Expected (both): det region crc32=0x54d7dadb (an independent Python/C model of drawPatch on
+// this patch). The patch has two posts per column with a topdelta gap (rows 0/3/7 stay 0),
+// exercising the multi-post loop, per-column offsets, topdelta placement, and clipping — the
+// exact width/sign/wrap surface where native and interp could diverge.
+pull "spill"
+pull "mem"
+pull "str"
+pull "../defs/gs" as gs
+pull "../v/v_video" as vv
+
+flex finna hex8(v: int) -> str {
+    lowkey val = v & 4294967295
+    lowkey buf = mem.slab[u8](8)
+    lowkey i = 0
+    vibin i < 8 {
+        lowkey nib = (val >> (28 - i * 4)) & 15
+        fr nib < 10 {
+            buf[i] = (48 + nib) as u8
+        } naw {
+            buf[i] = (87 + nib) as u8
+        }
+        i = i + 1
+    }
+    bet str.fromBytesTrust(buf)
+}
+
+flex finna crcTable() -> []i32 {
+    lowkey tbl = mem.slab[i32](256)
+    lowkey i = 0
+    vibin i < 256 {
+        lowkey c = i
+        lowkey k = 0
+        vibin k < 8 {
+            lowkey lsb = c & 1
+            c = c >> 1
+            fr lsb != 0 {
+                c = c ^ 3988292384
+            }
+            k = k + 1
+        }
+        tbl[i] = c as i32
+        i = i + 1
+    }
+    bet tbl
+}
+
+flex finna crc32U8(tbl: []i32, t: []u8, n: int) -> int {
+    lowkey crc = 4294967295
+    lowkey i = 0
+    vibin i < n {
+        lowkey byte = t[i] as int
+        crc = (crc >> 8) ^ ((tbl[((crc ^ byte) & 255)] as int) & 4294967295)
+        i = i + 1
+    }
+    bet (crc ^ 4294967295) & 4294967295
+}
+
+// buildPatch — an 8×8 patch_t (152 bytes). Each of the 8 columns holds two posts:
+//   post A: topdelta 1, length 2, pixels [10+c, 20+c]   (rows 1,2)
+//   post B: topdelta 4, length 3, pixels [30+c, 40+c, 50+c]  (rows 4,5,6)
+// rows 0/3/7 are left transparent (untouched). Column c's data starts at 40 + c*14.
+flex finna buildPatch() -> []u8 {
+    lowkey p = mem.slab[u8](152)
+    p[0] = 8         // width = 8 (u16 LE)
+    p[2] = 8         // height = 8
+    // leftoffset/topoffset = 0 (bytes 4..7 stay zero)
+    lowkey c = 0
+    vibin c < 8 {
+        lowkey co = 40 + c * 14
+        p[8 + c * 4] = (co & 255) as u8          // columnofs[c] (u32 LE; high bytes stay 0)
+        p[8 + c * 4 + 1] = ((co >> 8) & 255) as u8
+        p[co] = 1                                // post A: topdelta
+        p[co + 1] = 2                            //         length
+        p[co + 3] = (10 + c) as u8               //         pixel row1
+        p[co + 4] = (20 + c) as u8               //         pixel row2
+        p[co + 6] = 4                            // post B: topdelta
+        p[co + 7] = 3                            //         length
+        p[co + 9] = (30 + c) as u8               //         pixel row4
+        p[co + 10] = (40 + c) as u8              //         pixel row5
+        p[co + 11] = (50 + c) as u8              //         pixel row6
+        p[co + 13] = 255                         // column terminator (0xff)
+        c = c + 1
+    }
+    bet p
+}
+
+finna main() {
+    lowkey g0 = cop gs.GameState{} in gs.gsc
+    gs.gsInit(g0)
+
+    // stage the synthetic patch as the WAD buffer, then draw it at (0,0) into scr0
+    lowkey patch = buildPatch()
+    holla g = g0 in gs.gsc {
+        g.wad.buf = patch
+    } ghosted {
+        yeet("gs")
+    }
+    vv.drawPatch(g0, 0, 0, 0, 0)
+
+    // extract the 8×8 top-left region row-major and crc it
+    lowkey region = mem.slab[u8](64)
+    holla g = g0 in gs.gsc {
+        lowkey scr = g.vid.scr0
+        lowkey y = 0
+        vibin y < 8 {
+            lowkey x = 0
+            vibin x < 8 {
+                region[y * 8 + x] = scr[y * 320 + x]
+                x = x + 1
+            }
+            y = y + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey ctab = crcTable()
+    spill.f("det region crc32=0x{}\n", hex8(crc32U8(ctab, region, 64)))
+}
