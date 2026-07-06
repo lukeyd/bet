@@ -360,6 +360,28 @@ pub unsafe extern "C" fn bet_evict(handle: CribHandle) {
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_evict_slot(handle: CribHandle, tag: Tag) {
+    let c = unsafe { crib(handle) };
+    // Per-slot free is a typed-crib operation; a bump crib has no slots to free one of.
+    let CribKind::Typed(t) = &mut c.kind else {
+        return;
+    };
+    // Only a LIVE tag frees its slot: occupied and generation-matching (the same validity
+    // rule as `bet_holla_check`). A stale/null/out-of-range tag is a no-op, so double-evict
+    // and evict-after-mass-evict are safe. Bumping the generation ghosts every outstanding
+    // copy of the tag; pushing the index returns the slot to the free list, so the very
+    // next `cop` reuses it (LIFO) at the new generation.
+    if let Some(m) = t.slots.get_mut(tag.slot as usize)
+        && m.occupied
+        && m.generation == tag.generation
+    {
+        m.occupied = false;
+        m.generation = m.generation.wrapping_add(1);
+        t.free.push(tag.slot);
+    }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn bet_bump_alloc(handle: CribHandle, size: usize, align: usize) -> *mut u8 {
     let c = unsafe { crib(handle) };
     match &mut c.kind {
@@ -511,6 +533,26 @@ pub unsafe extern "C" fn bet_fs_read(
             std::ptr::null_mut()
         }
     }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_fs_write(
+    path_ptr: *const u8,
+    path_len: usize,
+    data_ptr: *const u8,
+    data_len: usize,
+) -> bool {
+    let path_bytes = unsafe { std::slice::from_raw_parts(path_ptr, path_len) };
+    let Ok(path) = std::str::from_utf8(path_bytes) else {
+        return false;
+    };
+    let data: &[u8] = if data_len == 0 {
+        // A zero-length write may arrive with a null data pointer (an empty `[]u8`).
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(data_ptr, data_len) }
+    };
+    std::fs::write(path, data).is_ok()
 }
 
 // ---------------------------------------------------------------------------

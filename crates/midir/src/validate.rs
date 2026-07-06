@@ -98,6 +98,10 @@ impl<'a> Checker<'a> {
             Stmt::Evict(op) => {
                 self.operand_kind(func, op);
             }
+            Stmt::EvictSlot { crib, tag } => {
+                self.operand_kind(func, crib);
+                self.operand_kind(func, tag);
+            }
             Stmt::Assign(place, rvalue) => {
                 let place_kind = self.place_kind(func, place);
                 let rv_kind = self.rvalue_kind(func, block, rvalue);
@@ -577,8 +581,9 @@ impl<'a> Checker<'a> {
             Const::Bool(_) => Some(TyKind::Bool),
             Const::Str(_) => Some(TyKind::Str),
             // A function reference's type needs an interned signature we can't build from
-            // a read-only module; skip its kind (still valid).
-            Const::FnRef(_) | Const::Ghosted => None,
+            // a read-only module; skip its kind (still valid). `ghosted` and `nullptr` are
+            // contextually typed (tag / any handle), so their kind is equally open.
+            Const::FnRef(_) | Const::Ghosted | Const::NullPtr => None,
         }
     }
 

@@ -230,6 +230,26 @@ pub unsafe extern "C" fn bet_evict(handle: CribHandle) {
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_evict_slot(handle: CribHandle, tag: Tag) {
+    let c = unsafe { &mut *crib(handle) };
+    // Per-slot free is a typed-crib operation; a bump crib has no slots to free one of.
+    let CribKind::Typed(t) = &mut c.kind else {
+        return;
+    };
+    // Only a LIVE tag frees its slot: occupied and generation-matching (the same validity
+    // rule as `bet_holla_check`). A stale/null/out-of-range tag is a no-op, so double-evict
+    // and evict-after-mass-evict are safe. Bumping the generation ghosts every outstanding
+    // copy of the tag; the stub's `bet_cop` scan finds the slot free again for reuse.
+    if let Some(m) = t.meta.get_mut(tag.slot as usize)
+        && m.occupied
+        && m.generation == tag.generation
+    {
+        m.occupied = false;
+        m.generation = m.generation.wrapping_add(1);
+    }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn bet_bump_alloc(handle: CribHandle, size: usize, align: usize) -> *mut u8 {
     let c = unsafe { &mut *crib(handle) };
     let CribKind::Bump(b) = &mut c.kind else {
@@ -388,6 +408,26 @@ pub unsafe extern "C" fn bet_fs_read(
             std::ptr::null_mut()
         }
     }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_fs_write(
+    path_ptr: *const u8,
+    path_len: usize,
+    data_ptr: *const u8,
+    data_len: usize,
+) -> bool {
+    let path_bytes = unsafe { std::slice::from_raw_parts(path_ptr, path_len) };
+    let Ok(path) = std::str::from_utf8(path_bytes) else {
+        return false;
+    };
+    let data: &[u8] = if data_len == 0 {
+        // A zero-length write may arrive with a null data pointer (an empty `[]u8`).
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(data_ptr, data_len) }
+    };
+    std::fs::write(path, data).is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -963,6 +1003,43 @@ mod tests {
             unsafe { bet_fs_read(missing.as_ptr(), missing.len(), &mut out_len as *mut usize) };
         assert!(ptr.is_null());
         assert_eq!(out_len, 0);
+    }
+
+    #[test]
+    fn fs_write_round_trips_through_fs_read() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("bet_fs_write_test_{}.bin", std::process::id()));
+        let path_str = path.to_str().unwrap();
+        let data = [0x42u8, 0x45, 0x54, 0x00, 0xFF];
+
+        let ok = unsafe {
+            bet_fs_write(path_str.as_ptr(), path_str.len(), data.as_ptr(), data.len())
+        };
+        assert!(ok, "writing into the temp dir should succeed");
+
+        let mut out_len: usize = 0;
+        let ptr = unsafe {
+            bet_fs_read(
+                path_str.as_ptr(),
+                path_str.len(),
+                &mut out_len as *mut usize,
+            )
+        };
+        assert_eq!(unsafe { std::slice::from_raw_parts(ptr, out_len) }, &data);
+        drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, out_len)) });
+
+        // Overwrite truncates: a shorter second write fully replaces the first.
+        let ok2 = unsafe { bet_fs_write(path_str.as_ptr(), path_str.len(), data.as_ptr(), 2) };
+        assert!(ok2);
+        assert_eq!(std::fs::read(&path).unwrap(), &data[..2]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fs_write_bad_destination_returns_false() {
+        let bad = "/nonexistent/bet/dir/for/sure/out.bin";
+        let ok = unsafe { bet_fs_write(bad.as_ptr(), bad.len(), b"x".as_ptr(), 1) };
+        assert!(!ok, "writing under a missing directory must report failure");
     }
 
     #[test]

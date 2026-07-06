@@ -196,6 +196,9 @@ impl Printer<'_> {
         match s {
             Stmt::Nop => "nop".into(),
             Stmt::Evict(op) => format!("evict {}", self.operand(op)),
+            Stmt::EvictSlot { crib, tag } => {
+                format!("evictslot {}, {}", self.operand(crib), self.operand(tag))
+            }
             Stmt::Assign(place, rv) => format!("{} = {}", self.place(place), self.rvalue(rv)),
         }
     }
@@ -410,6 +413,7 @@ impl Printer<'_> {
             Const::Bool(b) => if *b { "true" } else { "false" }.into(),
             Const::Str(s) => format!("\"{}\"", escape(s)),
             Const::Ghosted => "ghosted".into(),
+            Const::NullPtr => "nullptr".into(),
             Const::FnRef(f) => format!("@{}", self.m.func(*f).name),
         }
     }
@@ -1099,6 +1103,14 @@ impl Parser {
         if self.eat_kw("nop") {
             return Ok(Stmt::Nop);
         }
+        // `evictslot` before `evict`: both are keyword-led statements, and the longer
+        // spelling must not be half-eaten by the shorter one.
+        if self.eat_kw("evictslot") {
+            let crib = self.operand()?;
+            self.expect(&Tok::Comma)?;
+            let tag = self.operand()?;
+            return Ok(Stmt::EvictSlot { crib, tag });
+        }
         if self.eat_kw("evict") {
             return Ok(Stmt::Evict(self.operand()?));
         }
@@ -1642,6 +1654,9 @@ impl Parser {
         }
         if self.eat_kw("ghosted") {
             return Ok(Const::Ghosted);
+        }
+        if self.eat_kw("nullptr") {
+            return Ok(Const::NullPtr);
         }
         if self.eat(&Tok::At) {
             let name = self.expect_ident()?;

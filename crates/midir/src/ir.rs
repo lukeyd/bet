@@ -207,6 +207,11 @@ pub enum Const {
     Str(String),
     /// `ghosted` — the nil / no-error / null-tag literal.
     Ghosted,
+    /// A null pointer, for zero-defaulting handle-shaped fields (`vec`/`stash`/`rng`
+    /// handles, function values, raw pointers) in a `cop T{}` with omitted fields. Safe to
+    /// hold and overwrite; using it (calling/pushing/indexing) is a crash, exactly like a
+    /// zero-initialized handle in C.
+    NullPtr,
     /// A first-class function value (a code pointer), e.g. a `think` field.
     FnRef(FuncId),
 }
@@ -315,6 +320,11 @@ pub enum Stmt {
     Assign(Place, Rvalue),
     /// `evict crib` — O(1) mass-free that bumps every slot generation.
     Evict(Operand),
+    /// `evict tag in crib` — free ONE slot of a typed crib: mark it unoccupied and bump its
+    /// generation, so the freed tag (and every copy of it) ghosts while all other slots'
+    /// tags stay live. The slot returns to the crib's free pool for reuse by a later `cop`.
+    /// A stale/null tag is a no-op.
+    EvictSlot { crib: Operand, tag: Operand },
     Nop,
 }
 

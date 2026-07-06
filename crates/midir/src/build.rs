@@ -106,6 +106,11 @@ impl FuncBuilder {
         self.cur().stmts.push(Stmt::Evict(crib));
     }
 
+    /// Append `evict tag in crib` (single-slot free) to the current block.
+    pub fn evict_slot(&mut self, crib: Operand, tag: Operand) {
+        self.cur().stmts.push(Stmt::EvictSlot { crib, tag });
+    }
+
     /// Append an explicit no-op.
     pub fn nop(&mut self) {
         self.cur().stmts.push(Stmt::Nop);

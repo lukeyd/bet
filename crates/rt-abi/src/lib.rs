@@ -229,6 +229,12 @@ unsafe extern "C" {
     /// O(1) mass-free: mark every slot free and bump every slot's generation, so all
     /// outstanding tags into this crib safely become ghosted (spec §7.2).
     pub fn bet_evict(crib: CribHandle);
+    /// Free ONE slot of a typed crib (`evict tag in crib`): iff the slot is occupied and its
+    /// generation matches `tag`, mark it unoccupied and bump its generation — the freed tag
+    /// (and every copy) ghosts, and the slot returns to the free pool for reuse by a later
+    /// [`bet_cop`]. A stale, already-freed, null, or out-of-range tag is a no-op (double-evict
+    /// safe), as is calling it on a bump crib.
+    pub fn bet_evict_slot(crib: CribHandle, tag: Tag);
     /// Bump-allocate `size` bytes at `align` from an untyped bump crib.
     pub fn bet_bump_alloc(crib: CribHandle, size: usize, align: usize) -> *mut u8;
     /// The thread's built-in per-frame scratch crib (a bump arena).
@@ -275,6 +281,16 @@ unsafe extern "C" {
     /// buffer, writing its length to `out_len` and returning the buffer. Returns null (and
     /// leaves `out_len` = 0) on any error. The caller owns the buffer. Backs `fs.peep`.
     pub fn bet_fs_read(path_ptr: *const u8, path_len: usize, out_len: *mut usize) -> *mut u8;
+    /// Write the `data_len` bytes at `data_ptr` to the file at the `path_len`-byte path
+    /// `path_ptr`, creating the file if needed and truncating any existing contents (the
+    /// `std::fs::write` contract). Returns `true` on success, `false` on any error (invalid
+    /// UTF-8 path, missing parent directory, permissions, ...). Backs `fs.drop`.
+    pub fn bet_fs_write(
+        path_ptr: *const u8,
+        path_len: usize,
+        data_ptr: *const u8,
+        data_len: usize,
+    ) -> bool;
 
     // --- process arguments ---
 

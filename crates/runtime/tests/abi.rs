@@ -59,6 +59,47 @@ fn generation_reuse() {
     }
 }
 
+/// Per-slot free (`evict tag in crib`, rt-abi `bet_evict_slot`): the freed tag ghosts, other
+/// tags stay live, the freed slot is reused by the next `cop` at a bumped generation, and
+/// stale/null/double evicts are safe no-ops. (Parity oracle: mirrors rt-stub's test.)
+#[test]
+fn evict_slot_frees_one_slot_and_bumps_generation() {
+    unsafe {
+        let crib = bet_crib_new(8, 8, 2);
+
+        // Fill the crib completely so slot reuse is forced (implementation-independent).
+        let a = bet_cop(crib);
+        let b = bet_cop(crib);
+        *(bet_holla_check(crib, a) as *mut i64) = 7;
+        *(bet_holla_check(crib, b) as *mut i64) = 8;
+        assert_eq!(bet_cop(crib), Tag::NULL, "both slots occupied");
+
+        bet_evict_slot(crib, a);
+        assert_eq!(id_of(crib, a), -1, "the freed tag ghosts");
+        assert_eq!(id_of(crib, b), 8, "other slots are untouched");
+
+        // Double-evict and the null tag are safe no-ops.
+        bet_evict_slot(crib, a);
+        bet_evict_slot(crib, Tag::NULL);
+        assert_eq!(id_of(crib, b), 8);
+
+        // The freed slot is the only free one, so the next cop MUST reuse it, at a newer gen.
+        let c = bet_cop(crib);
+        assert_eq!(c.slot, a.slot, "the freed slot is reused");
+        assert_ne!(c.generation, a.generation, "generation must advance");
+        *(bet_holla_check(crib, c) as *mut i64) = 9;
+        assert_eq!(id_of(crib, c), 9);
+        assert_eq!(id_of(crib, a), -1, "the stale tag never sees the new occupant");
+
+        // A per-slot evict on a bump crib is a harmless no-op.
+        let bump = bet_crib_new_bump(64);
+        bet_evict_slot(bump, c);
+        bet_crib_free(bump);
+
+        bet_crib_free(crib);
+    }
+}
+
 #[test]
 fn cop_fills_then_returns_null_when_full() {
     unsafe {
