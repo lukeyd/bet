@@ -1,0 +1,413 @@
+// mus.bet — the DMX MUS format: a deterministic byte decoder plus the sequencer
+// that drives GENMIDI instruments onto an OPL2 chip at the DOOM 140Hz tick rate.
+//
+// MUS header (16 bytes): "MUS\x1a", scoreLen u16, scoreStart u16, channels u16,
+// secChannels u16, instrCount u16, dummy u16, then instrCount instrument-patch
+// u16's. The event stream begins at `scoreStart` (bytes from lump start).
+//
+// Event descriptor byte: bit7 = "last" (a variable-length time delay follows),
+// bits6-4 = type, bits3-0 = channel. Types: 0 release, 1 play(+opt volume),
+// 2 pitch-wheel, 3 system(channel-mode), 4 controller, 6 score-end. The delay is
+// 7-bit groups, MSB = continue, measured in 140Hz ticks.
+//
+// `decodeMus` is a PURE decode — no synthesis, no allocation beyond the event
+// vec — so its output is bit-for-bit reproducible and is checked against a
+// standalone C golden (goldens/gen/gen_mus.c -> goldens/mus_e1m1.golden).
+pull "wad"
+pull "opl"
+pull "genmidi"
+
+// One decoded MUS event. `delay` is the number of 140Hz ticks AFTER this event
+// before the next one fires (0 unless the descriptor's "last" bit was set). `a`
+// and `b` are the raw data bytes, or -1 when the event carries none.
+//   type 0 release : a=note              b=-1
+//   type 1 play    : a=note(0..127)      b=volume(0..127) or -1 if omitted
+//   type 2 pitch   : a=wheel(0..255)     b=-1
+//   type 3 system  : a=controller(10..14) b=-1
+//   type 4 control : a=controller#       b=value
+//   type 6 end     : a=-1                b=-1
+flex drip MusEvent {
+    flex typ: i32
+    flex channel: i32
+    flex a: i32
+    flex b: i32
+    flex delay: i32
+}
+
+// scoreStart field (byte offset of the event stream from the MUS lump start).
+flex finna scoreStart(wadBuf: []u8, lumpOfs: int) -> int {
+    bet wad.rdU16(wadBuf, lumpOfs + 6)
+}
+
+// Decode the full MUS event stream in `wadBuf[lumpOfs .. lumpOfs+lumpLen]` into a
+// timed event list, stopping at (and including) the score-end event.
+flex finna decodeMus(wadBuf: []u8, lumpOfs: int, lumpLen: int) -> vec[MusEvent] {
+    lowkey events = vec.new[MusEvent]()
+    lowkey pos = lumpOfs + scoreStart(wadBuf, lumpOfs)
+    lowkey running = nocap
+    vibin running {
+        lowkey desc = wadBuf[pos] as int
+        pos = pos + 1
+        lowkey last = (desc >> 7) & 1
+        lowkey typ = (desc >> 4) & 7
+        lowkey ch = desc & 0x0F
+        lowkey a = 0 - 1
+        lowkey b = 0 - 1
+
+        fr typ == 0 {
+            a = (wadBuf[pos] as int) & 0x7F
+            pos = pos + 1
+        } naw fr typ == 1 {
+            lowkey n = wadBuf[pos] as int
+            pos = pos + 1
+            a = n & 0x7F
+            fr (n & 0x80) != 0 {
+                b = (wadBuf[pos] as int) & 0x7F
+                pos = pos + 1
+            }
+        } naw fr typ == 2 {
+            a = wadBuf[pos] as int
+            pos = pos + 1
+        } naw fr typ == 3 {
+            a = (wadBuf[pos] as int) & 0x7F
+            pos = pos + 1
+        } naw fr typ == 4 {
+            a = (wadBuf[pos] as int) & 0x7F
+            pos = pos + 1
+            b = (wadBuf[pos] as int) & 0x7F
+            pos = pos + 1
+        } naw fr typ == 6 {
+            // score end: no data bytes
+        } naw {
+            yeet("bad MUS event type")
+        }
+
+        lowkey delay = 0
+        fr typ != 6 {
+            fr last != 0 {
+                lowkey more = nocap
+                vibin more {
+                    lowkey t = wadBuf[pos] as int
+                    pos = pos + 1
+                    delay = delay * 128 + (t & 0x7F)
+                    fr (t & 0x80) == 0 {
+                        more = cap
+                    }
+                }
+            }
+        }
+
+        events.stack(MusEvent{
+            typ: typ as i32,
+            channel: ch as i32,
+            a: a as i32,
+            b: b as i32,
+            delay: delay as i32
+        })
+
+        fr typ == 6 {
+            running = cap
+        }
+    }
+    bet events
+}
+
+// ---------------- sequencer: MUS events + GENMIDI -> OPL2 ----------------
+//
+// Dynamic-voice player modelled on DMX / Chocolate Doom's i_oplmusic: 16 MUS
+// channels are mapped onto the 9 OPL voices on demand; note-on loads the GENMIDI
+// instrument's operator registers and keys the voice, note-off releases it. MUS
+// channel 15 is percussion (fixed-note GENMIDI entries 128+). Faithful, not
+// bit-exact: single-voice (voice1) only, no tremolo/vibrato LFO, +/-2-semitone
+// pitch wheel.
+//
+// THREADING (interp==compiled): the OPL chip and the sequencer's voice/channel
+// tables are mutable state. Both are value-drips (fixed arrays inside), so a
+// mutation only sticks if the value is returned and rebound. They are bundled in
+// `MusicState` and threaded through every step (`ms = applyEvent(ms, ..)`) — a
+// single-value rebind, which lowers natively (tuple-rebind of existing vars does
+// not). This `MusicState` is exactly the handle the i_music glue persists.
+
+facts PERC_CHANNEL: int = 15
+facts CTRL_PATCH: int = 0    // controller 0: instrument (patch) change
+facts CTRL_VOLUME: int = 3   // controller 3: channel volume
+
+// Voice-allocation + per-channel sequencer state (value-drip of fixed arrays).
+flex drip SeqState {
+    flex voiceCh: int[9]     // MUS channel owning each OPL voice, or -1 if free
+    flex voiceNote: int[9]   // MIDI note each OPL voice is playing
+    flex voiceAge: int[9]    // allocation timestamp (for LRU steal)
+    flex chInstr: int[16]    // current GENMIDI patch per MUS channel
+    flex chVol: int[16]      // channel volume (controller 3)
+    flex chPitch: int[16]    // pitch-wheel value (128 = centre)
+    flex age: int            // monotonic allocation counter
+}
+
+// The persistent music handle: the OPL chip + the sequencer state. Threaded
+// through the whole player; the i_music glue stores ONE of these per active song.
+flex drip MusicState {
+    flex chip: opl.OplChip
+    flex seq: SeqState
+}
+
+finna zi9() -> int[9] {
+    bet [0, 0, 0, 0, 0, 0, 0, 0, 0]
+}
+finna zi16() -> int[16] {
+    bet [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+}
+
+// Fresh sequencer state: no voices allocated, channels at default volume/pitch.
+flex finna newSeq() -> SeqState {
+    lowkey s = SeqState{
+        voiceCh: zi9(),
+        voiceNote: zi9(),
+        voiceAge: zi9(),
+        chInstr: zi16(),
+        chVol: zi16(),
+        chPitch: zi16(),
+        age: 0
+    }
+    lowkey i = 0
+    vibin i < 9 {
+        s.voiceCh[i] = 0 - 1
+        s.voiceNote[i] = 0 - 1
+        i = i + 1
+    }
+    i = 0
+    vibin i < 16 {
+        s.chVol[i] = 100
+        s.chPitch[i] = 128
+        i = i + 1
+    }
+    bet s
+}
+
+// GENMIDI instrument index for a (channel, note): percussion channel selects a
+// fixed-note entry (128 + note-35), otherwise the channel's current patch.
+finna instrIndex(s: SeqState, ch: int, note: int, numInstr: int) -> int {
+    lowkey idx = s.chInstr[ch]
+    fr ch == PERC_CHANNEL {
+        idx = 128 + (note - 35)
+    }
+    fr idx < 0 {
+        idx = 0
+    }
+    fr idx >= numInstr {
+        idx = numInstr - 1
+    }
+    bet idx
+}
+
+// Combine the instrument's carrier level with the effective note volume into a
+// 0x40 register value (KSL bits preserved, TL raised as volume drops).
+finna carrierLevel(scale: int, level: int, volume: int) -> int {
+    lowkey vol = volume
+    fr vol < 0 {
+        vol = 0
+    }
+    fr vol > 127 {
+        vol = 127
+    }
+    lowkey tl = (level & 0x3F) + ((127 - vol) * 63) / 127
+    fr tl > 63 {
+        tl = 63
+    }
+    bet (scale & 0xC0) | tl
+}
+
+// Load GENMIDI voice1 onto OPL channel `oplCh`; carrier scaled by `volume`.
+// Threads (returns) the chip.
+finna loadInstrument(chip: opl.OplChip, oplCh: int, instr: genmidi.GenMidiInstr, volume: int) -> opl.OplChip {
+    lowkey v = instr.v1
+    lowkey mo = chip.modOff[oplCh]
+    lowkey co = chip.carOff[oplCh]
+    lowkey c = opl.oplWriteReg(chip, 0x20 + mo, v.modOp.tremolo)
+    c = opl.oplWriteReg(c, 0x60 + mo, v.modOp.attack)
+    c = opl.oplWriteReg(c, 0x80 + mo, v.modOp.sustain)
+    c = opl.oplWriteReg(c, 0xE0 + mo, v.modOp.waveform)
+    c = opl.oplWriteReg(c, 0x40 + mo, (v.modOp.scale & 0xC0) | (v.modOp.level & 0x3F))
+    c = opl.oplWriteReg(c, 0x20 + co, v.carOp.tremolo)
+    c = opl.oplWriteReg(c, 0x60 + co, v.carOp.attack)
+    c = opl.oplWriteReg(c, 0x80 + co, v.carOp.sustain)
+    c = opl.oplWriteReg(c, 0xE0 + co, v.carOp.waveform)
+    c = opl.oplWriteReg(c, 0x40 + co, carrierLevel(v.carOp.scale, v.carOp.level, volume))
+    c = opl.oplWriteReg(c, 0xC0 + oplCh, v.feedback)
+    bet c
+}
+
+// Compute F-num/block for a note and write 0xA0/0xB0 (keying the voice). Threads
+// the chip.
+finna setPitch(chip: opl.OplChip, oplCh: int, note: int, instr: genmidi.GenMidiInstr, wheel: int, keyon: int) -> opl.OplChip {
+    lowkey playNote = note
+    fr (instr.flags & genmidi.FLAG_FIXED) != 0 {
+        playNote = instr.fixedNote
+    } naw {
+        lowkey off = instr.v1.noteOffset
+        fr off > 0 - 48 && off < 48 {
+            playNote = note + off
+        }
+    }
+    fr playNote < 0 {
+        playNote = 0
+    }
+    fr playNote > 95 {
+        playNote = 95
+    }
+    lowkey bend = (wheel - 128) as f64 / 64.0
+    lowkey freq = opl.midiToHz((playNote as f64) + bend)
+    lowkey block = 0
+    vibin block < 7 {
+        fr freq * opl.pow2iPub(20 - block) / 49716.0 < 1023.0 {
+            dip
+        }
+        block = block + 1
+    }
+    lowkey fnum = (freq * opl.pow2iPub(20 - block) / 49716.0) as int
+    fr fnum > 1023 {
+        fnum = 1023
+    }
+    fr fnum < 0 {
+        fnum = 0
+    }
+    lowkey c = opl.oplWriteReg(chip, 0xA0 + oplCh, fnum & 0xFF)
+    c = opl.oplWriteReg(c, 0xB0 + oplCh, (keyon << 5) | (block << 2) | ((fnum >> 8) & 3))
+    bet c
+}
+
+// Allocate an OPL voice: prefer a free one, else steal the least-recently-used.
+finna allocVoice(s: SeqState) -> int {
+    lowkey best = 0
+    lowkey bestAge = s.voiceAge[0]
+    lowkey i = 0
+    vibin i < 9 {
+        fr s.voiceCh[i] < 0 {
+            bet i
+        }
+        fr s.voiceAge[i] < bestAge {
+            bestAge = s.voiceAge[i]
+            best = i
+        }
+        i = i + 1
+    }
+    bet best
+}
+
+// Find the OPL voice currently playing (ch, note), or -1.
+finna findVoice(s: SeqState, ch: int, note: int) -> int {
+    lowkey i = 0
+    vibin i < 9 {
+        fr s.voiceCh[i] == ch && s.voiceNote[i] == note {
+            bet i
+        }
+        i = i + 1
+    }
+    bet 0 - 1
+}
+
+// Note-on: allocate a voice, load the instrument, key it. Threads MusicState.
+finna noteOn(ms: MusicState, instrs: vec[genmidi.GenMidiInstr], ch: int, note: int, vol: int) -> MusicState {
+    lowkey s = ms.seq
+    lowkey idx = instrIndex(s, ch, note, instrs.gang() as int)
+    lowkey instr = instrs[idx]
+    lowkey oplCh = allocVoice(s)
+    lowkey eff = (vol * s.chVol[ch]) / 127
+    lowkey c = loadInstrument(ms.chip, oplCh, instr, eff)
+    c = setPitch(c, oplCh, note, instr, s.chPitch[ch], 1)
+    s.voiceCh[oplCh] = ch
+    s.voiceNote[oplCh] = note
+    s.age = s.age + 1
+    s.voiceAge[oplCh] = s.age
+    bet MusicState{ chip: c, seq: s }
+}
+
+// Note-off: release the matching voice (key-clear, preserve fnum/block).
+finna noteOff(ms: MusicState, ch: int, note: int) -> MusicState {
+    lowkey s = ms.seq
+    lowkey v = findVoice(s, ch, note)
+    lowkey c = ms.chip
+    fr v >= 0 {
+        c = opl.oplWriteReg(c, 0xB0 + v, (c.chBlock[v] << 2) | ((c.chFnum[v] >> 8) & 3))
+        s.voiceCh[v] = 0 - 1
+        s.voiceNote[v] = 0 - 1
+    }
+    bet MusicState{ chip: c, seq: s }
+}
+
+// Re-pitch every voice on a MUS channel (after a pitch-wheel change).
+finna pitchAll(ms: MusicState, instrs: vec[genmidi.GenMidiInstr], ch: int) -> MusicState {
+    lowkey s = ms.seq
+    lowkey c = ms.chip
+    lowkey i = 0
+    vibin i < 9 {
+        fr s.voiceCh[i] == ch {
+            lowkey idx = instrIndex(s, ch, s.voiceNote[i], instrs.gang() as int)
+            c = setPitch(c, i, s.voiceNote[i], instrs[idx], s.chPitch[ch], 1)
+        }
+        i = i + 1
+    }
+    bet MusicState{ chip: c, seq: s }
+}
+
+// Apply one decoded MUS event. Threads MusicState.
+flex finna applyEvent(ms: MusicState, instrs: vec[genmidi.GenMidiInstr], e: MusEvent) -> MusicState {
+    lowkey typ = e.typ as int
+    lowkey ch = e.channel as int
+    lowkey a = e.a as int
+    lowkey b = e.b as int
+    fr typ == 0 {
+        bet noteOff(ms, ch, a)
+    } naw fr typ == 1 {
+        lowkey vol = b
+        fr vol < 0 {
+            vol = 100
+        }
+        bet noteOn(ms, instrs, ch, a, vol)
+    } naw fr typ == 2 {
+        lowkey s = ms.seq
+        s.chPitch[ch] = a
+        bet pitchAll(MusicState{ chip: ms.chip, seq: s }, instrs, ch)
+    } naw fr typ == 4 {
+        lowkey s = ms.seq
+        fr a == CTRL_PATCH {
+            s.chInstr[ch] = b
+        } naw fr a == CTRL_VOLUME {
+            s.chVol[ch] = b
+        }
+        bet MusicState{ chip: ms.chip, seq: s }
+    }
+    bet ms
+}
+
+// Drive `events` through the OPL chip, appending mono i16 samples to `out` until
+// score-end or `maxSamples` is reached. Returns the updated chip + samples
+// rendered. Allocates its own fresh SeqState (a one-shot whole-song render); the
+// glue that streams per-frame should instead hold a MusicState and call
+// `applyEvent` / `opl.oplRender` itself.
+flex finna musToOpl(chip: opl.OplChip, events: vec[MusEvent], instrs: vec[genmidi.GenMidiInstr], out: vec[int], rate: int, maxSamples: int) -> (opl.OplChip, int) {
+    lowkey ms = MusicState{ chip: chip, seq: newSeq() }
+    lowkey samplesPerTick = rate / 140
+    lowkey total = 0
+    lowkey i = 0
+    vibin i < (events.gang() as int) {
+        lowkey e = events[i]
+        ms = applyEvent(ms, instrs, e)
+        lowkey delay = e.delay as int
+        fr delay > 0 {
+            lowkey n = delay * samplesPerTick
+            fr total + n > maxSamples {
+                n = maxSamples - total
+            }
+            fr n > 0 {
+                lowkey c2 = opl.oplRender(ms.chip, out, n)
+                ms = MusicState{ chip: c2, seq: ms.seq }
+                total = total + n
+            }
+            fr total >= maxSamples {
+                bet ms.chip, total
+            }
+        }
+        i = i + 1
+    }
+    bet ms.chip, total
+}

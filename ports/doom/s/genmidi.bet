@@ -1,0 +1,90 @@
+// genmidi.bet — parser for the GENMIDI lump (DMX OPL instrument bank). GENMIDI
+// maps the 128 General-MIDI melodic patches plus a percussion set onto OPL2 FM
+// operator register values; the MUS sequencer loads these onto the chip on
+// note-on.
+//
+// Lump layout: 8-byte header "#OPL_II#", then N instrument records of 36 bytes,
+// then N names of 32 bytes. N = (lumpLen - 8) / (36 + 32) = 175 for the retail
+// GENMIDI. Each 36-byte record (Chocolate Doom genmidi_instr_t):
+//   0  flags        u16   bit0 = fixed pitch (percussion), bit2 = use two voices
+//   2  fineTuning   u8    second-voice detune (128 = none)
+//   3  fixedNote    u8    MIDI note used when the fixed-pitch flag is set
+//   4  voice1       16B   { modulator(6) feedback(1) carrier(6) unused(1) noteOff(i16) }
+//   20 voice2       16B   same shape
+// genmidi_op_t (6 bytes): tremolo, attack, sustain, waveform, scale, level — the
+// raw OPL register bytes for registers 0x20/0x60/0x80/0xE0 and the KSL(0x40 top
+// bits)/TL(0x40 low bits) split. `feedback` is the 0xC0 feedback/connection byte.
+pull "bytes"
+pull "wad"
+
+flex facts FLAG_FIXED: int = 0x0001
+flex facts FLAG_2VOICE: int = 0x0004
+
+// Raw OPL operator register bytes for one FM operator.
+flex drip GenMidiOp {
+    flex tremolo: int    // reg 0x20: AM | VIB | EGT | KSR | MULT
+    flex attack: int     // reg 0x60: AR<<4 | DR
+    flex sustain: int    // reg 0x80: SL<<4 | RR
+    flex waveform: int   // reg 0xE0: WS (0..3 on OPL2)
+    flex scale: int      // reg 0x40 top bits: KSL (key scale level)
+    flex level: int      // reg 0x40 low bits: TL (total level attenuation)
+}
+
+// One OPL voice: modulator + carrier + feedback byte + per-voice note offset.
+flex drip GenMidiVoice {
+    flex modOp: GenMidiOp
+    flex feedback: int   // reg 0xC0: FEEDBACK<<1 | CONNECTION
+    flex carOp: GenMidiOp
+    flex noteOffset: int // signed base-note offset added to the played MIDI note
+}
+
+// A full GENMIDI instrument (one or two voices).
+flex drip GenMidiInstr {
+    flex flags: int
+    flex fineTuning: int
+    flex fixedNote: int
+    flex v1: GenMidiVoice
+    flex v2: GenMidiVoice
+}
+
+// Read a 6-byte genmidi_op_t at `base`.
+finna readOp(buf: []u8, base: int) -> GenMidiOp {
+    bet GenMidiOp{
+        tremolo: wad.rdU8(buf, base + 0),
+        attack: wad.rdU8(buf, base + 1),
+        sustain: wad.rdU8(buf, base + 2),
+        waveform: wad.rdU8(buf, base + 3),
+        scale: wad.rdU8(buf, base + 4),
+        level: wad.rdU8(buf, base + 5)
+    }
+}
+
+// Read a 16-byte genmidi_voice_t at `base`.
+finna readVoice(buf: []u8, base: int) -> GenMidiVoice {
+    bet GenMidiVoice{
+        modOp: readOp(buf, base + 0),
+        feedback: wad.rdU8(buf, base + 6),
+        carOp: readOp(buf, base + 7),
+        noteOffset: wad.rdI16(buf, base + 14)
+    }
+}
+
+// Parse the GENMIDI lump at `wadBuf[lumpOfs..lumpOfs+lumpLen]` into instruments.
+flex finna parseGenmidi(wadBuf: []u8, lumpOfs: int, lumpLen: int) -> vec[GenMidiInstr] {
+    lowkey out = vec.new[GenMidiInstr]()
+    lowkey num = (lumpLen - 8) / 68
+    lowkey base = lumpOfs + 8
+    lowkey i = 0
+    vibin i < num {
+        lowkey rec = base + i * 36
+        out.stack(GenMidiInstr{
+            flags: wad.rdU16(wadBuf, rec + 0),
+            fineTuning: wad.rdU8(wadBuf, rec + 2),
+            fixedNote: wad.rdU8(wadBuf, rec + 3),
+            v1: readVoice(wadBuf, rec + 4),
+            v2: readVoice(wadBuf, rec + 20)
+        })
+        i = i + 1
+    }
+    bet out
+}

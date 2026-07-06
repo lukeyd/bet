@@ -1,0 +1,126 @@
+// opl_test.bet — structural unit checks for the OPL2 core (s/opl.bet).
+//   1. a keyed-on carrier produces nonzero output;
+//   2. a percussive (EGT=0) envelope decays over time;
+//   3. the rendered pitch of a note matches midiToHz within tolerance
+//      (zero-crossing frequency estimate).
+// Run:   ./target/debug/bet run ports/doom/tools/opl_test.bet
+// Build: ./target/debug/bet build ports/doom/tools/opl_test.bet --runtime real -o /tmp/opl_test
+pull "spill"
+pull "vec"
+pull "../s/opl"
+
+facts RATE: int = 44100
+
+// Set up channel `ch` as a single audible carrier sine (modulator silenced,
+// additive connection) tuned to F-number `fnum` at `block`, then key on. Threads
+// the chip.
+finna pureTone(c: opl.OplChip, ch: int, fnum: int, block: int) -> opl.OplChip {
+    lowkey mo = c.modOff[ch]
+    lowkey co = c.carOff[ch]
+    lowkey x = opl.oplWriteReg(c, 0x20 + mo, 0x21)
+    x = opl.oplWriteReg(x, 0x60 + mo, 0xF0)
+    x = opl.oplWriteReg(x, 0x80 + mo, 0x00)
+    x = opl.oplWriteReg(x, 0xE0 + mo, 0x00)
+    x = opl.oplWriteReg(x, 0x40 + mo, 0x3F)
+    x = opl.oplWriteReg(x, 0x20 + co, 0x21)
+    x = opl.oplWriteReg(x, 0x60 + co, 0xF0)
+    x = opl.oplWriteReg(x, 0x80 + co, 0x00)
+    x = opl.oplWriteReg(x, 0xE0 + co, 0x00)
+    x = opl.oplWriteReg(x, 0x40 + co, 0x00)
+    x = opl.oplWriteReg(x, 0xC0 + ch, 0x01)
+    x = opl.oplWriteReg(x, 0xA0 + ch, fnum & 0xFF)
+    x = opl.oplWriteReg(x, 0xB0 + ch, 0x20 | (block << 2) | ((fnum >> 8) & 3))
+    bet x
+}
+
+// Peak absolute amplitude over a sample window.
+finna peakRange(buf: vec[int], a: int, b: int) -> int {
+    lowkey pk = 0
+    lowkey i = a
+    vibin i < b {
+        lowkey v = buf[i]
+        fr v < 0 {
+            v = 0 - v
+        }
+        fr v > pk {
+            pk = v
+        }
+        i = i + 1
+    }
+    bet pk
+}
+
+finna main() {
+    lowkey fails = 0
+
+    // ---- test 1 + 3: A4 (MIDI 69, 440 Hz) pure tone ----
+    lowkey c = opl.oplInit(RATE)
+    lowkey block = 4
+    lowkey fnum = (440.0 * opl.pow2iPub(20 - block) / 49716.0 + 0.5) as int
+    c = pureTone(c, 0, fnum, block)
+
+    lowkey buf = vec.new[int]()
+    c = opl.oplRender(c, buf, RATE)
+
+    lowkey peak = peakRange(buf, 0, buf.gang() as int)
+    spill.f("peak amplitude = {}\n", peak)
+    fr peak < 1000 {
+        spill.it("FAIL: keyed carrier produced near-silence")
+        fails = fails + 1
+    }
+
+    lowkey start = RATE / 10
+    lowkey crossings = 0
+    lowkey i = start + 1
+    vibin i < (buf.gang() as int) {
+        fr buf[i - 1] < 0 && buf[i] >= 0 {
+            crossings = crossings + 1
+        }
+        i = i + 1
+    }
+    lowkey dur = ((buf.gang() as int - start) as f64) / (RATE as f64)
+    lowkey estHz = (crossings as f64) / dur
+    lowkey wantHz = opl.midiToHz(69.0)
+    spill.f("pitch: est {} Hz, want {} Hz\n", estHz, wantHz)
+    lowkey err = estHz - wantHz
+    fr err < 0.0 {
+        err = 0.0 - err
+    }
+    fr err > 8.0 {
+        spill.it("FAIL: pitch outside tolerance")
+        fails = fails + 1
+    }
+
+    // ---- test 2: percussive envelope decays ----
+    lowkey c2 = opl.oplInit(RATE)
+    lowkey mo = c2.modOff[1]
+    lowkey co = c2.carOff[1]
+    c2 = opl.oplWriteReg(c2, 0x20 + mo, 0x01)
+    c2 = opl.oplWriteReg(c2, 0x40 + mo, 0x3F)
+    c2 = opl.oplWriteReg(c2, 0x60 + mo, 0xF0)
+    c2 = opl.oplWriteReg(c2, 0x80 + mo, 0x00)
+    c2 = opl.oplWriteReg(c2, 0x20 + co, 0x01)
+    c2 = opl.oplWriteReg(c2, 0x40 + co, 0x00)
+    c2 = opl.oplWriteReg(c2, 0x60 + co, 0xF4)
+    c2 = opl.oplWriteReg(c2, 0x80 + co, 0xF0)
+    c2 = opl.oplWriteReg(c2, 0xE0 + co, 0x00)
+    c2 = opl.oplWriteReg(c2, 0xC0 + 1, 0x01)
+    c2 = opl.oplWriteReg(c2, 0xA0 + 1, fnum & 0xFF)
+    c2 = opl.oplWriteReg(c2, 0xB0 + 1, 0x20 | (block << 2) | ((fnum >> 8) & 3))
+
+    lowkey buf2 = vec.new[int]()
+    c2 = opl.oplRender(c2, buf2, RATE)
+    lowkey early = peakRange(buf2, RATE / 100, RATE / 50)
+    lowkey late = peakRange(buf2, RATE / 2, RATE / 2 + RATE / 50)
+    spill.f("decay: early peak {}, late peak {}\n", early, late)
+    fr late >= early {
+        spill.it("FAIL: percussive envelope did not decay")
+        fails = fails + 1
+    }
+
+    fr fails == 0 {
+        spill.it("opl_test: all checks passed")
+    } naw {
+        spill.f("opl_test: {} check(s) FAILED\n", fails)
+    }
+}

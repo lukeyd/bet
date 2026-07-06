@@ -1,0 +1,104 @@
+// mus_render.bet — the listenable proof of the DOOM music path. Opens the
+// shareware WAD, parses its directory, locates GENMIDI + D_E1M1, decodes the MUS
+// stream, synthesizes it through the OPL2 emulator, and writes a mono 16-bit WAV
+// to /tmp/doom_e1m1.wav via fs.drop. Prints sample rate, sample/byte counts and
+// the decoded event count (the interp==compiled sanity value).
+//
+//   cargo build -p driver --features llvm
+//   target/debug/bet build ports/doom/tools/mus_render.bet --runtime real -o /tmp/mus_render
+//   /tmp/mus_render                 # native
+//   target/debug/bet run ports/doom/tools/mus_render.bet   # interpreter
+pull "spill"
+pull "fs"
+pull "mem"
+pull "vec"
+pull "str"
+pull "../s/wad"
+pull "../s/genmidi"
+pull "../s/mus"
+pull "../s/opl"
+
+facts WAD: str = "/Users/lukebaggett/Documents/bet/doom-reference/doom1.wad"
+facts OUT: str = "/tmp/doom_e1m1.wav"
+facts RATE: int = 44100
+facts SECONDS: int = 10
+
+// Append little-endian integers / ASCII to a byte vec (WAV header assembly).
+finna putU32(b: vec[int], v: int) {
+    b.stack(v & 0xFF)
+    b.stack((v >> 8) & 0xFF)
+    b.stack((v >> 16) & 0xFF)
+    b.stack((v >> 24) & 0xFF)
+}
+
+finna putU16(b: vec[int], v: int) {
+    b.stack(v & 0xFF)
+    b.stack((v >> 8) & 0xFF)
+}
+
+finna putStr(b: vec[int], s: str) {
+    lowkey i = 0
+    vibin i < str.len(s) {
+        b.stack(str.at(s, i))
+        i = i + 1
+    }
+}
+
+finna main() {
+    lowkey buf = fs.peep(WAD)
+    lowkey gmOfs, gmLen = wad.findLump(buf, "GENMIDI")
+    lowkey muOfs, muLen = wad.findLump(buf, "D_E1M1")
+    fr gmOfs < 0 || muOfs < 0 {
+        spill.it("GENMIDI or D_E1M1 lump missing")
+        bet
+    }
+
+    lowkey instrs = genmidi.parseGenmidi(buf, gmOfs, gmLen)
+    lowkey events = mus.decodeMus(buf, muOfs, muLen)
+    spill.f("instruments {}  events {}\n", instrs.gang() as int, events.gang() as int)
+
+    lowkey chip = opl.oplInit(RATE)
+    lowkey pcm = vec.new[int]()
+    lowkey finalChip, rendered = mus.musToOpl(chip, events, instrs, pcm, RATE, RATE * SECONDS)
+    spill.f("rate {} Hz  samples {}\n", RATE, rendered)
+
+    // assemble a mono 16-bit PCM WAV
+    lowkey nSamples = pcm.gang() as int
+    lowkey dataSize = nSamples * 2
+    lowkey wav = vec.new[int]()
+    putStr(wav, "RIFF")
+    putU32(wav, 36 + dataSize)
+    putStr(wav, "WAVE")
+    putStr(wav, "fmt ")
+    putU32(wav, 16)
+    putU16(wav, 1)
+    putU16(wav, 1)
+    putU32(wav, RATE)
+    putU32(wav, RATE * 2)
+    putU16(wav, 2)
+    putU16(wav, 16)
+    putStr(wav, "data")
+    putU32(wav, dataSize)
+    lowkey i = 0
+    vibin i < nSamples {
+        lowkey sv = pcm[i]
+        fr sv < 0 {
+            sv = sv + 65536
+        }
+        wav.stack(sv & 0xFF)
+        wav.stack((sv >> 8) & 0xFF)
+        i = i + 1
+    }
+
+    // copy the byte vec into a []u8 (inline — the only mem.slab, written in place)
+    // and write it out.
+    lowkey n = wav.gang() as int
+    lowkey out = mem.slab[u8](n)
+    lowkey k = 0
+    vibin k < n {
+        out[k] = wav[k]
+        k = k + 1
+    }
+    lowkey ok = fs.drop(OUT, out)
+    spill.f("wrote {} : {} bytes  ok {}\n", OUT, n, ok)
+}

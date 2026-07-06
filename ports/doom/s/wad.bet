@@ -1,0 +1,73 @@
+// wad.bet — the sliver of WAD directory parsing the music path needs: locate a
+// lump by name in an in-memory WAD image. No engine dependency — the full engine
+// WAD loader is a separate W-workstream; this only does header + directory walk
+// for the music tools (genmidi + mus).
+//
+// WAD layout: 12-byte header { magic[4], numlumps u32, dirofs u32 }, then
+// `numlumps` 16-byte directory entries { filepos u32, size u32, name[8] } where
+// the name is up to 8 ASCII chars, NUL-padded.
+//
+// BUFFER TYPE: `[]u8` (the raw `fs.peep` result), read via the `bytes.*` LE
+// intrinsics + direct indexing. This lowers to O(1) native slice access. (Under
+// the tree-walking interpreter a `[]u8` rvalue index clones the slice, so a 4MB
+// WAD is slow in `bet run` but correct; the tools are normally run natively where
+// it is instant. A `vec` would be interp-cheap but building one requires `squad`,
+// which does not yet lower to native — so `[]u8` is the portable choice.)
+//
+// The `bytes.*` intrinsics return NARROW UNSIGNED ints (u16/u32); these wrappers
+// cast to signed `int` up front so callers never mix widths/signedness (which the
+// native backend rejects).
+pull "bytes"
+pull "str"
+
+// Little-endian u16 at byte offset `o`.
+flex finna rdU16(buf: []u8, o: int) -> int {
+    bet bytes.readU16le(buf, o) as int
+}
+
+// Little-endian u32 at byte offset `o`.
+flex finna rdU32(buf: []u8, o: int) -> int {
+    bet bytes.readU32le(buf, o) as int
+}
+
+// Little-endian signed i16 at byte offset `o`.
+flex finna rdI16(buf: []u8, o: int) -> int {
+    bet bytes.readI16le(buf, o) as int
+}
+
+// Single byte at offset `o` as a signed int.
+flex finna rdU8(buf: []u8, o: int) -> int {
+    bet buf[o] as int
+}
+
+// Locate `name` in the WAD directory. Returns (filepos, size) of the lump's raw
+// bytes, or (-1, -1) if not present. Compared case-sensitively against the 8-byte
+// NUL-padded field (unused trailing bytes must be 0).
+flex finna findLump(buf: []u8, name: str) -> (int, int) {
+    lowkey numlumps = rdU32(buf, 4)
+    lowkey dirofs = rdU32(buf, 8)
+    lowkey nlen = str.len(name)
+    lowkey i = 0
+    vibin i < numlumps {
+        lowkey e = dirofs + i * 16
+        lowkey match = nocap
+        lowkey j = 0
+        vibin j < 8 {
+            lowkey bi = e + 8 + j
+            lowkey got = buf[bi] as int
+            lowkey want = 0
+            fr j < nlen {
+                want = str.at(name, j)
+            }
+            fr got != want {
+                match = cap
+            }
+            j = j + 1
+        }
+        fr match {
+            bet rdU32(buf, e), rdU32(buf, e + 4)
+        }
+        i = i + 1
+    }
+    bet 0 - 1, 0 - 1
+}
