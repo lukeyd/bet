@@ -20,6 +20,12 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 
 mod bake_fb;
+mod doom;
+mod doom_coverage;
+mod doom_gen;
+mod doom_golden;
+mod doom_oracle;
+mod doom_verify;
 
 const USAGE: &str = "\
 usage: cargo xtask <command>
@@ -38,6 +44,20 @@ usage: cargo xtask <command>
   bake-frozen-bubble --src <fb-checkout> --out <path/assets.dat>
                               decode a local Frozen Bubble (GPL-2) share/ tree into one packed
                               .dat + a generated assets_gen.bet index (FB assets are not shipped)
+  doom-gen [--doom-ref P] [--check|--inventory]
+                              generate ports/doom/defs/*.bet from id's linuxdoom-1.10 tables;
+                              --check byte-diffs vs committed; --inventory writes the frozen
+                              function census ports/doom/goldens/inventory.txt
+  doom-golden-gen [--doom-ref P]
+                              build+run the committed C generators (ports/doom/goldens/gen)
+                              against the reference source -> ports/doom/goldens/*.golden
+  doom-verify --goldens | --ours F --theirs F | --demo NAME
+                              golden diff for the bet twin / sync-stream diff engine / demo run
+  doom-coverage [--doom-ref P]
+                              %ported per reference file from // PORTED: markers vs inventory
+  doom-oracle --setup | --run --demo NAME
+                              clone+patch doomgeneric (headless dump platform) / produce a
+                              demo sync stream (ports/doom/goldens/<name>.oracle.sync)
   dist                        (stub — release packaging)";
 
 fn main() -> ExitCode {
@@ -52,6 +72,11 @@ fn main() -> ExitCode {
         "corpus" => corpus(rest),
         "selfhost" => selfhost(&workspace_root()),
         "bake-frozen-bubble" => bake_fb::run(rest),
+        "doom-gen" => doom_gen::run(rest, &workspace_root()),
+        "doom-golden-gen" => doom_golden::run(rest, &workspace_root()),
+        "doom-verify" => doom_verify::run(rest, &workspace_root()),
+        "doom-coverage" => doom_coverage::run(rest, &workspace_root()),
+        "doom-oracle" => doom_oracle::run(rest, &workspace_root()),
         "dist" => stub_cmd("dist", "release-artifact packaging for the 6 targets"),
         "" => {
             eprintln!("{USAGE}");

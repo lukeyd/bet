@@ -10,6 +10,10 @@
 # Local pinned-LLVM install used by `cargo xtask setup-llvm`
 /.llvm
 
+# doomgeneric clone used by `cargo xtask doom-oracle` (lives at the MAIN checkout root,
+# outside any worktree; shared scratch, never committed)
+/doom-oracle/
+
 # Release artifacts (`cargo xtask dist`)
 /dist
 
