@@ -1,0 +1,192 @@
+pull "spill"
+pull "mem"
+pull "str"
+pull "../defs/gs" as gs
+pull "../defs/fixed" as fixed
+pull "../defs/tables" as tables
+pull "../w/w_wad" as wad
+pull "../r/r_data" as rdata
+pull "../r/r_main" as rmain
+
+flex facts FU: int = 65536
+
+flex finna hex8(v: int) -> str {
+    lowkey val = v & 4294967295
+    lowkey buf = mem.slab[u8](8)
+    lowkey i = 0
+    vibin i < 8 {
+        lowkey nib = val >> 28 - i * 4 & 15
+        fr nib < 10 {
+            buf[i] = (48 + nib) as u8
+        } naw {
+            buf[i] = (87 + nib) as u8
+        }
+        i = i + 1
+    }
+    bet str.fromBytesTrust(buf)
+}
+
+flex finna crcTable() -> []i32 {
+    lowkey tbl = mem.slab[i32](256)
+    lowkey i = 0
+    vibin i < 256 {
+        lowkey c = i
+        lowkey k = 0
+        vibin k < 8 {
+            lowkey lsb = c & 1
+            c = c >> 1
+            fr lsb != 0 {
+                c = c ^ 3988292384
+            }
+            k = k + 1
+        }
+        tbl[i] = c as i32
+        i = i + 1
+    }
+    bet tbl
+}
+
+flex finna crc32U8(tbl: []i32, t: []u8, n: int) -> int {
+    lowkey crc = 4294967295
+    lowkey i = 0
+    vibin i < n {
+        lowkey byte = t[i] as int
+        crc = crc >> 8 ^ tbl[(crc ^ byte) & 255] as int & 4294967295
+        i = i + 1
+    }
+    bet (crc ^ 4294967295) & 4294967295
+}
+
+flex finna buildSyntheticLevel(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.level.numvertexes = 4
+        g.level.numsectors = 1
+        g.level.numsides = 4
+        g.level.numlines = 4
+        g.level.numsubsectors = 1
+        g.level.numsegs = 4
+        g.level.numnodes = 0
+        g.level.vtxX = mem.slab[i32](4)
+        g.level.vtxY = mem.slab[i32](4)
+        g.level.vtxX[0] = (256 * FU) as i32
+        g.level.vtxY[0] = (0 - 256 * FU) as i32
+        g.level.vtxX[1] = (0 - 256 * FU) as i32
+        g.level.vtxY[1] = (0 - 256 * FU) as i32
+        g.level.vtxX[2] = (0 - 256 * FU) as i32
+        g.level.vtxY[2] = (256 * FU) as i32
+        g.level.vtxX[3] = (256 * FU) as i32
+        g.level.vtxY[3] = (256 * FU) as i32
+        g.level.secFloorH = mem.slab[i32](1)
+        g.level.secCeilH = mem.slab[i32](1)
+        g.level.secFloorPic = mem.slab[i32](1)
+        g.level.secCeilPic = mem.slab[i32](1)
+        g.level.secLight = mem.slab[i32](1)
+        g.level.secFloorH[0] = 0
+        g.level.secCeilH[0] = (128 * FU) as i32
+        g.level.secFloorPic[0] = 0
+        g.level.secCeilPic[0] = 0
+        g.level.secLight[0] = 192
+        g.level.sdSector = mem.slab[i32](4)
+        g.level.sdTexOfs = mem.slab[i32](4)
+        g.level.sdRowOfs = mem.slab[i32](4)
+        g.level.sdTopTex = mem.slab[i32](4)
+        g.level.sdBotTex = mem.slab[i32](4)
+        g.level.sdMidTex = mem.slab[i32](4)
+        g.level.lineV1 = mem.slab[i32](4)
+        g.level.lineV2 = mem.slab[i32](4)
+        g.level.lineFlags = mem.slab[i32](4)
+        g.level.lineSide0 = mem.slab[i32](4)
+        g.level.lineSide1 = mem.slab[i32](4)
+        g.level.lineFront = mem.slab[i32](4)
+        g.level.lineBack = mem.slab[i32](4)
+        g.level.segV1 = mem.slab[i32](4)
+        g.level.segV2 = mem.slab[i32](4)
+        g.level.segAngle = mem.slab[u32](4)
+        g.level.segOffset = mem.slab[i32](4)
+        g.level.segSide = mem.slab[i32](4)
+        g.level.segLine = mem.slab[i32](4)
+        g.level.segFront = mem.slab[i32](4)
+        g.level.segBack = mem.slab[i32](4)
+        lowkey ang = mem.slab[u32](4)
+        ang[0] = tables.ANG180
+        ang[1] = tables.ANG90
+        ang[2] = 0
+        ang[3] = tables.ANG270
+        lowkey i = 0
+        vibin i < 4 {
+            lowkey j = i + 1 & 3
+            g.level.sdSector[i] = 0
+            g.level.sdTexOfs[i] = 0
+            g.level.sdRowOfs[i] = 0
+            g.level.sdTopTex[i] = 0
+            g.level.sdBotTex[i] = 0
+            g.level.sdMidTex[i] = 1
+            g.level.lineV1[i] = i as i32
+            g.level.lineV2[i] = j as i32
+            g.level.lineFlags[i] = 0
+            g.level.lineSide0[i] = i as i32
+            g.level.lineSide1[i] = -1
+            g.level.lineFront[i] = 0
+            g.level.lineBack[i] = -1
+            g.level.segV1[i] = i as i32
+            g.level.segV2[i] = j as i32
+            g.level.segAngle[i] = ang[i]
+            g.level.segOffset[i] = 0
+            g.level.segSide[i] = i as i32
+            g.level.segLine[i] = i as i32
+            g.level.segFront[i] = 0
+            g.level.segBack[i] = -1
+            i = i + 1
+        }
+        g.level.ssSector = mem.slab[i32](1)
+        g.level.ssNumLines = mem.slab[i32](1)
+        g.level.ssFirstLine = mem.slab[i32](1)
+        g.level.ssSector[0] = 0
+        g.level.ssNumLines[0] = 4
+        g.level.ssFirstLine[0] = 0
+        g.render.skyflatnum = 99
+        g.render.viewx = 0
+        g.render.viewy = 0
+        g.render.viewz = (41 * FU) as i32
+        g.render.viewangle = 0
+        g.render.extralight = 0
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+finna main() {
+    lowkey g0 = cop gs.GameState{} in gs.gsc
+    gs.gsInit(g0)
+    holla g = g0 in gs.gsc {
+        g.info.finesine = tables.initFinesineAll(g.info.finesine)
+        g.info.finetangent = tables.initFinetangentAll(g.info.finetangent)
+        g.info.tantoangle = tables.initTantoangleAll(g.info.tantoangle)
+    } ghosted {
+        yeet("gs")
+    }
+    wad.initWad(g0, "/Users/lukebaggett/Documents/bet/doom-reference/doom1.wad")
+    rmain.rInit(g0)
+    buildSyntheticLevel(g0)
+    rmain.renderPlayerView(g0, 0)
+    lowkey numTex = 0
+    lowkey nonzero = 0
+    lowkey crc = 0
+    lowkey ctab = crcTable()
+    holla g = g0 in gs.gsc {
+        numTex = g.render.numTextures as int
+        lowkey i = 0
+        vibin i < 64000 {
+            fr g.vid.scr0[i] as int != 0 {
+                nonzero = nonzero + 1
+            }
+            i = i + 1
+        }
+        crc = crc32U8(ctab, g.vid.scr0, 64000)
+    } ghosted {
+        yeet("gs")
+    }
+    spill.f("numTextures={}\n", numTex)
+    spill.f("scr0NonzeroPixels={}\n", nonzero)
+    spill.f("scr0Crc=0x{}\n", hex8(crc))
+}
