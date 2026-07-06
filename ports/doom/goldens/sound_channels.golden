@@ -1,0 +1,74 @@
+DS* SFX lumps present: 55 of 109
+DSPISTOL: rate=11025 sampleCount=5661 sfxLenTics=17
+== A filled 8x PSTART(pri100) ==
+  ch0 sfxId=18 voice=0 endRel=26
+  ch1 sfxId=18 voice=0 endRel=26
+  ch2 sfxId=18 voice=0 endRel=26
+  ch3 sfxId=18 voice=0 endRel=26
+  ch4 sfxId=18 voice=0 endRel=26
+  ch5 sfxId=18 voice=0 endRel=26
+  ch6 sfxId=18 voice=0 endRel=26
+  ch7 sfxId=18 voice=0 endRel=26
+== B PLDETH(pri32) steals ch0 ==
+  ch0 sfxId=57 voice=0 endRel=34
+  ch1 sfxId=18 voice=0 endRel=26
+  ch2 sfxId=18 voice=0 endRel=26
+  ch3 sfxId=18 voice=0 endRel=26
+  ch4 sfxId=18 voice=0 endRel=26
+  ch5 sfxId=18 voice=0 endRel=26
+  ch6 sfxId=18 voice=0 endRel=26
+  ch7 sfxId=18 voice=0 endRel=26
+== C SHOTGN reuses origin3's ch3 ==
+  ch0 sfxId=57 voice=0 endRel=34
+  ch1 sfxId=18 voice=0 endRel=26
+  ch2 sfxId=18 voice=0 endRel=26
+  ch3 sfxId=2 voice=0 endRel=29
+  ch4 sfxId=18 voice=0 endRel=26
+  ch5 sfxId=18 voice=0 endRel=26
+  ch6 sfxId=18 voice=0 endRel=26
+  ch7 sfxId=18 voice=0 endRel=26
+== D stopSound(origin5) frees ch5 ==
+  ch0 sfxId=57 voice=0 endRel=34
+  ch1 sfxId=18 voice=0 endRel=26
+  ch2 sfxId=18 voice=0 endRel=26
+  ch3 sfxId=2 voice=0 endRel=29
+  ch4 sfxId=18 voice=0 endRel=26
+  ch5 sfxId=0 voice=0 endRel=0
+  ch6 sfxId=18 voice=0 endRel=26
+  ch7 sfxId=18 voice=0 endRel=26
+== E ITEMUP takes freed ch5 ==
+  ch0 sfxId=57 voice=0 endRel=34
+  ch1 sfxId=18 voice=0 endRel=26
+  ch2 sfxId=18 voice=0 endRel=26
+  ch3 sfxId=2 voice=0 endRel=29
+  ch4 sfxId=18 voice=0 endRel=26
+  ch5 sfxId=32 voice=0 endRel=7
+  ch6 sfxId=18 voice=0 endRel=26
+  ch7 sfxId=18 voice=0 endRel=26
+== F after updateSounds at gametic=100000 (all finished) ==
+  ch0 sfxId=0 voice=0 endRel=0
+  ch1 sfxId=0 voice=0 endRel=0
+  ch2 sfxId=0 voice=0 endRel=0
+  ch3 sfxId=0 voice=0 endRel=0
+  ch4 sfxId=0 voice=0 endRel=0
+  ch5 sfxId=0 voice=0 endRel=0
+  ch6 sfxId=0 voice=0 endRel=0
+  ch7 sfxId=0 voice=0 endRel=0
+== G filled 8x PLDETH(pri32) ==
+  ch0 sfxId=57 voice=0 endRel=34
+  ch1 sfxId=57 voice=0 endRel=34
+  ch2 sfxId=57 voice=0 endRel=34
+  ch3 sfxId=57 voice=0 endRel=34
+  ch4 sfxId=57 voice=0 endRel=34
+  ch5 sfxId=57 voice=0 endRel=34
+  ch6 sfxId=57 voice=0 endRel=34
+  ch7 sfxId=57 voice=0 endRel=34
+== G PSTART(pri100) dropped (no steal, unchanged) ==
+  ch0 sfxId=57 voice=0 endRel=34
+  ch1 sfxId=57 voice=0 endRel=34
+  ch2 sfxId=57 voice=0 endRel=34
+  ch3 sfxId=57 voice=0 endRel=34
+  ch4 sfxId=57 voice=0 endRel=34
+  ch5 sfxId=57 voice=0 endRel=34
+  ch6 sfxId=57 voice=0 endRel=34
+  ch7 sfxId=57 voice=0 endRel=34

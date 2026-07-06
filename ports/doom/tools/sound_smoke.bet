@@ -1,0 +1,204 @@
+// tools/sound_smoke.bet — the P1.3 SOUND proof. Cops a GameState, fills the data tables, loads
+// the shareware IWAD, runs i_sound.initSound (registers every present DS* lump with gg), reports
+// the load stats + DSPISTOL header, then drives a SCRIPTED s_sound channel-allocation sequence
+// and dumps the per-channel {sfxId, voice, endRel} decisions after each step. The channel
+// decisions are DETERMINISTIC given the scripted input (no C oracle — this is a self-consistency
+// regression baseline committed as goldens/sound_channels.golden).
+//
+// Build+run NATIVE (headless — gg.sound/play/tune are no-ops returning 0/valid; the CHANNEL
+// LOGIC still runs and is what's under test):
+//   cargo build -p driver --features llvm && cargo build -p runtime --features gg-desktop
+//   bet build ports/doom/tools/sound_smoke.bet --runtime real -o /tmp/sound_smoke
+//   BET_GG_HEADLESS=1 /tmp/sound_smoke
+//
+// A windowed run (actually audible — plays real DSPISTOL etc.) drops BET_GG_HEADLESS:
+//   /tmp/sound_smoke      (manual audible check; the scripted sounds fire during setup)
+//
+// NATIVE-ONLY: initSound walks the multi-MB WAD; the interpreter clones arrays per element read
+// (CONTRACTS "Native-first"), so this is not a `bet run` target.
+pull "spill"
+pull "mem"
+pull "vec"
+pull "../defs/gs" as gs
+pull "../defs/sounds" as sounds
+pull "../defs/think" as think
+pull "../defs/tables" as tables
+pull "../util/m_random" as rnd
+pull "../util/bstream" as bstream
+pull "../w/w_wad" as w
+pull "../i/i_sound" as isnd
+pull "../s/s_sound" as ss
+
+// printChannels — dump the 8 mixing channels as {sfxId, voice, endRel} where endRel = endTick -
+// gametic (0 for a free channel). endRel of a just-started sound == its sfxLenTics.
+flex finna printChannels(gt: tag gs.GameState, label: str) {
+    spill.f("== {} ==\n", label)
+    holla g = gt in gs.gsc {
+        lowkey gametic = g.shell.gametic as i64
+        lowkey i = 0
+        vibin i < 8 {
+            lowkey sid = g.sound.channels[i].sfxId as int
+            lowkey v = g.sound.channels[i].voice as int
+            lowkey rel = 0
+            fr sid != 0 {
+                rel = (g.sound.channels[i].endTick - gametic) as int
+            }
+            spill.f("  ch{} sfxId={} voice={} endRel={}\n", i, sid, v, rel)
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+finna main() {
+    lowkey g0 = cop gs.GameState{} in gs.gsc
+    gs.gsInit(g0)
+
+    // Fill the generated data tables the sound engine reads (sfx rows, finesine + tantoangle for
+    // attenuation) and the RNG table (pitch jitter).
+    holla g = g0 in gs.gsc {
+        sounds.initSfxAll(g.info.sfx)
+        g.info.finesine = tables.initFinesineAll(g.info.finesine)
+        g.info.tantoangle = tables.initTantoangleAll(g.info.tantoangle)
+        g.tick.rndtable = rnd.initRndtable(g.tick.rndtable)
+    } ghosted {
+        yeet("gs")
+    }
+    rnd.clearRandom(g0)
+
+    // Load the IWAD and pre-cache all SFX (the native-only heavy step).
+    w.initWad(g0, "/Users/lukebaggett/Documents/bet/doom-reference/doom1.wad")
+    isnd.initSound(g0)
+
+    // ---- load stats: how many of the NUMSFX sounds have a present DS* lump ----
+    lowkey loaded = 0
+    lowkey i = 1
+    vibin i < sounds.NUMSFX {
+        lowkey name = ""
+        lowkey link = -1
+        holla g = g0 in gs.gsc {
+            name = g.info.sfx[i].name
+            link = g.info.sfx[i].link as int
+        } ghosted {
+            yeet("gs")
+        }
+        fr link == -1 && w.checkNumForName(g0, isnd.dsName(name)) != -1 {
+            loaded = loaded + 1
+        }
+        i = i + 1
+    }
+    spill.f("DS* SFX lumps present: {} of {}\n", loaded, sounds.NUMSFX as int)
+
+    // ---- DSPISTOL header + computed tic length ----
+    lowkey plump = w.getNumForName(g0, "DSPISTOL")
+    lowkey pofs = w.lumpNum(g0, plump)
+    lowkey prate = 0
+    lowkey pcount = 0
+    lowkey ptics = 0
+    holla g = g0 in gs.gsc {
+        prate = bstream.rdU16(g.wad.buf, pofs + 2)
+        pcount = bstream.rdU32(g.wad.buf, pofs + 4)
+        ptics = g.sound.sfxLenTics[sounds.SFX_PISTOL] as int
+    } ghosted {
+        yeet("gs")
+    }
+    spill.f("DSPISTOL: rate={} sampleCount={} sfxLenTics={}\n", prate, pcount, ptics)
+
+    // ==========================================================================================
+    // scripted channel-allocation trace
+    // ==========================================================================================
+    // Init the engine: max volume, all channels free. Fix gametic so endRel == sfxLenTics for a
+    // freshly started sound.
+    ss.sInit(g0, 127, 127)
+    holla g = g0 in gs.gsc {
+        g.shell.consoleplayer = 0
+        g.shell.gametic = 100
+    } ghosted {
+        yeet("gs")
+    }
+
+    // The listener (player mobj) at the origin, facing east; register it as players[0].mo.
+    lowkey listener = cop think.Thinker{ funcId: think.FUNC_MOBJ } in gs.thinkers
+    holla lm = listener in gs.thinkers {
+        lm.mobj.x = 0
+        lm.mobj.y = 0
+        lm.mobj.angle = 0
+    } ghosted {
+        yeet("l")
+    }
+    holla g = g0 in gs.gsc {
+        g.shell.players[0].mo = listener
+    } ghosted {
+        yeet("gs")
+    }
+
+    // Ten distinct sound origins, all within S_CLOSE_DIST of the listener (so every sound is
+    // audible at full volume — the channel decisions, not attenuation, are what we trace).
+    lowkey origins = vec.new[tag think.Thinker]()
+    lowkey k = 0
+    vibin k < 10 {
+        lowkey o = cop think.Thinker{ funcId: think.FUNC_MOBJ } in gs.thinkers
+        holla om = o in gs.thinkers {
+            om.mobj.x = (k * 8 * 65536) as i32   // k*8 map units east; k*8 <= 72 < 160 (close)
+            om.mobj.y = 0
+        } ghosted {
+            yeet("o")
+        }
+        origins.stack(o)
+        k = k + 1
+    }
+
+    // Phase A — fill all 8 channels with SFX_PSTART (priority 100, low importance) on 8 origins.
+    lowkey a = 0
+    vibin a < 8 {
+        ss.startSound(g0, origins[a], sounds.SFX_PSTART)
+        a = a + 1
+    }
+    printChannels(g0, "A filled 8x PSTART(pri100)")
+
+    // Phase B — SFX_PLDETH (priority 32, important) on a 9th origin: no free channel, so the
+    // priority scan steals ch0 (100 >= 32).
+    ss.startSound(g0, origins[8], sounds.SFX_PLDETH)
+    printChannels(g0, "B PLDETH(pri32) steals ch0")
+
+    // Phase C — SFX_SHOTGN on origin[3] (already owns ch3): startSound stops that origin's channel
+    // first, then re-allocates it — the sound count stays 8, ch3 changes sfx.
+    ss.startSound(g0, origins[3], sounds.SFX_SHOTGN)
+    printChannels(g0, "C SHOTGN reuses origin3's ch3")
+
+    // Phase D — stop the sound at origin[5]: its channel frees.
+    ss.stopSound(g0, origins[5])
+    printChannels(g0, "D stopSound(origin5) frees ch5")
+
+    // Phase E — SFX_ITEMUP on a fresh origin[9]: takes the first free channel (ch5).
+    ss.startSound(g0, origins[9], sounds.SFX_ITEMUP)
+    printChannels(g0, "E ITEMUP takes freed ch5")
+
+    // Phase F — advance gametic far past every endTick and updateSounds: all finished sounds free.
+    holla g = g0 in gs.gsc {
+        g.shell.gametic = 100000
+    } ghosted {
+        yeet("gs")
+    }
+    ss.updateSounds(g0, listener)
+    printChannels(g0, "F after updateSounds at gametic=100000 (all finished)")
+
+    // Phase G — the "no lower priority" drop: fill all 8 with PLDETH (pri32, most important) then
+    // try PSTART (pri100) — getChannel finds nothing to steal and returns -1; the sound is
+    // dropped (channel set unchanged).
+    ss.sInit(g0, 127, 127)
+    holla g = g0 in gs.gsc {
+        g.shell.gametic = 200
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey b = 0
+    vibin b < 8 {
+        ss.startSound(g0, origins[b], sounds.SFX_PLDETH)
+        b = b + 1
+    }
+    printChannels(g0, "G filled 8x PLDETH(pri32)")
+    ss.startSound(g0, origins[8], sounds.SFX_PSTART)
+    printChannels(g0, "G PSTART(pri100) dropped (no steal, unchanged)")
+}
