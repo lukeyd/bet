@@ -1,0 +1,80 @@
+// wad.bet — the sliver of WAD directory parsing the music path needs: load a WAD
+// into a byte buffer and locate lumps by name. No engine dependency — the full
+// engine WAD loader is a separate W-workstream; this only does header + directory
+// walk for the music tools (genmidi + mus).
+//
+// WAD layout: 12-byte header { magic[4], numlumps u32, dirofs u32 }, then
+// `numlumps` 16-byte directory entries { filepos u32, size u32, name[8] } where
+// the name is up to 8 ASCII chars, NUL-padded.
+//
+// BYTE-BUFFER REPRESENTATION: the buffer is a `vec[int]` (one int per byte), NOT
+// a `[]u8`. This is deliberate and load-bearing for interp==compiled parity: the
+// tree-walking interpreter clones a whole `[]u8`/`mem.slab` on every rvalue index
+// (Value::Array is not shared), which makes a 4MB WAD unusable under `bet run`.
+// A `vec` is an Rc-backed shared handle, so indexing and passing it are cheap in
+// BOTH the interpreter and native code — the only representation that keeps the
+// two paths fast and identical. The one `[]u8` cost (the `fs.peep` result) is paid
+// exactly once in `loadWad`, then never indexed again.
+pull "fs"
+pull "str"
+
+// Read a WAD file and return its bytes as a `vec[int]`. The single `[]u8`->`vec`
+// copy here is the only place the raw slice is iterated (via `squad`, one clone).
+flex finna loadWad(path: str) -> vec[int] {
+    lowkey raw = fs.peep(path)
+    lowkey buf = vec.new[int]()
+    squad b in raw {
+        buf.stack(b as int)
+    }
+    bet buf
+}
+
+// Little-endian u16 at byte offset `o`.
+flex finna rdU16(buf: vec[int], o: int) -> int {
+    bet buf[o] | (buf[o + 1] << 8)
+}
+
+// Little-endian u32 at byte offset `o`.
+flex finna rdU32(buf: vec[int], o: int) -> int {
+    bet buf[o] | (buf[o + 1] << 8) | (buf[o + 2] << 16) | (buf[o + 3] << 24)
+}
+
+// Little-endian signed i16 at byte offset `o`.
+flex finna rdI16(buf: vec[int], o: int) -> int {
+    lowkey v = buf[o] | (buf[o + 1] << 8)
+    fr v >= 32768 {
+        v = v - 65536
+    }
+    bet v
+}
+
+// Locate `name` in the WAD directory. Returns (filepos, size) of the lump's raw
+// bytes, or (-1, -1) if not present. Compared case-sensitively against the 8-byte
+// NUL-padded field (unused trailing bytes must be 0).
+flex finna findLump(buf: vec[int], name: str) -> (int, int) {
+    lowkey numlumps = rdU32(buf, 4)
+    lowkey dirofs = rdU32(buf, 8)
+    lowkey nlen = str.len(name)
+    lowkey i = 0
+    vibin i < numlumps {
+        lowkey e = dirofs + i * 16
+        lowkey match = nocap
+        lowkey j = 0
+        vibin j < 8 {
+            lowkey got = buf[e + 8 + j]
+            lowkey want = 0
+            fr j < nlen {
+                want = str.at(name, j)
+            }
+            fr got != want {
+                match = cap
+            }
+            j = j + 1
+        }
+        fr match {
+            bet rdU32(buf, e), rdU32(buf, e + 4)
+        }
+        i = i + 1
+    }
+    bet 0 - 1, 0 - 1
+}

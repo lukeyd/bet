@@ -1,0 +1,30 @@
+// mus_golden.bet — the bet twin of goldens/gen/gen_mus.c. Opens the shareware WAD,
+// finds D_E1M1, decodes the MUS stream with `mus.decodeMus`, and prints the exact
+// same five-column stream (<tick> <type> <ch> <a> <b>) so it can be diffed against
+// ports/doom/goldens/mus_e1m1.golden for a byte-identical match.
+//
+//   ./target/debug/bet run ports/doom/tools/mus_golden.bet > /tmp/mus_bet.txt
+//   diff /tmp/mus_bet.txt ports/doom/goldens/mus_e1m1.golden && echo MATCH
+pull "spill"
+pull "../s/wad"
+pull "../s/mus"
+
+facts WAD: str = "/Users/lukebaggett/Documents/bet/doom-reference/doom1.wad"
+
+finna main() {
+    lowkey buf = wad.loadWad(WAD)
+    lowkey ofs, len = wad.findLump(buf, "D_E1M1")
+    fr ofs < 0 {
+        spill.it("D_E1M1 not found")
+        bet
+    }
+    lowkey events = mus.decodeMus(buf, ofs, len)
+    lowkey tick = 0
+    lowkey i = 0
+    vibin i < events.gang() {
+        lowkey e = events[i]
+        spill.f("{} {} {} {} {}\n", tick, e.typ as int, e.channel as int, e.a as int, e.b as int)
+        tick = tick + (e.delay as int)
+        i = i + 1
+    }
+}

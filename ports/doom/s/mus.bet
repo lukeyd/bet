@@ -1,0 +1,112 @@
+// mus.bet — the DMX MUS format: a deterministic byte decoder plus the sequencer
+// that drives GENMIDI instruments onto an OPL2 chip at the DOOM 140Hz tick rate.
+//
+// MUS header (16 bytes): "MUS\x1a", scoreLen u16, scoreStart u16, channels u16,
+// secChannels u16, instrCount u16, dummy u16, then instrCount instrument-patch
+// u16's. The event stream begins at `scoreStart` (bytes from lump start).
+//
+// Event descriptor byte: bit7 = "last" (a variable-length time delay follows),
+// bits6-4 = type, bits3-0 = channel. Types: 0 release, 1 play(+opt volume),
+// 2 pitch-wheel, 3 system(channel-mode), 4 controller, 6 score-end. The delay is
+// 7-bit groups, MSB = continue, measured in 140Hz ticks.
+//
+// `decodeMus` is a PURE decode — no synthesis, no allocation beyond the event
+// vec — so its output is bit-for-bit reproducible and is checked against a
+// standalone C golden (goldens/gen/gen_mus.c -> goldens/mus_e1m1.golden).
+pull "wad"
+
+// One decoded MUS event. `delay` is the number of 140Hz ticks AFTER this event
+// before the next one fires (0 unless the descriptor's "last" bit was set). `a`
+// and `b` are the raw data bytes, or -1 when the event carries none.
+//   type 0 release : a=note              b=-1
+//   type 1 play    : a=note(0..127)      b=volume(0..127) or -1 if omitted
+//   type 2 pitch   : a=wheel(0..255)     b=-1
+//   type 3 system  : a=controller(10..14) b=-1
+//   type 4 control : a=controller#       b=value
+//   type 6 end     : a=-1                b=-1
+flex drip MusEvent {
+    flex typ: i32
+    flex channel: i32
+    flex a: i32
+    flex b: i32
+    flex delay: i32
+}
+
+// scoreStart field (byte offset of the event stream from the MUS lump start).
+flex finna scoreStart(wadBuf: vec[int], lumpOfs: int) -> int {
+    bet wad.rdU16(wadBuf, lumpOfs + 6)
+}
+
+// Decode the full MUS event stream in `wadBuf[lumpOfs .. lumpOfs+lumpLen]` into a
+// timed event list, stopping at (and including) the score-end event. `wadBuf` is
+// a `vec[int]` of WAD bytes (see wad.bet on why not `[]u8`).
+flex finna decodeMus(wadBuf: vec[int], lumpOfs: int, lumpLen: int) -> vec[MusEvent] {
+    lowkey events = vec.new[MusEvent]()
+    lowkey pos = lumpOfs + scoreStart(wadBuf, lumpOfs)
+    lowkey running = nocap
+    vibin running {
+        lowkey desc = wadBuf[pos]
+        pos = pos + 1
+        lowkey last = (desc >> 7) & 1
+        lowkey typ = (desc >> 4) & 7
+        lowkey ch = desc & 0x0F
+        lowkey a = 0 - 1
+        lowkey b = 0 - 1
+
+        fr typ == 0 {
+            a = (wadBuf[pos]) & 0x7F
+            pos = pos + 1
+        } naw fr typ == 1 {
+            lowkey n = wadBuf[pos]
+            pos = pos + 1
+            a = n & 0x7F
+            fr (n & 0x80) != 0 {
+                b = (wadBuf[pos]) & 0x7F
+                pos = pos + 1
+            }
+        } naw fr typ == 2 {
+            a = wadBuf[pos]
+            pos = pos + 1
+        } naw fr typ == 3 {
+            a = (wadBuf[pos]) & 0x7F
+            pos = pos + 1
+        } naw fr typ == 4 {
+            a = (wadBuf[pos]) & 0x7F
+            pos = pos + 1
+            b = (wadBuf[pos]) & 0x7F
+            pos = pos + 1
+        } naw fr typ == 6 {
+            // score end: no data bytes
+        } naw {
+            yeet("bad MUS event type")
+        }
+
+        lowkey delay = 0
+        fr typ != 6 {
+            fr last != 0 {
+                lowkey more = nocap
+                vibin more {
+                    lowkey t = wadBuf[pos]
+                    pos = pos + 1
+                    delay = delay * 128 + (t & 0x7F)
+                    fr (t & 0x80) == 0 {
+                        more = cap
+                    }
+                }
+            }
+        }
+
+        events.stack(MusEvent{
+            typ: typ as i32,
+            channel: ch as i32,
+            a: a as i32,
+            b: b as i32,
+            delay: delay as i32
+        })
+
+        fr typ == 6 {
+            running = cap
+        }
+    }
+    bet events
+}
