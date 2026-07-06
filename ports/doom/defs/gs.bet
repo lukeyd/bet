@@ -510,6 +510,13 @@ flex drip TickState {
 
 // ---- GameShell: the D_DoomMain/G_Game/doomstat.h globals — game/level flags, players. -----
 flex drip GameShell {
+    // --- P1.2 (i/i_system + i/i_video) CONTRACTS amendment: two system-level fields with no
+    // doomstat.h home. `baseTick` is I_GetTime's `static int basetime` (the gg.ticks() base
+    // captured by initTime; getTime returns tics since it). `quitRequested` is set by
+    // i_video.startTic on a gg QUIT (window close) — the main loop returns when it is set
+    // (I_Quit has no D_PostEvent analog on gg). Both are additive; no existing path changes. ---
+    flex baseTick: i64           // I_InitTime base (gg.ticks() ns at init)
+    flex quitRequested: bool     // gg window-close latched; main loop exits when true
     flex gamestate: i32          // GS_*
     flex gameaction: i32         // GA_*
     flex gametic: i32            // canonical game tic counter

@@ -1,0 +1,64 @@
+// i/i_system.bet — the i_system.c seam on the gg platform: the game clock (I_GetTime), the
+// fatal-error path (I_Error), and VBL pacing (I_WaitVBL). Timing is derived from gg.ticks()
+// (a monotonic nanosecond counter) instead of gettimeofday.
+//
+// PORTED:  I_InitTime(new)/I_GetTime, I_Error, I_WaitVBL.
+// SKIPPED: I_ZoneBase/I_AllocLow/I_GetHeapSize (no zone allocator — bet arenas/slabs),
+//          I_Quit/I_Init/I_BaseTiccmd/I_Tactile/I_BeginRead/I_EndRead (quit is a flag the
+//          main loop honors; no DMX/zone/tactile hardware on gg).
+//
+// baseTick lives in g.shell.baseTick (a P1.2 CONTRACTS amendment to GameShell — see gs.bet):
+// i_system.c's `static int basetime` inside I_GetTime, rehomed into GameState so getTime is a
+// pure function of state + the monotonic clock.
+pull "spill"
+pull "../defs/gs" as gs
+
+// TICRATE — 35 tics/sec (doomdef.TICRATE); kept local so callers needn't pull doomdef.
+flex facts TICRATE: int = 35
+
+// initTime — capture the monotonic base (I_GetTime's lazy `basetime` init, done eagerly).
+// Call once at startup before the first getTime.
+flex finna initTime(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.shell.baseTick = gg.ticks()
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// getTime — I_GetTime: elapsed 1/35s tics since initTime. gg.ticks() is nanoseconds, so
+// tics = (now - base) * 35 / 1e9. The multiply is done in i64 BEFORE the divide (matching id's
+// `(sec-base)*TICRATE + usec*TICRATE/1e6` intent) so sub-second resolution isn't lost.
+flex finna getTime(gt: tag gs.GameState) -> int {
+    lowkey tics = 0
+    holla g = gt in gs.gsc {
+        lowkey now = gg.ticks()
+        lowkey elapsed = now - g.shell.baseTick
+        tics = elapsed * TICRATE / 1000000000
+    } ghosted {
+        yeet("gs")
+    }
+    bet tics
+}
+
+// iError — I_Error: print the message then abort. No GameState needed (id's I_Error is a bare
+// varargs abort); `yeet` is bet's fatal unwind, standing in for fprintf(stderr)+exit(-1).
+flex finna iError(msg: str) {
+    spill.f("Error: {}\n", msg)   // spill.f, not `"..." + msg`: native has no str `+` operator
+    yeet("I_Error")               // native `yeet` needs a literal; the detail went to stderr above
+}
+
+// waitVBL — I_WaitVBL: busy-wait `count` vertical-blank periods. A VBL is 1/70s (usleep in
+// id was count*(1e6/70) microseconds), so we spin until gg.ticks() advances count/70 seconds.
+// Pacing is normally done at the frame level (finishUpdate / the main loop), so this is here
+// only for the few call sites (I_InitSound stall, screen-wipe) that pace at VBL granularity.
+flex finna waitVBL(gt: tag gs.GameState, count: int) {
+    lowkey target = 0
+    holla g = gt in gs.gsc {
+        target = gg.ticks() + count * 1000000000 / 70
+    } ghosted {
+        yeet("gs")
+    }
+    vibin gg.ticks() < target {
+    }
+}

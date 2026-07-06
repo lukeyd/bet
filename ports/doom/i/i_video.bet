@@ -1,0 +1,188 @@
+// i/i_video.bet — the i_video.c seam translated from X11 to the gg platform. Owns the present
+// buffer + palette, the palette→XRGB build (I_SetPalette), the scr0→framebuffer present
+// (I_FinishUpdate), and the input pump (I_StartTic: gg events → DOOM event ring).
+//
+// ALLOCATION OWNERSHIP: initGraphics owns g.vid.fb (u32 present buffer) + g.vid.pal (256 XRGB),
+// and calls v_video.vInit which owns the five 8-bit screens. (gsInit pre-allocates all of them;
+// these re-assert the sizing each subsystem owns.)
+//
+// PORTED:  I_InitGraphics(→gg), I_SetPalette(PLAYPAL×gamma→XRGB), I_FinishUpdate(expand+present),
+//          I_StartTic(gg.poll→xlatekey→D_PostEvent + mouse), D_PostEvent.
+// SKIPPED: the X11/SHM/Expand2/4 machinery, I_ReadScreen, I_UpdateNoBlit, I_StartFrame,
+//          I_ShutdownGraphics (gg owns the window; present is gg.show; no SHM).
+pull "mem"
+pull "../defs/gs" as gs
+pull "../defs/doomdef" as doomdef
+pull "../defs/event" as event
+pull "../util/bstream" as bstream
+pull "../w/w_wad" as w
+pull "../v/v_video" as v
+
+// gg event kinds (from the gg contract): NONE=0 KEY_DOWN=1 KEY_UP=2 MOUSE_MOVE=3 QUIT=4
+// MOUSE_DOWN=5 MOUSE_UP=6.
+flex facts GG_NONE: int = 0
+flex facts GG_KEYDOWN: int = 1
+flex facts GG_KEYUP: int = 2
+flex facts GG_QUIT: int = 4
+flex facts GG_MOUSEDOWN: int = 5
+flex facts GG_MOUSEUP: int = 6
+
+// initGraphics — I_InitGraphics on gg: screens (via v_video), plus the u32 present buffer and
+// the 256-entry XRGB palette. No window/visual/colormap setup (gg owns the window).
+flex finna initGraphics(gt: tag gs.GameState) {
+    v.vInit(gt)
+    holla g = gt in gs.gsc {
+        g.vid.fb = mem.slab[u32](64000)
+        g.vid.pal = mem.slab[u32](256)
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// xlateKey — the gg-keycode → DOOM-keycode map (i_video.c xlatekey's intent on gg codes).
+// Letters lowercase (gg 'A'=65 → DOOM 'a'=97); digits/space/most punctuation pass through
+// (their gg code == DOOM's ASCII code); the named keys map to DOOM's KEY_* (doomdef.bet).
+flex finna xlateKey(code: int) -> int {
+    fr code >= 65 && code <= 90 {
+        bet code + 32                 // A-Z -> a-z (DOOM stores lowercase ASCII)
+    }
+    fr code == 10 {
+        bet doomdef.KEY_ENTER         // gg ENTER 10 -> 13
+    }
+    fr code == 27 {
+        bet doomdef.KEY_ESCAPE        // 27
+    }
+    fr code == 9 {
+        bet doomdef.KEY_TAB           // 9
+    }
+    fr code == 8 {
+        bet doomdef.KEY_BACKSPACE     // gg BACKSPACE 8 -> 127
+    }
+    fr code == 256 {
+        bet doomdef.KEY_UPARROW
+    }
+    fr code == 257 {
+        bet doomdef.KEY_DOWNARROW
+    }
+    fr code == 258 {
+        bet doomdef.KEY_LEFTARROW
+    }
+    fr code == 259 {
+        bet doomdef.KEY_RIGHTARROW
+    }
+    fr code == 260 || code == 261 {
+        bet doomdef.KEY_RCTRL         // L/R CTRL -> KEY_RCTRL (fire)
+    }
+    fr code == 262 || code == 263 {
+        bet doomdef.KEY_RSHIFT        // L/R SHIFT -> KEY_RSHIFT (run)
+    }
+    fr code == 264 || code == 265 {
+        bet doomdef.KEY_RALT          // L/R ALT -> KEY_RALT (strafe)
+    }
+    fr code == 266 {
+        bet doomdef.KEY_PAUSE
+    }
+    fr code == 45 {
+        bet doomdef.KEY_MINUS
+    }
+    fr code == 61 {
+        bet doomdef.KEY_EQUALS
+    }
+    fr code >= 280 && code <= 289 {
+        bet doomdef.KEY_F1 + (code - 280)  // F1..F10 are contiguous 0xbb..0xc4
+    }
+    fr code == 290 {
+        bet doomdef.KEY_F11           // 0xd7 (not contiguous with F10)
+    }
+    fr code == 291 {
+        bet doomdef.KEY_F12           // 0xd8
+    }
+    bet code                          // digits, space, [ ] ; ' , . / ` \ pass through
+}
+
+// postEvent — D_PostEvent: append to the 64-slot event ring (head is the write cursor).
+flex finna postEvent(gt: tag gs.GameState, e: event.Event) {
+    holla g = gt in gs.gsc {
+        g.events.ring[g.events.head as int] = e
+        g.events.head = ((g.events.head + 1) & 63) as i32
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// startTic — I_StartTic: drain the gg event queue, translate each event to a DOOM event, and
+// post it. Keys → ev_keydown/ev_keyup with the xlateKey code. One ev_mouse per tic is built
+// from gg.mouseDelta() (X11 I_GetEvent's MotionNotify model: data1=buttons, data2=dx<<2,
+// data3=-dy<<2). QUIT (window close) latches g.shell.quitRequested (no D_PostEvent analog).
+//
+// NOTE (deferred): held mouse-button state ACROSS tics needs a persisted mask; gg gives edge
+// MOUSE_DOWN/UP, so this build only reflects presses seen within the current tic. Mouse is not
+// exercised by the P1.2 smoke test (headless poll returns NONE); refine when g_game uses it.
+flex finna startTic(gt: tag gs.GameState) {
+    lowkey mbtn = 0
+    lowkey draining = nocap
+    vibin draining {
+        lowkey kind, code = gg.poll()
+        fr kind == GG_NONE {
+            draining = cap
+        } naw fr kind == GG_KEYDOWN {
+            postEvent(gt, event.Event{ typ: event.EV_KEYDOWN as i32, data1: xlateKey(code) as i32, data2: 0, data3: 0 })
+        } naw fr kind == GG_KEYUP {
+            postEvent(gt, event.Event{ typ: event.EV_KEYUP as i32, data1: xlateKey(code) as i32, data2: 0, data3: 0 })
+        } naw fr kind == GG_MOUSEDOWN {
+            mbtn = mbtn | (1 << code)
+        } naw fr kind == GG_MOUSEUP {
+            mbtn = mbtn | (1 << code)
+        } naw fr kind == GG_QUIT {
+            holla g = gt in gs.gsc {
+                g.shell.quitRequested = nocap
+            } ghosted {
+                yeet("gs")
+            }
+        }
+    }
+    lowkey dx, dy = gg.mouseDelta()
+    fr mbtn != 0 || dx != 0 || dy != 0 {
+        postEvent(gt, event.Event{ typ: event.EV_MOUSE as i32, data1: mbtn as i32, data2: (dx << 2) as i32, data3: ((0 - dy) << 2) as i32 })
+    }
+}
+
+// setPalette — I_SetPalette. Read the 256×RGB (768-byte) sub-palette `palIndex` (0..13) from the
+// PLAYPAL lump, push each component through the gamma LUT row `g.vid.gammaIndex`, and pack XRGB
+// (0x00RRGGBB) into g.vid.pal. (The screen bytes are palette INDICES, so a screen's crc32 does
+// not depend on this — only the presented colors do.)
+flex finna setPalette(gt: tag gs.GameState, palIndex: int) {
+    lowkey base = w.lumpNameOfs(gt, "PLAYPAL") + palIndex * 768
+    lowkey gamma = v.gammatable()
+    holla g = gt in gs.gsc {
+        g.vid.paletteIndex = palIndex as i32
+        lowkey gi = g.vid.gammaIndex as int
+        lowkey grow = gi * 256
+        lowkey i = 0
+        vibin i < 256 {
+            lowkey r = gamma[grow + bstream.rdU8(g.wad.buf, base + i * 3)] as int
+            lowkey gc = gamma[grow + bstream.rdU8(g.wad.buf, base + i * 3 + 1)] as int
+            lowkey b = gamma[grow + bstream.rdU8(g.wad.buf, base + i * 3 + 2)] as int
+            g.vid.pal[i] = ((r << 16) | (gc << 8) | b) as u32
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// finishUpdate — I_FinishUpdate: expand the 8-bit scr0 through the XRGB palette into the u32
+// present buffer, then hand it to gg.show (fixed 320×200 logical size, aspect-fit letterbox).
+// The expand stays inline (hot path). devparm tic-dots are omitted.
+flex finna finishUpdate(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        lowkey i = 0
+        vibin i < 64000 {
+            g.vid.fb[i] = g.vid.pal[g.vid.scr0[i] as int]
+            i = i + 1
+        }
+        gg.show(g.vid.fb, 320, 200)
+    } ghosted {
+        yeet("gs")
+    }
+}

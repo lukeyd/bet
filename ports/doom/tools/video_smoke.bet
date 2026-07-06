@@ -1,0 +1,112 @@
+// tools/video_smoke.bet — the P1.2 WAD+VIDEO+SYSTEM proof. Cops a GameState, gsInit, loads
+// the shareware IWAD, sets palette 0, draws TITLEPIC (a 320×200 patch) into scr0 via
+// v_video.drawPatch, presents once (i_video.finishUpdate → gg.show), and crc32's the 8-bit
+// scr0. Prints the WAD-directory sanity numbers too.
+//
+// Build+run NATIVE (headless):
+//   cargo build -p driver --features llvm && cargo build -p runtime --features gg-desktop
+//   bet build ports/doom/tools/video_smoke.bet --runtime real -o /tmp/video_smoke
+//   BET_GG_HEADLESS=1 /tmp/video_smoke
+//
+// NATIVE is the correctness target (CONTRACTS "Native-first"). The scr0 crc32 (0xb6290c41)
+// matches an independent C/Python model of V_DrawPatch on TITLEPIC. This tool is NOT run under
+// the interpreter: the interpreter clones a Value::Array (and the whole crib) on every element
+// READ, so the ~89k WAD reads + 64k scr0 reads here take ~hours (measured). The cross-backend
+// DETERMINISM of the blitter is proved by tools/video_det.bet (a tiny synthetic patch whose
+// crc is byte-identical native==interp).
+pull "spill"
+pull "mem"
+pull "str"
+pull "../defs/gs" as gs
+pull "../w/w_wad" as wad
+pull "../i/i_system" as isys
+pull "../i/i_video" as iv
+pull "../v/v_video" as vv
+
+// ---- crc32 (IEEE-802.3 reflected, poly 0xEDB88320, init/xorout 0xFFFFFFFF) — the same
+// pipeline crc as ports/doom/goldens + tools/goldens.bet, specialized to a []u8 stream. -------
+flex finna hex8(v: int) -> str {
+    lowkey val = v & 4294967295
+    lowkey buf = mem.slab[u8](8)
+    lowkey i = 0
+    vibin i < 8 {
+        lowkey nib = (val >> (28 - i * 4)) & 15
+        fr nib < 10 {
+            buf[i] = (48 + nib) as u8
+        } naw {
+            buf[i] = (87 + nib) as u8
+        }
+        i = i + 1
+    }
+    bet str.fromBytesTrust(buf)
+}
+
+flex finna crcTable() -> []i32 {
+    lowkey tbl = mem.slab[i32](256)
+    lowkey i = 0
+    vibin i < 256 {
+        lowkey c = i
+        lowkey k = 0
+        vibin k < 8 {
+            lowkey lsb = c & 1
+            c = c >> 1
+            fr lsb != 0 {
+                c = c ^ 3988292384
+            }
+            k = k + 1
+        }
+        tbl[i] = c as i32
+        i = i + 1
+    }
+    bet tbl
+}
+
+flex finna crc32U8(tbl: []i32, t: []u8, n: int) -> int {
+    lowkey crc = 4294967295
+    lowkey i = 0
+    vibin i < n {
+        lowkey byte = t[i] as int
+        crc = (crc >> 8) ^ ((tbl[((crc ^ byte) & 255)] as int) & 4294967295)
+        i = i + 1
+    }
+    bet (crc ^ 4294967295) & 4294967295
+}
+
+finna main() {
+    lowkey g0 = cop gs.GameState{} in gs.gsc
+    gs.gsInit(g0)
+    isys.initTime(g0)
+    wad.initWad(g0, "/Users/lukebaggett/Documents/bet/doom-reference/doom1.wad")
+    iv.initGraphics(g0)
+    iv.setPalette(g0, 0)
+
+    // ---- WAD directory sanity ----
+    lowkey numLumps = 0
+    holla g = g0 in gs.gsc {
+        numLumps = g.wad.numLumps as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey ppN = wad.getNumForName(g0, "PLAYPAL")
+    lowkey tpN = wad.getNumForName(g0, "TITLEPIC")
+    lowkey e1N = wad.getNumForName(g0, "E1M1")
+    spill.f("numLumps={}\n", numLumps)
+    spill.f("PLAYPAL  lump={} ofs={} len={}\n", ppN, wad.lumpNum(g0, ppN), wad.lumpLength(g0, ppN))
+    spill.f("TITLEPIC lump={} ofs={} len={}\n", tpN, wad.lumpNum(g0, tpN), wad.lumpLength(g0, tpN))
+    spill.f("E1M1     lump={} ofs={} len={}\n", e1N, wad.lumpNum(g0, e1N), wad.lumpLength(g0, e1N))
+
+    // ---- draw TITLEPIC (a full-screen patch) into scr0, present once ----
+    lowkey tpOfs = wad.lumpNum(g0, tpN)
+    vv.drawPatch(g0, 0, 0, 0, tpOfs)
+    iv.finishUpdate(g0)
+
+    // ---- crc32 of the 8-bit index screen scr0 (palette/gamma-independent) ----
+    lowkey ctab = crcTable()
+    lowkey crc = 0
+    holla g = g0 in gs.gsc {
+        crc = crc32U8(ctab, g.vid.scr0, 64000)
+    } ghosted {
+        yeet("gs")
+    }
+    spill.f("scr0 crc32=0x{}\n", hex8(crc))
+}
