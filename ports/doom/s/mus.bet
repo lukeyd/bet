@@ -46,7 +46,7 @@ flex finna decodeMus(wadBuf: []u8, lumpOfs: int, lumpLen: int) -> vec[MusEvent] 
     lowkey pos = lumpOfs + scoreStart(wadBuf, lumpOfs)
     lowkey running = nocap
     vibin running {
-        lowkey desc = wad.rdU8(wadBuf, pos)
+        lowkey desc = wadBuf[pos] as int
         pos = pos + 1
         lowkey last = (desc >> 7) & 1
         lowkey typ = (desc >> 4) & 7
@@ -55,26 +55,26 @@ flex finna decodeMus(wadBuf: []u8, lumpOfs: int, lumpLen: int) -> vec[MusEvent] 
         lowkey b = 0 - 1
 
         fr typ == 0 {
-            a = (wad.rdU8(wadBuf, pos)) & 0x7F
+            a = (wadBuf[pos] as int) & 0x7F
             pos = pos + 1
         } naw fr typ == 1 {
-            lowkey n = wad.rdU8(wadBuf, pos)
+            lowkey n = wadBuf[pos] as int
             pos = pos + 1
             a = n & 0x7F
             fr (n & 0x80) != 0 {
-                b = (wad.rdU8(wadBuf, pos)) & 0x7F
+                b = (wadBuf[pos] as int) & 0x7F
                 pos = pos + 1
             }
         } naw fr typ == 2 {
-            a = wad.rdU8(wadBuf, pos)
+            a = wadBuf[pos] as int
             pos = pos + 1
         } naw fr typ == 3 {
-            a = (wad.rdU8(wadBuf, pos)) & 0x7F
+            a = (wadBuf[pos] as int) & 0x7F
             pos = pos + 1
         } naw fr typ == 4 {
-            a = (wad.rdU8(wadBuf, pos)) & 0x7F
+            a = (wadBuf[pos] as int) & 0x7F
             pos = pos + 1
-            b = (wad.rdU8(wadBuf, pos)) & 0x7F
+            b = (wadBuf[pos] as int) & 0x7F
             pos = pos + 1
         } naw fr typ == 6 {
             // score end: no data bytes
@@ -87,7 +87,7 @@ flex finna decodeMus(wadBuf: []u8, lumpOfs: int, lumpLen: int) -> vec[MusEvent] 
             fr last != 0 {
                 lowkey more = nocap
                 vibin more {
-                    lowkey t = wad.rdU8(wadBuf, pos)
+                    lowkey t = wadBuf[pos] as int
                     pos = pos + 1
                     delay = delay * 128 + (t & 0x7F)
                     fr (t & 0x80) == 0 {
