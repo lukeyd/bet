@@ -115,6 +115,7 @@ facts CLEAR: u32 = 0x00000000
 facts DOT: u32 = 0x80FFFFFF
 facts WIN_COL: u32 = 0xA020C040
 facts LOSE_COL: u32 = 0xA0C03020
+facts TEXT_BG: u32 = 0xC0000000    // dark translucent panel behind text — readability over pale art
 
 // Scalar/struct game state — value-threaded (the board/worklists are shared handles, kept out).
 drip Game {
@@ -501,6 +502,24 @@ finna drawAim(coss: vec[int], sins: vec[int], ang: int, descent: int) {
 // 170 MB pack, and the whole thing lives safely in a helper. Unknown glyphs advance without drawing.
 finna drawText(fontTex: int, fontX: vec[int], fontW: vec[int], s: str, x: int, y: int) {
     lowkey n = str.len(s)
+    // measure the run's advance so we can lay a dark backing panel for contrast
+    lowkey bw = 0
+    lowkey bi = 0
+    vibin bi < n {
+        lowkey bc = str.at(s, bi)
+        fr bc == 32 {
+            bw = bw + 12
+        } naw {
+            lowkey bwid = fontW[bc]
+            fr bwid > 0 {
+                bw = bw + bwid + 3
+            } naw {
+                bw = bw + 9
+            }
+        }
+        bi = bi + 1
+    }
+    gg.rect(x - 5, y - 4, bw + 10, GLYPH_H + 8, TEXT_BG)
     lowkey px = x
     lowkey i = 0
     vibin i < n {
@@ -535,6 +554,14 @@ finna drawInt(fontTex: int, fontX: vec[int], fontW: vec[int], val: int, x: int, 
             v = v / 10
         }
     }
+    lowkey bw = 0
+    lowkey bj = digs.gang() as int - 1
+    vibin bj >= 0 {
+        lowkey bcode = 48 + digs[bj]
+        bw = bw + fontW[bcode] + 3
+        bj = bj - 1
+    }
+    gg.rect(x - 5, y - 4, bw + 10, GLYPH_H + 8, TEXT_BG)
     lowkey px = x
     lowkey i = digs.gang() as int - 1
     vibin i >= 0 {
