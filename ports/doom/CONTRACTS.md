@@ -110,16 +110,61 @@ g.info g.menu g.hud g.stbar g.am g.wi g.finale g.wipe g.net`
 | `numvertexes` / `numsectors` / `numsides` / `numlines` / `numsubsectors` / `numsegs` / `numnodes` | `g.level.num*` |
 | `vertexes` / `sectors` / `sides` / `lines` / `segs` / `subsectors` / `nodes` | `g.level.*` SoA slabs (below) |
 | `colormaps` | `g.render.colormaps` ([]u8 arena); colormap refs are byte offsets |
-| `textureheight` / `spritewidth` / `spriteoffset` / `spritetopoffset` | **P1.4 r_data** — add to RenderState via amendment |
-| `flattranslation` / `texturetranslation` | **P1.4 r_data** — amendment |
-| `firstflat` / `firstspritelump` / `lastspritelump` / `numspritelumps` | **P1.4 r_data** — amendment |
-| `sprites` / `numsprites` | **P1.4 r_data** — amendment |
+| `textureheight` / `spritewidth` / `spriteoffset` / `spritetopoffset` | `g.render.textureHeight` / `.spriteWidth` / `.spriteOffset` / `.spriteTopOffset` (P1.4, below) |
+| `flattranslation` / `texturetranslation` | `g.render.flatTranslation` / `.textureTranslation` (P1.4) |
+| `firstflat` / `firstspritelump` / `lastspritelump` / `numspritelumps` | `g.render.firstFlat` / `.firstSpriteLump` / (last = first+num-1) / `.numSpriteLumps` (P1.4) |
+| `sprites` / `numsprites` | `g.render.sprite*` SoA + `.numSprites` (P1.4) |
 
-> **Note (P1.4):** texture/flat/sprite composite tables (r_data.c) are intentionally NOT in the
-> frozen RenderState yet — P1.4 owns r_data and adds `texArenaOfs`, `textureheight[]`,
-> `spritewidth[]`, `spriteoffset[]`, `spritetopoffset[]`, `flattranslation[]`,
-> `texturetranslation[]`, `sprites` (SoA), `firstflat`/`firstspritelump`/… via a CONTRACTS
-> amendment. Composites precompute into one `[]u8` arena; render regs reference it by offset.
+### P1.4 RenderState amendment (r/r_data.bet + r/r_sky.bet)
+
+The texture/flat/sprite/sky tables (r_data.c, r_sky.c, and the sprite-def half of r_things.c)
+are now **frozen additive fields on `RenderState`** (only the RenderState drip changed). Every
+field below is `g.render.<name>`. Composited wall textures precompute into ONE `[]u8` arena;
+render regs reference a column by a byte offset (`getColumn`), never a pointer.
+
+**Textures** (`R_InitTextures` / `R_GenerateLookup`+`R_GenerateComposite`, fused & eager):
+- `numTextures: i32` · `textureWidth: []i32` (pixels) · `textureHeight: []i32` (fixed_t,
+  `height<<FRACBITS`) · `textureWidthMask: []i32` (column mask).
+- `texArena: []u8` + `texArenaLen: int` — every **multi-patch** column composited back-to-front,
+  packed. Single-patch columns are NOT in the arena (they stay in their patch lump).
+- `textureComposite: []i32` — per texture, base byte offset into `texArena` (`-1` if the texture
+  has no multi-patch columns).
+- `textureColumnStart: []i32` — per texture, base index into the flattened `textureColumnLump` /
+  `textureColumnOfs` (`[]i32`, length = Σ widths). Per column: `textureColumnLump[k]` is the patch
+  lump (`>0`, single-patch) or `-1` (composited); `textureColumnOfs[k]` is the in-lump byte offset
+  (single) or the in-arena-block offset (composite).
+- `texNameToNum: stash[str,int]` · `textureTranslation: []i32` (identity animation map, len N+1).
+
+**getColumn contract:** `getColumn(gt, tex, col) -> int` returns an **absolute** byte offset:
+into `g.wad.buf` when the column is single-patch, into `g.render.texArena` when composited —
+mirroring `R_GetColumn`'s two cases. The companion `columnLumpOf(gt, tex, col) -> int` returns
+the column's patch lump (`>0` ⇒ offset indexes `g.wad.buf`; `<=0` ⇒ indexes `texArena`), so the
+caller knows which buffer to read. (id returned one `byte*`; here `buf` and `texArena` are
+separate slabs, so the buffer is selected by the lump sign.)
+
+**Flats** (`R_InitFlats`): `firstFlat: i32` · `numFlats: i32` · `flatNameToNum: stash[str,int]`
+(name → 0-based flat number) · `flatTranslation: []i32` (identity).
+
+**Sprite lumps** (`R_InitSpriteLumps`): `firstSpriteLump: i32` · `numSpriteLumps: i32` ·
+`spriteWidth`/`spriteOffset`/`spriteTopOffset: []i32` (all fixed_t).
+
+**Sprite frames** (`R_InitSpriteDefs`) — **SoA** representation (chosen over `vec[SpriteFrame]`
+to match the Level SoA style and avoid an array-typed drip field):
+- `numSprites: i32` (= `info.NUMSPRITES`) · `spriteNumFrames: []i32` (per sprite) ·
+  `spriteFrameStart: []i32` (per sprite, base index into the frame arrays).
+- Per frame: `spriteFrameRotate: []i32` (`0` = one view for all angles, `1` = 8 rotations) ·
+  `spriteFrameLump: []i32` (8 per frame: `[frame*8 + rot]`, sprite-lump index) ·
+  `spriteFrameFlip: []i32` (8 per frame, flip flag). Sprite `s` frame `f` rotation `r` →
+  `spriteFrame*[(spriteFrameStart[s] + f) * (1 or 8) + r]`.
+
+**Colormaps / sky:** `colormapsBytes: int` (actual COLORMAP length loaded into the reserved
+`colormaps` arena, = 8704) · `skytexture: i32` · `skytexturemid: i32` (fixed_t, set by
+`r_sky.initSkyMap`). `skyflatnum` (pre-existing) is set by the level loader (P2.5).
+
+> **Regression baseline:** `ports/doom/tools/rdata_smoke.bet` (native) loads shareware doom1.wad
+> and prints the counts + a crc32 of `texArena` and of the COLORMAP slab, committed as
+> `ports/doom/goldens/rdata.golden` (deterministic given the WAD; both CRCs match an independent
+> model). Native-only: the interpreter clones an array per element read (WAD-scale intractable).
 
 ## r_defs.h runtime structs → Level SoA slabs
 
@@ -235,3 +280,10 @@ floor_e, plat_e, plattype_e, stair_e, result_e, bwhere_e) are defined by **p/p_s
    thinker field is unused in id's code).
 8. **`Mobj.player`** is a player index (−1 none), NOT a tag; `Player.mo` is a `tag think.Thinker`.
    `Mobj.subsector` is a subsector index (−1 none).
+9. **`r/r_geom.pointToAngle2` (P1.4)** takes the tantoangle table as an explicit first param
+   (`pointToAngle2(tan: []u32, x1, y1, x2, y2) -> u32`) rather than being fully gs-free: it needs
+   `tantoangle` but must not open a `holla`, so the caller passes `g.info.tantoangle`. The gs
+   form `pointToAngle(gt, x, y)` reads viewx/viewy + `g.info.tantoangle` itself. `tables.slopeDiv`
+   is native-correct only (CONTRACTS note 2); `tools/goldens.bet` calls `pointToAngle2` for the
+   P2A sweep (interp-safe there — the sweep's `|coord| ≤ 0x02000000` never overflows `num<<3`)
+   but keeps a local wrap-safe `slopeDivSafe` for the full-range SLOPEDIV grid.

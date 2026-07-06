@@ -1,0 +1,250 @@
+// r/r_geom.bet — render geometry math (linuxdoom-1.10 r_main.c: R_PointOnSide,
+// R_PointOnSegSide, R_PointToAngle/2, R_PointToDist, R_PointInSubsector,
+// R_ScaleFromGlobalAngle). Split LOW so the play-sim (P2.x) can call it without dragging in
+// the renderer. Every stateful fn takes `gt: tag gs.GameState` first and opens exactly one
+//     holla g = gt in gs.gsc { ... } ghosted { yeet("gs") }
+// pointToAngle2 is gs-free (arbitrary endpoints) but needs the tantoangle table, so it takes
+// it as an explicit `tan: []u32` param (the caller passes `g.info.tantoangle`); see
+// CONTRACTS.md "P1.4" note.
+//
+// WIDTH DISCIPLINE (native is strict, interp lenient): fixed_t -> i32, angle_t -> u32, C `int`
+// side/index -> `int` (i64). Octant angle results are computed in i64 and folded to u32 with an
+// explicit `as u32` (matches id's unsigned wrap, incl. octant 8's `-tantoangle[...]`). All
+// literal operands carry explicit `as int` casts so no bare literal defaults to i32.
+pull "../defs/gs" as gs
+pull "../defs/tables" as tables
+pull "../defs/fixed" as fixed
+
+// partitionSide — the shared body of R_PointOnSide / R_PointOnSegSide: which side (0 front, 1
+// back) of the directed partition line (px,py)->(px+pdx,py+pdy) the point (x,y) lies on. The
+// sign-bit fast path `(a)&0x80000000` is rewritten as an i32 `< 0` test (identical for i32).
+flex finna partitionSide(px: i32, py: i32, pdx: i32, pdy: i32, x: i32, y: i32) -> int {
+    fr pdx == 0 {
+        fr x <= px {
+            fr pdy > 0 {
+                bet 1
+            }
+            bet 0
+        }
+        fr pdy < 0 {
+            bet 1
+        }
+        bet 0
+    }
+    fr pdy == 0 {
+        fr y <= py {
+            fr pdx < 0 {
+                bet 1
+            }
+            bet 0
+        }
+        fr pdx > 0 {
+            bet 1
+        }
+        bet 0
+    }
+    lowkey ddx: i32 = x - px
+    lowkey ddy: i32 = y - py
+    lowkey xr: i32 = pdy ^ pdx ^ ddx ^ ddy
+    fr xr < 0 {
+        lowkey xr2: i32 = pdy ^ ddx
+        fr xr2 < 0 {
+            bet 1
+        }
+        bet 0
+    }
+    lowkey left: i32 = fixed.fixedMul(pdy >> 16, ddx)
+    lowkey right: i32 = fixed.fixedMul(ddy, pdx >> 16)
+    fr right < left {
+        bet 0
+    }
+    bet 1
+}
+
+// R_PointOnSide — descend the BSP: which side of node `node`'s partition the point is on.
+flex finna pointOnSide(gt: tag gs.GameState, x: i32, y: i32, node: i32) -> int {
+    lowkey res: int = 0
+    holla g = gt in gs.gsc {
+        lowkey px: i32 = g.level.nodeX[node]
+        lowkey py: i32 = g.level.nodeY[node]
+        lowkey pdx: i32 = g.level.nodeDx[node]
+        lowkey pdy: i32 = g.level.nodeDy[node]
+        res = partitionSide(px, py, pdx, pdy, x, y)
+    } ghosted {
+        yeet("gs")
+    }
+    bet res
+}
+
+// R_PointOnSegSide — same test against a seg's v1->v2 direction.
+flex finna pointOnSegSide(gt: tag gs.GameState, x: i32, y: i32, seg: i32) -> int {
+    lowkey res: int = 0
+    holla g = gt in gs.gsc {
+        lowkey v1: int = g.level.segV1[seg] as int
+        lowkey v2: int = g.level.segV2[seg] as int
+        lowkey lx: i32 = g.level.vtxX[v1]
+        lowkey ly: i32 = g.level.vtxY[v1]
+        lowkey ldx: i32 = g.level.vtxX[v2] - lx
+        lowkey ldy: i32 = g.level.vtxY[v2] - ly
+        res = partitionSide(lx, ly, ldx, ldy, x, y)
+    } ghosted {
+        yeet("gs")
+    }
+    bet res
+}
+
+// angleFromDeltas — R_PointToAngle's 8-octant dispatch for a delta (x,y), copied verbatim from
+// r_main.c. Returns the BAM angle. Uses tables.slopeDiv (native-correct) + the tantoangle table.
+flex finna angleFromDeltas(tan: []u32, x: i32, y: i32) -> u32 {
+    fr x == 0 {
+        fr y == 0 {
+            bet 0
+        }
+    }
+    fr x >= 0 {
+        fr y >= 0 {
+            fr x > y {
+                lowkey s0: int = tables.slopeDiv(y as u32, x as u32) as int
+                bet tan[s0]
+            }
+            lowkey s1: int = tables.slopeDiv(x as u32, y as u32) as int
+            bet ((tables.ANG90 as int) - (1 as int) - (tan[s1] as int)) as u32
+        } naw {
+            lowkey yy: i32 = 0 - y
+            fr x > yy {
+                lowkey s8: int = tables.slopeDiv(yy as u32, x as u32) as int
+                bet ((0 as int) - (tan[s8] as int)) as u32
+            }
+            lowkey s7: int = tables.slopeDiv(x as u32, yy as u32) as int
+            bet ((tables.ANG270 as int) + (tan[s7] as int)) as u32
+        }
+    }
+    lowkey xx: i32 = 0 - x
+    fr y >= 0 {
+        fr xx > y {
+            lowkey s3: int = tables.slopeDiv(y as u32, xx as u32) as int
+            bet ((tables.ANG180 as int) - (1 as int) - (tan[s3] as int)) as u32
+        }
+        lowkey s2: int = tables.slopeDiv(xx as u32, y as u32) as int
+        bet ((tables.ANG90 as int) + (tan[s2] as int)) as u32
+    }
+    lowkey yy2: i32 = 0 - y
+    fr xx > yy2 {
+        lowkey s4: int = tables.slopeDiv(yy2 as u32, xx as u32) as int
+        bet ((tables.ANG180 as int) + (tan[s4] as int)) as u32
+    }
+    lowkey s5: int = tables.slopeDiv(xx as u32, yy2 as u32) as int
+    bet ((tables.ANG270 as int) - (1 as int) - (tan[s5] as int)) as u32
+}
+
+// R_PointToAngle — angle of (x,y) as seen from the current view point (viewx/viewy).
+flex finna pointToAngle(gt: tag gs.GameState, x: i32, y: i32) -> u32 {
+    lowkey res: u32 = 0
+    holla g = gt in gs.gsc {
+        lowkey dx: i32 = x - g.render.viewx
+        lowkey dy: i32 = y - g.render.viewy
+        res = angleFromDeltas(g.info.tantoangle, dx, dy)
+    } ghosted {
+        yeet("gs")
+    }
+    bet res
+}
+
+// R_PointToAngle2 — angle of the vector (x1,y1)->(x2,y2). gs-free; `tan` is the tantoangle
+// table (pass g.info.tantoangle). id sets viewx=x1/viewy=y1 then calls R_PointToAngle; we
+// compute the deltas directly instead of mutating a global.
+flex finna pointToAngle2(tan: []u32, x1: i32, y1: i32, x2: i32, y2: i32) -> u32 {
+    bet angleFromDeltas(tan, x2 - x1, y2 - y1)
+}
+
+// R_PointToDist — the distance from the view point to (x,y), via tantoangle + finesine.
+flex finna pointToDist(gt: tag gs.GameState, x: i32, y: i32) -> i32 {
+    lowkey res: i32 = 0
+    holla g = gt in gs.gsc {
+        lowkey dx: i32 = x - g.render.viewx
+        fr dx < 0 {
+            dx = 0 - dx
+        }
+        lowkey dy: i32 = y - g.render.viewy
+        fr dy < 0 {
+            dy = 0 - dy
+        }
+        fr dy > dx {
+            lowkey t: i32 = dx
+            dx = dy
+            dy = t
+        }
+        lowkey fd: i32 = fixed.fixedDiv(dy, dx)
+        lowkey idx: int = (fd >> 5) as int
+        lowkey ang: u32 = (g.info.tantoangle[idx] + tables.ANG90) >> 19
+        lowkey aidx: int = ang as int
+        res = fixed.fixedDiv(dx, g.info.finesine[aidx])
+    } ghosted {
+        yeet("gs")
+    }
+    bet res
+}
+
+// R_PointInSubsector — descend the BSP from the root node to the subsector containing (x,y).
+// Needs loaded nodes (p/p_setup, P2.5), so this COMPILES now but is first exercised there.
+flex finna pointInSubsector(gt: tag gs.GameState, x: i32, y: i32) -> int {
+    lowkey res: int = 0
+    holla g = gt in gs.gsc {
+        fr g.level.numnodes == 0 {
+            res = 0
+        } naw {
+            lowkey nodenum: int = (g.level.numnodes - 1) as int
+            vibin (nodenum & 32768) == 0 {
+                lowkey px: i32 = g.level.nodeX[nodenum]
+                lowkey py: i32 = g.level.nodeY[nodenum]
+                lowkey pdx: i32 = g.level.nodeDx[nodenum]
+                lowkey pdy: i32 = g.level.nodeDy[nodenum]
+                lowkey side: int = partitionSide(px, py, pdx, pdy, x, y)
+                fr side == 0 {
+                    nodenum = g.level.nodeChild0[nodenum] as int
+                } naw {
+                    nodenum = g.level.nodeChild1[nodenum] as int
+                }
+            }
+            res = nodenum & 32767
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    bet res
+}
+
+// R_ScaleFromGlobalAngle — the texture-mapping scale for a wall column at `visangle`
+// (rw_distance must be current). Wall-render helper; COMPILES now, exercised at P2.6.
+flex finna scaleFromGlobalAngle(gt: tag gs.GameState, visangle: u32) -> i32 {
+    lowkey res: i32 = 0
+    holla g = gt in gs.gsc {
+        lowkey da: u32 = visangle - g.render.viewangle
+        lowkey anglea: u32 = tables.ANG90 + da
+        lowkey db: u32 = visangle - g.render.rw_normalangle
+        lowkey angleb: u32 = tables.ANG90 + db
+        lowkey ia: int = (anglea >> 19) as int
+        lowkey ib: int = (angleb >> 19) as int
+        lowkey sinea: i32 = g.info.finesine[ia]
+        lowkey sineb: i32 = g.info.finesine[ib]
+        lowkey num: i32 = fixed.fixedMul(g.render.projection, sineb) << g.render.detailshift
+        lowkey den: i32 = fixed.fixedMul(g.render.rw_distance, sinea)
+        lowkey scale: i32 = 0
+        fr den > (num >> 16) {
+            scale = fixed.fixedDiv(num, den)
+            fr scale > 4194304 {
+                scale = 4194304
+            } naw {
+                fr scale < 256 {
+                    scale = 256
+                }
+            }
+        } naw {
+            scale = 4194304
+        }
+        res = scale
+    } ghosted {
+        yeet("gs")
+    }
+    bet res
+}
