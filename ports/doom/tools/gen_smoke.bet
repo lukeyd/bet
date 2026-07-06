@@ -1,0 +1,115 @@
+// gen_smoke.bet — sanity harness for the GENERATED data modules (ports/doom/defs/*.bet).
+// Pulls all three, fills the vecs/slabs, and checks values extracted from id's C source by
+// hand inspection (info.h/info.c/sounds.c/tables.c of linuxdoom-1.10):
+//   * NUMSTATES=967, NUMSPRITES=138, NUMMOBJTYPES=137, NUMSFX=109, NUMMUSIC=68
+//   * states[S_LIGHTDONE] = {SPR_SHTG,4,0,{A_Light0},S_NULL,0,0}
+//   * states[S_PISTOLFLASH] = {SPR_PISF,32768,7,{A_Light1},S_LIGHTDONE,0,0}
+//   * mobjinfo[MT_PLAYER]: doomednum -1, radius 16*FRACUNIT, flags
+//     MF_SOLID|MF_SHOOTABLE|MF_DROPOFF|MF_PICKUP|MF_NOTDMATCH = 33557510
+//   * finesine[0]=25, finesine[10239]=65535, finetangent[0]=-170910304,
+//     tantoangle[0]=0, tantoangle[2048]=536870912
+//   * S_sfx[sfx_chgun].link = sfx_pistol; S_sfx[0] = the "none" dummy
+//   * SlopeDiv: den<512 and >SLOPERANGE clamps + an exact quotient
+// Run: cargo run -p driver -- run ports/doom/tools/gen_smoke.bet
+pull "../defs/info"
+pull "../defs/tables"
+pull "../defs/sounds"
+
+finna check(fails: vec[int], what: str, got: int, want: int) {
+    fr got != want {
+        spill.f("FAIL {}: got {} want {}\n", what, got, want)
+        fails.stack(1)
+    }
+}
+
+finna checkStr(fails: vec[int], what: str, got: str, want: str) {
+    fr !str.slaps(got, want) {
+        spill.f("FAIL {}: got {} want {}\n", what, got, want)
+        fails.stack(1)
+    }
+}
+
+finna main() {
+    lowkey fails = vec.new[int]()
+
+    // ---- enum sizes ----
+    check(fails, "NUMSTATES", info.NUMSTATES, 967)
+    check(fails, "NUMSPRITES", info.NUMSPRITES, 138)
+    check(fails, "NUMMOBJTYPES", info.NUMMOBJTYPES, 137)
+    check(fails, "NUMSFX", sounds.NUMSFX, 109)
+    check(fails, "NUMMUSIC", sounds.NUMMUSIC, 68)
+
+    // ---- states[] ----
+    lowkey states = vec.new[info.State]()
+    info.initStatesAll(states)
+    check(fails, "states.gang", states.gang(), 967)
+    lowkey s1 = states[info.S_LIGHTDONE]
+    check(fails, "S_LIGHTDONE.spriteIdx", s1.spriteIdx, info.SPR_SHTG)
+    check(fails, "S_LIGHTDONE.frame", s1.frame, 4)
+    check(fails, "S_LIGHTDONE.tics", s1.tics, 0)
+    check(fails, "S_LIGHTDONE.actionId", s1.actionId, info.AID_LIGHT0)
+    check(fails, "S_LIGHTDONE.nextstate", s1.nextstate, info.S_NULL)
+    lowkey sp = states[info.S_PISTOLFLASH]
+    check(fails, "S_PISTOLFLASH.frame", sp.frame, 32768)
+    check(fails, "S_PISTOLFLASH.tics", sp.tics, 7)
+    check(fails, "S_PISTOLFLASH.actionId", sp.actionId, info.AID_LIGHT1)
+    check(fails, "S_PISTOLFLASH.nextstate", sp.nextstate, info.S_LIGHTDONE)
+
+    // ---- mobjinfo[] ----
+    lowkey mobjs = vec.new[info.MobjInfo]()
+    info.initMobjinfoAll(mobjs)
+    check(fails, "mobjinfo.gang", mobjs.gang(), 137)
+    lowkey mp = mobjs[info.MT_PLAYER]
+    check(fails, "MT_PLAYER.doomednum", mp.doomednum, -1)
+    check(fails, "MT_PLAYER.spawnstate", mp.spawnstate, info.S_PLAY)
+    check(fails, "MT_PLAYER.spawnhealth", mp.spawnhealth, 100)
+    check(fails, "MT_PLAYER.radius", mp.radius, 1048576)
+    check(fails, "MT_PLAYER.flags", mp.flags, 33557510)
+    check(fails, "MT_PLAYER.painsound", mp.painsound, sounds.SFX_PLPAIN)
+
+    // ---- sprite names ----
+    checkStr(fails, "spriteName(0)", info.spriteName(0), "TROO")
+    checkStr(fails, "spriteName(SPR_SHTG)", info.spriteName(info.SPR_SHTG), "SHTG")
+    checkStr(fails, "spriteName(137)", info.spriteName(137), "TLP2")
+
+    // ---- tables ----
+    lowkey fsin = mem.slab[i32](tables.FINESINE_LEN)
+    fsin = tables.initFinesineAll(fsin)
+    check(fails, "finesine[0]", fsin[0], 25)
+    check(fails, "finesine[last]", fsin[10239], 65535)
+    // finecosine[0] == finesine[2048] == 65535: id's table PEAKS at 65535, one below
+    // FRACUNIT — the kind of 1993 rounding quirk the verbatim-copy rule preserves.
+    check(fails, "finesine[2048]", fsin[2048], 65535)
+
+    lowkey ftan = mem.slab[i32](tables.FINETANGENT_LEN)
+    ftan = tables.initFinetangentAll(ftan)
+    check(fails, "finetangent[0]", ftan[0], -170910304)
+
+    lowkey t2a = mem.slab[u32](tables.TANTOANGLE_LEN)
+    t2a = tables.initTantoangleAll(t2a)
+    check(fails, "tantoangle[0]", t2a[0] as int, 0)
+    check(fails, "tantoangle[2048]", t2a[2048] as int, 536870912)
+
+    // ---- SlopeDiv ----
+    check(fails, "slopeDiv small den", tables.slopeDiv(12345, 511) as int, 2048)
+    check(fails, "slopeDiv exact", tables.slopeDiv(1000, 2048) as int, 1000)
+    check(fails, "slopeDiv clamp", tables.slopeDiv(1000000, 512) as int, 2048)
+
+    // ---- sounds ----
+    lowkey sfx = vec.new[sounds.SfxInfo]()
+    sounds.initSfxAll(sfx)
+    check(fails, "sfx.gang", sfx.gang(), 109)
+    checkStr(fails, "sfx[0].name", sfx[0].name, "none")
+    check(fails, "sfx[0].link", sfx[0].link, -1)
+    check(fails, "sfx[0].pitch", sfx[0].pitch, -1)
+    checkStr(fails, "sfx[SFX_PISTOL].name", sfx[sounds.SFX_PISTOL].name, "pistol")
+    check(fails, "sfx[SFX_PISTOL].priority", sfx[sounds.SFX_PISTOL].priority, 64)
+    check(fails, "sfx[SFX_CHGUN].link", sfx[sounds.SFX_CHGUN].link, sounds.SFX_PISTOL)
+    check(fails, "sfx[SFX_CHGUN].pitch", sfx[sounds.SFX_CHGUN].pitch, 150)
+
+    fr fails.gang() == 0 {
+        spill.it("gen_smoke: all checks passed")
+    } naw {
+        spill.f("gen_smoke: {} check(s) FAILED\n", fails.gang())
+    }
+}
