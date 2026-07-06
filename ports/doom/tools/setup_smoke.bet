@@ -1,0 +1,236 @@
+// tools/setup_smoke.bet — the P2.5 LEVEL-LOAD proof. Cops a GameState, gsInit, fills the generated
+// data tables, loads the shareware IWAD, runs R_InitData (needed for flat/texture name->num during
+// the load), then P_SetupLevel(episode=1, map=1, skill=SK_HARD) and dumps a DETERMINISTIC SETUP
+// block in the oracle's format (goldens/demo3.oracle.sync):
+//   SETUP sectors=%08x lines=%08x things=%08x          (things = # of spawned mobjs)
+//   SETUP T i=%08x type=%08x x=%08x y=%08x a=%08x       (per spawned mobj, in spawn order)
+// plus the remaining counts and a crc32 of three key slabs (vtxX / secFloorH / blockmap) as a
+// self-consistency regression baseline (committed as goldens/e1m1_setup.golden — deterministic
+// given the WAD). W3 diffs the SETUP block against a fresh oracle E1M1 run.
+//
+// Single-player: consoleplayer 0, playeringame[0] = true, netgame/deathmatch/nomonsters off,
+// gamemode = shareware. So exactly one player start (type 1) spawns MT_PLAYER; things pass the
+// skill-3 (MTF_HARD bit) + single-player gate.
+//
+// Build+run NATIVE (headless); the interpreter clones an array per element read (WAD-scale
+// intractable), exactly like rdata_smoke:
+//   cargo build -p driver --features llvm
+//   bet build ports/doom/tools/setup_smoke.bet --runtime real -o /tmp/setup_smoke
+//   /tmp/setup_smoke
+pull "spill"
+pull "mem"
+pull "str"
+pull "../defs/gs" as gs
+pull "../defs/think" as think
+pull "../defs/info" as info
+pull "../defs/sounds" as sounds
+pull "../defs/tables" as tables
+pull "../defs/doomdef" as doomdef
+pull "../util/m_random" as rnd
+pull "../w/w_wad" as wad
+pull "../r/r_data" as rdata
+pull "../p/p_setup" as psetup
+
+// ---- crc32 (IEEE reflected, poly 0xEDB88320) over []i32 slabs, little-endian per entry (same as
+// goldens.bet / rdata_smoke) ----------------------------------------------------------------
+flex finna hex8(v: int) -> str {
+    lowkey val = v & 4294967295
+    lowkey buf = mem.slab[u8](8)
+    lowkey i = 0
+    vibin i < 8 {
+        lowkey nib = (val >> (28 - i * 4)) & 15
+        fr nib < 10 {
+            buf[i] = (48 + nib) as u8
+        } naw {
+            buf[i] = (87 + nib) as u8
+        }
+        i = i + 1
+    }
+    bet str.fromBytesTrust(buf)
+}
+
+flex finna crcTable() -> []i32 {
+    lowkey tbl = mem.slab[i32](256)
+    lowkey i = 0
+    vibin i < 256 {
+        lowkey c = i
+        lowkey k = 0
+        vibin k < 8 {
+            lowkey lsb = c & 1
+            c = c >> 1
+            fr lsb != 0 {
+                c = c ^ 3988292384
+            }
+            k = k + 1
+        }
+        tbl[i] = c as i32
+        i = i + 1
+    }
+    bet tbl
+}
+
+flex finna crc32I32(tbl: []i32, t: []i32, n: int) -> int {
+    lowkey crc = 4294967295
+    lowkey i = 0
+    vibin i < n {
+        lowkey v = (t[i] as int) & 4294967295
+        lowkey b = 0
+        vibin b < 4 {
+            lowkey byte = (v >> (b * 8)) & 255
+            crc = (crc >> 8) ^ ((tbl[((crc ^ byte) & 255)] as int) & 4294967295)
+            b = b + 1
+        }
+        i = i + 1
+    }
+    bet (crc ^ 4294967295) & 4294967295
+}
+
+// countMobjs — walk the thinker ring from thinkercap.next; return the number of live FUNC_MOBJ nodes.
+flex finna countMobjs(gt: tag gs.GameState) -> int {
+    lowkey capT: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        capT = g.tick.thinkercap
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey cur: tag think.Thinker = ghosted
+    holla c = capT in gs.thinkers {
+        cur = c.next
+    } ghosted {
+        yeet("cap")
+    }
+    lowkey n = 0
+    vibin !(cur == capT) {
+        lowkey fid = 0
+        lowkey nxt: tag think.Thinker = ghosted
+        holla t = cur in gs.thinkers {
+            fid = t.funcId as int
+            nxt = t.next
+        } ghosted {
+            yeet("cur")
+        }
+        fr fid == think.FUNC_MOBJ {
+            n = n + 1
+        }
+        cur = nxt
+    }
+    bet n
+}
+
+// dumpMobjs — walk the ring again and print a SETUP T line per spawned mobj, in spawn order.
+flex finna dumpMobjs(gt: tag gs.GameState) {
+    lowkey capT: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        capT = g.tick.thinkercap
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey cur: tag think.Thinker = ghosted
+    holla c = capT in gs.thinkers {
+        cur = c.next
+    } ghosted {
+        yeet("cap")
+    }
+    lowkey idx = 0
+    vibin !(cur == capT) {
+        lowkey fid = 0
+        lowkey nxt: tag think.Thinker = ghosted
+        lowkey typ = 0
+        lowkey x = 0
+        lowkey y = 0
+        lowkey a = 0
+        holla t = cur in gs.thinkers {
+            fid = t.funcId as int
+            nxt = t.next
+            typ = t.mobj.typeIdx as int
+            x = t.mobj.x as int
+            y = t.mobj.y as int
+            a = t.mobj.angle as int
+        } ghosted {
+            yeet("cur")
+        }
+        fr fid == think.FUNC_MOBJ {
+            spill.f("SETUP T i={} type={} x={} y={} a={}\n", hex8(idx), hex8(typ), hex8(x), hex8(y), hex8(a))
+            idx = idx + 1
+        }
+        cur = nxt
+    }
+}
+
+finna main() {
+    lowkey g0 = cop gs.GameState{} in gs.gsc
+    gs.gsInit(g0)
+
+    // generated data tables + RNG table (spawnMobj reads mobjinfo/states; P_Random needs rndtable)
+    holla g = g0 in gs.gsc {
+        info.initStatesAll(g.info.states)
+        info.initMobjinfoAll(g.info.mobjinfo)
+        sounds.initSfxAll(g.info.sfx)
+        g.info.finesine = tables.initFinesineAll(g.info.finesine)
+        g.info.finetangent = tables.initFinetangentAll(g.info.finetangent)
+        g.info.tantoangle = tables.initTantoangleAll(g.info.tantoangle)
+        g.tick.rndtable = rnd.initRndtable(g.tick.rndtable)
+        // single-player shell config
+        g.shell.gamemode = doomdef.GM_SHAREWARE as i32
+        g.shell.gameskill = doomdef.SK_HARD as i32
+        g.shell.gameepisode = 1
+        g.shell.gamemap = 1
+        g.shell.consoleplayer = 0
+        g.shell.displayplayer = 0
+        g.shell.playeringame[0] = nocap
+        g.shell.netgame = cap
+        g.shell.deathmatch = 0
+        g.shell.nomonsters = cap
+    } ghosted {
+        yeet("gs")
+    }
+    rnd.clearRandom(g0)
+
+    wad.initWad(g0, "/Users/lukebaggett/Documents/bet/doom-reference/doom1.wad")
+    rdata.initData(g0)
+
+    psetup.setupLevel(g0, 1, 1, doomdef.SK_HARD)
+
+    // ---- SETUP block ------------------------------------------------------------------------
+    lowkey numsectors = 0
+    lowkey numlines = 0
+    lowkey numvertexes = 0
+    lowkey numsides = 0
+    lowkey numsegs = 0
+    lowkey numsubsectors = 0
+    lowkey numnodes = 0
+    holla g = g0 in gs.gsc {
+        numsectors = g.level.numsectors as int
+        numlines = g.level.numlines as int
+        numvertexes = g.level.numvertexes as int
+        numsides = g.level.numsides as int
+        numsegs = g.level.numsegs as int
+        numsubsectors = g.level.numsubsectors as int
+        numnodes = g.level.numnodes as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey things = countMobjs(g0)
+    spill.f("SETUP sectors={} lines={} things={}\n", hex8(numsectors), hex8(numlines), hex8(things))
+    dumpMobjs(g0)
+
+    // ---- extra counts + slab CRCs -----------------------------------------------------------
+    spill.f("V numvertexes={} numsides={} numsegs={} numsubsectors={} numnodes={}\n",
+        hex8(numvertexes), hex8(numsides), hex8(numsegs), hex8(numsubsectors), hex8(numnodes))
+
+    // blockmap array length = lumpshorts - 4 (the header-less []i32 contract).
+    lowkey mapnum = wad.getNumForName(g0, "E1M1")
+    lowkey blockmapLen = wad.lumpLength(g0, mapnum + doomdef.ML_BLOCKMAP) / 2 - 4
+    lowkey ctab = crcTable()
+    lowkey crcVtx = 0
+    lowkey crcSecF = 0
+    lowkey crcBmap = 0
+    holla g = g0 in gs.gsc {
+        crcVtx = crc32I32(ctab, g.level.vtxX, numvertexes)
+        crcSecF = crc32I32(ctab, g.level.secFloorH, numsectors)
+        crcBmap = crc32I32(ctab, g.level.blockmap, blockmapLen)
+    } ghosted {
+        yeet("gs")
+    }
+    spill.f("CRC vtxX={} secFloorH={} blockmap={}\n", hex8(crcVtx), hex8(crcSecF), hex8(crcBmap))
+}

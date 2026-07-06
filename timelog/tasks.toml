@@ -500,6 +500,17 @@ name = "Doom P2.9a: status bar + HUD (st_stuff/st_lib/hu_stuff/hu_lib) — face 
 size = 5
 status = "doing"
 
+[[task]]
+slug = "doom-p25"
+name = "Doom P2.5: level load (p_setup) — parse map WAD lumps into Level SoA + spawn things (P_SpawnMapThing/P_SpawnPlayer)"
+size = 4
+# DONE. ports/doom/p/p_setup.bet ports p_setup.c faithfully (all ML_* loaders in id's order,
+# P_GroupLines, blockmap rebuilt into P2.1's []i32 contract with -4 header rebase) + P_SpawnMapThing/
+# P_SpawnPlayer with skill/flag/deathmatch filtering. tools/setup_smoke loads E1M1 native and dumps
+# the oracle-format SETUP block; goldens/e1m1_setup.golden. Counts + 116 spawned mobjs + vtxX/
+# secFloorH/blockmap CRCs all match an independent Python WAD reader. No gs.bet change.
+status = "done"
+
 # ─────────────────────── Oregon Trail port + the language features it needs ───────────────────────
 # A faithful port of the 1978 MECC Oregon Trail BASIC listing (ports/oregon-trail/). It needs two
 # stdlib intrinsics the language lacked: a seedable RNG and interactive stdin. betfe is intentionally
