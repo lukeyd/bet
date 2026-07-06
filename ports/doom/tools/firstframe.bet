@@ -1,0 +1,71 @@
+// firstframe.bet — the first REAL DOOM frame: load E1M1, render from the player start,
+// dump the 8-bit screen. A milestone/regression tool (native-only, WAD-scale).
+pull "spill"
+pull "mem"
+pull "fs"
+pull "../defs/gs" as gs
+pull "../defs/tables" as tables
+pull "../defs/info" as info
+pull "../defs/sounds" as sounds
+pull "../defs/think" as think
+pull "../w/w_wad" as wad
+pull "../r/r_main" as rmain
+pull "../p/p_setup" as psetup
+pull "../p/p_think" as pthink
+pull "../i/i_video" as ivideo
+
+facts FU: int = 65536
+
+finna main() {
+    lowkey g0 = cop gs.GameState{} in gs.gsc
+    gs.gsInit(g0)
+    holla g = g0 in gs.gsc {
+        g.info.finesine = tables.initFinesineAll(g.info.finesine)
+        g.info.finetangent = tables.initFinetangentAll(g.info.finetangent)
+        g.info.tantoangle = tables.initTantoangleAll(g.info.tantoangle)
+        info.initStatesAll(g.info.states)
+        info.initMobjinfoAll(g.info.mobjinfo)
+        sounds.initSfxAll(g.info.sfx)
+    } ghosted {
+        yeet("gs")
+    }
+    wad.initWad(g0, "/Users/lukebaggett/Documents/bet/doom-reference/doom1.wad")
+    rmain.rInit(g0)
+    ivideo.initGraphics(g0)
+    ivideo.setPalette(g0, 0)
+    pthink.initThinkers(g0)
+    psetup.setupLevel(g0, 1, 1, 3)
+
+    // POV = the spawned player; give it an eye height (P_CalcHeight is P2.4) and skip weapon.
+    holla g = g0 in gs.gsc {
+        g.shell.consoleplayer = 0
+        g.shell.displayplayer = 0
+        g.shell.players[0].psprites[0].stateIdx = -1
+        g.shell.players[0].psprites[1].stateIdx = -1
+        lowkey pz: i32 = 0
+        holla m = g.shell.players[0].mo in gs.thinkers {
+            pz = m.mobj.z
+        } ghosted {
+        }
+        g.shell.players[0].viewz = pz + (41 * FU) as i32
+    } ghosted {
+        yeet("gs")
+    }
+
+    rmain.renderPlayerView(g0, 0)
+
+    lowkey nz = 0
+    holla g = g0 in gs.gsc {
+        lowkey i = 0
+        vibin i < 64000 {
+            fr g.vid.scr0[i] != 0 {
+                nz = nz + 1
+            }
+            i = i + 1
+        }
+        fs.drop("/tmp/e1m1_scr0.raw", g.vid.scr0)
+    } ghosted {
+        yeet("gs")
+    }
+    spill.f("E1M1 first frame: {} / 64000 nonzero pixels (scr0 -> /tmp/e1m1_scr0.raw)", nz)
+}
