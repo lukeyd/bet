@@ -1,0 +1,169 @@
+// st/st_lib.bet — the status-bar WIDGET PRIMITIVES (linuxdoom-1.10 st_lib.c).
+//
+// id's widgets (st_number_t / st_percent_t / st_multicon_t / st_binicon_t) hold C POINTERS:
+// `int* num`, `boolean* on`, `patch_t** p`. bet has no pointers, so the widgets here carry only
+// their POSITION/CONFIG (a small drip returned by the init* fn); the live VALUE, the on-flag,
+// and the patch-offset table are passed to the draw* fn each call. st_stuff (P2.9a) owns the
+// patch offsets (in StBarState) and the player-derived values. Every draw goes through
+// v_video.drawPatch / v_video.copyRect — the P1.2 seam.
+//
+// Screen numbers (st_lib.c): BG=4 (the pristine STBAR backdrop, drawn by ST_refreshBackground),
+// FG=0 (the composited status bar in scr0). A numeric/percent widget clears its cell by copying
+// the pristine backdrop from BG at (x, y-ST_Y) then draws digit patches on top — exactly id's
+// V_CopyRect(x, y-ST_Y, BG, ...) + V_DrawPatch(FG). Multi/bin icons clear+draw the same way.
+//
+// PORTED:  STlib_initNum/updateNum(drawNum), STlib_initPercent/updatePercent(drawPercent),
+//          STlib_initMultIcon/updateMultIcon(drawMultIcon), STlib_initBinIcon/updateBinIcon
+//          (drawBinIcon). STlib_init (STTMINUS load) lives in st_stuff (it owns the wad offsets).
+// MODEL:   ST_Drawer runs the full-refresh path every frame (st_firsttime), so the diff-draw
+//          `oldnum`/`oldinum` bookkeeping id used to skip redraws is dropped — each draw* fully
+//          repaints its cell (identical pixels to id's refresh frame). See st_stuff.bet.
+pull "mem"
+pull "../defs/gs" as gs
+pull "../util/bstream" as bstream
+pull "../v/v_video" as vv
+
+flex facts BG: int = 4
+flex facts FG: int = 0
+flex facts ST_Y: int = 168
+
+// ---- widget config drips (position + max width; NO pointers) -------------------------------
+flex drip StNumber {
+    flex x: int          // upper-right corner (right-justified)
+    flex y: int
+    flex width: int      // max # of digits
+}
+
+flex drip StPercent {
+    flex x: int
+    flex y: int
+    flex width: int
+}
+
+flex drip StMultIcon {
+    flex x: int          // center-justified icon location
+    flex y: int
+}
+
+flex drip StBinIcon {
+    flex x: int
+    flex y: int
+}
+
+// ---- patch-dimension readers (patch_t header in g.wad.buf: width u16@0, height u16@2) -------
+flex finna patchWidth(gt: tag gs.GameState, ofs: int) -> int {
+    lowkey w = 0
+    holla g = gt in gs.gsc {
+        w = bstream.rdU16(g.wad.buf, ofs)
+    } ghosted {
+        yeet("gs")
+    }
+    bet w
+}
+
+flex finna patchHeight(gt: tag gs.GameState, ofs: int) -> int {
+    lowkey h = 0
+    holla g = gt in gs.gsc {
+        h = bstream.rdU16(g.wad.buf, ofs + 2)
+    } ghosted {
+        yeet("gs")
+    }
+    bet h
+}
+
+// ---- init routines (STlib_initNum/Percent/MultIcon/BinIcon) --------------------------------
+flex finna initNum(x: int, y: int, width: int) -> StNumber {
+    bet StNumber{ x: x, y: y, width: width }
+}
+
+flex finna initPercent(x: int, y: int) -> StPercent {
+    bet StPercent{ x: x, y: y, width: 3 }
+}
+
+flex finna initMultIcon(x: int, y: int) -> StMultIcon {
+    bet StMultIcon{ x: x, y: y }
+}
+
+flex finna initBinIcon(x: int, y: int) -> StBinIcon {
+    bet StBinIcon{ x: x, y: y }
+}
+
+// drawNum — STlib_drawNum: draw `num` right-justified, ending at (n.x, n.y), using the ten
+// digit patches `digitOfs[0..9]` (byte offsets into g.wad.buf) and `sttminusOfs` for a minus.
+// Clears the cell from BG first (identical pixels on a fresh bar). num==1994 draws nothing
+// (id's "n/a" sentinel for a no-ammo ready weapon).
+flex finna drawNum(gt: tag gs.GameState, n: StNumber, digitOfs: []i32, sttminusOfs: int, num: int, screen: int) {
+    lowkey w = patchWidth(gt, digitOfs[0] as int)
+    lowkey h = patchHeight(gt, digitOfs[0] as int)
+    lowkey numdigits = n.width
+    lowkey num2 = num
+    lowkey neg = num2 < 0
+    fr neg {
+        fr numdigits == 2 && num2 < -9 {
+            num2 = -9
+        } naw fr numdigits == 3 && num2 < -99 {
+            num2 = -99
+        }
+        num2 = -num2
+    }
+    // clear the area (V_CopyRect from BG at bar-relative y)
+    lowkey clx = n.x - numdigits * w
+    vv.copyRect(gt, clx, n.y - ST_Y, BG, w * numdigits, h, clx, n.y, screen)
+    // 1994 => "n/a": clear but draw nothing
+    fr num2 == 1994 {
+        bet
+    }
+    lowkey x = n.x
+    // in the special case of 0, draw a single 0
+    fr num2 == 0 {
+        vv.drawPatch(gt, x - w, n.y, screen, digitOfs[0] as int)
+    }
+    vibin num2 != 0 && numdigits > 0 {
+        x = x - w
+        vv.drawPatch(gt, x, n.y, screen, digitOfs[num2 % 10] as int)
+        num2 = num2 / 10
+        numdigits = numdigits - 1
+    }
+    fr neg {
+        vv.drawPatch(gt, x - 8, n.y, screen, sttminusOfs)
+    }
+}
+
+// drawPercent — STlib_drawPercent: draw the percent-sign patch at (p.x, p.y), then the number.
+flex finna drawPercent(gt: tag gs.GameState, p: StPercent, digitOfs: []i32, sttminusOfs: int, percentOfs: int, num: int, screen: int) {
+    vv.drawPatch(gt, p.x, p.y, screen, percentOfs)
+    drawNum(gt, StNumber{ x: p.x, y: p.y, width: p.width }, digitOfs, sttminusOfs, num, screen)
+}
+
+// drawMultIcon — STlib_drawMultIcon: draw patchOfs[inum] at (mi.x, mi.y). inum==-1 => draw
+// nothing (blank). The full-refresh model repaints the STBAR backdrop each frame, so the old-
+// icon clear id did (V_CopyRect from BG) is unnecessary here.
+flex finna drawMultIcon(gt: tag gs.GameState, mi: StMultIcon, patchOfs: []i32, inum: int, screen: int) {
+    fr inum != -1 {
+        vv.drawPatch(gt, mi.x, mi.y, screen, patchOfs[inum] as int)
+    }
+}
+
+// drawBinIcon — STlib_drawBinIcon: if `val`, draw the icon at (b.x, b.y); else clear its cell
+// from BG (V_CopyRect), using the patch's leftoffset/topoffset for the true top-left.
+flex finna drawBinIcon(gt: tag gs.GameState, b: StBinIcon, patchOfs: int, val: bool, screen: int) {
+    fr val {
+        vv.drawPatch(gt, b.x, b.y, screen, patchOfs)
+    } naw {
+        lowkey lofs = 0
+        lowkey tofs = 0
+        lowkey w = 0
+        lowkey h = 0
+        holla g = gt in gs.gsc {
+            lofs = bstream.rdI16(g.wad.buf, patchOfs + 4)
+            tofs = bstream.rdI16(g.wad.buf, patchOfs + 6)
+            w = bstream.rdU16(g.wad.buf, patchOfs)
+            h = bstream.rdU16(g.wad.buf, patchOfs + 2)
+        } ghosted {
+            yeet("gs")
+        }
+        lowkey x = b.x - lofs
+        lowkey y = b.y - tofs
+        vv.copyRect(gt, x, y - ST_Y, BG, w, h, x, y, screen)
+    }
+}

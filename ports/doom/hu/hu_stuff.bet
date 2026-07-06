@@ -1,0 +1,155 @@
+// hu/hu_stuff.bet — the heads-up display driver (linuxdoom-1.10 hu_stuff.c).
+//
+// Single-player scope: the player MESSAGE path (plr->message -> the message line -> drawn at the
+// top of the screen) is the one that matters and is ported faithfully; the netgame CHAT input is
+// kept minimal (HU_Responder toggles/echoes, HU_Ticker does not pull remote chat chars). The map
+// title widget (drawn only under the automap) is deferred to the automap workstream.
+//
+// State lives in gs.HudState: message/messageOn/messageCounter (id's w_message SText line +
+// message_on + message_counter), chatOn/chatString (chat_on + w_chat.l.l), huFontOfs (the 63
+// STCFN font patch offsets). consoleplayer is g.shell.consoleplayer.
+//
+// PORTED:  HU_Init (load STCFN%.3d font), HU_Start, HU_Drawer, HU_Ticker, HU_Responder.
+// SKIPPED: the four mapnames tables + w_title (automap-only), the french shiftxform, the chat
+//          macro/broadcast machinery (netgame). HU_dequeueChatChar/HU_Erase: add when the driver
+//          (P2.8) needs them; the full-refresh HUD needs no erase.
+pull "mem"
+pull "str"
+pull "../defs/gs" as gs
+pull "../defs/doomdef" as doomdef
+pull "../defs/strings" as strings
+pull "../w/w_wad" as wad
+pull "../hu/hu_lib" as hulib
+
+flex facts HU_MSGX: int = 0
+flex facts HU_MSGY: int = 0
+flex facts HU_MSGTIMEOUT: int = 140       // 4 * TICRATE
+flex facts HU_MSGREFRESH: int = 13        // KEY_ENTER
+flex facts HU_INPUTTOGGLE: int = 116      // 't'
+
+// stcfnName — build "STCFN%.3d" (zero-padded 3-digit) for glyph code `num` (33..95).
+flex finna stcfnName(num: int) -> str {
+    lowkey buf = mem.slab[u8](8)
+    buf[0] = 83   // S
+    buf[1] = 84   // T
+    buf[2] = 67   // C
+    buf[3] = 70   // F
+    buf[4] = 78   // N
+    buf[5] = (48 + (num / 100) % 10) as u8
+    buf[6] = (48 + (num / 10) % 10) as u8
+    buf[7] = (48 + num % 10) as u8
+    bet str.fromBytesTrust(buf)
+}
+
+// HU_Init — load the heads-up font (STCFN033..STCFN095) into HudState.huFontOfs.
+flex finna huInit(gt: tag gs.GameState) {
+    lowkey ofsTable = mem.slab[i32](hulib.HU_FONTSIZE)
+    lowkey i = 0
+    lowkey j = hulib.HU_FONTSTART
+    vibin i < hulib.HU_FONTSIZE {
+        // lumpNameOfs opens its own gsc holla — call it OUTSIDE ours.
+        lowkey lo = wad.lumpNameOfs(gt, stcfnName(j))
+        ofsTable[i] = lo as i32
+        i = i + 1
+        j = j + 1
+    }
+    holla g = gt in gs.gsc {
+        g.hud.huFontOfs = ofsTable
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// HU_Start — reset the message/chat state for a new level.
+flex finna huStart(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.hud.messageOn = cap
+        g.hud.message = ""
+        g.hud.messageCounter = 0
+        g.hud.chatOn = cap
+        g.hud.chatString = ""
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// HU_Ticker — count the message down; when the console player has a pending message, promote it
+// to the message line (mirrors hu_stuff.c's showMessages path; showMessages assumed on).
+flex finna huTicker(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        fr g.hud.messageCounter > 0 {
+            g.hud.messageCounter = g.hud.messageCounter - 1
+            fr g.hud.messageCounter == 0 {
+                g.hud.messageOn = cap
+            }
+        }
+        lowkey cp = g.shell.consoleplayer as int
+        lowkey pm = g.shell.players[cp].message
+        fr str.len(pm) > 0 {
+            g.hud.message = pm
+            g.shell.players[cp].message = ""
+            g.hud.messageOn = nocap
+            g.hud.messageCounter = HU_MSGTIMEOUT
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// HU_Drawer — draw the message line (and the chat line when chat is open).
+flex finna huDrawer(gt: tag gs.GameState) {
+    lowkey on = cap
+    lowkey msg = ""
+    lowkey chatOn = cap
+    lowkey chatStr = ""
+    lowkey fontOfs = mem.slab[i32](0)
+    holla g = gt in gs.gsc {
+        on = g.hud.messageOn
+        msg = g.hud.message
+        chatOn = g.hud.chatOn
+        chatStr = g.hud.chatString
+        fontOfs = g.hud.huFontOfs
+    } ghosted {
+        yeet("gs")
+    }
+    fr on {
+        hulib.drawTextLineStr(gt, HU_MSGX, HU_MSGY, hulib.HU_FONTSTART, fontOfs, msg, cap, 0)
+    }
+    fr chatOn {
+        hulib.drawTextLineStr(gt, HU_MSGX, HU_MSGY, hulib.HU_FONTSTART, fontOfs, chatStr, nocap, 0)
+    }
+}
+
+// HU_Responder — the message-refresh key and a minimal chat toggle/echo. `evType` is the event
+// type (EV_KEYDOWN==0); only keydown is handled. Returns whether the key was eaten. (Full
+// netgame chat: macros, broadcast, per-player buffers — deferred.)
+flex finna huResponder(gt: tag gs.GameState, evType: int, key: int) -> bool {
+    lowkey eatkey = cap
+    fr evType != 0 {
+        bet cap
+    }
+    holla g = gt in gs.gsc {
+        fr !g.hud.chatOn {
+            fr key == HU_MSGREFRESH {
+                g.hud.messageOn = nocap
+                g.hud.messageCounter = HU_MSGTIMEOUT
+                eatkey = nocap
+            } naw fr g.shell.netgame && key == HU_INPUTTOGGLE {
+                g.hud.chatOn = nocap
+                g.hud.chatString = ""
+                eatkey = nocap
+            }
+        } naw {
+            fr key == doomdef.KEY_ENTER || key == doomdef.KEY_ESCAPE {
+                g.hud.chatOn = cap
+                eatkey = nocap
+            } naw fr key >= 32 && key <= hulib.HU_FONTEND {
+                g.hud.chatString = hulib.appendChar(g.hud.chatString, key)
+                eatkey = nocap
+            }
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    bet eatkey
+}

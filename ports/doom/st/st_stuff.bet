@@ -1,0 +1,1119 @@
+// st/st_stuff.bet — the DOOM status bar (linuxdoom-1.10 st_stuff.c): health/ammo/armor/keys/
+// weapons(arms)/frags/face drawn into the bottom 32 rows of scr0, the face-selection state
+// machine, the palette red/gold/green shifts, and the cheat-code responder.
+//
+// State: gs.StBarState (face/palette statics + the loaded graphic byte-offsets + cheat matcher
+// state). The console player is g.shell.players[g.shell.consoleplayer]. Graphics load through
+// w_wad (byte offsets), draw through st_lib -> v_video.drawPatch. Face RNG is M_Random.
+//
+// MODEL: ST_Drawer runs the FULL-REFRESH path every frame (ST_doRefresh): repaint the STBAR
+// backdrop (scr4 -> scr0) then repaint every widget. This drops id's diff-draw bookkeeping while
+// producing identical pixels to id's refresh frame — the correctness target (the W3 oracle diffs
+// full frames). The palette shift calls i_video.setPalette (it only recolors the u32 present
+// buffer, so it never perturbs the 8-bit scr0 CRC).
+//
+// PORTED:  ST_Init, ST_Start, ST_Ticker (ST_updateWidgets + ST_updateFaceWidget + calcPainOffset),
+//          ST_Drawer (ST_doPaletteStuff + ST_refreshBackground + ST_drawWidgets), ST_Responder
+//          (the cheat codes).
+// DEFERRED: P_GivePower / S_ChangeMusic / G_DeferedInitNew calls in cheats (fields+message set,
+//          the downstream effect noted); the automap ev_keyup message-header filter (automap
+//          workstream); netgame faceback; the mypos angle/coords formatting (message set plain).
+pull "mem"
+pull "str"
+pull "../defs/gs" as gs
+pull "../defs/doomdef" as doomdef
+pull "../defs/player" as player
+pull "../defs/strings" as strings
+pull "../defs/tables" as tables
+pull "../w/w_wad" as wad
+pull "../v/v_video" as vv
+pull "../st/st_lib" as stlib
+pull "../util/m_random" as rnd
+pull "../util/m_cheat" as cheat
+pull "../r/r_geom" as rgeom
+pull "../i/i_video" as iv
+
+// ---- status-bar geometry / screen numbers -------------------------------------------------
+flex facts ST_X: int = 0
+flex facts ST_Y: int = 168
+flex facts ST_WIDTH: int = 320
+flex facts ST_HEIGHT: int = 32
+flex facts BG: int = 4
+flex facts FG: int = 0
+
+// ---- face constants (st_stuff.c) ----------------------------------------------------------
+flex facts ST_NUMPAINFACES: int = 5
+flex facts ST_NUMSTRAIGHTFACES: int = 3
+flex facts ST_FACESTRIDE: int = 8      // straight(3)+turn(2)+special(3)
+flex facts ST_NUMFACES: int = 42       // stride*painfaces + 2 extra
+flex facts ST_TURNOFFSET: int = 3
+flex facts ST_OUCHOFFSET: int = 5
+flex facts ST_EVILGRINOFFSET: int = 6
+flex facts ST_RAMPAGEOFFSET: int = 7
+flex facts ST_GODFACE: int = 40        // painfaces*stride
+flex facts ST_DEADFACE: int = 41
+flex facts ST_FACESX: int = 143
+flex facts ST_FACESY: int = 168
+flex facts ST_EVILGRINCOUNT: int = 70  // 2*TICRATE
+flex facts ST_STRAIGHTFACECOUNT: int = 17  // TICRATE/2
+flex facts ST_TURNCOUNT: int = 35      // 1*TICRATE
+flex facts ST_RAMPAGEDELAY: int = 70   // 2*TICRATE
+flex facts ST_MUCHPAIN: int = 20
+
+// ---- palette shift constants --------------------------------------------------------------
+flex facts STARTREDPALS: int = 1
+flex facts STARTBONUSPALS: int = 9
+flex facts NUMREDPALS: int = 8
+flex facts NUMBONUSPALS: int = 4
+flex facts RADIATIONPAL: int = 13
+
+// ---- cheat ordinals (index into StBarState.cheatPos) --------------------------------------
+flex facts CH_GOD: int = 0
+flex facts CH_AMMO: int = 1        // idkfa
+flex facts CH_AMMONOKEY: int = 2   // idfa
+flex facts CH_NOCLIP: int = 3      // idspispopd
+flex facts CH_COMMNOCLIP: int = 4  // idclip
+flex facts CH_CHOPPERS: int = 5
+flex facts CH_MUS: int = 6
+flex facts CH_CLEV: int = 7
+flex facts CH_MYPOS: int = 8
+flex facts CH_BEHOLD0: int = 9     // 9..15 = powerup[0..6]
+
+// =========================================================================================
+// name builders — status-bar lumps are "BASE" + one/two decimal digits.
+// =========================================================================================
+flex finna nm(base: str, a: int) -> str {
+    lowkey n = str.len(base)
+    lowkey buf = mem.slab[u8](n + 1)
+    lowkey i = 0
+    vibin i < n {
+        buf[i] = str.at(base, i) as u8
+        i = i + 1
+    }
+    buf[n] = (48 + a) as u8
+    bet str.fromBytesTrust(buf)
+}
+
+flex finna nm2(base: str, a: int, b: int) -> str {
+    lowkey n = str.len(base)
+    lowkey buf = mem.slab[u8](n + 2)
+    lowkey i = 0
+    vibin i < n {
+        buf[i] = str.at(base, i) as u8
+        i = i + 1
+    }
+    buf[n] = (48 + a) as u8
+    buf[n + 1] = (48 + b) as u8
+    bet str.fromBytesTrust(buf)
+}
+
+// nmZ — "BASE<a>0" (id's "%d0" turn-face names).
+flex finna nmZ(base: str, a: int) -> str {
+    bet nm2(base, a, 0)
+}
+
+// weaponAmmo — weaponinfo[w].ammo (p_pspr.c weaponinfo table): the ammo type each weapon draws.
+flex finna weaponAmmo(w: int) -> int {
+    fr w == doomdef.WP_PISTOL {
+        bet doomdef.AM_CLIP
+    }
+    fr w == doomdef.WP_SHOTGUN {
+        bet doomdef.AM_SHELL
+    }
+    fr w == doomdef.WP_CHAINGUN {
+        bet doomdef.AM_CLIP
+    }
+    fr w == doomdef.WP_MISSILE {
+        bet doomdef.AM_MISL
+    }
+    fr w == doomdef.WP_PLASMA {
+        bet doomdef.AM_CELL
+    }
+    fr w == doomdef.WP_BFG {
+        bet doomdef.AM_CELL
+    }
+    fr w == doomdef.WP_SUPERSHOTGUN {
+        bet doomdef.AM_SHELL
+    }
+    bet doomdef.AM_NOAMMO   // fist, chainsaw
+}
+
+// =========================================================================================
+// ST_Init — ST_loadData: PLAYPAL lump number + every status-bar graphic (as byte offsets),
+// the cheat matcher storage. screens[4] (scr4/BG) is pre-allocated by gsInit.
+// =========================================================================================
+flex finna stInit(gt: tag gs.GameState) {
+    lowkey lp = wad.getNumForName(gt, "PLAYPAL")
+    lowkey cp = 0
+    holla g = gt in gs.gsc {
+        cp = g.shell.consoleplayer as int
+    } ghosted {
+        yeet("gs")
+    }
+
+    lowkey tallnum = mem.slab[i32](10)
+    lowkey shortnum = mem.slab[i32](10)
+    lowkey i = 0
+    vibin i < 10 {
+        tallnum[i] = wad.lumpNameOfs(gt, nm("STTNUM", i)) as i32
+        shortnum[i] = wad.lumpNameOfs(gt, nm("STYSNUM", i)) as i32
+        i = i + 1
+    }
+    lowkey tallpercent = wad.lumpNameOfs(gt, "STTPRCNT")
+    lowkey sttminus = wad.lumpNameOfs(gt, "STTMINUS")
+
+    lowkey keys = mem.slab[i32](6)
+    i = 0
+    vibin i < doomdef.NUMCARDS {
+        keys[i] = wad.lumpNameOfs(gt, nm("STKEYS", i)) as i32
+        i = i + 1
+    }
+
+    lowkey armsbg = wad.lumpNameOfs(gt, "STARMS")
+    lowkey arms = mem.slab[i32](12)
+    i = 0
+    vibin i < 6 {
+        arms[i * 2 + 0] = wad.lumpNameOfs(gt, nm("STGNUM", i + 2)) as i32   // gray
+        arms[i * 2 + 1] = shortnum[i + 2]                                   // yellow
+        i = i + 1
+    }
+
+    lowkey faceback = wad.lumpNameOfs(gt, nm("STFB", cp))
+    lowkey sbar = wad.lumpNameOfs(gt, "STBAR")
+
+    // face states
+    lowkey faces = mem.slab[i32](ST_NUMFACES)
+    lowkey facenum = 0
+    i = 0
+    vibin i < ST_NUMPAINFACES {
+        lowkey j = 0
+        vibin j < ST_NUMSTRAIGHTFACES {
+            faces[facenum] = wad.lumpNameOfs(gt, nm2("STFST", i, j)) as i32
+            facenum = facenum + 1
+            j = j + 1
+        }
+        faces[facenum] = wad.lumpNameOfs(gt, nmZ("STFTR", i)) as i32   // turn right
+        facenum = facenum + 1
+        faces[facenum] = wad.lumpNameOfs(gt, nmZ("STFTL", i)) as i32   // turn left
+        facenum = facenum + 1
+        faces[facenum] = wad.lumpNameOfs(gt, nm("STFOUCH", i)) as i32  // ouch
+        facenum = facenum + 1
+        faces[facenum] = wad.lumpNameOfs(gt, nm("STFEVL", i)) as i32   // evil grin
+        facenum = facenum + 1
+        faces[facenum] = wad.lumpNameOfs(gt, nm("STFKILL", i)) as i32  // rampage
+        facenum = facenum + 1
+        i = i + 1
+    }
+    faces[facenum] = wad.lumpNameOfs(gt, "STFGOD0") as i32
+    facenum = facenum + 1
+    faces[facenum] = wad.lumpNameOfs(gt, "STFDEAD0") as i32
+
+    lowkey cheatPos = mem.slab[i32](16)
+    lowkey cMus = seqMus()
+    lowkey cClev = seqClev()
+
+    holla g = gt in gs.gsc {
+        g.stbar.luPalette = lp as i32
+        g.stbar.tallnumOfs = tallnum
+        g.stbar.shortnumOfs = shortnum
+        g.stbar.tallpercentOfs = tallpercent as i32
+        g.stbar.sttminusOfs = sttminus as i32
+        g.stbar.keysOfs = keys
+        g.stbar.armsbgOfs = armsbg as i32
+        g.stbar.armsOfs = arms
+        g.stbar.facebackOfs = faceback as i32
+        g.stbar.sbarOfs = sbar as i32
+        g.stbar.facesOfs = faces
+        g.stbar.cheatPos = cheatPos
+        g.stbar.cMus = cMus
+        g.stbar.cClev = cClev
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// =========================================================================================
+// ST_Start — ST_initData + ST_createWidgets (widgets are constructed at draw time in the
+// full-refresh model, so this just resets the face/palette state).
+// =========================================================================================
+flex finna stStart(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        lowkey cp = g.shell.consoleplayer as int
+        g.stbar.firsttime = nocap
+        g.stbar.currentState = 1        // FirstPersonState
+        g.stbar.statusBarOn = nocap
+        g.stbar.faceIndex = 0
+        g.stbar.faceCount = 0
+        g.stbar.priority = 0
+        g.stbar.lastAttackDown = -1
+        g.stbar.stPalette = -1
+        g.stbar.oldHealth = -1
+        g.stbar.painOldHealth = -1
+        g.stbar.painLastCalc = 0
+        g.stbar.started = nocap
+        lowkey i = 0
+        vibin i < doomdef.NUMWEAPONS {
+            g.stbar.oldweaponsowned[i] = g.shell.players[cp].weaponowned[i]
+            i = i + 1
+        }
+        i = 0
+        vibin i < 3 {
+            g.stbar.keyboxes[i] = -1
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// =========================================================================================
+// ST_Ticker — advance the RNG, update the key/face widgets, remember the health.
+// =========================================================================================
+flex finna stTicker(gt: tag gs.GameState) {
+    lowkey rn = rnd.mRandom(gt)          // its own gsc holla (closed before ours opens)
+    holla g = gt in gs.gsc {
+        g.stbar.randomNumber = rn as i32
+        lowkey cp = g.shell.consoleplayer as int
+
+        // update keycard multi-widgets (cards[0..2] cards, cards[3..5] skulls override)
+        lowkey i = 0
+        vibin i < 3 {
+            lowkey kb = -1
+            fr g.shell.players[cp].cards[i] {
+                kb = i
+            }
+            fr g.shell.players[cp].cards[i + 3] {
+                kb = i + 3
+            }
+            g.stbar.keyboxes[i] = kb as i32
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    // face machine (own gsc holla), then remember this tic's health as st_oldhealth.
+    updateFaceWidget(gt)
+    holla g = gt in gs.gsc {
+        g.stbar.oldHealth = g.shell.players[g.shell.consoleplayer].health
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// updateFaceWidget — the face state machine (precedence dead > evil grin > attacked > self-hurt
+// > rampage > god > straight). Opens its own gsc holla; reads st_oldhealth BEFORE ST_Ticker
+// refreshes it (id order).
+flex finna updateFaceWidget(gt: tag gs.GameState) {
+  holla g = gt in gs.gsc {
+    lowkey cp = g.shell.consoleplayer as int
+    lowkey health = g.shell.players[cp].health as int
+    lowkey damagecount = g.shell.players[cp].damagecount as int
+    lowkey bonuscount = g.shell.players[cp].bonuscount as int
+    lowkey attackdown = g.shell.players[cp].attackdown
+    lowkey cheats = g.shell.players[cp].cheats as int
+    lowkey powInvuln = g.shell.players[cp].powers[doomdef.PW_INVULNERABILITY] as int
+
+    // ST_calcPainOffset (health-bucketed pain face base), cached on health.
+    lowkey ph = health
+    fr ph > 100 {
+        ph = 100
+    }
+    fr ph != g.stbar.painOldHealth as int {
+        g.stbar.painLastCalc = (ST_FACESTRIDE * (((100 - ph) * ST_NUMPAINFACES) / 101)) as i32
+        g.stbar.painOldHealth = ph as i32
+    }
+    lowkey painOffset = g.stbar.painLastCalc as int
+
+    lowkey priority = g.stbar.priority as int
+    lowkey faceindex = g.stbar.faceIndex as int
+    lowkey facecount = g.stbar.faceCount as int
+    lowkey lastattackdown = g.stbar.lastAttackDown as int
+    lowkey oldhealth = g.stbar.oldHealth as int
+
+    // read the player mobj + attacker (coords/angle/owner) via the thinkers crib.
+    lowkey moLive = cap
+    lowkey mox: i32 = 0
+    lowkey moy: i32 = 0
+    lowkey moang: u32 = 0
+    holla mm = g.shell.players[cp].mo in gs.thinkers {
+        moLive = nocap
+        mox = mm.mobj.x
+        moy = mm.mobj.y
+        moang = mm.mobj.angle
+    } ghosted {
+    }
+    lowkey atkLive = cap
+    lowkey atkx: i32 = 0
+    lowkey atky: i32 = 0
+    lowkey atkPlayer = 0
+    holla aa = g.shell.players[cp].attacker in gs.thinkers {
+        atkLive = nocap
+        atkx = aa.mobj.x
+        atky = aa.mobj.y
+        atkPlayer = aa.mobj.player as int
+    } ghosted {
+    }
+
+    // dead
+    fr priority < 10 {
+        fr health == 0 {
+            priority = 9
+            faceindex = ST_DEADFACE
+            facecount = 1
+        }
+    }
+    // evil grin — just picked up a weapon
+    fr priority < 9 {
+        fr bonuscount != 0 {
+            lowkey doevilgrin = cap
+            lowkey i = 0
+            vibin i < doomdef.NUMWEAPONS {
+                lowkey nw = g.shell.players[cp].weaponowned[i]
+                fr g.stbar.oldweaponsowned[i] != nw {
+                    doevilgrin = nocap
+                    g.stbar.oldweaponsowned[i] = nw
+                }
+                i = i + 1
+            }
+            fr doevilgrin {
+                priority = 8
+                facecount = ST_EVILGRINCOUNT
+                faceindex = painOffset + ST_EVILGRINOFFSET
+            }
+        }
+    }
+    // being attacked by another mobj
+    fr priority < 8 {
+        fr damagecount != 0 && atkLive && moLive && atkPlayer != cp {
+            priority = 7
+            fr health - oldhealth > ST_MUCHPAIN {
+                facecount = ST_TURNCOUNT
+                faceindex = painOffset + ST_OUCHOFFSET
+            } naw {
+                lowkey badguyangle: u32 = rgeom.pointToAngle2(g.info.tantoangle, mox, moy, atkx, atky)
+                lowkey turnRight = cap
+                lowkey diffang: u32 = 0
+                fr badguyangle > moang {
+                    diffang = badguyangle - moang
+                    turnRight = diffang > tables.ANG180
+                } naw {
+                    diffang = moang - badguyangle
+                    turnRight = diffang <= tables.ANG180
+                }
+                facecount = ST_TURNCOUNT
+                faceindex = painOffset
+                fr diffang < tables.ANG45 {
+                    faceindex = faceindex + ST_RAMPAGEOFFSET   // head-on
+                } naw fr turnRight {
+                    faceindex = faceindex + ST_TURNOFFSET
+                } naw {
+                    faceindex = faceindex + ST_TURNOFFSET + 1
+                }
+            }
+        }
+    }
+    // self-inflicted hurt (floors/crushers/own rockets: no other attacker)
+    fr priority < 7 {
+        fr damagecount != 0 {
+            fr health - oldhealth > ST_MUCHPAIN {
+                priority = 7
+                facecount = ST_TURNCOUNT
+                faceindex = painOffset + ST_OUCHOFFSET
+            } naw {
+                priority = 6
+                facecount = ST_TURNCOUNT
+                faceindex = painOffset + ST_RAMPAGEOFFSET
+            }
+        }
+    }
+    // rapid firing (rampage)
+    fr priority < 6 {
+        fr attackdown {
+            fr lastattackdown == -1 {
+                lastattackdown = ST_RAMPAGEDELAY
+            } naw {
+                lastattackdown = lastattackdown - 1
+                fr lastattackdown == 0 {
+                    priority = 5
+                    faceindex = painOffset + ST_RAMPAGEOFFSET
+                    facecount = 1
+                    lastattackdown = 1
+                }
+            }
+        } naw {
+            lastattackdown = -1
+        }
+    }
+    // invulnerability
+    fr priority < 5 {
+        fr (cheats & player.CF_GODMODE) != 0 || powInvuln != 0 {
+            priority = 4
+            faceindex = ST_GODFACE
+            facecount = 1
+        }
+    }
+    // straight-ahead when the timer expired
+    fr facecount == 0 {
+        faceindex = painOffset + (g.stbar.randomNumber as int % 3)
+        facecount = ST_STRAIGHTFACECOUNT
+        priority = 0
+    }
+    facecount = facecount - 1
+
+    g.stbar.priority = priority as i32
+    g.stbar.faceIndex = faceindex as i32
+    g.stbar.faceCount = facecount as i32
+    g.stbar.lastAttackDown = lastattackdown as i32
+  } ghosted {
+    yeet("gs")
+  }
+}
+
+// =========================================================================================
+// ST_Drawer — palette shift + full status-bar repaint.
+// =========================================================================================
+flex finna stDrawer(gt: tag gs.GameState, fullscreen: bool, refresh: bool) {
+    holla g = gt in gs.gsc {
+        g.stbar.statusBarOn = !fullscreen || g.shell.automapactive
+    } ghosted {
+        yeet("gs")
+    }
+    doPaletteStuff(gt)
+    refreshBackground(gt)
+    drawWidgets(gt)
+}
+
+// ST_doPaletteStuff — pick the damage(red)/bonus(gold)/radiation(green) palette and set it.
+flex finna doPaletteStuff(gt: tag gs.GameState) {
+    lowkey palette = 0
+    lowkey oldPalette = 0
+    holla g = gt in gs.gsc {
+        lowkey cp = g.shell.consoleplayer as int
+        lowkey cnt = g.shell.players[cp].damagecount as int
+        lowkey powStr = g.shell.players[cp].powers[doomdef.PW_STRENGTH] as int
+        fr powStr != 0 {
+            lowkey bzc = 12 - (powStr >> 6)
+            fr bzc > cnt {
+                cnt = bzc
+            }
+        }
+        fr cnt != 0 {
+            palette = (cnt + 7) >> 3
+            fr palette >= NUMREDPALS {
+                palette = NUMREDPALS - 1
+            }
+            palette = palette + STARTREDPALS
+        } naw fr g.shell.players[cp].bonuscount as int != 0 {
+            palette = (g.shell.players[cp].bonuscount as int + 7) >> 3
+            fr palette >= NUMBONUSPALS {
+                palette = NUMBONUSPALS - 1
+            }
+            palette = palette + STARTBONUSPALS
+        } naw fr g.shell.players[cp].powers[doomdef.PW_IRONFEET] as int > 128 || (g.shell.players[cp].powers[doomdef.PW_IRONFEET] as int & 8) != 0 {
+            palette = RADIATIONPAL
+        } naw {
+            palette = 0
+        }
+        oldPalette = g.stbar.stPalette as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr palette != oldPalette {
+        holla g = gt in gs.gsc {
+            g.stbar.stPalette = palette as i32
+        } ghosted {
+            yeet("gs")
+        }
+        iv.setPalette(gt, palette)
+    }
+}
+
+// ST_refreshBackground — draw the STBAR backdrop into scr4 then copy it to scr0 rows 168..199.
+flex finna refreshBackground(gt: tag gs.GameState) {
+    lowkey on = cap
+    lowkey sbar = 0
+    holla g = gt in gs.gsc {
+        on = g.stbar.statusBarOn
+        sbar = g.stbar.sbarOfs as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr on {
+        vv.drawPatch(gt, ST_X, 0, BG, sbar)
+        vv.copyRect(gt, ST_X, 0, BG, ST_WIDTH, ST_HEIGHT, ST_X, ST_Y, FG)
+    }
+}
+
+// ammo/maxammo widget positions (id ST_AMMO*X/Y, ST_MAXAMMO*X/Y).
+flex finna ammoX(i: int) -> int {
+    bet 288
+}
+flex finna ammoY(i: int) -> int {
+    fr i == 0 {
+        bet 173
+    }
+    fr i == 1 {
+        bet 179
+    }
+    fr i == 2 {
+        bet 191
+    }
+    bet 185
+}
+flex finna maxammoY(i: int) -> int {
+    bet ammoY(i)
+}
+
+// ST_drawWidgets (full refresh) — read the player + graphics state, then repaint every widget.
+flex finna drawWidgets(gt: tag gs.GameState) {
+    lowkey readyAmmo = 0
+    lowkey ammo0 = 0
+    lowkey ammo1 = 0
+    lowkey ammo2 = 0
+    lowkey ammo3 = 0
+    lowkey max0 = 0
+    lowkey max1 = 0
+    lowkey max2 = 0
+    lowkey max3 = 0
+    lowkey health = 0
+    lowkey armor = 0
+    lowkey faceindex = 0
+    lowkey kb0 = -1
+    lowkey kb1 = -1
+    lowkey kb2 = -1
+    lowkey own1 = 0
+    lowkey own2 = 0
+    lowkey own3 = 0
+    lowkey own4 = 0
+    lowkey own5 = 0
+    lowkey own6 = 0
+    lowkey deathmatch = 0
+    lowkey tallnum = mem.slab[i32](0)
+    lowkey shortnum = mem.slab[i32](0)
+    lowkey keys = mem.slab[i32](0)
+    lowkey faces = mem.slab[i32](0)
+    lowkey arms = mem.slab[i32](0)
+    lowkey tallpercent = 0
+    lowkey sttminus = 0
+    lowkey armsbg = 0
+
+    holla g = gt in gs.gsc {
+        lowkey cp = g.shell.consoleplayer as int
+        lowkey rw = g.shell.players[cp].readyweapon as int
+        lowkey at = weaponAmmo(rw)
+        fr at == doomdef.AM_NOAMMO {
+            readyAmmo = 1994
+        } naw {
+            readyAmmo = g.shell.players[cp].ammo[at] as int
+        }
+        ammo0 = g.shell.players[cp].ammo[0] as int
+        ammo1 = g.shell.players[cp].ammo[1] as int
+        ammo2 = g.shell.players[cp].ammo[2] as int
+        ammo3 = g.shell.players[cp].ammo[3] as int
+        max0 = g.shell.players[cp].maxammo[0] as int
+        max1 = g.shell.players[cp].maxammo[1] as int
+        max2 = g.shell.players[cp].maxammo[2] as int
+        max3 = g.shell.players[cp].maxammo[3] as int
+        health = g.shell.players[cp].health as int
+        armor = g.shell.players[cp].armorpoints as int
+        faceindex = g.stbar.faceIndex as int
+        kb0 = g.stbar.keyboxes[0] as int
+        kb1 = g.stbar.keyboxes[1] as int
+        kb2 = g.stbar.keyboxes[2] as int
+        fr g.shell.players[cp].weaponowned[1] { own1 = 1 }
+        fr g.shell.players[cp].weaponowned[2] { own2 = 1 }
+        fr g.shell.players[cp].weaponowned[3] { own3 = 1 }
+        fr g.shell.players[cp].weaponowned[4] { own4 = 1 }
+        fr g.shell.players[cp].weaponowned[5] { own5 = 1 }
+        fr g.shell.players[cp].weaponowned[6] { own6 = 1 }
+        deathmatch = g.shell.deathmatch as int
+        tallnum = g.stbar.tallnumOfs
+        shortnum = g.stbar.shortnumOfs
+        keys = g.stbar.keysOfs
+        faces = g.stbar.facesOfs
+        arms = g.stbar.armsOfs
+        tallpercent = g.stbar.tallpercentOfs as int
+        sttminus = g.stbar.sttminusOfs as int
+        armsbg = g.stbar.armsbgOfs as int
+    } ghosted {
+        yeet("gs")
+    }
+
+    // ready weapon ammo
+    stlib.drawNum(gt, stlib.initNum(44, 171, 3), tallnum, sttminus, readyAmmo, FG)
+    // ammo + max ammo (all four kinds, short yellow numbers)
+    stlib.drawNum(gt, stlib.initNum(ammoX(0), ammoY(0), 3), shortnum, sttminus, ammo0, FG)
+    stlib.drawNum(gt, stlib.initNum(ammoX(1), ammoY(1), 3), shortnum, sttminus, ammo1, FG)
+    stlib.drawNum(gt, stlib.initNum(ammoX(2), ammoY(2), 3), shortnum, sttminus, ammo2, FG)
+    stlib.drawNum(gt, stlib.initNum(ammoX(3), ammoY(3), 3), shortnum, sttminus, ammo3, FG)
+    stlib.drawNum(gt, stlib.initNum(314, maxammoY(0), 3), shortnum, sttminus, max0, FG)
+    stlib.drawNum(gt, stlib.initNum(314, maxammoY(1), 3), shortnum, sttminus, max1, FG)
+    stlib.drawNum(gt, stlib.initNum(314, maxammoY(2), 3), shortnum, sttminus, max2, FG)
+    stlib.drawNum(gt, stlib.initNum(314, maxammoY(3), 3), shortnum, sttminus, max3, FG)
+    // health + armor percentages
+    stlib.drawPercent(gt, stlib.initPercent(90, 171), tallnum, sttminus, tallpercent, health, FG)
+    stlib.drawPercent(gt, stlib.initPercent(221, 171), tallnum, sttminus, tallpercent, armor, FG)
+    // arms background (drawn when not deathmatch)
+    stlib.drawBinIcon(gt, stlib.initBinIcon(104, 168), armsbg, deathmatch == 0, FG)
+    // weapons owned (6 arms cells; gray/yellow selected by ownership)
+    drawArm(gt, 0, 111, 172, arms, own1)
+    drawArm(gt, 1, 123, 172, arms, own2)
+    drawArm(gt, 2, 135, 172, arms, own3)
+    drawArm(gt, 3, 111, 182, arms, own4)
+    drawArm(gt, 4, 123, 182, arms, own5)
+    drawArm(gt, 5, 135, 182, arms, own6)
+    // face
+    stlib.drawMultIcon(gt, stlib.initMultIcon(ST_FACESX, ST_FACESY), faces, faceindex, FG)
+    // keys
+    stlib.drawMultIcon(gt, stlib.initMultIcon(239, 171), keys, kb0, FG)
+    stlib.drawMultIcon(gt, stlib.initMultIcon(239, 181), keys, kb1, FG)
+    stlib.drawMultIcon(gt, stlib.initMultIcon(239, 191), keys, kb2, FG)
+}
+
+// drawArm — one weapon-ownership cell: arms[i][owned] via a MultIcon whose patch list is the
+// flat arms table indexed by i*2 + owned (0 gray / 1 yellow).
+flex finna drawArm(gt: tag gs.GameState, i: int, x: int, y: int, arms: []i32, owned: int) {
+    stlib.drawMultIcon(gt, stlib.initMultIcon(x, y), arms, i * 2 + owned, FG)
+}
+
+// =========================================================================================
+// cheat sequences (SCRAMBLE'd bytes, verbatim from st_stuff.c, terminated 0xff).
+// =========================================================================================
+flex finna seqGod() -> []u8 {
+    lowkey s = mem.slab[u8](6)
+    s[0] = 0xb2 as u8
+    s[1] = 0x26 as u8
+    s[2] = 0x26 as u8
+    s[3] = 0xaa as u8
+    s[4] = 0x26 as u8
+    s[5] = 0xff as u8
+    bet s
+}
+flex finna seqAmmo() -> []u8 {          // idkfa
+    lowkey s = mem.slab[u8](6)
+    s[0] = 0xb2 as u8
+    s[1] = 0x26 as u8
+    s[2] = 0xf2 as u8
+    s[3] = 0x66 as u8
+    s[4] = 0xa2 as u8
+    s[5] = 0xff as u8
+    bet s
+}
+flex finna seqAmmonokey() -> []u8 {     // idfa
+    lowkey s = mem.slab[u8](5)
+    s[0] = 0xb2 as u8
+    s[1] = 0x26 as u8
+    s[2] = 0x66 as u8
+    s[3] = 0xa2 as u8
+    s[4] = 0xff as u8
+    bet s
+}
+flex finna seqNoclip() -> []u8 {        // idspispopd
+    lowkey s = mem.slab[u8](11)
+    s[0] = 0xb2 as u8
+    s[1] = 0x26 as u8
+    s[2] = 0xea as u8
+    s[3] = 0x2a as u8
+    s[4] = 0xb2 as u8
+    s[5] = 0xea as u8
+    s[6] = 0x2a as u8
+    s[7] = 0xf6 as u8
+    s[8] = 0x2a as u8
+    s[9] = 0x26 as u8
+    s[10] = 0xff as u8
+    bet s
+}
+flex finna seqCommNoclip() -> []u8 {    // idclip
+    lowkey s = mem.slab[u8](7)
+    s[0] = 0xb2 as u8
+    s[1] = 0x26 as u8
+    s[2] = 0xe2 as u8
+    s[3] = 0x36 as u8
+    s[4] = 0xb2 as u8
+    s[5] = 0x2a as u8
+    s[6] = 0xff as u8
+    bet s
+}
+flex finna seqChoppers() -> []u8 {      // idchoppers
+    lowkey s = mem.slab[u8](11)
+    s[0] = 0xb2 as u8
+    s[1] = 0x26 as u8
+    s[2] = 0xe2 as u8
+    s[3] = 0x32 as u8
+    s[4] = 0xf6 as u8
+    s[5] = 0x2a as u8
+    s[6] = 0x2a as u8
+    s[7] = 0xa6 as u8
+    s[8] = 0x6a as u8
+    s[9] = 0xea as u8
+    s[10] = 0xff as u8
+    bet s
+}
+flex finna seqMypos() -> []u8 {         // idmypos
+    lowkey s = mem.slab[u8](8)
+    s[0] = 0xb2 as u8
+    s[1] = 0x26 as u8
+    s[2] = 0xb6 as u8
+    s[3] = 0xba as u8
+    s[4] = 0x2a as u8
+    s[5] = 0xf6 as u8
+    s[6] = 0xea as u8
+    s[7] = 0xff as u8
+    bet s
+}
+flex finna seqMus() -> []u8 {           // idmus## (two param slots)
+    lowkey s = mem.slab[u8](9)
+    s[0] = 0xb2 as u8
+    s[1] = 0x26 as u8
+    s[2] = 0xb6 as u8
+    s[3] = 0xae as u8
+    s[4] = 0xea as u8
+    s[5] = 1 as u8
+    s[6] = 0 as u8
+    s[7] = 0 as u8
+    s[8] = 0xff as u8
+    bet s
+}
+flex finna seqClev() -> []u8 {          // idclev## (two param slots)
+    lowkey s = mem.slab[u8](10)
+    s[0] = 0xb2 as u8
+    s[1] = 0x26 as u8
+    s[2] = 0xe2 as u8
+    s[3] = 0x36 as u8
+    s[4] = 0xa6 as u8
+    s[5] = 0x6e as u8
+    s[6] = 1 as u8
+    s[7] = 0 as u8
+    s[8] = 0 as u8
+    s[9] = 0xff as u8
+    bet s
+}
+// behold<x> powerup cheats (7): shared "behold" prefix + a per-power final byte (v/s/i/r/a/l),
+// entry 6 is the bare "behold" menu.
+flex finna seqBehold(idx: int) -> []u8 {
+    lowkey tail = mem.slab[u8](6)   // v,s,i,r,a,l
+    tail[0] = 0x6e as u8
+    tail[1] = 0xea as u8
+    tail[2] = 0xb2 as u8
+    tail[3] = 0x6a as u8
+    tail[4] = 0xa2 as u8
+    tail[5] = 0x36 as u8
+    fr idx == 6 {
+        lowkey s = mem.slab[u8](9)
+        s[0] = 0xb2 as u8
+        s[1] = 0x26 as u8
+        s[2] = 0x62 as u8
+        s[3] = 0xa6 as u8
+        s[4] = 0x32 as u8
+        s[5] = 0xf6 as u8
+        s[6] = 0x36 as u8
+        s[7] = 0x26 as u8
+        s[8] = 0xff as u8
+        bet s
+    }
+    lowkey s = mem.slab[u8](10)
+    s[0] = 0xb2 as u8
+    s[1] = 0x26 as u8
+    s[2] = 0x62 as u8
+    s[3] = 0xa6 as u8
+    s[4] = 0x32 as u8
+    s[5] = 0xf6 as u8
+    s[6] = 0x36 as u8
+    s[7] = 0x26 as u8
+    s[8] = tail[idx]
+    s[9] = 0xff as u8
+    bet s
+}
+
+// =========================================================================================
+// ST_Responder — feed a keypress to the cheat matcher; set the player fields / message on a hit.
+// `evType` is EV_KEYDOWN (0); `key` is ev->data1. Returns false (cheats never eat the key).
+// =========================================================================================
+flex finna stResponder(gt: tag gs.GameState, evType: int, key: int) -> bool {
+    fr evType != 0 {
+        bet cap
+    }
+    lowkey netgame = cap
+    holla g = gt in gs.gsc {
+        netgame = g.shell.netgame
+    } ghosted {
+        yeet("gs")
+    }
+    fr netgame {
+        bet cap
+    }
+
+    // 'iddqd' — god mode toggle
+    fr matchCheat(gt, seqGod(), CH_GOD, key) {
+        cheatGod(gt)
+    }
+    // 'idfa' — full arsenal (no keys)
+    fr matchCheat(gt, seqAmmonokey(), CH_AMMONOKEY, key) {
+        cheatFullArsenal(gt, cap)
+    }
+    // 'idkfa' — full arsenal + keys
+    fr matchCheat(gt, seqAmmo(), CH_AMMO, key) {
+        cheatFullArsenal(gt, nocap)
+    }
+    // 'idclip' / 'idspispopd' — noclip toggle
+    fr matchCheat(gt, seqCommNoclip(), CH_COMMNOCLIP, key) || matchCheat(gt, seqNoclip(), CH_NOCLIP, key) {
+        cheatNoclip(gt)
+    }
+    // 'idchoppers' — chainsaw + invulnerability
+    fr matchCheat(gt, seqChoppers(), CH_CHOPPERS, key) {
+        cheatChoppers(gt)
+    }
+    // 'behold<x>' — powerups; 'behold' — the menu
+    lowkey bi = 0
+    vibin bi < 6 {
+        fr matchCheat(gt, seqBehold(bi), CH_BEHOLD0 + bi, key) {
+            cheatPowerup(gt, bi)
+        }
+        bi = bi + 1
+    }
+    fr matchCheat(gt, seqBehold(6), CH_BEHOLD0 + 6, key) {
+        setMessage(gt, strings.STSTR_BEHOLD)
+    }
+    // 'idmus##' — music change (validated; S_ChangeMusic deferred)
+    matchMus(gt, key)
+    // 'idclev##' — change level (validated; G_DeferedInitNew deferred)
+    matchClev(gt, key)
+    // 'idmypos' — position readout (message set plain; angle/coord formatting deferred)
+    fr matchCheat(gt, seqMypos(), CH_MYPOS, key) {
+        setMessage(gt, "mypos")
+    }
+    bet cap
+}
+
+// matchCheat — run one keypress `key` through cheat `idx` (constant, non-param seq). Returns
+// whether the sequence just completed. Only the match position persists (in cheatPos[idx]).
+flex finna matchCheat(gt: tag gs.GameState, seq: []u8, idx: int, key: int) -> bool {
+    lowkey pos = 0
+    holla g = gt in gs.gsc {
+        pos = g.stbar.cheatPos[idx] as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey res = cheat.checkCheat(seq, pos, key)
+    holla g = gt in gs.gsc {
+        g.stbar.cheatPos[idx] = res.p as i32
+    } ghosted {
+        yeet("gs")
+    }
+    bet res.rc == 1
+}
+
+// setMessage — set the console player's hint message (HU_Ticker promotes it to the HUD line).
+flex finna setMessage(gt: tag gs.GameState, msg: str) {
+    holla g = gt in gs.gsc {
+        g.shell.players[g.shell.consoleplayer].message = msg
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// cheatGod — toggle CF_GODMODE; on => health=100 (+ mo->health) and DQDON, off => DQDOFF.
+flex finna cheatGod(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        lowkey cp = g.shell.consoleplayer as int
+        g.shell.players[cp].cheats = g.shell.players[cp].cheats ^ (player.CF_GODMODE as i32)
+        fr (g.shell.players[cp].cheats as int & player.CF_GODMODE) != 0 {
+            g.shell.players[cp].health = 100
+            g.shell.players[cp].message = strings.STSTR_DQDON
+            // mo->health = 100 if the player has a body (nested thinkers holla; ghost = no body)
+            holla m = g.shell.players[cp].mo in gs.thinkers {
+                m.mobj.health = 100
+            } ghosted {
+            }
+        } naw {
+            g.shell.players[cp].message = strings.STSTR_DQDOFF
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// cheatFullArsenal — idfa/idkfa: 200/2 armor, all weapons, ammo=maxammo, (+cards for idkfa).
+flex finna cheatFullArsenal(gt: tag gs.GameState, withKeys: bool) {
+    holla g = gt in gs.gsc {
+        lowkey cp = g.shell.consoleplayer as int
+        g.shell.players[cp].armorpoints = 200
+        g.shell.players[cp].armortype = 2
+        lowkey i = 0
+        vibin i < doomdef.NUMWEAPONS {
+            g.shell.players[cp].weaponowned[i] = nocap
+            i = i + 1
+        }
+        i = 0
+        vibin i < doomdef.NUMAMMO {
+            g.shell.players[cp].ammo[i] = g.shell.players[cp].maxammo[i]
+            i = i + 1
+        }
+        fr withKeys {
+            i = 0
+            vibin i < doomdef.NUMCARDS {
+                g.shell.players[cp].cards[i] = nocap
+                i = i + 1
+            }
+            g.shell.players[cp].message = strings.STSTR_KFAADDED
+        } naw {
+            g.shell.players[cp].message = strings.STSTR_FAADDED
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// cheatNoclip — toggle CF_NOCLIP; message NCON/NCOFF.
+flex finna cheatNoclip(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        lowkey cp = g.shell.consoleplayer as int
+        g.shell.players[cp].cheats = g.shell.players[cp].cheats ^ (player.CF_NOCLIP as i32)
+        fr (g.shell.players[cp].cheats as int & player.CF_NOCLIP) != 0 {
+            g.shell.players[cp].message = strings.STSTR_NCON
+        } naw {
+            g.shell.players[cp].message = strings.STSTR_NCOFF
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// cheatChoppers — grant chainsaw + invulnerability; message CHOPPERS.
+flex finna cheatChoppers(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        lowkey cp = g.shell.consoleplayer as int
+        g.shell.players[cp].weaponowned[doomdef.WP_CHAINSAW] = nocap
+        g.shell.players[cp].powers[doomdef.PW_INVULNERABILITY] = 1
+        g.shell.players[cp].message = strings.STSTR_CHOPPERS
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// cheatPowerup — behold<x>: give (P_GivePower deferred → set to power duration) or toggle a
+// powerup; message BEHOLDX. i in 0..5 = pw_invulnerability..pw_infrared.
+flex finna cheatPowerup(gt: tag gs.GameState, i: int) {
+    holla g = gt in gs.gsc {
+        lowkey cp = g.shell.consoleplayer as int
+        fr g.shell.players[cp].powers[i] as int == 0 {
+            g.shell.players[cp].powers[i] = powerDuration(i) as i32   // stand-in for P_GivePower
+        } naw fr i != doomdef.PW_STRENGTH {
+            g.shell.players[cp].powers[i] = 1
+        } naw {
+            g.shell.players[cp].powers[i] = 0
+        }
+        g.shell.players[cp].message = strings.STSTR_BEHOLDX
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// powerDuration — the tic count P_GivePower would set (approximation; 1 for the untimed ones).
+flex finna powerDuration(i: int) -> int {
+    fr i == doomdef.PW_INVULNERABILITY {
+        bet doomdef.INVULNTICS
+    }
+    fr i == doomdef.PW_INVISIBILITY {
+        bet doomdef.INVISTICS
+    }
+    fr i == doomdef.PW_INFRARED {
+        bet doomdef.INFRATICS
+    }
+    fr i == doomdef.PW_IRONFEET {
+        bet doomdef.IRONTICS
+    }
+    bet 1
+}
+
+// matchMus — idmus##: capture the two map digits, validate, set MUS/NOMUS. Persistent seq cMus.
+flex finna matchMus(gt: tag gs.GameState, key: int) {
+    lowkey rc = 0
+    lowkey pos = 0
+    lowkey d0 = 0
+    lowkey d1 = 0
+    lowkey commercial = cap
+    holla g = gt in gs.gsc {
+        pos = g.stbar.cheatPos[CH_MUS] as int
+        commercial = g.shell.gamemode as int == doomdef.GM_COMMERCIAL
+        lowkey res = cheat.checkCheat(g.stbar.cMus, pos, key)
+        rc = res.rc
+        g.stbar.cheatPos[CH_MUS] = res.p as i32
+        fr rc == 1 {
+            // params live in cMus[6], cMus[7] (after the '1' marker at index 5)
+            d0 = g.stbar.cMus[6] as int
+            d1 = g.stbar.cMus[7] as int
+            // re-zero the captured slots so the cheat is reusable (cht_GetParam does this)
+            g.stbar.cMus[6] = 0 as u8
+            g.stbar.cMus[7] = 0 as u8
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    fr rc == 1 {
+        lowkey n = 0
+        lowkey ok = nocap
+        fr commercial {
+            n = (d0 - 48) * 10 + (d1 - 48)
+            fr n > 35 {
+                ok = cap
+            }
+        } naw {
+            n = (d0 - 49) * 9 + (d1 - 49)
+            fr n > 31 {
+                ok = cap
+            }
+        }
+        fr ok {
+            setMessage(gt, strings.STSTR_MUS)   // S_ChangeMusic deferred
+        } naw {
+            setMessage(gt, strings.STSTR_NOMUS)
+        }
+    }
+}
+
+// matchClev — idclev##: capture episode/map digits, validate against gamemode, message CLEV.
+flex finna matchClev(gt: tag gs.GameState, key: int) {
+    lowkey rc = 0
+    lowkey pos = 0
+    lowkey d0 = 0
+    lowkey d1 = 0
+    lowkey gamemode = 0
+    holla g = gt in gs.gsc {
+        pos = g.stbar.cheatPos[CH_CLEV] as int
+        gamemode = g.shell.gamemode as int
+        lowkey res = cheat.checkCheat(g.stbar.cClev, pos, key)
+        rc = res.rc
+        g.stbar.cheatPos[CH_CLEV] = res.p as i32
+        fr rc == 1 {
+            d0 = g.stbar.cClev[7] as int
+            d1 = g.stbar.cClev[8] as int
+            g.stbar.cClev[7] = 0 as u8
+            g.stbar.cClev[8] = 0 as u8
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    fr rc == 1 {
+        lowkey epsd = 0
+        lowkey map = 0
+        fr gamemode == doomdef.GM_COMMERCIAL {
+            epsd = 0
+            map = (d0 - 48) * 10 + (d1 - 48)
+        } naw {
+            epsd = d0 - 48
+            map = d1 - 48
+        }
+        lowkey valid = nocap
+        fr epsd < 1 && gamemode != doomdef.GM_COMMERCIAL {
+            valid = cap
+        }
+        fr map < 1 {
+            valid = cap
+        }
+        fr valid {
+            setMessage(gt, strings.STSTR_CLEV)   // G_DeferedInitNew deferred
+        }
+    }
+}
+
