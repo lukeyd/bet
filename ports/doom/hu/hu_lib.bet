@@ -1,0 +1,219 @@
+// hu/hu_lib.bet — the heads-up TEXT-LINE / MESSAGE widget primitives (linuxdoom-1.10 hu_lib.c).
+//
+// id's hu_textline_t carries `patch_t** f` (the font) and a fixed `char l[81]` buffer; here the
+// text is a bet `str` (immutable, rebuilt on add) and the font (63 STCFN patch byte-offsets) is
+// passed to the draw fn — st/hu own the offsets (HudState.huFontOfs). Text draws through
+// v_video.drawPatch of the HU_FONT glyphs (id's V_DrawPatchDirect == drawPatch off the PC path).
+//
+// The single-player message path (the important one) only needs one text line: HU_Ticker pulls
+// the player message into the SText line, HU_Drawer draws it. The SText scroll queue / IText
+// chat input are ported for completeness (chat is netgame-only).
+//
+// PORTED:  HUlib_init, clearTextLine, initTextLine, addCharToTextLine, delCharFromTextLine,
+//          drawTextLine, eraseTextLine, initSText, addLineToSText, addMessageToSText, drawSText,
+//          initIText, keyInIText, resetIText, drawIText.
+// MODEL:   eraseTextLine is a documented near-no-op: id erased the message row by copying scr1->
+//          scr0 only when the 3D view was reduced (viewwindowx != 0); the full-refresh HUD path
+//          and the fullscreen view make it vestigial here (see hu_stuff.bet). needsupdate is
+//          kept so the field/behaviour reads like id's.
+pull "mem"
+pull "str"
+pull "../defs/gs" as gs
+pull "../defs/doomdef" as doomdef
+pull "../util/bstream" as bstream
+pull "../v/v_video" as vv
+
+flex facts HU_FONTSTART: int = 33     // '!'
+flex facts HU_FONTEND: int = 95       // '_'
+flex facts HU_FONTSIZE: int = 63      // HU_FONTEND - HU_FONTSTART + 1
+flex facts HU_MAXLINELENGTH: int = 80
+flex facts HU_BG: int = 1             // hu_lib BG (unused in the full-refresh model)
+flex facts HU_FG: int = 0
+
+// hu_textline_t: position + start-char + the text (str) + the needsupdate countdown.
+flex drip HuTextLine {
+    flex x: int
+    flex y: int
+    flex sc: int             // start character (HU_FONTSTART)
+    flex needsupdate: int
+    flex l: str              // current line text
+}
+
+// hu_stext_t (single-line message scroller — HU_MSGHEIGHT is 1 for the message widget).
+flex drip HuSText {
+    flex line: HuTextLine
+    flex on: bool
+}
+
+// hu_itext_t (chat input line).
+flex drip HuIText {
+    flex line: HuTextLine
+    flex lm: int             // left margin (past which delete stops)
+    flex on: bool
+}
+
+// ---- helpers -------------------------------------------------------------------------------
+flex finna toUpper(c: int) -> int {
+    fr c >= 97 && c <= 122 {
+        bet c - 32
+    }
+    bet c
+}
+
+// append one character code to a str (rebuild via a byte buffer — str is immutable).
+flex finna appendChar(s: str, ch: int) -> str {
+    lowkey n = str.len(s)
+    lowkey buf = mem.slab[u8](n + 1)
+    lowkey i = 0
+    vibin i < n {
+        buf[i] = str.at(s, i) as u8
+        i = i + 1
+    }
+    buf[n] = (ch & 255) as u8
+    bet str.fromBytesTrust(buf)
+}
+
+flex finna patchWidth(gt: tag gs.GameState, ofs: int) -> int {
+    lowkey w = 0
+    holla g = gt in gs.gsc {
+        w = bstream.rdU16(g.wad.buf, ofs)
+    } ghosted {
+        yeet("gs")
+    }
+    bet w
+}
+
+// ---- HUlib_init: nothing to do (id's was empty too) ----------------------------------------
+flex finna init() {
+}
+
+// ---- text-line routines --------------------------------------------------------------------
+flex finna clearTextLine(t: HuTextLine) -> HuTextLine {
+    bet HuTextLine{ x: t.x, y: t.y, sc: t.sc, needsupdate: 1, l: "" }
+}
+
+flex finna initTextLine(x: int, y: int, sc: int) -> HuTextLine {
+    bet HuTextLine{ x: x, y: y, sc: sc, needsupdate: 1, l: "" }
+}
+
+// HUlib_addCharToTextLine — append ch (fails silently at HU_MAXLINELENGTH, returning t).
+flex finna addCharToTextLine(t: HuTextLine, ch: int) -> HuTextLine {
+    fr str.len(t.l) == HU_MAXLINELENGTH {
+        bet t
+    }
+    bet HuTextLine{ x: t.x, y: t.y, sc: t.sc, needsupdate: 4, l: appendChar(t.l, ch) }
+}
+
+// HUlib_delCharFromTextLine — drop the last char.
+flex finna delCharFromTextLine(t: HuTextLine) -> HuTextLine {
+    lowkey n = str.len(t.l)
+    fr n == 0 {
+        bet t
+    }
+    bet HuTextLine{ x: t.x, y: t.y, sc: t.sc, needsupdate: 4, l: str.sub(t.l, 0, n - 1) }
+}
+
+// drawTextLineStr — the core: draw string `s` starting at (x, y) with the HU font `fontOfs`
+// (63 glyph byte-offsets, glyph index = toupper(c) - sc). Non-glyph/space advances 4px. Draws
+// a trailing '_' cursor when drawcursor is set. Mirrors HUlib_drawTextLine exactly.
+flex finna drawTextLineStr(gt: tag gs.GameState, x0: int, y: int, sc: int, fontOfs: []i32, s: str, drawcursor: bool, screen: int) {
+    lowkey x = x0
+    lowkey n = str.len(s)
+    lowkey i = 0
+    vibin i < n {
+        lowkey c = toUpper(str.at(s, i))
+        fr c != 32 && c >= sc && c <= HU_FONTEND {
+            lowkey ofs = fontOfs[c - sc] as int
+            lowkey w = patchWidth(gt, ofs)
+            fr x + w > doomdef.SCREENWIDTH {
+                dip
+            }
+            vv.drawPatch(gt, x, y, screen, ofs)
+            x = x + w
+        } naw {
+            x = x + 4
+            fr x >= doomdef.SCREENWIDTH {
+                dip
+            }
+        }
+        i = i + 1
+    }
+    fr drawcursor {
+        lowkey cofs = fontOfs[HU_FONTEND - sc] as int
+        lowkey cw = patchWidth(gt, cofs)
+        fr x + cw <= doomdef.SCREENWIDTH {
+            vv.drawPatch(gt, x, y, screen, cofs)
+        }
+    }
+}
+
+// HUlib_drawTextLine — draw the widget's own line.
+flex finna drawTextLine(gt: tag gs.GameState, t: HuTextLine, fontOfs: []i32, drawcursor: bool, screen: int) {
+    drawTextLineStr(gt, t.x, t.y, t.sc, fontOfs, t.l, drawcursor, screen)
+}
+
+// HUlib_eraseTextLine — vestigial in the full-refresh HUD (see header). Kept as a no-op that
+// still ticks needsupdate down, so callers read like id's.
+flex finna eraseTextLine(t: HuTextLine) -> HuTextLine {
+    lowkey nu = t.needsupdate
+    fr nu > 0 {
+        nu = nu - 1
+    }
+    bet HuTextLine{ x: t.x, y: t.y, sc: t.sc, needsupdate: nu, l: t.l }
+}
+
+// ---- SText (scrolling message window; single line for the message widget) ------------------
+flex finna initSText(x: int, y: int, sc: int) -> HuSText {
+    bet HuSText{ line: initTextLine(x, y, sc), on: cap }
+}
+
+// HUlib_addMessageToSText — clear the line and add the message chars (prefix handling omitted:
+// single-player messages have no player-name prefix).
+flex finna addMessageToSText(s: HuSText, msg: str) -> HuSText {
+    lowkey t = clearTextLine(s.line)
+    lowkey i = 0
+    lowkey n = str.len(msg)
+    vibin i < n {
+        t = addCharToTextLine(t, str.at(msg, i))
+        i = i + 1
+    }
+    bet HuSText{ line: t, on: s.on }
+}
+
+// HUlib_drawSText — draw the line when the widget is on.
+flex finna drawSText(gt: tag gs.GameState, s: HuSText, fontOfs: []i32, screen: int) {
+    fr s.on {
+        drawTextLine(gt, s.line, fontOfs, cap, screen)
+    }
+}
+
+// ---- IText (chat input line) ---------------------------------------------------------------
+flex finna initIText(x: int, y: int, sc: int) -> HuIText {
+    bet HuIText{ line: initTextLine(x, y, sc), lm: 0, on: cap }
+}
+
+// HUlib_resetIText — clear line + left margin.
+flex finna resetIText(it: HuIText) -> HuIText {
+    bet HuIText{ line: clearTextLine(it.line), lm: 0, on: it.on }
+}
+
+// HUlib_keyInIText — feed a key; returns the (possibly) updated widget. Printable ' '..'_' is
+// appended; KEY_BACKSPACE deletes to the left margin; other keys are ignored. (The "ate the
+// key" boolean is computed by the caller from the key value.)
+flex finna keyInIText(it: HuIText, ch: int) -> HuIText {
+    fr ch >= 32 && ch <= HU_FONTEND {
+        bet HuIText{ line: addCharToTextLine(it.line, ch), lm: it.lm, on: it.on }
+    } naw fr ch == doomdef.KEY_BACKSPACE {
+        fr str.len(it.line.l) != it.lm {
+            bet HuIText{ line: delCharFromTextLine(it.line), lm: it.lm, on: it.on }
+        }
+    }
+    bet it
+}
+
+// HUlib_drawIText — draw the chat line with a cursor when on.
+flex finna drawIText(gt: tag gs.GameState, it: HuIText, fontOfs: []i32, screen: int) {
+    fr it.on {
+        drawTextLine(gt, it.line, fontOfs, nocap, screen)
+    }
+}
