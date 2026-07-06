@@ -1,0 +1,362 @@
+pull "../defs/gs" as gs
+pull "../defs/think" as think
+pull "../defs/sounds" as sounds
+pull "../util/m_random" as rnd
+pull "../p/p_specutil" as psu
+pull "../p/p_floor" as pfloor
+pull "../p/p_think" as pthink
+pull "../s/s_sound" as ssnd
+
+flex finna tPlatRaise(gt: tag gs.GameState, platT: tag think.Thinker) {
+    lowkey secnum: int = 0
+    lowkey speed: i32 = 0
+    lowkey low: i32 = 0
+    lowkey high: i32 = 0
+    lowkey wait: int = 0
+    lowkey count: int = 0
+    lowkey status: int = 0
+    lowkey crush: bool = cap
+    lowkey kind: int = 0
+    holla t = platT in gs.thinkers {
+        secnum = t.sa.secnum as int
+        speed = t.sa.speed
+        low = t.sa.low
+        high = t.sa.high
+        wait = t.sa.wait as int
+        count = t.sa.count as int
+        status = t.sa.status as int
+        crush = t.sa.crush
+        kind = t.sa.kind as int
+    } ghosted {
+        yeet("plat")
+    }
+    lowkey lt: int = 0
+    holla g = gt in gs.gsc {
+        lt = g.tick.leveltime as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr status == psu.PLAT_UP {
+        lowkey res: int = pfloor.tMovePlane(gt, secnum, speed, high, crush, 0, 1)
+        fr kind == psu.PLATT_RAISEANDCHANGE || kind == psu.PLATT_RAISETONEARESTANDCHANGE {
+            fr lt & 7 == 0 {
+                ssnd.startSound(gt, ghosted, sounds.SFX_STNMOV)
+            }
+        }
+        fr res == psu.RES_CRUSHED && !crush {
+            holla t = platT in gs.thinkers {
+                t.sa.count = wait as i32
+                t.sa.status = psu.PLAT_DOWN as i32
+            } ghosted {
+                yeet("plat")
+            }
+            ssnd.startSound(gt, ghosted, sounds.SFX_PSTART)
+        } naw {
+            fr res == psu.RES_PASTDEST {
+                holla t = platT in gs.thinkers {
+                    t.sa.count = wait as i32
+                    t.sa.status = psu.PLAT_WAITING as i32
+                } ghosted {
+                    yeet("plat")
+                }
+                ssnd.startSound(gt, ghosted, sounds.SFX_PSTOP)
+                fr kind == psu.PLATT_BLAZEDWUS || kind == psu.PLATT_DOWNWAITUPSTAY || kind == psu.PLATT_RAISEANDCHANGE || kind == psu.PLATT_RAISETONEARESTANDCHANGE {
+                    removeActivePlat(gt, platT)
+                }
+            }
+        }
+    } naw fr status == psu.PLAT_DOWN {
+        lowkey res: int = pfloor.tMovePlane(gt, secnum, speed, low, cap, 0, -1)
+        fr res == psu.RES_PASTDEST {
+            holla t = platT in gs.thinkers {
+                t.sa.count = wait as i32
+                t.sa.status = psu.PLAT_WAITING as i32
+            } ghosted {
+                yeet("plat")
+            }
+            ssnd.startSound(gt, ghosted, sounds.SFX_PSTOP)
+        }
+    } naw fr status == psu.PLAT_WAITING {
+        count = count - 1
+        holla t = platT in gs.thinkers {
+            t.sa.count = count as i32
+        } ghosted {
+            yeet("plat")
+        }
+        fr count == 0 {
+            lowkey curFloor: i32 = psu.getFloorH(gt, secnum)
+            lowkey newStatus: int = psu.PLAT_DOWN
+            fr curFloor == low {
+                newStatus = psu.PLAT_UP
+            }
+            holla t = platT in gs.thinkers {
+                t.sa.status = newStatus as i32
+            } ghosted {
+                yeet("plat")
+            }
+            ssnd.startSound(gt, ghosted, sounds.SFX_PSTART)
+        }
+    }
+}
+
+flex finna evDoPlat(gt: tag gs.GameState, line: int, plattype: int, amount: int) -> int {
+    lowkey secnum: int = -1
+    lowkey rtn: int = 0
+    fr plattype == psu.PLATT_PERPETUALRAISE {
+        lowkey ltag: int = 0
+        holla g = gt in gs.gsc {
+            ltag = g.level.lineTag[line] as int
+        } ghosted {
+            yeet("gs")
+        }
+        activateInStasis(gt, ltag)
+    }
+    vibin nocap {
+        secnum = psu.findSectorFromLineTag(gt, line, secnum)
+        fr secnum < 0 {
+            dip
+        }
+        fr psu.hasSpecialData(gt, secnum) {
+            skip
+        }
+        rtn = 1
+        lowkey platT = cop think.Thinker{ funcId: think.FUNC_PLAT as i32 } in gs.thinkers
+        pthink.addThinker(gt, platT)
+        psu.setSectorSpecialData(gt, secnum, platT)
+        lowkey ltag: int = 0
+        holla g = gt in gs.gsc {
+            ltag = g.level.lineTag[line] as int
+        } ghosted {
+            yeet("gs")
+        }
+        holla t = platT in gs.thinkers {
+            t.sa.kind = plattype as i32
+            t.sa.secnum = secnum as i32
+            t.sa.crush = cap
+            t.sa.secTag = ltag as i32
+        } ghosted {
+            yeet("plat")
+        }
+        lowkey secFloor: i32 = psu.getFloorH(gt, secnum)
+        fr plattype == psu.PLATT_RAISETONEARESTANDCHANGE {
+            lowkey frontpic: int = frontSideFloorPic(gt, line)
+            lowkey high: i32 = psu.findNextHighestFloor(gt, secnum, secFloor)
+            holla g = gt in gs.gsc {
+                g.level.secFloorPic[secnum] = frontpic as i32
+                g.level.secSpecial[secnum] = 0
+            } ghosted {
+                yeet("gs")
+            }
+            holla t = platT in gs.thinkers {
+                t.sa.speed = (psu.PLATSPEED / 2) as i32
+                t.sa.high = high
+                t.sa.wait = 0
+                t.sa.status = psu.PLAT_UP as i32
+            } ghosted {
+                yeet("plat")
+            }
+            ssnd.startSound(gt, ghosted, sounds.SFX_STNMOV)
+        } naw fr plattype == psu.PLATT_RAISEANDCHANGE {
+            lowkey frontpic: int = frontSideFloorPic(gt, line)
+            holla g = gt in gs.gsc {
+                g.level.secFloorPic[secnum] = frontpic as i32
+            } ghosted {
+                yeet("gs")
+            }
+            holla t = platT in gs.thinkers {
+                t.sa.speed = (psu.PLATSPEED / 2) as i32
+                t.sa.high = (secFloor + amount * 65536) as i32
+                t.sa.wait = 0
+                t.sa.status = psu.PLAT_UP as i32
+            } ghosted {
+                yeet("plat")
+            }
+            ssnd.startSound(gt, ghosted, sounds.SFX_STNMOV)
+        } naw fr plattype == psu.PLATT_DOWNWAITUPSTAY {
+            lowkey low: i32 = psu.findLowestFloorSurrounding(gt, secnum)
+            fr low > secFloor {
+                low = secFloor
+            }
+            holla t = platT in gs.thinkers {
+                t.sa.speed = (psu.PLATSPEED * 4) as i32
+                t.sa.low = low
+                t.sa.high = secFloor
+                t.sa.wait = (35 * psu.PLATWAIT) as i32
+                t.sa.status = psu.PLAT_DOWN as i32
+            } ghosted {
+                yeet("plat")
+            }
+            ssnd.startSound(gt, ghosted, sounds.SFX_PSTART)
+        } naw fr plattype == psu.PLATT_BLAZEDWUS {
+            lowkey low: i32 = psu.findLowestFloorSurrounding(gt, secnum)
+            fr low > secFloor {
+                low = secFloor
+            }
+            holla t = platT in gs.thinkers {
+                t.sa.speed = (psu.PLATSPEED * 8) as i32
+                t.sa.low = low
+                t.sa.high = secFloor
+                t.sa.wait = (35 * psu.PLATWAIT) as i32
+                t.sa.status = psu.PLAT_DOWN as i32
+            } ghosted {
+                yeet("plat")
+            }
+            ssnd.startSound(gt, ghosted, sounds.SFX_PSTART)
+        } naw fr plattype == psu.PLATT_PERPETUALRAISE {
+            lowkey low: i32 = psu.findLowestFloorSurrounding(gt, secnum)
+            fr low > secFloor {
+                low = secFloor
+            }
+            lowkey high: i32 = psu.findHighestFloorSurrounding(gt, secnum)
+            fr high < secFloor {
+                high = secFloor
+            }
+            lowkey st: int = rnd.pRandom(gt) & 1
+            holla t = platT in gs.thinkers {
+                t.sa.speed = psu.PLATSPEED
+                t.sa.low = low
+                t.sa.high = high
+                t.sa.wait = (35 * psu.PLATWAIT) as i32
+                t.sa.status = st as i32
+            } ghosted {
+                yeet("plat")
+            }
+            ssnd.startSound(gt, ghosted, sounds.SFX_PSTART)
+        }
+        addActivePlat(gt, platT)
+    }
+    bet rtn
+}
+
+flex finna frontSideFloorPic(gt: tag gs.GameState, line: int) -> int {
+    lowkey pic: int = 0
+    holla g = gt in gs.gsc {
+        lowkey sd: int = g.level.lineSide0[line] as int
+        lowkey sec: int = g.level.sdSector[sd] as int
+        pic = g.level.secFloorPic[sec] as int
+    } ghosted {
+        yeet("gs")
+    }
+    bet pic
+}
+
+flex finna activateInStasis(gt: tag gs.GameState, ptag: int) {
+    lowkey i: int = 0
+    vibin i < psu.MAXPLATS {
+        lowkey p: tag think.Thinker = ghosted
+        holla g = gt in gs.gsc {
+            p = g.tick.activeplats[i].t
+        } ghosted {
+            yeet("gs")
+        }
+        fr !(p == ghosted) {
+            lowkey pTag: int = 0
+            lowkey pStatus: int = 0
+            lowkey pOld: int = 0
+            holla t = p in gs.thinkers {
+                pTag = t.sa.secTag as int
+                pStatus = t.sa.status as int
+                pOld = t.sa.oldstatus as int
+            } ghosted {
+                yeet("plat")
+            }
+            fr pTag == ptag && pStatus == psu.PLAT_INSTASIS {
+                holla t = p in gs.thinkers {
+                    t.sa.status = pOld as i32
+                } ghosted {
+                    yeet("plat")
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+flex finna evStopPlat(gt: tag gs.GameState, line: int) {
+    lowkey ltag: int = 0
+    holla g = gt in gs.gsc {
+        ltag = g.level.lineTag[line] as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey j: int = 0
+    vibin j < psu.MAXPLATS {
+        lowkey p: tag think.Thinker = ghosted
+        holla g = gt in gs.gsc {
+            p = g.tick.activeplats[j].t
+        } ghosted {
+            yeet("gs")
+        }
+        fr !(p == ghosted) {
+            lowkey pTag: int = 0
+            lowkey pStatus: int = 0
+            holla t = p in gs.thinkers {
+                pTag = t.sa.secTag as int
+                pStatus = t.sa.status as int
+            } ghosted {
+                yeet("plat")
+            }
+            fr pStatus != psu.PLAT_INSTASIS && pTag == ltag {
+                holla t = p in gs.thinkers {
+                    t.sa.oldstatus = pStatus as i32
+                    t.sa.status = psu.PLAT_INSTASIS as i32
+                } ghosted {
+                    yeet("plat")
+                }
+            }
+        }
+        j = j + 1
+    }
+}
+
+flex finna addActivePlat(gt: tag gs.GameState, plat: tag think.Thinker) {
+    lowkey placed: bool = cap
+    holla g = gt in gs.gsc {
+        lowkey i: int = 0
+        vibin i < psu.MAXPLATS {
+            fr g.tick.activeplats[i].t == ghosted {
+                g.tick.activeplats[i].t = plat
+                placed = nocap
+                dip
+            }
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    fr !placed {
+        yeet("P_AddActivePlat: no more plats")
+    }
+}
+
+flex finna removeActivePlat(gt: tag gs.GameState, plat: tag think.Thinker) {
+    lowkey found: int = -1
+    holla g = gt in gs.gsc {
+        lowkey i: int = 0
+        vibin i < psu.MAXPLATS {
+            fr g.tick.activeplats[i].t == plat {
+                found = i
+                dip
+            }
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    fr found < 0 {
+        yeet("P_RemoveActivePlat: can't find plat")
+    }
+    lowkey sec: int = 0
+    holla t = plat in gs.thinkers {
+        sec = t.sa.secnum as int
+    } ghosted {
+        yeet("plat")
+    }
+    psu.clearSectorSpecialData(gt, sec)
+    pthink.removeThinker(gt, plat)
+    holla g = gt in gs.gsc {
+        g.tick.activeplats[found].t = ghosted
+    } ghosted {
+        yeet("gs")
+    }
+}

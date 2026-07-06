@@ -1,0 +1,348 @@
+pull "../defs/gs" as gs
+pull "../defs/think" as think
+pull "../util/m_random" as rnd
+pull "../p/p_specutil" as psu
+pull "../p/p_think" as pthink
+
+flex finna tFireFlicker(gt: tag gs.GameState, flickT: tag think.Thinker) {
+    lowkey secnum: int = 0
+    lowkey count: int = 0
+    lowkey maxlight: int = 0
+    lowkey minlight: int = 0
+    holla t = flickT in gs.thinkers {
+        secnum = t.sa.secnum as int
+        count = t.sa.count as int
+        maxlight = t.sa.maxlight as int
+        minlight = t.sa.minlight as int
+    } ghosted {
+        yeet("flick")
+    }
+    count = count - 1
+    fr count != 0 {
+        holla t = flickT in gs.thinkers {
+            t.sa.count = count as i32
+        } ghosted {
+            yeet("flick")
+        }
+        bet
+    }
+    lowkey amount: int = (rnd.pRandom(gt) & 3) * 16
+    lowkey cur: int = psu.getSecLight(gt, secnum)
+    fr cur - amount < minlight {
+        psu.setSecLight(gt, secnum, minlight)
+    } naw {
+        psu.setSecLight(gt, secnum, maxlight - amount)
+    }
+    holla t = flickT in gs.thinkers {
+        t.sa.count = 4
+    } ghosted {
+        yeet("flick")
+    }
+}
+
+flex finna spawnFireFlicker(gt: tag gs.GameState, sec: int) {
+    holla g = gt in gs.gsc {
+        g.level.secSpecial[sec] = 0
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey maxlight: int = psu.getSecLight(gt, sec)
+    lowkey minlight: int = psu.findMinSurroundingLight(gt, sec, maxlight) + 16
+    lowkey flickT = cop think.Thinker{ funcId: think.FUNC_FLICKER as i32 } in gs.thinkers
+    pthink.addThinker(gt, flickT)
+    holla t = flickT in gs.thinkers {
+        t.sa.secnum = sec as i32
+        t.sa.maxlight = maxlight as i32
+        t.sa.minlight = minlight as i32
+        t.sa.count = 4
+    } ghosted {
+        yeet("flick")
+    }
+}
+
+flex finna tLightFlash(gt: tag gs.GameState, flashT: tag think.Thinker) {
+    lowkey secnum: int = 0
+    lowkey count: int = 0
+    lowkey maxlight: int = 0
+    lowkey minlight: int = 0
+    lowkey maxtime: int = 0
+    lowkey mintime: int = 0
+    holla t = flashT in gs.thinkers {
+        secnum = t.sa.secnum as int
+        count = t.sa.count as int
+        maxlight = t.sa.maxlight as int
+        minlight = t.sa.minlight as int
+        maxtime = t.sa.maxtime as int
+        mintime = t.sa.mintime as int
+    } ghosted {
+        yeet("flash")
+    }
+    count = count - 1
+    fr count != 0 {
+        holla t = flashT in gs.thinkers {
+            t.sa.count = count as i32
+        } ghosted {
+            yeet("flash")
+        }
+        bet
+    }
+    lowkey cur: int = psu.getSecLight(gt, secnum)
+    fr cur == maxlight {
+        psu.setSecLight(gt, secnum, minlight)
+        holla t = flashT in gs.thinkers {
+            t.sa.count = ((rnd.pRandom(gt) & mintime) + 1) as i32
+        } ghosted {
+            yeet("flash")
+        }
+    } naw {
+        psu.setSecLight(gt, secnum, maxlight)
+        holla t = flashT in gs.thinkers {
+            t.sa.count = ((rnd.pRandom(gt) & maxtime) + 1) as i32
+        } ghosted {
+            yeet("flash")
+        }
+    }
+}
+
+flex finna spawnLightFlash(gt: tag gs.GameState, sec: int) {
+    holla g = gt in gs.gsc {
+        g.level.secSpecial[sec] = 0
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey maxlight: int = psu.getSecLight(gt, sec)
+    lowkey minlight: int = psu.findMinSurroundingLight(gt, sec, maxlight)
+    lowkey flashT = cop think.Thinker{ funcId: think.FUNC_FLASH as i32 } in gs.thinkers
+    pthink.addThinker(gt, flashT)
+    lowkey initCount: int = (rnd.pRandom(gt) & 64) + 1
+    holla t = flashT in gs.thinkers {
+        t.sa.secnum = sec as i32
+        t.sa.maxlight = maxlight as i32
+        t.sa.minlight = minlight as i32
+        t.sa.maxtime = 64
+        t.sa.mintime = 7
+        t.sa.count = initCount as i32
+    } ghosted {
+        yeet("flash")
+    }
+}
+
+flex finna tStrobeFlash(gt: tag gs.GameState, flashT: tag think.Thinker) {
+    lowkey secnum: int = 0
+    lowkey count: int = 0
+    lowkey minlight: int = 0
+    lowkey maxlight: int = 0
+    lowkey darktime: int = 0
+    lowkey brighttime: int = 0
+    holla t = flashT in gs.thinkers {
+        secnum = t.sa.secnum as int
+        count = t.sa.count as int
+        minlight = t.sa.minlight as int
+        maxlight = t.sa.maxlight as int
+        darktime = t.sa.darktime as int
+        brighttime = t.sa.brighttime as int
+    } ghosted {
+        yeet("strobe")
+    }
+    count = count - 1
+    fr count != 0 {
+        holla t = flashT in gs.thinkers {
+            t.sa.count = count as i32
+        } ghosted {
+            yeet("strobe")
+        }
+        bet
+    }
+    lowkey cur: int = psu.getSecLight(gt, secnum)
+    fr cur == minlight {
+        psu.setSecLight(gt, secnum, maxlight)
+        holla t = flashT in gs.thinkers {
+            t.sa.count = brighttime as i32
+        } ghosted {
+            yeet("strobe")
+        }
+    } naw {
+        psu.setSecLight(gt, secnum, minlight)
+        holla t = flashT in gs.thinkers {
+            t.sa.count = darktime as i32
+        } ghosted {
+            yeet("strobe")
+        }
+    }
+}
+
+flex finna spawnStrobeFlash(gt: tag gs.GameState, sec: int, fastOrSlow: int, inSync: int) {
+    lowkey maxlight: int = psu.getSecLight(gt, sec)
+    lowkey minlight: int = psu.findMinSurroundingLight(gt, sec, maxlight)
+    fr minlight == maxlight {
+        minlight = 0
+    }
+    holla g = gt in gs.gsc {
+        g.level.secSpecial[sec] = 0
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey flashT = cop think.Thinker{ funcId: think.FUNC_STROBE as i32 } in gs.thinkers
+    pthink.addThinker(gt, flashT)
+    lowkey cnt: int = 1
+    fr inSync == 0 {
+        cnt = (rnd.pRandom(gt) & 7) + 1
+    }
+    holla t = flashT in gs.thinkers {
+        t.sa.secnum = sec as i32
+        t.sa.darktime = fastOrSlow as i32
+        t.sa.brighttime = psu.STROBEBRIGHT as i32
+        t.sa.maxlight = maxlight as i32
+        t.sa.minlight = minlight as i32
+        t.sa.count = cnt as i32
+    } ghosted {
+        yeet("strobe")
+    }
+}
+
+flex finna evStartLightStrobing(gt: tag gs.GameState, line: int) {
+    lowkey secnum: int = -1
+    vibin nocap {
+        secnum = psu.findSectorFromLineTag(gt, line, secnum)
+        fr secnum < 0 {
+            dip
+        }
+        fr psu.hasSpecialData(gt, secnum) {
+            skip
+        }
+        spawnStrobeFlash(gt, secnum, psu.SLOWDARK, 0)
+    }
+}
+
+flex finna evTurnTagLightsOff(gt: tag gs.GameState, line: int) {
+    lowkey ltag: int = 0
+    lowkey nsec: int = 0
+    holla g = gt in gs.gsc {
+        ltag = g.level.lineTag[line] as int
+        nsec = g.level.numsectors as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey j: int = 0
+    vibin j < nsec {
+        lowkey sTag: int = 0
+        holla g = gt in gs.gsc {
+            sTag = g.level.secTag[j] as int
+        } ghosted {
+            yeet("gs")
+        }
+        fr sTag == ltag {
+            lowkey minv: int = psu.getSecLight(gt, j)
+            lowkey n: int = psu.sectorLineCount(gt, j)
+            lowkey i: int = 0
+            vibin i < n {
+                lowkey ld: int = psu.lineOfSector(gt, j, i)
+                lowkey tsec: int = psu.getNextSector(gt, ld, j)
+                fr tsec >= 0 {
+                    lowkey tl: int = psu.getSecLight(gt, tsec)
+                    fr tl < minv {
+                        minv = tl
+                    }
+                }
+                i = i + 1
+            }
+            psu.setSecLight(gt, j, minv)
+        }
+        j = j + 1
+    }
+}
+
+flex finna evLightTurnOn(gt: tag gs.GameState, line: int, bright: int) {
+    lowkey ltag: int = 0
+    lowkey nsec: int = 0
+    holla g = gt in gs.gsc {
+        ltag = g.level.lineTag[line] as int
+        nsec = g.level.numsectors as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey i: int = 0
+    vibin i < nsec {
+        lowkey sTag: int = 0
+        holla g = gt in gs.gsc {
+            sTag = g.level.secTag[i] as int
+        } ghosted {
+            yeet("gs")
+        }
+        fr sTag == ltag {
+            lowkey b: int = bright
+            fr b == 0 {
+                lowkey n: int = psu.sectorLineCount(gt, i)
+                lowkey k: int = 0
+                vibin k < n {
+                    lowkey ld: int = psu.lineOfSector(gt, i, k)
+                    lowkey tsec: int = psu.getNextSector(gt, ld, i)
+                    fr tsec >= 0 {
+                        lowkey tl: int = psu.getSecLight(gt, tsec)
+                        fr tl > b {
+                            b = tl
+                        }
+                    }
+                    k = k + 1
+                }
+            }
+            psu.setSecLight(gt, i, b)
+        }
+        i = i + 1
+    }
+}
+
+flex finna tGlow(gt: tag gs.GameState, glowT: tag think.Thinker) {
+    lowkey secnum: int = 0
+    lowkey minlight: int = 0
+    lowkey maxlight: int = 0
+    lowkey direction: int = 0
+    holla t = glowT in gs.thinkers {
+        secnum = t.sa.secnum as int
+        minlight = t.sa.minlight as int
+        maxlight = t.sa.maxlight as int
+        direction = t.sa.direction as int
+    } ghosted {
+        yeet("glow")
+    }
+    lowkey cur: int = psu.getSecLight(gt, secnum)
+    fr direction == -1 {
+        cur = cur - psu.GLOWSPEED
+        fr cur <= minlight {
+            cur = cur + psu.GLOWSPEED
+            direction = 1
+        }
+    } naw fr direction == 1 {
+        cur = cur + psu.GLOWSPEED
+        fr cur >= maxlight {
+            cur = cur - psu.GLOWSPEED
+            direction = -1
+        }
+    }
+    psu.setSecLight(gt, secnum, cur)
+    holla t = glowT in gs.thinkers {
+        t.sa.direction = direction as i32
+    } ghosted {
+        yeet("glow")
+    }
+}
+
+flex finna spawnGlowingLight(gt: tag gs.GameState, sec: int) {
+    lowkey maxlight: int = psu.getSecLight(gt, sec)
+    lowkey minlight: int = psu.findMinSurroundingLight(gt, sec, maxlight)
+    lowkey glowT = cop think.Thinker{ funcId: think.FUNC_GLOW as i32 } in gs.thinkers
+    pthink.addThinker(gt, glowT)
+    holla t = glowT in gs.thinkers {
+        t.sa.secnum = sec as i32
+        t.sa.minlight = minlight as i32
+        t.sa.maxlight = maxlight as i32
+        t.sa.direction = -1
+    } ghosted {
+        yeet("glow")
+    }
+    holla g = gt in gs.gsc {
+        g.level.secSpecial[sec] = 0
+    } ghosted {
+        yeet("gs")
+    }
+}
