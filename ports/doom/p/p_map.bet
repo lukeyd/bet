@@ -1358,8 +1358,8 @@ flex finna aimLineAttack(gt: tag gs.GameState, t1: tag think.Thinker, angle: u32
     lowkey x2: i32 = 0
     lowkey y2: i32 = 0
     holla g = gt in gs.gsc {
-        x2 = x1 + fixed.fixedMul(distance, g.info.finesine[fine + 2048])
-        y2 = y1 + fixed.fixedMul(distance, g.info.finesine[fine])
+        x2 = x1 + (distance >> 16) * g.info.finesine[fine + 2048]
+        y2 = y1 + (distance >> 16) * g.info.finesine[fine]
     } ghosted {
         yeet("gs")
     }
@@ -1409,8 +1409,8 @@ flex finna lineAttack(gt: tag gs.GameState, t1: tag think.Thinker, angle: u32, d
     lowkey x2: i32 = 0
     lowkey y2: i32 = 0
     holla g = gt in gs.gsc {
-        x2 = x1 + fixed.fixedMul(distance, g.info.finesine[fine + 2048])
-        y2 = y1 + fixed.fixedMul(distance, g.info.finesine[fine])
+        x2 = x1 + (distance >> 16) * g.info.finesine[fine + 2048]
+        y2 = y1 + (distance >> 16) * g.info.finesine[fine]
     } ghosted {
         yeet("gs")
     }
