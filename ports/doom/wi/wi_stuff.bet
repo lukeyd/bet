@@ -1,0 +1,1803 @@
+// wi/wi_stuff.bet — the level-completion INTERMISSION screen (linuxdoom-1.10 wi_stuff.c).
+//
+// The animated stat-counting state machine: WI_Start builds from g.shell.wminfo (WbStart: the
+// episode/last/next/maxkills/maxitems/maxsecret/partime + per-player WbPlayer stats), then
+// WI_Ticker advances StatCount (counting kills/items/secrets %, then time/par) with the counting
+// SFX ticking through s_sound, then ShowNextLoc (the "You Are Here" flash), then NoState (hand
+// back to G_WorldDone). WI_Drawer slams the WIMAP<epsd> background and draws the stat lines via
+// the WINUM/WIPCNT/WICOLON patch numbers.
+//
+// bet has no file-static globals (mutable globals don't lower native), so wi_stuff.c's ~40 statics
+// live on gs.WiState (P2.9c amendment, additive to WiState ONLY): state/acceleratestage/cnt/bcnt,
+// the sp_state / dm_state / ng_state machine counters, cnt_kills/items/secret/time/par/pause, the
+// per-anim mutable animation state, and the loaded intermission graphics (byte offsets into
+// g.wad.buf). The wbstart input is the canonical g.shell.wminfo; me = wbs->pnum.
+//
+// SP path (single-player) is ported faithfully and is what the smoke proves; the deathmatch and
+// netgame stat machines are ported structurally (gated by g.shell.deathmatch / g.shell.netgame).
+//
+// PORTED: WI_Start/WI_initVariables/WI_loadData, WI_Ticker + WI_checkForAccelerate, the three
+//   init/update/draw stat triples (Stats/NetgameStats/DeathmatchStats), WI_init/update/drawNoState
+//   + ShowNextLoc, WI_initAnimatedBack/updateAnimatedBack, WI_drawLF/drawEL/drawOnLnode,
+//   WI_drawNum/drawPercent/drawTime, WI_slamBackground, WI_fragSum, WI_Responder.
+// FAITHFUL id BUG: WI_drawAnimatedBack begins `if (commercial) return;` in linuxdoom-1.10 —
+//   `commercial` is the ENUM CONSTANT (==2, always truthy), NOT `gamemode == commercial` — so the
+//   animated fire cels are NEVER drawn. Reproduced exactly (the cels are still loaded + ticked).
+// SKIPPED: WI_unloadData (Z_ChangeTag cache management — no zone allocator here; the offsets just
+//   go stale on the next WI_Start), the french `items` variant, RANGECHECK asserts.
+pull "mem"
+pull "str"
+pull "../defs/gs" as gs
+pull "../defs/doomdef" as doomdef
+pull "../defs/sounds" as sounds
+pull "../defs/think" as think
+pull "../defs/event" as event
+pull "../util/bstream" as bstream
+pull "../util/m_random" as rnd
+pull "../w/w_wad" as wad
+pull "../v/v_video" as vv
+pull "../s/s_sound" as ssnd
+
+// ---- constants (wi_stuff.c #defines) -------------------------------------------------------
+flex facts SCREENWIDTH: int = 320
+flex facts SCREENHEIGHT: int = 200
+flex facts TICRATE: int = 35
+flex facts MAXPLAYERS: int = 4
+
+flex facts WI_TITLEY: int = 2
+flex facts WI_SPACINGY: int = 33
+flex facts SP_STATSX: int = 50
+flex facts SP_STATSY: int = 50
+flex facts SP_TIMEX: int = 16
+flex facts SP_TIMEY: int = 168          // SCREENHEIGHT-32
+flex facts NG_STATSY: int = 50
+flex facts NG_SPACINGX: int = 64
+flex facts DM_MATRIXX: int = 42
+flex facts DM_MATRIXY: int = 68
+flex facts DM_SPACINGX: int = 40
+flex facts DM_TOTALSX: int = 269
+flex facts DM_KILLERSX: int = 10
+flex facts DM_KILLERSY: int = 100
+flex facts DM_VICTIMSX: int = 5
+flex facts DM_VICTIMSY: int = 50
+flex facts SHOWNEXTLOCDELAY: int = 4
+
+// stateenum_t
+flex facts NOSTATE: int = -1            // NoState
+flex facts STATCOUNT: int = 0           // StatCount
+flex facts SHOWNEXTLOC: int = 1         // ShowNextLoc
+
+// animenum_t
+flex facts ANIM_ALWAYS: int = 0
+flex facts ANIM_RANDOM: int = 1
+flex facts ANIM_LEVEL: int = 2
+
+// ============================================================================================
+// lump-name builders ("BASE" + decimal digits). Loads are one-shot; not perf-critical.
+// ============================================================================================
+flex finna name1(base: str, a: int) -> str {
+    lowkey n = str.len(base)
+    lowkey buf = mem.slab[u8](n + 1)
+    lowkey i = 0
+    vibin i < n {
+        buf[i] = str.at(base, i) as u8
+        i = i + 1
+    }
+    buf[n] = (48 + a % 10) as u8
+    bet str.fromBytesTrust(buf)
+}
+
+flex finna name2(base: str, a: int, b: int) -> str {
+    lowkey n = str.len(base)
+    lowkey buf = mem.slab[u8](n + 2)
+    lowkey i = 0
+    vibin i < n {
+        buf[i] = str.at(base, i) as u8
+        i = i + 1
+    }
+    buf[n] = (48 + a % 10) as u8
+    buf[n + 1] = (48 + b % 10) as u8
+    bet str.fromBytesTrust(buf)
+}
+
+// name2d — "BASE" + 2-digit zero-padded `a` (id's "%2.2d", e.g. CWILV%2.2d).
+flex finna name2d(base: str, a: int) -> str {
+    bet name2(base, a / 10, a)
+}
+
+// wiaName — "WIA%d%.2d%.2d" (epsd 1-digit, j 2-digit, i 2-digit).
+flex finna wiaName(epsd: int, j: int, i: int) -> str {
+    lowkey buf = mem.slab[u8](8)
+    buf[0] = 87   // W
+    buf[1] = 73   // I
+    buf[2] = 65   // A
+    buf[3] = (48 + epsd % 10) as u8
+    buf[4] = (48 + (j / 10) % 10) as u8
+    buf[5] = (48 + j % 10) as u8
+    buf[6] = (48 + (i / 10) % 10) as u8
+    buf[7] = (48 + i % 10) as u8
+    bet str.fromBytesTrust(buf)
+}
+
+// ============================================================================================
+// animation geometry — id's lnodes[NUMEPISODES][NUMMAPS] + epsd{0,1,2}animinfo tables, expressed
+// as accessor functions (module data; mutable globals don't lower native). Only episode 0
+// (shareware Knee-Deep) is exercised; 1 and 2 are ported for fidelity.
+// ============================================================================================
+flex finna numAnims(epsd: int) -> int {
+    fr epsd == 0 {
+        bet 10
+    }
+    fr epsd == 1 {
+        bet 9
+    }
+    fr epsd == 2 {
+        bet 6
+    }
+    bet 0
+}
+
+flex finna animType(epsd: int) -> int {
+    fr epsd == 1 {
+        bet ANIM_LEVEL
+    }
+    bet ANIM_ALWAYS
+}
+
+flex finna animPeriod(epsd: int, i: int) -> int {
+    fr epsd == 2 && i == 5 {
+        bet 8              // TICRATE/4
+    }
+    bet 11                 // TICRATE/3
+}
+
+flex finna animNanims(epsd: int, i: int) -> int {
+    fr epsd == 1 {
+        fr i == 7 {
+            bet 3
+        }
+        bet 1
+    }
+    bet 3
+}
+
+// ANIM_LEVEL data1 (the level number that triggers the anim); only meaningful for episode 1.
+flex finna animData1(i: int) -> int {
+    fr i == 8 {
+        bet 8
+    }
+    bet i + 1
+}
+
+// anim on-screen location (loc.x, loc.y) per (epsd, i).
+flex finna animLoc(epsd: int, i: int) -> (int, int) {
+    fr epsd == 0 {
+        fr i == 0 { bet 224, 104 }
+        fr i == 1 { bet 184, 160 }
+        fr i == 2 { bet 112, 136 }
+        fr i == 3 { bet 72, 112 }
+        fr i == 4 { bet 88, 96 }
+        fr i == 5 { bet 64, 48 }
+        fr i == 6 { bet 192, 40 }
+        fr i == 7 { bet 136, 16 }
+        fr i == 8 { bet 80, 16 }
+        bet 64, 24
+    }
+    fr epsd == 1 {
+        fr i == 7 { bet 192, 144 }
+        bet 128, 136
+    }
+    // epsd == 2
+    fr i == 0 { bet 104, 168 }
+    fr i == 1 { bet 40, 136 }
+    fr i == 2 { bet 160, 96 }
+    fr i == 3 { bet 104, 80 }
+    fr i == 4 { bet 120, 32 }
+    bet 40, 0
+}
+
+// lnodes[epsd][n] — the level-marker map positions.
+flex finna lnode(epsd: int, n: int) -> (int, int) {
+    fr epsd == 0 {
+        fr n == 0 { bet 185, 164 }
+        fr n == 1 { bet 148, 143 }
+        fr n == 2 { bet 69, 122 }
+        fr n == 3 { bet 209, 102 }
+        fr n == 4 { bet 116, 89 }
+        fr n == 5 { bet 166, 55 }
+        fr n == 6 { bet 71, 56 }
+        fr n == 7 { bet 135, 29 }
+        bet 71, 24
+    }
+    fr epsd == 1 {
+        fr n == 0 { bet 254, 25 }
+        fr n == 1 { bet 97, 50 }
+        fr n == 2 { bet 188, 64 }
+        fr n == 3 { bet 128, 78 }
+        fr n == 4 { bet 214, 92 }
+        fr n == 5 { bet 133, 130 }
+        fr n == 6 { bet 208, 136 }
+        fr n == 7 { bet 148, 140 }
+        bet 235, 158
+    }
+    // epsd == 2
+    fr n == 0 { bet 156, 168 }
+    fr n == 1 { bet 48, 154 }
+    fr n == 2 { bet 174, 95 }
+    fr n == 3 { bet 265, 75 }
+    fr n == 4 { bet 130, 48 }
+    fr n == 5 { bet 279, 23 }
+    fr n == 6 { bet 198, 48 }
+    fr n == 7 { bet 140, 25 }
+    bet 281, 136
+}
+
+// ============================================================================================
+// small helpers — patch header fields + the null-origin UI sound + the background slam
+// ============================================================================================
+flex finna patchWidth(gt: tag gs.GameState, ofs: int) -> int {
+    lowkey w = 0
+    holla g = gt in gs.gsc {
+        w = bstream.rdU16(g.wad.buf, ofs)
+    } ghosted {
+        yeet("gs")
+    }
+    bet w
+}
+
+flex finna patchHeight(gt: tag gs.GameState, ofs: int) -> int {
+    lowkey h = 0
+    holla g = gt in gs.gsc {
+        h = bstream.rdU16(g.wad.buf, ofs + 2)
+    } ghosted {
+        yeet("gs")
+    }
+    bet h
+}
+
+flex finna patchLeft(gt: tag gs.GameState, ofs: int) -> int {
+    lowkey v = 0
+    holla g = gt in gs.gsc {
+        v = bstream.rdI16(g.wad.buf, ofs + 4)
+    } ghosted {
+        yeet("gs")
+    }
+    bet v
+}
+
+flex finna patchTop(gt: tag gs.GameState, ofs: int) -> int {
+    lowkey v = 0
+    holla g = gt in gs.gsc {
+        v = bstream.rdI16(g.wad.buf, ofs + 6)
+    } ghosted {
+        yeet("gs")
+    }
+    bet v
+}
+
+// WI_slamBackground — memcpy(screens[0], screens[1], ...): the WIMAP background (drawn into scr1
+// by WI_loadData) is copied to scr0 each frame before the stats overlay.
+flex finna slamBackground(gt: tag gs.GameState) {
+    vv.copyRect(gt, 0, 0, 1, SCREENWIDTH, SCREENHEIGHT, 0, 0, 0)
+}
+
+// S_StartSound(0, sfx): a global (null-origin) UI/counting sound.
+flex finna wiSnd(gt: tag gs.GameState, sfx: int) {
+    lowkey nullOrigin: tag think.Thinker = ghosted
+    ssnd.startSound(gt, nullOrigin, sfx)
+}
+
+// WI_fragSum — total frags player `pnum` scored: sum of plrs[pnum].frags[i] over other in-game
+// players, minus the self-frag (id's JDC negative-frags hack).
+flex finna fragSum(gt: tag gs.GameState, pnum: int) -> int {
+    lowkey frags = 0
+    holla g = gt in gs.gsc {
+        lowkey i = 0
+        vibin i < MAXPLAYERS {
+            fr g.shell.playeringame[i] && i != pnum {
+                frags = frags + (g.shell.wminfo.plyr[pnum].frags[i] as int)
+            }
+            i = i + 1
+        }
+        frags = frags - (g.shell.wminfo.plyr[pnum].frags[pnum] as int)
+    } ghosted {
+        yeet("gs")
+    }
+    bet frags
+}
+
+// ============================================================================================
+// number / percent / time drawing (WI_drawNum / WI_drawPercent / WI_drawTime).
+// The WINUM patch offsets + WIMINUS/WIPCNT/WICOLON/WISUCKS are passed in (loaded by WI_loadData).
+// ============================================================================================
+// WI_drawNum — draw `n` right-aligned at x (min `digits` glyphs, or exactly as many if digits<0).
+// Returns the new left x. drawPatch opens its own holla, so these run OUTSIDE any gsc holla.
+flex finna drawNum(gt: tag gs.GameState, x0: int, y: int, n0: int, digits0: int, numOfs: []i32, wiminusOfs: int) -> int {
+    lowkey x = x0
+    lowkey n = n0
+    lowkey digits = digits0
+    lowkey fontwidth = patchWidth(gt, numOfs[0] as int)
+    fr digits < 0 {
+        fr n == 0 {
+            digits = 1
+        } naw {
+            digits = 0
+            lowkey temp = n
+            vibin temp != 0 {
+                temp = temp / 10
+                digits = digits + 1
+            }
+        }
+    }
+    lowkey neg = n < 0
+    fr neg {
+        n = -n
+    }
+    // if non-number (id's 1994 sentinel), do not draw it
+    fr n == 1994 {
+        bet 0
+    }
+    vibin digits > 0 {
+        x = x - fontwidth
+        vv.drawPatch(gt, x, y, 0, numOfs[n % 10] as int)
+        n = n / 10
+        digits = digits - 1
+    }
+    fr neg {
+        x = x - 8
+        vv.drawPatch(gt, x, y, 0, wiminusOfs)
+    }
+    bet x
+}
+
+// WI_drawPercent — draw the '%' then the number.
+flex finna drawPercent(gt: tag gs.GameState, x: int, y: int, p: int, numOfs: []i32, percentOfs: int, wiminusOfs: int) {
+    fr p < 0 {
+        bet
+    }
+    vv.drawPatch(gt, x, y, 0, percentOfs)
+    drawNum(gt, x, y, p, -1, numOfs, wiminusOfs)
+}
+
+// WI_drawTime — level time / par (mm:ss), or the "sucks" patch on overflow (> 61*59 tics-seconds).
+flex finna drawTime(gt: tag gs.GameState, x0: int, y: int, t: int, numOfs: []i32, colonOfs: int, sucksOfs: int, wiminusOfs: int) {
+    lowkey x = x0
+    fr t < 0 {
+        bet
+    }
+    fr t <= 61 * 59 {
+        lowkey div = 1
+        vibin nocap {
+            lowkey n = (t / div) % 60
+            x = drawNum(gt, x, y, n, 2, numOfs, wiminusOfs) - patchWidth(gt, colonOfs)
+            div = div * 60
+            fr div == 60 || (t / div) != 0 {
+                vv.drawPatch(gt, x, y, 0, colonOfs)
+            }
+            fr (t / div) == 0 {
+                dip
+            }
+        }
+    } naw {
+        vv.drawPatch(gt, x - patchWidth(gt, sucksOfs), y, 0, sucksOfs)
+    }
+}
+
+// WI_drawLF — "<LevelName> Finished!" (lnames[wbs->last] + WIF).
+flex finna drawLF(gt: tag gs.GameState, lnamesOfs: []i32, finishedOfs: int, last: int) {
+    lowkey y = WI_TITLEY
+    lowkey lw = patchWidth(gt, lnamesOfs[last] as int)
+    lowkey lh = patchHeight(gt, lnamesOfs[last] as int)
+    vv.drawPatch(gt, (SCREENWIDTH - lw) / 2, y, 0, lnamesOfs[last] as int)
+    y = y + (5 * lh) / 4
+    lowkey fw = patchWidth(gt, finishedOfs)
+    vv.drawPatch(gt, (SCREENWIDTH - fw) / 2, y, 0, finishedOfs)
+}
+
+// WI_drawEL — "Entering <LevelName>" (WIENTER + lnames[wbs->next]).
+flex finna drawEL(gt: tag gs.GameState, lnamesOfs: []i32, enteringOfs: int, next: int) {
+    lowkey y = WI_TITLEY
+    lowkey ew = patchWidth(gt, enteringOfs)
+    vv.drawPatch(gt, (SCREENWIDTH - ew) / 2, y, 0, enteringOfs)
+    lowkey lh = patchHeight(gt, lnamesOfs[next] as int)
+    y = y + (5 * lh) / 4
+    lowkey lw = patchWidth(gt, lnamesOfs[next] as int)
+    vv.drawPatch(gt, (SCREENWIDTH - lw) / 2, y, 0, lnamesOfs[next] as int)
+}
+
+// WI_drawOnLnode — draw the first of `c[0..1]` that fits on-screen at lnodes[epsd][n]. `ofsA`/`ofsB`
+// are the two candidate patch offsets (for a single-patch splat pass both the same).
+flex finna drawOnLnode(gt: tag gs.GameState, n: int, ofsA: int, ofsB: int, epsd: int) {
+    lowkey lx, ly = lnode(epsd, n)
+    lowkey i = 0
+    lowkey fits = cap
+    vibin nocap {
+        lowkey ofs = ofsA
+        fr i == 1 {
+            ofs = ofsB
+        }
+        lowkey left = lx - patchLeft(gt, ofs)
+        lowkey top = ly - patchTop(gt, ofs)
+        lowkey right = left + patchWidth(gt, ofs)
+        lowkey bottom = top + patchHeight(gt, ofs)
+        fr left >= 0 && right < SCREENWIDTH && top >= 0 && bottom < SCREENHEIGHT {
+            fits = nocap
+        } naw {
+            i = i + 1
+        }
+        fr fits || i == 2 {
+            dip
+        }
+    }
+    fr fits && i < 2 {
+        lowkey ofs = ofsA
+        fr i == 1 {
+            ofs = ofsB
+        }
+        vv.drawPatch(gt, lx, ly, 0, ofs)
+    }
+}
+
+// ============================================================================================
+// animated background (WI_initAnimatedBack / WI_updateAnimatedBack / WI_drawAnimatedBack).
+// ============================================================================================
+flex finna initAnimatedBack(gt: tag gs.GameState) {
+    lowkey gamemode = 0
+    lowkey epsd = 0
+    lowkey bcnt = 0
+    holla g = gt in gs.gsc {
+        gamemode = g.shell.gamemode as int
+        epsd = g.shell.wminfo.epsd as int
+        bcnt = g.wi.bcnt as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr gamemode == doomdef.GM_COMMERCIAL {
+        bet
+    }
+    fr epsd > 2 {
+        bet
+    }
+    lowkey n = numAnims(epsd)
+    lowkey ctrArr = mem.slab[i32](10)
+    lowkey ntArr = mem.slab[i32](10)
+    lowkey i = 0
+    vibin i < n {
+        lowkey typ = animType(epsd)
+        ctrArr[i] = -1
+        fr typ == ANIM_ALWAYS {
+            // M_Random opens its own gsc holla — we are NOT in one here.
+            lowkey r = rnd.mRandom(gt)
+            ntArr[i] = (bcnt + 1 + (r % animPeriod(epsd, i))) as i32
+        } naw {
+            // ANIM_LEVEL (episode 1); ANIM_RANDOM is unused by episodes 0-2.
+            ntArr[i] = (bcnt + 1) as i32
+        }
+        i = i + 1
+    }
+    holla g = gt in gs.gsc {
+        lowkey k = 0
+        vibin k < n {
+            g.wi.animCtr[k] = ctrArr[k]
+            g.wi.animNexttic[k] = ntArr[k]
+            k = k + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna updateAnimatedBack(gt: tag gs.GameState) {
+    lowkey gamemode = 0
+    lowkey epsd = 0
+    lowkey bcnt = 0
+    lowkey st = 0
+    lowkey nextLvl = 0
+    lowkey ctrArr = mem.slab[i32](10)
+    lowkey ntArr = mem.slab[i32](10)
+    holla g = gt in gs.gsc {
+        gamemode = g.shell.gamemode as int
+        epsd = g.shell.wminfo.epsd as int
+        bcnt = g.wi.bcnt as int
+        st = g.wi.state as int
+        nextLvl = g.shell.wminfo.next as int
+        lowkey k = 0
+        vibin k < 10 {
+            ctrArr[k] = g.wi.animCtr[k]
+            ntArr[k] = g.wi.animNexttic[k]
+            k = k + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    fr gamemode == doomdef.GM_COMMERCIAL {
+        bet
+    }
+    fr epsd > 2 {
+        bet
+    }
+    lowkey n = numAnims(epsd)
+    lowkey i = 0
+    vibin i < n {
+        fr bcnt == (ntArr[i] as int) {
+            lowkey typ = animType(epsd)
+            lowkey ctr = ctrArr[i] as int
+            fr typ == ANIM_ALWAYS {
+                ctr = ctr + 1
+                fr ctr >= animNanims(epsd, i) {
+                    ctr = 0
+                }
+                ctrArr[i] = ctr as i32
+                ntArr[i] = (bcnt + animPeriod(epsd, i)) as i32
+            } naw fr typ == ANIM_LEVEL {
+                // gawd-awful hack for level anims (id's comment)
+                fr !(st == STATCOUNT && i == 7) && nextLvl == animData1(i) {
+                    ctr = ctr + 1
+                    fr ctr == animNanims(epsd, i) {
+                        ctr = ctr - 1
+                    }
+                    ctrArr[i] = ctr as i32
+                    ntArr[i] = (bcnt + animPeriod(epsd, i)) as i32
+                }
+            }
+        }
+        i = i + 1
+    }
+    holla g = gt in gs.gsc {
+        lowkey k = 0
+        vibin k < n {
+            g.wi.animCtr[k] = ctrArr[k]
+            g.wi.animNexttic[k] = ntArr[k]
+            k = k + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// WI_drawAnimatedBack — FAITHFUL id BUG: linuxdoom-1.10 opens with `if (commercial) return;`
+// where `commercial` is the enum constant (==2, always truthy), so the animated cels are never
+// drawn. Reproduced as a no-op (see file header).
+flex finna drawAnimatedBack(gt: tag gs.GameState) {
+}
+
+// ============================================================================================
+// state init/update/draw — NoState + ShowNextLoc
+// ============================================================================================
+flex finna initNoState(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.wi.state = NOSTATE as i32
+        g.wi.acceleratestage = 0
+        g.wi.cnt = 10
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna updateNoState(gt: tag gs.GameState) {
+    updateAnimatedBack(gt)
+    lowkey cnt = 0
+    holla g = gt in gs.gsc {
+        g.wi.cnt = g.wi.cnt - 1
+        cnt = g.wi.cnt as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr cnt == 0 {
+        // WI_End() (unload — no-op) + G_WorldDone(): the P2.8 g_game seam.
+        holla g = gt in gs.gsc {
+            g.shell.gameaction = doomdef.GA_WORLDDONE as i32
+        } ghosted {
+            yeet("gs")
+        }
+    }
+}
+
+flex finna initShowNextLoc(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.wi.state = SHOWNEXTLOC as i32
+        g.wi.acceleratestage = 0
+        g.wi.cnt = (SHOWNEXTLOCDELAY * TICRATE) as i32
+    } ghosted {
+        yeet("gs")
+    }
+    initAnimatedBack(gt)
+}
+
+flex finna updateShowNextLoc(gt: tag gs.GameState) {
+    updateAnimatedBack(gt)
+    lowkey cnt = 0
+    lowkey acc = 0
+    holla g = gt in gs.gsc {
+        g.wi.cnt = g.wi.cnt - 1
+        cnt = g.wi.cnt as int
+        acc = g.wi.acceleratestage as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr cnt == 0 || acc != 0 {
+        initNoState(gt)
+    } naw {
+        holla g = gt in gs.gsc {
+            g.wi.snlPointeron = (cnt & 31) < 20
+        } ghosted {
+            yeet("gs")
+        }
+    }
+}
+
+flex finna drawShowNextLoc(gt: tag gs.GameState) {
+    lowkey gamemode = 0
+    lowkey epsd = 0
+    lowkey last = 0
+    lowkey next = 0
+    lowkey didsecret = cap
+    lowkey snlOn = cap
+    lowkey splatOfs = 0
+    lowkey yah0 = 0
+    lowkey yah1 = 0
+    lowkey enteringOfs = 0
+    lowkey lnamesOfs = mem.slab[i32](0)
+    holla g = gt in gs.gsc {
+        gamemode = g.shell.gamemode as int
+        epsd = g.shell.wminfo.epsd as int
+        last = g.shell.wminfo.last as int
+        next = g.shell.wminfo.next as int
+        didsecret = g.shell.wminfo.didsecret
+        snlOn = g.wi.snlPointeron
+        splatOfs = g.wi.splatOfs as int
+        yah0 = g.wi.yahOfs[0] as int
+        yah1 = g.wi.yahOfs[1] as int
+        enteringOfs = g.wi.enteringOfs as int
+        lnamesOfs = g.wi.lnamesOfs
+    } ghosted {
+        yeet("gs")
+    }
+    slamBackground(gt)
+    drawAnimatedBack(gt)
+    fr gamemode != doomdef.GM_COMMERCIAL {
+        fr epsd > 2 {
+            drawEL(gt, lnamesOfs, enteringOfs, next)
+            bet
+        }
+        lowkey lastCity = last
+        fr last == 8 {
+            lastCity = next - 1
+        }
+        lowkey i = 0
+        vibin i <= lastCity {
+            drawOnLnode(gt, i, splatOfs, splatOfs, epsd)
+            i = i + 1
+        }
+        fr didsecret {
+            drawOnLnode(gt, 8, splatOfs, splatOfs, epsd)
+        }
+        fr snlOn {
+            drawOnLnode(gt, next, yah0, yah1, epsd)
+        }
+    }
+    fr gamemode != doomdef.GM_COMMERCIAL || next != 30 {
+        drawEL(gt, lnamesOfs, enteringOfs, next)
+    }
+}
+
+flex finna drawNoState(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.wi.snlPointeron = nocap
+    } ghosted {
+        yeet("gs")
+    }
+    drawShowNextLoc(gt)
+}
+
+// ============================================================================================
+// single-player stats (WI_initStats / WI_updateStats / WI_drawStats)
+// ============================================================================================
+flex finna initStats(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.wi.state = STATCOUNT as i32
+        g.wi.acceleratestage = 0
+        g.wi.spstate = 1
+        g.wi.cntKills[0] = -1
+        g.wi.cntItems[0] = -1
+        g.wi.cntSecret[0] = -1
+        g.wi.cntTime = -1
+        g.wi.cntPar = -1
+        g.wi.cntPause = TICRATE as i32
+    } ghosted {
+        yeet("gs")
+    }
+    initAnimatedBack(gt)
+}
+
+flex finna updateStats(gt: tag gs.GameState) {
+    updateAnimatedBack(gt)
+    lowkey acc = 0
+    lowkey spState = 0
+    lowkey ck = 0
+    lowkey ci = 0
+    lowkey cs = 0
+    lowkey ct = 0
+    lowkey cp = 0
+    lowkey cntPause = 0
+    lowkey bcnt = 0
+    lowkey me = 0
+    lowkey gamemode = 0
+    lowkey maxk = 1
+    lowkey maxi = 1
+    lowkey maxs = 1
+    lowkey partime = 0
+    lowkey skills = 0
+    lowkey sitems = 0
+    lowkey ssecret = 0
+    lowkey stime = 0
+    holla g = gt in gs.gsc {
+        acc = g.wi.acceleratestage as int
+        spState = g.wi.spstate as int
+        ck = g.wi.cntKills[0] as int
+        ci = g.wi.cntItems[0] as int
+        cs = g.wi.cntSecret[0] as int
+        ct = g.wi.cntTime as int
+        cp = g.wi.cntPar as int
+        cntPause = g.wi.cntPause as int
+        bcnt = g.wi.bcnt as int
+        me = g.wi.me as int
+        gamemode = g.shell.gamemode as int
+        maxk = g.shell.wminfo.maxkills as int
+        maxi = g.shell.wminfo.maxitems as int
+        maxs = g.shell.wminfo.maxsecret as int
+        partime = g.shell.wminfo.partime as int
+        skills = g.shell.wminfo.plyr[me].skills as int
+        sitems = g.shell.wminfo.plyr[me].sitems as int
+        ssecret = g.shell.wminfo.plyr[me].ssecret as int
+        stime = g.shell.wminfo.plyr[me].stime as int
+    } ghosted {
+        yeet("gs")
+    }
+
+    fr acc != 0 && spState != 10 {
+        acc = 0
+        ck = (skills * 100) / maxk
+        ci = (sitems * 100) / maxi
+        cs = (ssecret * 100) / maxs
+        ct = stime / TICRATE
+        cp = partime / TICRATE
+        wiSnd(gt, sounds.SFX_BAREXP)
+        spState = 10
+    }
+
+    fr spState == 2 {
+        ck = ck + 2
+        fr (bcnt & 3) == 0 {
+            wiSnd(gt, sounds.SFX_PISTOL)
+        }
+        fr ck >= (skills * 100) / maxk {
+            ck = (skills * 100) / maxk
+            wiSnd(gt, sounds.SFX_BAREXP)
+            spState = spState + 1
+        }
+    } naw fr spState == 4 {
+        ci = ci + 2
+        fr (bcnt & 3) == 0 {
+            wiSnd(gt, sounds.SFX_PISTOL)
+        }
+        fr ci >= (sitems * 100) / maxi {
+            ci = (sitems * 100) / maxi
+            wiSnd(gt, sounds.SFX_BAREXP)
+            spState = spState + 1
+        }
+    } naw fr spState == 6 {
+        cs = cs + 2
+        fr (bcnt & 3) == 0 {
+            wiSnd(gt, sounds.SFX_PISTOL)
+        }
+        fr cs >= (ssecret * 100) / maxs {
+            cs = (ssecret * 100) / maxs
+            wiSnd(gt, sounds.SFX_BAREXP)
+            spState = spState + 1
+        }
+    } naw fr spState == 8 {
+        fr (bcnt & 3) == 0 {
+            wiSnd(gt, sounds.SFX_PISTOL)
+        }
+        ct = ct + 3
+        fr ct >= stime / TICRATE {
+            ct = stime / TICRATE
+        }
+        cp = cp + 3
+        fr cp >= partime / TICRATE {
+            cp = partime / TICRATE
+            fr ct >= stime / TICRATE {
+                wiSnd(gt, sounds.SFX_BAREXP)
+                spState = spState + 1
+            }
+        }
+    } naw fr spState == 10 {
+        fr acc != 0 {
+            wiSnd(gt, sounds.SFX_SGCOCK)
+            fr gamemode == doomdef.GM_COMMERCIAL {
+                initNoState(gt)
+            } naw {
+                initShowNextLoc(gt)
+            }
+            bet   // transitioned; init* owns the state fields
+        }
+    } naw fr (spState & 1) != 0 {
+        cntPause = cntPause - 1
+        fr cntPause == 0 {
+            spState = spState + 1
+            cntPause = TICRATE
+        }
+    }
+
+    holla g = gt in gs.gsc {
+        g.wi.acceleratestage = acc as i32
+        g.wi.spstate = spState as i32
+        g.wi.cntKills[0] = ck as i32
+        g.wi.cntItems[0] = ci as i32
+        g.wi.cntSecret[0] = cs as i32
+        g.wi.cntTime = ct as i32
+        g.wi.cntPar = cp as i32
+        g.wi.cntPause = cntPause as i32
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna drawStats(gt: tag gs.GameState) {
+    lowkey ck = 0
+    lowkey ci = 0
+    lowkey cs = 0
+    lowkey ct = 0
+    lowkey cp = 0
+    lowkey epsd = 0
+    lowkey last = 0
+    lowkey numOfs = mem.slab[i32](0)
+    lowkey lnamesOfs = mem.slab[i32](0)
+    lowkey killsOfs = 0
+    lowkey itemsOfs = 0
+    lowkey spSecretOfs = 0
+    lowkey timeOfs = 0
+    lowkey parOfs = 0
+    lowkey percentOfs = 0
+    lowkey wiminusOfs = 0
+    lowkey colonOfs = 0
+    lowkey sucksOfs = 0
+    lowkey finishedOfs = 0
+    holla g = gt in gs.gsc {
+        ck = g.wi.cntKills[0] as int
+        ci = g.wi.cntItems[0] as int
+        cs = g.wi.cntSecret[0] as int
+        ct = g.wi.cntTime as int
+        cp = g.wi.cntPar as int
+        epsd = g.shell.wminfo.epsd as int
+        last = g.shell.wminfo.last as int
+        numOfs = g.wi.numOfs
+        lnamesOfs = g.wi.lnamesOfs
+        killsOfs = g.wi.killsOfs as int
+        itemsOfs = g.wi.itemsOfs as int
+        spSecretOfs = g.wi.spSecretOfs as int
+        timeOfs = g.wi.timeOfs as int
+        parOfs = g.wi.parOfs as int
+        percentOfs = g.wi.percentOfs as int
+        wiminusOfs = g.wi.wiminusOfs as int
+        colonOfs = g.wi.colonOfs as int
+        sucksOfs = g.wi.sucksOfs as int
+        finishedOfs = g.wi.finishedOfs as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey lh = (3 * patchHeight(gt, numOfs[0] as int)) / 2
+
+    slamBackground(gt)
+    drawAnimatedBack(gt)
+    drawLF(gt, lnamesOfs, finishedOfs, last)
+
+    vv.drawPatch(gt, SP_STATSX, SP_STATSY, 0, killsOfs)
+    drawPercent(gt, SCREENWIDTH - SP_STATSX, SP_STATSY, ck, numOfs, percentOfs, wiminusOfs)
+
+    vv.drawPatch(gt, SP_STATSX, SP_STATSY + lh, 0, itemsOfs)
+    drawPercent(gt, SCREENWIDTH - SP_STATSX, SP_STATSY + lh, ci, numOfs, percentOfs, wiminusOfs)
+
+    vv.drawPatch(gt, SP_STATSX, SP_STATSY + 2 * lh, 0, spSecretOfs)
+    drawPercent(gt, SCREENWIDTH - SP_STATSX, SP_STATSY + 2 * lh, cs, numOfs, percentOfs, wiminusOfs)
+
+    vv.drawPatch(gt, SP_TIMEX, SP_TIMEY, 0, timeOfs)
+    drawTime(gt, SCREENWIDTH / 2 - SP_TIMEX, SP_TIMEY, ct, numOfs, colonOfs, sucksOfs, wiminusOfs)
+
+    fr epsd < 3 {
+        vv.drawPatch(gt, SCREENWIDTH / 2 + SP_TIMEX, SP_TIMEY, 0, parOfs)
+        drawTime(gt, SCREENWIDTH - SP_TIMEX, SP_TIMEY, cp, numOfs, colonOfs, sucksOfs, wiminusOfs)
+    }
+}
+
+// ============================================================================================
+// netgame stats (WI_initNetgameStats / WI_updateNetgameStats / WI_drawNetgameStats).
+// Ported structurally; single-player takes the drawStats path.
+// ============================================================================================
+flex finna initNetgameStats(gt: tag gs.GameState) {
+    lowkey dofrags = 0
+    holla g = gt in gs.gsc {
+        g.wi.state = STATCOUNT as i32
+        g.wi.acceleratestage = 0
+        g.wi.ngState = 1
+        g.wi.cntPause = TICRATE as i32
+        lowkey i = 0
+        vibin i < MAXPLAYERS {
+            fr g.shell.playeringame[i] {
+                g.wi.cntKills[i] = 0
+                g.wi.cntItems[i] = 0
+                g.wi.cntSecret[i] = 0
+                g.wi.cntFrags[i] = 0
+            }
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    // dofrags = !!sum of fragSum(i) over in-game players (fragSum opens its own holla)
+    lowkey i = 0
+    vibin i < MAXPLAYERS {
+        lowkey inGame = cap
+        holla g = gt in gs.gsc {
+            inGame = g.shell.playeringame[i]
+        } ghosted {
+            yeet("gs")
+        }
+        fr inGame {
+            dofrags = dofrags + fragSum(gt, i)
+        }
+        i = i + 1
+    }
+    fr dofrags != 0 {
+        dofrags = 1
+    }
+    holla g = gt in gs.gsc {
+        g.wi.dofrags = dofrags as i32
+    } ghosted {
+        yeet("gs")
+    }
+    initAnimatedBack(gt)
+}
+
+flex finna updateNetgameStats(gt: tag gs.GameState) {
+    updateAnimatedBack(gt)
+    lowkey acc = 0
+    lowkey ngState = 0
+    lowkey bcnt = 0
+    lowkey cntPause = 0
+    lowkey dofrags = 0
+    lowkey gamemode = 0
+    lowkey maxk = 1
+    lowkey maxi = 1
+    lowkey maxs = 1
+    lowkey ck = mem.slab[i32](4)
+    lowkey ci = mem.slab[i32](4)
+    lowkey cs = mem.slab[i32](4)
+    lowkey cf = mem.slab[i32](4)
+    lowkey pin = mem.slab[i32](4)
+    lowkey pk = mem.slab[i32](4)
+    lowkey pit = mem.slab[i32](4)
+    lowkey ps = mem.slab[i32](4)
+    holla g = gt in gs.gsc {
+        acc = g.wi.acceleratestage as int
+        ngState = g.wi.ngState as int
+        bcnt = g.wi.bcnt as int
+        cntPause = g.wi.cntPause as int
+        dofrags = g.wi.dofrags as int
+        gamemode = g.shell.gamemode as int
+        maxk = g.shell.wminfo.maxkills as int
+        maxi = g.shell.wminfo.maxitems as int
+        maxs = g.shell.wminfo.maxsecret as int
+        lowkey i = 0
+        vibin i < MAXPLAYERS {
+            ck[i] = g.wi.cntKills[i]
+            ci[i] = g.wi.cntItems[i]
+            cs[i] = g.wi.cntSecret[i]
+            cf[i] = g.wi.cntFrags[i]
+            fr g.shell.playeringame[i] {
+                pin[i] = 1
+            }
+            pk[i] = g.shell.wminfo.plyr[i].skills
+            pit[i] = g.shell.wminfo.plyr[i].sitems
+            ps[i] = g.shell.wminfo.plyr[i].ssecret
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+
+    fr acc != 0 && ngState != 10 {
+        acc = 0
+        lowkey i = 0
+        vibin i < MAXPLAYERS {
+            fr pin[i] != 0 {
+                ck[i] = (((pk[i] as int) * 100) / maxk) as i32
+                ci[i] = (((pit[i] as int) * 100) / maxi) as i32
+                cs[i] = (((ps[i] as int) * 100) / maxs) as i32
+                fr dofrags != 0 {
+                    cf[i] = fragSum(gt, i) as i32
+                }
+            }
+            i = i + 1
+        }
+        wiSnd(gt, sounds.SFX_BAREXP)
+        ngState = 10
+    }
+
+    lowkey transitioned = cap
+    fr ngState == 2 {
+        fr (bcnt & 3) == 0 {
+            wiSnd(gt, sounds.SFX_PISTOL)
+        }
+        lowkey stillticking = cap
+        lowkey i = 0
+        vibin i < MAXPLAYERS {
+            fr pin[i] != 0 {
+                ck[i] = ck[i] + 2
+                lowkey target = ((pk[i] as int) * 100) / maxk
+                fr (ck[i] as int) >= target {
+                    ck[i] = target as i32
+                } naw {
+                    stillticking = nocap
+                }
+            }
+            i = i + 1
+        }
+        fr !stillticking {
+            wiSnd(gt, sounds.SFX_BAREXP)
+            ngState = ngState + 1
+        }
+    } naw fr ngState == 4 {
+        fr (bcnt & 3) == 0 {
+            wiSnd(gt, sounds.SFX_PISTOL)
+        }
+        lowkey stillticking = cap
+        lowkey i = 0
+        vibin i < MAXPLAYERS {
+            fr pin[i] != 0 {
+                ci[i] = ci[i] + 2
+                lowkey target = ((pit[i] as int) * 100) / maxi
+                fr (ci[i] as int) >= target {
+                    ci[i] = target as i32
+                } naw {
+                    stillticking = nocap
+                }
+            }
+            i = i + 1
+        }
+        fr !stillticking {
+            wiSnd(gt, sounds.SFX_BAREXP)
+            ngState = ngState + 1
+        }
+    } naw fr ngState == 6 {
+        fr (bcnt & 3) == 0 {
+            wiSnd(gt, sounds.SFX_PISTOL)
+        }
+        lowkey stillticking = cap
+        lowkey i = 0
+        vibin i < MAXPLAYERS {
+            fr pin[i] != 0 {
+                cs[i] = cs[i] + 2
+                lowkey target = ((ps[i] as int) * 100) / maxs
+                fr (cs[i] as int) >= target {
+                    cs[i] = target as i32
+                } naw {
+                    stillticking = nocap
+                }
+            }
+            i = i + 1
+        }
+        fr !stillticking {
+            wiSnd(gt, sounds.SFX_BAREXP)
+            ngState = ngState + 1 + 2 * (1 - dofrags)
+        }
+    } naw fr ngState == 8 {
+        fr (bcnt & 3) == 0 {
+            wiSnd(gt, sounds.SFX_PISTOL)
+        }
+        lowkey stillticking = cap
+        lowkey i = 0
+        vibin i < MAXPLAYERS {
+            fr pin[i] != 0 {
+                cf[i] = cf[i] + 1
+                lowkey fsum = fragSum(gt, i)
+                fr (cf[i] as int) >= fsum {
+                    cf[i] = fsum as i32
+                } naw {
+                    stillticking = nocap
+                }
+            }
+            i = i + 1
+        }
+        fr !stillticking {
+            wiSnd(gt, sounds.SFX_PLDETH)
+            ngState = ngState + 1
+        }
+    } naw fr ngState == 10 {
+        fr acc != 0 {
+            wiSnd(gt, sounds.SFX_SGCOCK)
+            fr gamemode == doomdef.GM_COMMERCIAL {
+                initNoState(gt)
+            } naw {
+                initShowNextLoc(gt)
+            }
+            transitioned = nocap
+        }
+    } naw fr (ngState & 1) != 0 {
+        cntPause = cntPause - 1
+        fr cntPause == 0 {
+            ngState = ngState + 1
+            cntPause = TICRATE
+        }
+    }
+
+    holla g = gt in gs.gsc {
+        lowkey i = 0
+        vibin i < MAXPLAYERS {
+            g.wi.cntKills[i] = ck[i]
+            g.wi.cntItems[i] = ci[i]
+            g.wi.cntSecret[i] = cs[i]
+            g.wi.cntFrags[i] = cf[i]
+            i = i + 1
+        }
+        fr !transitioned {
+            g.wi.acceleratestage = acc as i32
+            g.wi.ngState = ngState as i32
+            g.wi.cntPause = cntPause as i32
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna drawNetgameStats(gt: tag gs.GameState) {
+    lowkey me = 0
+    lowkey dofrags = 0
+    lowkey last = 0
+    lowkey numOfs = mem.slab[i32](0)
+    lowkey pOfs = mem.slab[i32](0)
+    lowkey lnamesOfs = mem.slab[i32](0)
+    lowkey killsOfs = 0
+    lowkey itemsOfs = 0
+    lowkey secretOfs = 0
+    lowkey fragsOfs = 0
+    lowkey percentOfs = 0
+    lowkey wiminusOfs = 0
+    lowkey starOfs = 0
+    lowkey finishedOfs = 0
+    lowkey ck = mem.slab[i32](4)
+    lowkey ci = mem.slab[i32](4)
+    lowkey cs = mem.slab[i32](4)
+    lowkey cf = mem.slab[i32](4)
+    lowkey pin = mem.slab[i32](4)
+    holla g = gt in gs.gsc {
+        me = g.wi.me as int
+        dofrags = g.wi.dofrags as int
+        last = g.shell.wminfo.last as int
+        numOfs = g.wi.numOfs
+        pOfs = g.wi.pOfs
+        lnamesOfs = g.wi.lnamesOfs
+        killsOfs = g.wi.killsOfs as int
+        itemsOfs = g.wi.itemsOfs as int
+        secretOfs = g.wi.secretOfs as int
+        fragsOfs = g.wi.fragsOfs as int
+        percentOfs = g.wi.percentOfs as int
+        wiminusOfs = g.wi.wiminusOfs as int
+        starOfs = g.wi.starOfs as int
+        finishedOfs = g.wi.finishedOfs as int
+        lowkey i = 0
+        vibin i < MAXPLAYERS {
+            ck[i] = g.wi.cntKills[i]
+            ci[i] = g.wi.cntItems[i]
+            cs[i] = g.wi.cntSecret[i]
+            cf[i] = g.wi.cntFrags[i]
+            fr g.shell.playeringame[i] {
+                pin[i] = 1
+            }
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey pwidth = patchWidth(gt, percentOfs)
+
+    slamBackground(gt)
+    drawAnimatedBack(gt)
+    drawLF(gt, lnamesOfs, finishedOfs, last)
+
+    // stat titles (NG_STATSX = 32 + star->width/2 + 32*!dofrags)
+    lowkey starW = patchWidth(gt, starOfs)
+    lowkey ngStatsX = 32 + starW / 2
+    fr dofrags == 0 {
+        ngStatsX = ngStatsX + 32
+    }
+    vv.drawPatch(gt, ngStatsX + NG_SPACINGX - patchWidth(gt, killsOfs), NG_STATSY, 0, killsOfs)
+    vv.drawPatch(gt, ngStatsX + 2 * NG_SPACINGX - patchWidth(gt, itemsOfs), NG_STATSY, 0, itemsOfs)
+    vv.drawPatch(gt, ngStatsX + 3 * NG_SPACINGX - patchWidth(gt, secretOfs), NG_STATSY, 0, secretOfs)
+    fr dofrags != 0 {
+        vv.drawPatch(gt, ngStatsX + 4 * NG_SPACINGX - patchWidth(gt, fragsOfs), NG_STATSY, 0, fragsOfs)
+    }
+
+    lowkey y = NG_STATSY + patchHeight(gt, killsOfs)
+    lowkey i = 0
+    vibin i < MAXPLAYERS {
+        fr pin[i] != 0 {
+            lowkey x = ngStatsX
+            vv.drawPatch(gt, x - patchWidth(gt, pOfs[i] as int), y, 0, pOfs[i] as int)
+            fr i == me {
+                vv.drawPatch(gt, x - patchWidth(gt, pOfs[i] as int), y, 0, starOfs)
+            }
+            x = x + NG_SPACINGX
+            drawPercent(gt, x - pwidth, y + 10, ck[i] as int, numOfs, percentOfs, wiminusOfs)
+            x = x + NG_SPACINGX
+            drawPercent(gt, x - pwidth, y + 10, ci[i] as int, numOfs, percentOfs, wiminusOfs)
+            x = x + NG_SPACINGX
+            drawPercent(gt, x - pwidth, y + 10, cs[i] as int, numOfs, percentOfs, wiminusOfs)
+            x = x + NG_SPACINGX
+            fr dofrags != 0 {
+                drawNum(gt, x, y + 10, cf[i] as int, -1, numOfs, wiminusOfs)
+            }
+            y = y + WI_SPACINGY
+        }
+        i = i + 1
+    }
+}
+
+// ============================================================================================
+// deathmatch stats (WI_initDeathmatchStats / WI_updateDeathmatchStats / WI_drawDeathmatchStats).
+// Ported structurally; dm_frags[i][j] flattens to dmFrags[i*4 + j].
+// ============================================================================================
+flex finna initDeathmatchStats(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.wi.state = STATCOUNT as i32
+        g.wi.acceleratestage = 0
+        g.wi.dmState = 1
+        g.wi.cntPause = TICRATE as i32
+        lowkey i = 0
+        vibin i < MAXPLAYERS {
+            fr g.shell.playeringame[i] {
+                lowkey j = 0
+                vibin j < MAXPLAYERS {
+                    fr g.shell.playeringame[j] {
+                        g.wi.dmFrags[i * 4 + j] = 0
+                    }
+                    j = j + 1
+                }
+                g.wi.dmTotals[i] = 0
+            }
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    initAnimatedBack(gt)
+}
+
+flex finna updateDeathmatchStats(gt: tag gs.GameState) {
+    updateAnimatedBack(gt)
+    lowkey acc = 0
+    lowkey dmState = 0
+    lowkey bcnt = 0
+    lowkey cntPause = 0
+    lowkey gamemode = 0
+    lowkey pin = mem.slab[i32](4)
+    lowkey df = mem.slab[i32](16)
+    lowkey dt = mem.slab[i32](4)
+    lowkey pf = mem.slab[i32](16)   // plrs[i].frags[j]
+    holla g = gt in gs.gsc {
+        acc = g.wi.acceleratestage as int
+        dmState = g.wi.dmState as int
+        bcnt = g.wi.bcnt as int
+        cntPause = g.wi.cntPause as int
+        gamemode = g.shell.gamemode as int
+        lowkey i = 0
+        vibin i < MAXPLAYERS {
+            fr g.shell.playeringame[i] {
+                pin[i] = 1
+            }
+            dt[i] = g.wi.dmTotals[i]
+            lowkey j = 0
+            vibin j < MAXPLAYERS {
+                df[i * 4 + j] = g.wi.dmFrags[i * 4 + j]
+                pf[i * 4 + j] = g.shell.wminfo.plyr[i].frags[j]
+                j = j + 1
+            }
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+
+    fr acc != 0 && dmState != 4 {
+        acc = 0
+        lowkey i = 0
+        vibin i < MAXPLAYERS {
+            fr pin[i] != 0 {
+                lowkey j = 0
+                vibin j < MAXPLAYERS {
+                    fr pin[j] != 0 {
+                        df[i * 4 + j] = pf[i * 4 + j]
+                    }
+                    j = j + 1
+                }
+                dt[i] = fragSum(gt, i) as i32
+            }
+            i = i + 1
+        }
+        wiSnd(gt, sounds.SFX_BAREXP)
+        dmState = 4
+    }
+
+    lowkey transitioned = cap
+    fr dmState == 2 {
+        fr (bcnt & 3) == 0 {
+            wiSnd(gt, sounds.SFX_PISTOL)
+        }
+        lowkey stillticking = cap
+        lowkey i = 0
+        vibin i < MAXPLAYERS {
+            fr pin[i] != 0 {
+                lowkey j = 0
+                vibin j < MAXPLAYERS {
+                    fr pin[j] != 0 && (df[i * 4 + j] as int) != (pf[i * 4 + j] as int) {
+                        fr (pf[i * 4 + j] as int) < 0 {
+                            df[i * 4 + j] = df[i * 4 + j] - 1
+                        } naw {
+                            df[i * 4 + j] = df[i * 4 + j] + 1
+                        }
+                        fr (df[i * 4 + j] as int) > 99 {
+                            df[i * 4 + j] = 99
+                        }
+                        fr (df[i * 4 + j] as int) < -99 {
+                            df[i * 4 + j] = -99
+                        }
+                        stillticking = nocap
+                    }
+                    j = j + 1
+                }
+                dt[i] = fragSum(gt, i) as i32
+                fr (dt[i] as int) > 99 {
+                    dt[i] = 99
+                }
+                fr (dt[i] as int) < -99 {
+                    dt[i] = -99
+                }
+            }
+            i = i + 1
+        }
+        fr !stillticking {
+            wiSnd(gt, sounds.SFX_BAREXP)
+            dmState = dmState + 1
+        }
+    } naw fr dmState == 4 {
+        fr acc != 0 {
+            wiSnd(gt, sounds.SFX_SLOP)
+            fr gamemode == doomdef.GM_COMMERCIAL {
+                initNoState(gt)
+            } naw {
+                initShowNextLoc(gt)
+            }
+            transitioned = nocap
+        }
+    } naw fr (dmState & 1) != 0 {
+        cntPause = cntPause - 1
+        fr cntPause == 0 {
+            dmState = dmState + 1
+            cntPause = TICRATE
+        }
+    }
+
+    holla g = gt in gs.gsc {
+        lowkey i = 0
+        vibin i < MAXPLAYERS {
+            g.wi.dmTotals[i] = dt[i]
+            lowkey j = 0
+            vibin j < MAXPLAYERS {
+                g.wi.dmFrags[i * 4 + j] = df[i * 4 + j]
+                j = j + 1
+            }
+            i = i + 1
+        }
+        fr !transitioned {
+            g.wi.acceleratestage = acc as i32
+            g.wi.dmState = dmState as i32
+            g.wi.cntPause = cntPause as i32
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna drawDeathmatchStats(gt: tag gs.GameState) {
+    lowkey me = 0
+    lowkey last = 0
+    lowkey numOfs = mem.slab[i32](0)
+    lowkey pOfs = mem.slab[i32](0)
+    lowkey lnamesOfs = mem.slab[i32](0)
+    lowkey totalOfs = 0
+    lowkey killersOfs = 0
+    lowkey victimsOfs = 0
+    lowkey starOfs = 0
+    lowkey bstarOfs = 0
+    lowkey wiminusOfs = 0
+    lowkey finishedOfs = 0
+    lowkey pin = mem.slab[i32](4)
+    lowkey df = mem.slab[i32](16)
+    lowkey dt = mem.slab[i32](4)
+    holla g = gt in gs.gsc {
+        me = g.wi.me as int
+        last = g.shell.wminfo.last as int
+        numOfs = g.wi.numOfs
+        pOfs = g.wi.pOfs
+        lnamesOfs = g.wi.lnamesOfs
+        totalOfs = g.wi.totalOfs as int
+        killersOfs = g.wi.killersOfs as int
+        victimsOfs = g.wi.victimsOfs as int
+        starOfs = g.wi.starOfs as int
+        bstarOfs = g.wi.bstarOfs as int
+        wiminusOfs = g.wi.wiminusOfs as int
+        finishedOfs = g.wi.finishedOfs as int
+        lowkey i = 0
+        vibin i < MAXPLAYERS {
+            dt[i] = g.wi.dmTotals[i]
+            fr g.shell.playeringame[i] {
+                pin[i] = 1
+            }
+            lowkey j = 0
+            vibin j < MAXPLAYERS {
+                df[i * 4 + j] = g.wi.dmFrags[i * 4 + j]
+                j = j + 1
+            }
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+
+    slamBackground(gt)
+    drawAnimatedBack(gt)
+    drawLF(gt, lnamesOfs, finishedOfs, last)
+
+    vv.drawPatch(gt, DM_TOTALSX - patchWidth(gt, totalOfs) / 2, DM_MATRIXY - WI_SPACINGY + 10, 0, totalOfs)
+    vv.drawPatch(gt, DM_KILLERSX, DM_KILLERSY, 0, killersOfs)
+    vv.drawPatch(gt, DM_VICTIMSX, DM_VICTIMSY, 0, victimsOfs)
+
+    lowkey x = DM_MATRIXX + DM_SPACINGX
+    lowkey y = DM_MATRIXY
+    lowkey i = 0
+    vibin i < MAXPLAYERS {
+        fr pin[i] != 0 {
+            lowkey pw = patchWidth(gt, pOfs[i] as int)
+            vv.drawPatch(gt, x - pw / 2, DM_MATRIXY - WI_SPACINGY, 0, pOfs[i] as int)
+            vv.drawPatch(gt, DM_MATRIXX - pw / 2, y, 0, pOfs[i] as int)
+            fr i == me {
+                vv.drawPatch(gt, x - pw / 2, DM_MATRIXY - WI_SPACINGY, 0, bstarOfs)
+                vv.drawPatch(gt, DM_MATRIXX - pw / 2, y, 0, starOfs)
+            }
+        }
+        x = x + DM_SPACINGX
+        y = y + WI_SPACINGY
+        i = i + 1
+    }
+
+    y = DM_MATRIXY + 10
+    lowkey w = patchWidth(gt, numOfs[0] as int)
+    i = 0
+    vibin i < MAXPLAYERS {
+        x = DM_MATRIXX + DM_SPACINGX
+        fr pin[i] != 0 {
+            lowkey j = 0
+            vibin j < MAXPLAYERS {
+                fr pin[j] != 0 {
+                    drawNum(gt, x + w, y, df[i * 4 + j] as int, 2, numOfs, wiminusOfs)
+                }
+                x = x + DM_SPACINGX
+                j = j + 1
+            }
+            drawNum(gt, DM_TOTALSX + w, y, dt[i] as int, 2, numOfs, wiminusOfs)
+        }
+        y = y + WI_SPACINGY
+        i = i + 1
+    }
+}
+
+// ============================================================================================
+// WI_checkForAccelerate + WI_Ticker + WI_Drawer + WI_Responder
+// ============================================================================================
+flex finna checkForAccelerate(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        lowkey i = 0
+        vibin i < MAXPLAYERS {
+            fr g.shell.playeringame[i] {
+                lowkey buttons = g.shell.players[i].cmd.buttons as int
+                fr (buttons & event.BT_ATTACK) != 0 {
+                    fr !g.shell.players[i].attackdown {
+                        g.wi.acceleratestage = 1
+                    }
+                    g.shell.players[i].attackdown = nocap
+                } naw {
+                    g.shell.players[i].attackdown = cap
+                }
+                fr (buttons & event.BT_USE) != 0 {
+                    fr !g.shell.players[i].usedown {
+                        g.wi.acceleratestage = 1
+                    }
+                    g.shell.players[i].usedown = nocap
+                } naw {
+                    g.shell.players[i].usedown = cap
+                }
+            }
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// WI_Ticker — advance the background counter, kick off the intermission music at bcnt==1, poll the
+// skip buttons, then dispatch by state.
+flex finna wiTicker(gt: tag gs.GameState) {
+    lowkey bcnt = 0
+    lowkey st = 0
+    lowkey dm = 0
+    lowkey ng = cap
+    lowkey gamemode = 0
+    holla g = gt in gs.gsc {
+        g.wi.bcnt = g.wi.bcnt + 1
+        bcnt = g.wi.bcnt as int
+        st = g.wi.state as int
+        dm = g.shell.deathmatch as int
+        ng = g.shell.netgame
+        gamemode = g.shell.gamemode as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr bcnt == 1 {
+        fr gamemode == doomdef.GM_COMMERCIAL {
+            ssnd.changeMusic(gt, sounds.MUS_DM2INT, 1)
+        } naw {
+            ssnd.changeMusic(gt, sounds.MUS_INTER, 1)
+        }
+    }
+    checkForAccelerate(gt)
+    fr st == STATCOUNT {
+        fr dm != 0 {
+            updateDeathmatchStats(gt)
+        } naw fr ng {
+            updateNetgameStats(gt)
+        } naw {
+            updateStats(gt)
+        }
+    } naw fr st == SHOWNEXTLOC {
+        updateShowNextLoc(gt)
+    } naw fr st == NOSTATE {
+        updateNoState(gt)
+    }
+}
+
+// WI_Drawer — draw the current state (single-player → drawStats).
+flex finna wiDrawer(gt: tag gs.GameState) {
+    lowkey st = 0
+    lowkey dm = 0
+    lowkey ng = cap
+    holla g = gt in gs.gsc {
+        st = g.wi.state as int
+        dm = g.shell.deathmatch as int
+        ng = g.shell.netgame
+    } ghosted {
+        yeet("gs")
+    }
+    fr st == STATCOUNT {
+        fr dm != 0 {
+            drawDeathmatchStats(gt)
+        } naw fr ng {
+            drawNetgameStats(gt)
+        } naw {
+            drawStats(gt)
+        }
+    } naw fr st == SHOWNEXTLOC {
+        drawShowNextLoc(gt)
+    } naw fr st == NOSTATE {
+        drawNoState(gt)
+    }
+}
+
+// WI_Responder — id's is a no-op (skip keys are polled in the ticker for netgame timing).
+flex finna wiResponder(gt: tag gs.GameState, evType: int, key: int) -> bool {
+    bet cap
+}
+
+// ============================================================================================
+// WI_loadData — cache every intermission graphic (byte offsets into g.wad.buf) + draw the WIMAP
+// background into scr1 (slammed to scr0 each frame). Non-commercial (DOOM1) path is the exercised
+// one; commercial is ported structurally.
+// ============================================================================================
+flex finna loadData(gt: tag gs.GameState) {
+    lowkey gamemode = 0
+    lowkey epsd = 0
+    holla g = gt in gs.gsc {
+        gamemode = g.shell.gamemode as int
+        epsd = g.shell.wminfo.epsd as int
+    } ghosted {
+        yeet("gs")
+    }
+
+    // background name: "WIMAP%d" (per episode), or INTERPIC for commercial / retail-E4.
+    lowkey bgName = "INTERPIC"
+    fr gamemode != doomdef.GM_COMMERCIAL {
+        bgName = name1("WIMAP", epsd)
+    }
+    fr gamemode == doomdef.GM_RETAIL && epsd == 3 {
+        bgName = "INTERPIC"
+    }
+    lowkey bgOfs = wad.lumpNameOfs(gt, bgName)
+
+    // level-name patches
+    lowkey lnames = mem.slab[i32](9)
+    fr gamemode == doomdef.GM_COMMERCIAL {
+        lnames = mem.slab[i32](32)                 // NUMCMAPS
+        lowkey i = 0
+        vibin i < 32 {
+            lnames[i] = wad.lumpNameOfs(gt, name2d("CWILV", i)) as i32
+            i = i + 1
+        }
+    } naw {
+        lowkey i = 0
+        vibin i < 9 {                              // NUMMAPS
+            lnames[i] = wad.lumpNameOfs(gt, name2("WILV", epsd, i)) as i32
+            i = i + 1
+        }
+    }
+
+    lowkey yah0 = 0
+    lowkey yah1 = 0
+    lowkey splat = 0
+    lowkey animPArr = mem.slab[i32](30)
+    fr gamemode != doomdef.GM_COMMERCIAL {
+        yah0 = wad.lumpNameOfs(gt, "WIURH0")
+        yah1 = wad.lumpNameOfs(gt, "WIURH1")
+        splat = wad.lumpNameOfs(gt, "WISPLAT")
+        fr epsd < 3 {
+            lowkey na = numAnims(epsd)
+            lowkey j = 0
+            vibin j < na {
+                lowkey nf = animNanims(epsd, j)
+                lowkey i = 0
+                vibin i < nf {
+                    fr epsd == 1 && j == 8 {
+                        // MONDO HACK: episode-1 anim 8 reuses anim 4's frames.
+                        animPArr[j * 3 + i] = animPArr[4 * 3 + i]
+                    } naw {
+                        animPArr[j * 3 + i] = wad.lumpNameOfs(gt, wiaName(epsd, j, i)) as i32
+                    }
+                    i = i + 1
+                }
+                j = j + 1
+            }
+        }
+    }
+
+    lowkey wiminus = wad.lumpNameOfs(gt, "WIMINUS")
+    lowkey numArr = mem.slab[i32](10)
+    lowkey k = 0
+    vibin k < 10 {
+        numArr[k] = wad.lumpNameOfs(gt, name1("WINUM", k)) as i32
+        k = k + 1
+    }
+    lowkey percent = wad.lumpNameOfs(gt, "WIPCNT")
+    lowkey finished = wad.lumpNameOfs(gt, "WIF")
+    lowkey entering = wad.lumpNameOfs(gt, "WIENTER")
+    lowkey kills = wad.lumpNameOfs(gt, "WIOSTK")
+    lowkey secret = wad.lumpNameOfs(gt, "WIOSTS")
+    lowkey spSecret = wad.lumpNameOfs(gt, "WISCRT2")
+    lowkey items = wad.lumpNameOfs(gt, "WIOSTI")
+    lowkey frags = wad.lumpNameOfs(gt, "WIFRGS")
+    lowkey colon = wad.lumpNameOfs(gt, "WICOLON")
+    lowkey timeP = wad.lumpNameOfs(gt, "WITIME")
+    lowkey sucks = wad.lumpNameOfs(gt, "WISUCKS")
+    lowkey parP = wad.lumpNameOfs(gt, "WIPAR")
+    lowkey killers = wad.lumpNameOfs(gt, "WIKILRS")
+    lowkey victims = wad.lumpNameOfs(gt, "WIVCTMS")
+    lowkey total = wad.lumpNameOfs(gt, "WIMSTT")
+    lowkey star = wad.lumpNameOfs(gt, "STFST01")
+    lowkey bstar = wad.lumpNameOfs(gt, "STFDEAD0")
+    lowkey pArr = mem.slab[i32](4)
+    lowkey bpArr = mem.slab[i32](4)
+    k = 0
+    vibin k < 4 {
+        pArr[k] = wad.lumpNameOfs(gt, name1("STPB", k)) as i32
+        bpArr[k] = wad.lumpNameOfs(gt, name1("WIBP", k + 1)) as i32
+        k = k + 1
+    }
+
+    // draw the background into scr1 (WI_slamBackground copies scr1 -> scr0 each frame)
+    vv.drawPatch(gt, 0, 0, 1, bgOfs)
+
+    holla g = gt in gs.gsc {
+        g.wi.bgOfs = bgOfs as i32
+        g.wi.splatOfs = splat as i32
+        g.wi.yahOfs[0] = yah0 as i32
+        g.wi.yahOfs[1] = yah1 as i32
+        g.wi.wiminusOfs = wiminus as i32
+        g.wi.percentOfs = percent as i32
+        g.wi.finishedOfs = finished as i32
+        g.wi.enteringOfs = entering as i32
+        g.wi.killsOfs = kills as i32
+        g.wi.secretOfs = secret as i32
+        g.wi.spSecretOfs = spSecret as i32
+        g.wi.itemsOfs = items as i32
+        g.wi.fragsOfs = frags as i32
+        g.wi.colonOfs = colon as i32
+        g.wi.timeOfs = timeP as i32
+        g.wi.sucksOfs = sucks as i32
+        g.wi.parOfs = parP as i32
+        g.wi.killersOfs = killers as i32
+        g.wi.victimsOfs = victims as i32
+        g.wi.totalOfs = total as i32
+        g.wi.starOfs = star as i32
+        g.wi.bstarOfs = bstar as i32
+        g.wi.numOfs = numArr
+        g.wi.pOfs = pArr
+        g.wi.bpOfs = bpArr
+        g.wi.lnamesOfs = lnames
+        lowkey m = 0
+        vibin m < 30 {
+            g.wi.animP[m] = animPArr[m]
+            m = m + 1
+        }
+        g.wi.loaded = nocap
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// WI_initVariables — bind the passed wbstart (into the canonical g.shell.wminfo), clamp the max*
+// counts to >=1, capture `me` = pnum, and apply the non-retail episode wraparound.
+flex finna initVariables(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.wi.acceleratestage = 0
+        g.wi.cnt = 0
+        g.wi.bcnt = 0
+        g.wi.me = g.shell.wminfo.pnum
+        fr g.shell.wminfo.maxkills == 0 {
+            g.shell.wminfo.maxkills = 1
+        }
+        fr g.shell.wminfo.maxitems == 0 {
+            g.shell.wminfo.maxitems = 1
+        }
+        fr g.shell.wminfo.maxsecret == 0 {
+            g.shell.wminfo.maxsecret = 1
+        }
+        fr (g.shell.gamemode as int) != doomdef.GM_RETAIL {
+            fr g.shell.wminfo.epsd > 2 {
+                g.shell.wminfo.epsd = g.shell.wminfo.epsd - 3
+            }
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// WI_Start — the intermission entry point. The wbstart input is the canonical g.shell.wminfo
+// (id's WI_Start(&wminfo) — the shell/P2.8 fills g.shell.wminfo in G_DoCompleted before calling).
+// Bind the variables/graphics, then kick off the per-mode stat machine.
+flex finna wiStart(gt: tag gs.GameState) {
+    initVariables(gt)
+    loadData(gt)
+    lowkey dm = 0
+    lowkey ng = cap
+    holla g = gt in gs.gsc {
+        dm = g.shell.deathmatch as int
+        ng = g.shell.netgame
+    } ghosted {
+        yeet("gs")
+    }
+    fr dm != 0 {
+        initDeathmatchStats(gt)
+    } naw fr ng {
+        initNetgameStats(gt)
+    } naw {
+        initStats(gt)
+    }
+}
