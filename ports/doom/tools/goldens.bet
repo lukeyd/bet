@@ -20,6 +20,7 @@ pull "../defs/fixed" as fixed
 pull "../defs/tables" as tables
 pull "../defs/gs" as gs
 pull "../util/m_random" as rnd
+pull "../r/r_geom" as rgeom
 
 // 8-digit lowercase hex of the low 32 bits of v (two's complement for negatives).
 flex finna hex8(v: int) -> str {
@@ -105,48 +106,10 @@ flex finna slopeDivSafe(num: u32, den: u32) -> u32 {
     bet 2048
 }
 
-// R_PointToAngle (r_main.c) with viewx=viewy=0, computed via tantoangle[SlopeDiv(...)].
-// The octant results are computed in i64 then folded to u32 (matches the C unsigned wrap,
-// incl. octant 8's `-tantoangle[...]`).
-flex finna pointToAngle(tan: []u32, x: i32, y: i32) -> u32 {
-    fr x == 0 && y == 0 {
-        bet 0
-    }
-    fr x >= 0 {
-        fr y >= 0 {
-            fr x > y {
-                lowkey s0 = slopeDivSafe(y as u32, x as u32) as int
-                bet tan[s0]
-            }
-            lowkey s1 = slopeDivSafe(x as u32, y as u32) as int
-            bet (1073741824 - 1 - (tan[s1] as int)) as u32
-        } naw {
-            lowkey yy = 0 - y
-            fr x > yy {
-                lowkey s8 = slopeDivSafe(yy as u32, x as u32) as int
-                bet (0 - (tan[s8] as int)) as u32
-            }
-            lowkey s7 = slopeDivSafe(x as u32, yy as u32) as int
-            bet (3221225472 + (tan[s7] as int)) as u32
-        }
-    }
-    lowkey xx = 0 - x
-    fr y >= 0 {
-        fr xx > y {
-            lowkey s3 = slopeDivSafe(y as u32, xx as u32) as int
-            bet (2147483648 - 1 - (tan[s3] as int)) as u32
-        }
-        lowkey s2 = slopeDivSafe(xx as u32, y as u32) as int
-        bet (1073741824 + (tan[s2] as int)) as u32
-    }
-    lowkey yy2 = 0 - y
-    fr xx > yy2 {
-        lowkey s4 = slopeDivSafe(yy2 as u32, xx as u32) as int
-        bet (2147483648 + (tan[s4] as int)) as u32
-    }
-    lowkey s5 = slopeDivSafe(xx as u32, yy2 as u32) as int
-    bet (3221225472 - 1 - (tan[s5] as int)) as u32
-}
+// The P2A sweep is now produced by r/r_geom.pointToAngle2 (P1.4 owns the geometry). Under the
+// interpreter (which doom-verify --goldens runs) tables.slopeDiv is wrap-safe for these inputs
+// (|coord| <= 0x02000000, so num<<3 never overflows u32); the SLOPEDIV grid section below still
+// uses the local slopeDivSafe because it probes the full u32 range (n up to 0xFFFFFFFF).
 
 // ---- section emitters --------------------------------------------------------------------
 
@@ -177,7 +140,7 @@ flex finna emitFixed() {
     vibin i < 20 {
         lowkey j = 0
         vibin j < 20 {
-            spill.it("FIXEDMUL a=" + hex8(mul[i] as int) + " b=" + hex8(mul[j] as int) + " r=" + hex8(fixed.fixedMul(mul[i], mul[j]) as int))
+            spill.f("FIXEDMUL a={} b={} r={}\n", hex8(mul[i] as int), hex8(mul[j] as int), hex8(fixed.fixedMul(mul[i], mul[j]) as int))
             j = j + 1
         }
         i = i + 1
@@ -203,7 +166,7 @@ flex finna emitFixed() {
     vibin i < 16 {
         lowkey j = 0
         vibin j < 16 {
-            spill.it("FIXEDDIV a=" + hex8(dv[i] as int) + " b=" + hex8(dv[j] as int) + " r=" + hex8(fixed.fixedDiv(dv[i], dv[j]) as int))
+            spill.f("FIXEDDIV a={} b={} r={}\n", hex8(dv[i] as int), hex8(dv[j] as int), hex8(fixed.fixedDiv(dv[i], dv[j]) as int))
             j = j + 1
         }
         i = i + 1
@@ -229,7 +192,7 @@ flex finna emitFixed() {
     eb[7] = 0x7FFFFFFF
     i = 0
     vibin i < 8 {
-        spill.it("FIXEDDIV a=" + hex8(ea[i] as int) + " b=" + hex8(eb[i] as int) + " r=" + hex8(fixed.fixedDiv(ea[i], eb[i]) as int))
+        spill.f("FIXEDDIV a={} b={} r={}\n", hex8(ea[i] as int), hex8(eb[i] as int), hex8(fixed.fixedDiv(ea[i], eb[i]) as int))
         i = i + 1
     }
 }
@@ -244,7 +207,7 @@ flex finna emitRandom(gt: tag gs.GameState) {
     holla g = gt in gs.gsc {
         lowkey i = 0
         vibin i < 256 {
-            spill.it("RNDTABLE i=" + hex8(i) + " v=" + hex8(g.tick.rndtable[i] as int))
+            spill.f("RNDTABLE i={} v={}\n", hex8(i as int), hex8(g.tick.rndtable[i] as int))
             i = i + 1
         }
         // first 2000 P_Random() calls (prndindex starts at 0)
@@ -252,7 +215,7 @@ flex finna emitRandom(gt: tag gs.GameState) {
         vibin n < 2000 {
             g.tick.prndindex = (g.tick.prndindex + 1) & 255
             lowkey v = g.tick.rndtable[g.tick.prndindex] as int
-            spill.it("PRANDOM n=" + hex8(n) + " i=" + hex8(g.tick.prndindex) + " v=" + hex8(v))
+            spill.f("PRANDOM n={} i={} v={}\n", hex8(n as int), hex8(g.tick.prndindex as int), hex8(v))
             n = n + 1
         }
     } ghosted {
@@ -284,7 +247,7 @@ flex finna emitAngle(tan: []u32) {
     vibin i < 17 {
         lowkey j = 0
         vibin j < 17 {
-            spill.it("SLOPEDIV n=" + hex8(sl[i] as int) + " d=" + hex8(sl[j] as int) + " r=" + hex8(slopeDivSafe(sl[i], sl[j]) as int))
+            spill.f("SLOPEDIV n={} d={} r={}\n", hex8(sl[i] as int), hex8(sl[j] as int), hex8(slopeDivSafe(sl[i], sl[j]) as int))
             j = j + 1
         }
         i = i + 1
@@ -307,7 +270,7 @@ flex finna emitAngle(tan: []u32) {
     vibin i < 13 {
         lowkey j = 0
         vibin j < 13 {
-            spill.it("P2A x=" + hex8(p[i] as int) + " y=" + hex8(p[j] as int) + " a=" + hex8(pointToAngle(tan, p[i], p[j]) as int))
+            spill.f("P2A x={} y={} a={}\n", hex8(p[i] as int), hex8(p[j] as int), hex8(rgeom.pointToAngle2(tan, 0, 0, p[i], p[j]) as int))
             j = j + 1
         }
         i = i + 1
@@ -316,26 +279,26 @@ flex finna emitAngle(tan: []u32) {
 
 // dumpTableI32/dumpTableU32: TABLECRC + every-256th TABLEVAL (+ last entry if not aligned).
 flex finna dumpTableI32(tbl: []i32, name: str, t: []i32, n: int) {
-    spill.it("TABLECRC t=" + name + " n=" + hex8(n) + " crc=" + hex8(crc32I32(tbl, t, n)))
+    spill.f("TABLECRC t={} n={} crc={}\n", name, hex8(n), hex8(crc32I32(tbl, t, n)))
     lowkey i = 0
     vibin i < n {
-        spill.it("TABLEVAL t=" + name + " i=" + hex8(i) + " v=" + hex8(t[i] as int))
+        spill.f("TABLEVAL t={} i={} v={}\n", name, hex8(i as int), hex8(t[i] as int))
         i = i + 256
     }
     fr (n - 1) & 255 != 0 {
-        spill.it("TABLEVAL t=" + name + " i=" + hex8(n - 1) + " v=" + hex8(t[n - 1] as int))
+        spill.f("TABLEVAL t={} i={} v={}\n", name, hex8(n - 1), hex8(t[n - 1] as int))
     }
 }
 
 flex finna dumpTableU32(tbl: []i32, name: str, t: []u32, n: int) {
-    spill.it("TABLECRC t=" + name + " n=" + hex8(n) + " crc=" + hex8(crc32U32(tbl, t, n)))
+    spill.f("TABLECRC t={} n={} crc={}\n", name, hex8(n), hex8(crc32U32(tbl, t, n)))
     lowkey i = 0
     vibin i < n {
-        spill.it("TABLEVAL t=" + name + " i=" + hex8(i) + " v=" + hex8(t[i] as int))
+        spill.f("TABLEVAL t={} i={} v={}\n", name, hex8(i as int), hex8(t[i] as int))
         i = i + 256
     }
     fr (n - 1) & 255 != 0 {
-        spill.it("TABLEVAL t=" + name + " i=" + hex8(n - 1) + " v=" + hex8(t[n - 1] as int))
+        spill.f("TABLEVAL t={} i={} v={}\n", name, hex8(n - 1), hex8(t[n - 1] as int))
     }
 }
 
