@@ -1,0 +1,530 @@
+pull "spill"
+pull "../defs/gs" as gs
+pull "../defs/fixed" as fixed
+pull "../defs/tables" as tables
+pull "../r/r_geom" as rgeom
+pull "../r/r_data" as rdata
+pull "../r/r_draw" as rdraw
+pull "../r/r_plane" as rplane
+
+flex facts LIGHTLEVELS: int = 16
+flex facts MAXLIGHTSCALE: int = 48
+flex facts NEGONE_BASE: int = 0
+flex facts SCREENHT_BASE: int = 320
+
+flex finna drawWallTier(gt: tag gs.GameState, tex: int, texcol: int, yl: int, yh: int, texmid: i32) {
+    lowkey colOfs = rdata.getColumn(gt, tex, texcol)
+    lowkey colBuf = rdata.columnLumpOf(gt, tex, texcol)
+    holla g = gt in gs.gsc {
+        g.render.dc_yl = yl as i32
+        g.render.dc_yh = yh as i32
+        g.render.dc_texturemid = texmid
+        g.render.dc_sourceOfs = colOfs as i32
+        fr colBuf > 0 {
+            g.render.dc_sourceBuf = 1
+        } naw {
+            g.render.dc_sourceBuf = 0
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    rdraw.drawColumn(gt)
+}
+
+flex finna renderSegLoop(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        vibin g.render.rw_x as int < g.render.rw_stopx as int {
+            lowkey rwx = g.render.rw_x as int
+            lowkey yl = (g.render.topfrac + 4095 >> 12) as int
+            lowkey ceilc = g.render.ceilingclip[rwx] as int
+            fr yl < ceilc + 1 {
+                yl = ceilc + 1
+            }
+            fr g.render.markceiling {
+                lowkey top = ceilc + 1
+                lowkey bottom = yl - 1
+                lowkey floorc0 = g.render.floorclip[rwx] as int
+                fr bottom >= floorc0 {
+                    bottom = floorc0 - 1
+                }
+                fr top <= bottom {
+                    lowkey cbase = g.render.ceilingplane as int * gs.VPSTRIDE + 1
+                    g.render.vpTop[cbase + rwx] = top as u8
+                    g.render.vpBottom[cbase + rwx] = bottom as u8
+                }
+            }
+            lowkey yh = (g.render.bottomfrac >> 12) as int
+            lowkey floorc = g.render.floorclip[rwx] as int
+            fr yh >= floorc {
+                yh = floorc - 1
+            }
+            fr g.render.markfloor {
+                lowkey top2 = yh + 1
+                lowkey bottom2 = floorc - 1
+                lowkey ceilc2 = g.render.ceilingclip[rwx] as int
+                fr top2 <= ceilc2 {
+                    top2 = ceilc2 + 1
+                }
+                fr top2 <= bottom2 {
+                    lowkey fbase = g.render.floorplane as int * gs.VPSTRIDE + 1
+                    g.render.vpTop[fbase + rwx] = top2 as u8
+                    g.render.vpBottom[fbase + rwx] = bottom2 as u8
+                }
+            }
+            lowkey texturecolumn = 0
+            fr g.render.segtextured {
+                lowkey angle = (g.render.rw_centerangle + g.render.xtoviewangle[rwx] >> 19) as int
+                lowkey tc = g.render.rw_offset - fixed.fixedMul(g.info.finetangent[angle], g.render.rw_distance)
+                texturecolumn = (tc >> 16) as int
+                lowkey index = (g.render.rw_scale >> 12) as int
+                fr index >= MAXLIGHTSCALE {
+                    index = MAXLIGHTSCALE - 1
+                }
+                fr g.render.walllightsFixed {
+                    g.render.dc_colormapOfs = g.render.fixedcolormapOfs
+                } naw {
+                    g.render.dc_colormapOfs = g.render.scalelight[g.render.walllightsBase as int + index]
+                }
+                g.render.dc_x = rwx as i32
+                g.render.dc_iscale = (4294967295 as u32 / g.render.rw_scale as u32) as i32
+            }
+            fr g.render.midtexture != 0 {
+                drawWallTier(gt, g.render.midtexture as int, texturecolumn, yl, yh, g.render.rw_midtexturemid)
+                g.render.ceilingclip[rwx] = g.render.viewheight as i16
+                g.render.floorclip[rwx] = -1
+            } naw {
+                fr g.render.toptexture != 0 {
+                    lowkey mid = (g.render.pixhigh >> 12) as int
+                    g.render.pixhigh = g.render.pixhigh + g.render.pixhighstep
+                    lowkey fc = g.render.floorclip[rwx] as int
+                    fr mid >= fc {
+                        mid = fc - 1
+                    }
+                    fr mid >= yl {
+                        drawWallTier(gt, g.render.toptexture as int, texturecolumn, yl, mid, g.render.rw_toptexturemid)
+                        g.render.ceilingclip[rwx] = mid as i16
+                    } naw {
+                        g.render.ceilingclip[rwx] = (yl - 1) as i16
+                    }
+                } naw {
+                    fr g.render.markceiling {
+                        g.render.ceilingclip[rwx] = (yl - 1) as i16
+                    }
+                }
+                fr g.render.bottomtexture != 0 {
+                    lowkey midb = (g.render.pixlow + 4095 >> 12) as int
+                    g.render.pixlow = g.render.pixlow + g.render.pixlowstep
+                    lowkey cc = g.render.ceilingclip[rwx] as int
+                    fr midb <= cc {
+                        midb = cc + 1
+                    }
+                    fr midb <= yh {
+                        drawWallTier(gt, g.render.bottomtexture as int, texturecolumn, midb, yh, g.render.rw_bottomtexturemid)
+                        g.render.floorclip[rwx] = midb as i16
+                    } naw {
+                        g.render.floorclip[rwx] = (yh + 1) as i16
+                    }
+                } naw {
+                    fr g.render.markfloor {
+                        g.render.floorclip[rwx] = (yh + 1) as i16
+                    }
+                }
+                fr g.render.maskedtexture {
+                    g.render.openings[g.render.maskedtexturecolOfs as int + rwx] = texturecolumn as i16
+                }
+            }
+            g.render.rw_scale = g.render.rw_scale + g.render.rw_scalestep
+            g.render.topfrac = g.render.topfrac + g.render.topstep
+            g.render.bottomfrac = g.render.bottomfrac + g.render.bottomstep
+            g.render.rw_x = g.render.rw_x + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna storeWallRange(gt: tag gs.GameState, start: int, stop: int) {
+    lowkey full = cap
+    holla g = gt in gs.gsc {
+        fr g.render.dsP as int == gs.MAXDRAWSEGS {
+            full = nocap
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    fr full {
+        bet
+    }
+    lowkey v1x: i32 = 0
+    lowkey v1y: i32 = 0
+    lowkey distangle: u32 = 0
+    lowkey startVisangle: u32 = 0
+    lowkey stopVisangle: u32 = 0
+    holla g = gt in gs.gsc {
+        lowkey cl = g.render.curline as int
+        lowkey line = g.level.segLine[cl] as int
+        lowkey dsi = g.render.dsP as int
+        g.level.lineFlags[line] = g.level.lineFlags[line] | 256
+        g.render.rw_normalangle = g.level.segAngle[cl] + tables.ANG90
+        lowkey diff: i32 = (g.render.rw_normalangle - g.render.rw_angle1 as u32) as i32
+        fr diff < 0 {
+            diff = 0 - diff
+        }
+        lowkey offsetangle: u32 = diff as u32
+        fr offsetangle > tables.ANG90 {
+            offsetangle = tables.ANG90
+        }
+        distangle = tables.ANG90 - offsetangle
+        v1x = g.level.vtxX[g.level.segV1[cl] as int]
+        v1y = g.level.vtxY[g.level.segV1[cl] as int]
+        g.render.rw_x = start as i32
+        g.render.rw_stopx = (stop + 1) as i32
+        g.render.drawsegs[dsi].x1 = start as i32
+        g.render.drawsegs[dsi].x2 = stop as i32
+        g.render.drawsegs[dsi].curline = cl as i32
+        startVisangle = g.render.viewangle + g.render.xtoviewangle[start]
+        stopVisangle = g.render.viewangle + g.render.xtoviewangle[stop]
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey hyp = rgeom.pointToDist(gt, v1x, v1y)
+    holla g = gt in gs.gsc {
+        lowkey sineval = g.info.finesine[(distangle >> 19) as int]
+        g.render.rw_distance = fixed.fixedMul(hyp, sineval)
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey scale1 = rgeom.scaleFromGlobalAngle(gt, startVisangle)
+    lowkey scale2 = scale1
+    holla g = gt in gs.gsc {
+        lowkey dsi = g.render.dsP as int
+        g.render.rw_scale = scale1
+        g.render.drawsegs[dsi].scale1 = scale1
+    } ghosted {
+        yeet("gs")
+    }
+    fr stop > start {
+        scale2 = rgeom.scaleFromGlobalAngle(gt, stopVisangle)
+    }
+    holla g = gt in gs.gsc {
+        lowkey dsi = g.render.dsP as int
+        g.render.drawsegs[dsi].scale2 = scale2
+        fr stop > start {
+            g.render.rw_scalestep = (scale2 - scale1) / (stop - start) as i32
+            g.render.drawsegs[dsi].scalestep = g.render.rw_scalestep
+        } naw {
+            g.render.rw_scalestep = 0
+            g.render.drawsegs[dsi].scalestep = 0
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    storeWallTextures(gt, start, stop, hyp)
+    checkPlanesForSeg(gt)
+    renderSegLoop(gt)
+    saveSpriteClip(gt, start, stop)
+    holla g = gt in gs.gsc {
+        g.render.dsP = g.render.dsP + 1
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna storeWallTextures(gt: tag gs.GameState, start: int, stop: int, hyp: i32) {
+    holla g = gt in gs.gsc {
+        lowkey cl = g.render.curline as int
+        lowkey side = g.level.segSide[cl] as int
+        lowkey line = g.level.segLine[cl] as int
+        lowkey fs = g.render.frontsector as int
+        lowkey bs = g.render.backsector as int
+        lowkey dsi = g.render.dsP as int
+        lowkey lineflags = g.level.lineFlags[line] as int
+        lowkey worldtop: i32 = g.level.secCeilH[fs] - g.render.viewz
+        lowkey worldbottom: i32 = g.level.secFloorH[fs] - g.render.viewz
+        g.render.midtexture = 0
+        g.render.toptexture = 0
+        g.render.bottomtexture = 0
+        g.render.maskedtexture = cap
+        g.render.drawsegs[dsi].maskedtexturecolOfs = -1
+        lowkey worldhigh: i32 = 0
+        lowkey worldlow: i32 = 0
+        fr bs == -1 {
+            g.render.midtexture = g.render.textureTranslation[g.level.sdMidTex[side] as int]
+            g.render.markfloor = nocap
+            g.render.markceiling = nocap
+            fr lineflags & 16 != 0 {
+                lowkey vtop = g.level.secFloorH[fs] + g.render.textureHeight[g.level.sdMidTex[side] as int]
+                g.render.rw_midtexturemid = vtop - g.render.viewz
+            } naw {
+                g.render.rw_midtexturemid = worldtop
+            }
+            g.render.rw_midtexturemid = g.render.rw_midtexturemid + g.level.sdRowOfs[side]
+            g.render.drawsegs[dsi].silhouette = 3
+            g.render.drawsegs[dsi].sprtopclipOfs = SCREENHT_BASE as i32
+            g.render.drawsegs[dsi].sprbottomclipOfs = NEGONE_BASE as i32
+            g.render.drawsegs[dsi].bsilheight = fixed.MAXINT
+            g.render.drawsegs[dsi].tsilheight = fixed.MININT
+        } naw {
+            g.render.drawsegs[dsi].sprtopclipOfs = -1
+            g.render.drawsegs[dsi].sprbottomclipOfs = -1
+            g.render.drawsegs[dsi].silhouette = 0
+            fr g.level.secFloorH[fs] > g.level.secFloorH[bs] {
+                g.render.drawsegs[dsi].silhouette = 1
+                g.render.drawsegs[dsi].bsilheight = g.level.secFloorH[fs]
+            } naw fr g.level.secFloorH[bs] > g.render.viewz {
+                g.render.drawsegs[dsi].silhouette = 1
+                g.render.drawsegs[dsi].bsilheight = fixed.MAXINT
+            }
+            fr g.level.secCeilH[fs] < g.level.secCeilH[bs] {
+                g.render.drawsegs[dsi].silhouette = g.render.drawsegs[dsi].silhouette | 2
+                g.render.drawsegs[dsi].tsilheight = g.level.secCeilH[fs]
+            } naw fr g.level.secCeilH[bs] < g.render.viewz {
+                g.render.drawsegs[dsi].silhouette = g.render.drawsegs[dsi].silhouette | 2
+                g.render.drawsegs[dsi].tsilheight = fixed.MININT
+            }
+            fr g.level.secCeilH[bs] <= g.level.secFloorH[fs] {
+                g.render.drawsegs[dsi].sprbottomclipOfs = NEGONE_BASE as i32
+                g.render.drawsegs[dsi].bsilheight = fixed.MAXINT
+                g.render.drawsegs[dsi].silhouette = g.render.drawsegs[dsi].silhouette | 1
+            }
+            fr g.level.secFloorH[bs] >= g.level.secCeilH[fs] {
+                g.render.drawsegs[dsi].sprtopclipOfs = SCREENHT_BASE as i32
+                g.render.drawsegs[dsi].tsilheight = fixed.MININT
+                g.render.drawsegs[dsi].silhouette = g.render.drawsegs[dsi].silhouette | 2
+            }
+            worldhigh = g.level.secCeilH[bs] - g.render.viewz
+            worldlow = g.level.secFloorH[bs] - g.render.viewz
+            fr g.level.secCeilPic[fs] == g.render.skyflatnum && g.level.secCeilPic[bs] == g.render.skyflatnum {
+                worldtop = worldhigh
+            }
+            fr worldlow != worldbottom || g.level.secFloorPic[bs] != g.level.secFloorPic[fs] || g.level.secLight[bs] != g.level.secLight[fs] {
+                g.render.markfloor = nocap
+            } naw {
+                g.render.markfloor = cap
+            }
+            fr worldhigh != worldtop || g.level.secCeilPic[bs] != g.level.secCeilPic[fs] || g.level.secLight[bs] != g.level.secLight[fs] {
+                g.render.markceiling = nocap
+            } naw {
+                g.render.markceiling = cap
+            }
+            fr g.level.secCeilH[bs] <= g.level.secFloorH[fs] || g.level.secFloorH[bs] >= g.level.secCeilH[fs] {
+                g.render.markceiling = nocap
+                g.render.markfloor = nocap
+            }
+            fr worldhigh < worldtop {
+                g.render.toptexture = g.render.textureTranslation[g.level.sdTopTex[side] as int]
+                fr lineflags & 8 != 0 {
+                    g.render.rw_toptexturemid = worldtop
+                } naw {
+                    lowkey vtop = g.level.secCeilH[bs] + g.render.textureHeight[g.level.sdTopTex[side] as int]
+                    g.render.rw_toptexturemid = vtop - g.render.viewz
+                }
+            }
+            fr worldlow > worldbottom {
+                g.render.bottomtexture = g.render.textureTranslation[g.level.sdBotTex[side] as int]
+                fr lineflags & 16 != 0 {
+                    g.render.rw_bottomtexturemid = worldtop
+                } naw {
+                    g.render.rw_bottomtexturemid = worldlow
+                }
+            }
+            g.render.rw_toptexturemid = g.render.rw_toptexturemid + g.level.sdRowOfs[side]
+            g.render.rw_bottomtexturemid = g.render.rw_bottomtexturemid + g.level.sdRowOfs[side]
+            fr g.level.sdMidTex[side] as int != 0 {
+                g.render.maskedtexture = nocap
+                g.render.maskedtexturecolOfs = (g.render.lastopening as int - g.render.rw_x as int) as i32
+                g.render.drawsegs[dsi].maskedtexturecolOfs = g.render.maskedtexturecolOfs
+                g.render.lastopening = (g.render.lastopening as int + (g.render.rw_stopx as int - g.render.rw_x as int)) as i32
+            }
+        }
+        g.render.segtextured = g.render.midtexture != 0 || g.render.toptexture != 0 || g.render.bottomtexture != 0 || g.render.maskedtexture
+        fr g.render.segtextured {
+            lowkey offsetangle2: u32 = g.render.rw_normalangle - g.render.rw_angle1 as u32
+            fr offsetangle2 > tables.ANG180 {
+                offsetangle2 = 0 - offsetangle2
+            }
+            fr offsetangle2 > tables.ANG90 {
+                offsetangle2 = tables.ANG90
+            }
+            lowkey sineval2 = g.info.finesine[(offsetangle2 >> 19) as int]
+            g.render.rw_offset = fixed.fixedMul(hyp, sineval2)
+            fr g.render.rw_normalangle - g.render.rw_angle1 as u32 < tables.ANG180 {
+                g.render.rw_offset = 0 - g.render.rw_offset
+            }
+            g.render.rw_offset = g.render.rw_offset + g.level.sdTexOfs[side] + g.level.segOffset[cl]
+            g.render.rw_centerangle = tables.ANG90 + g.render.viewangle - g.render.rw_normalangle
+            fr g.render.fixedcolormapOfs != -1 {
+                g.render.walllightsFixed = nocap
+            } naw {
+                g.render.walllightsFixed = cap
+                lowkey lightnum = (g.level.secLight[fs] as int >> 4) + g.render.extralight as int
+                fr g.level.vtxY[g.level.segV1[cl] as int] == g.level.vtxY[g.level.segV2[cl] as int] {
+                    lightnum = lightnum - 1
+                } naw fr g.level.vtxX[g.level.segV1[cl] as int] == g.level.vtxX[g.level.segV2[cl] as int] {
+                    lightnum = lightnum + 1
+                }
+                fr lightnum < 0 {
+                    g.render.walllightsBase = 0
+                } naw fr lightnum >= LIGHTLEVELS {
+                    g.render.walllightsBase = ((LIGHTLEVELS - 1) * MAXLIGHTSCALE) as i32
+                } naw {
+                    g.render.walllightsBase = (lightnum * MAXLIGHTSCALE) as i32
+                }
+            }
+        }
+        fr g.level.secFloorH[fs] >= g.render.viewz {
+            g.render.markfloor = cap
+        }
+        fr g.level.secCeilH[fs] <= g.render.viewz && g.level.secCeilPic[fs] != g.render.skyflatnum {
+            g.render.markceiling = cap
+        }
+        lowkey wtop = worldtop >> 4
+        lowkey wbot = worldbottom >> 4
+        g.render.topstep = 0 - fixed.fixedMul(g.render.rw_scalestep, wtop)
+        g.render.topfrac = (g.render.centeryfrac >> 4) - fixed.fixedMul(wtop, g.render.rw_scale)
+        g.render.bottomstep = 0 - fixed.fixedMul(g.render.rw_scalestep, wbot)
+        g.render.bottomfrac = (g.render.centeryfrac >> 4) - fixed.fixedMul(wbot, g.render.rw_scale)
+        fr bs != -1 {
+            lowkey whigh = worldhigh >> 4
+            lowkey wlow = worldlow >> 4
+            fr whigh < wtop {
+                g.render.pixhigh = (g.render.centeryfrac >> 4) - fixed.fixedMul(whigh, g.render.rw_scale)
+                g.render.pixhighstep = 0 - fixed.fixedMul(g.render.rw_scalestep, whigh)
+            }
+            fr wlow > wbot {
+                g.render.pixlow = (g.render.centeryfrac >> 4) - fixed.fixedMul(wlow, g.render.rw_scale)
+                g.render.pixlowstep = 0 - fixed.fixedMul(g.render.rw_scalestep, wlow)
+            }
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna checkPlanesForSeg(gt: tag gs.GameState) {
+    lowkey doCeil = cap
+    lowkey doFloor = cap
+    lowkey ceilPl = 0
+    lowkey floorPl = 0
+    lowkey rwx = 0
+    lowkey rwstopx = 0
+    holla g = gt in gs.gsc {
+        doCeil = g.render.markceiling
+        doFloor = g.render.markfloor
+        ceilPl = g.render.ceilingplane as int
+        floorPl = g.render.floorplane as int
+        rwx = g.render.rw_x as int
+        rwstopx = g.render.rw_stopx as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr doCeil {
+        lowkey np = rplane.checkPlane(gt, ceilPl, rwx, rwstopx - 1)
+        holla g = gt in gs.gsc {
+            g.render.ceilingplane = np as i32
+        } ghosted {
+            yeet("gs")
+        }
+    }
+    fr doFloor {
+        lowkey np = rplane.checkPlane(gt, floorPl, rwx, rwstopx - 1)
+        holla g = gt in gs.gsc {
+            g.render.floorplane = np as i32
+        } ghosted {
+            yeet("gs")
+        }
+    }
+}
+
+flex finna saveSpriteClip(gt: tag gs.GameState, start: int, stop: int) {
+    holla g = gt in gs.gsc {
+        lowkey dsi = g.render.dsP as int
+        lowkey rwstopx = g.render.rw_stopx as int
+        lowkey sil = g.render.drawsegs[dsi].silhouette as int
+        lowkey masked = g.render.maskedtexture
+        fr (sil & 2 != 0 || masked) && g.render.drawsegs[dsi].sprtopclipOfs as int == -1 {
+            lowkey lo = g.render.lastopening as int
+            lowkey k = 0
+            vibin k < rwstopx - start {
+                g.render.openings[lo + k] = g.render.ceilingclip[start + k]
+                k = k + 1
+            }
+            g.render.drawsegs[dsi].sprtopclipOfs = (lo - start) as i32
+            g.render.lastopening = (lo + (rwstopx - start)) as i32
+        }
+        fr (sil & 1 != 0 || masked) && g.render.drawsegs[dsi].sprbottomclipOfs as int == -1 {
+            lowkey lo = g.render.lastopening as int
+            lowkey k = 0
+            vibin k < rwstopx - start {
+                g.render.openings[lo + k] = g.render.floorclip[start + k]
+                k = k + 1
+            }
+            g.render.drawsegs[dsi].sprbottomclipOfs = (lo - start) as i32
+            g.render.lastopening = (lo + (rwstopx - start)) as i32
+        }
+        fr masked && sil & 2 == 0 {
+            g.render.drawsegs[dsi].silhouette = g.render.drawsegs[dsi].silhouette | 2
+            g.render.drawsegs[dsi].tsilheight = fixed.MININT
+        }
+        fr masked && g.render.drawsegs[dsi].silhouette as int & 1 == 0 {
+            g.render.drawsegs[dsi].silhouette = g.render.drawsegs[dsi].silhouette | 1
+            g.render.drawsegs[dsi].bsilheight = fixed.MAXINT
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna renderMaskedSegRange(gt: tag gs.GameState, ds: int, x1: int, x2: int) {
+    holla g = gt in gs.gsc {
+        lowkey cl = g.render.drawsegs[ds].curline as int
+        g.render.curline = cl as i32
+        g.render.frontsector = g.level.segFront[cl]
+        g.render.backsector = g.level.segBack[cl]
+        lowkey side = g.level.segSide[cl] as int
+        lowkey texnum = g.render.textureTranslation[g.level.sdMidTex[side] as int] as int
+        lowkey lightnum = (g.level.secLight[g.render.frontsector as int] as int >> 4) + g.render.extralight as int
+        fr g.level.vtxY[g.level.segV1[cl] as int] == g.level.vtxY[g.level.segV2[cl] as int] {
+            lightnum = lightnum - 1
+        } naw fr g.level.vtxX[g.level.segV1[cl] as int] == g.level.vtxX[g.level.segV2[cl] as int] {
+            lightnum = lightnum + 1
+        }
+        g.render.walllightsFixed = cap
+        fr lightnum < 0 {
+            g.render.walllightsBase = 0
+        } naw fr lightnum >= LIGHTLEVELS {
+            g.render.walllightsBase = ((LIGHTLEVELS - 1) * MAXLIGHTSCALE) as i32
+        } naw {
+            g.render.walllightsBase = (lightnum * MAXLIGHTSCALE) as i32
+        }
+        g.render.maskedtexturecolOfs = g.render.drawsegs[ds].maskedtexturecolOfs
+        g.render.rw_scalestep = g.render.drawsegs[ds].scalestep
+        g.render.spryscale = g.render.drawsegs[ds].scale1 + (x1 - g.render.drawsegs[ds].x1 as int) as i32 * g.render.rw_scalestep
+        g.render.mfloorclipOfs = g.render.drawsegs[ds].sprbottomclipOfs
+        g.render.mceilingclipOfs = g.render.drawsegs[ds].sprtopclipOfs
+        lowkey line = g.level.segLine[cl] as int
+        lowkey fs = g.render.frontsector as int
+        lowkey bs = g.render.backsector as int
+        fr g.level.lineFlags[line] as int & 16 != 0 {
+            fr g.level.secFloorH[fs] > g.level.secFloorH[bs] {
+                g.render.dc_texturemid = g.level.secFloorH[fs]
+            } naw {
+                g.render.dc_texturemid = g.level.secFloorH[bs]
+            }
+            g.render.dc_texturemid = g.render.dc_texturemid + g.render.textureHeight[texnum] - g.render.viewz
+        } naw {
+            fr g.level.secCeilH[fs] < g.level.secCeilH[bs] {
+                g.render.dc_texturemid = g.level.secCeilH[fs]
+            } naw {
+                g.render.dc_texturemid = g.level.secCeilH[bs]
+            }
+            g.render.dc_texturemid = g.render.dc_texturemid - g.render.viewz
+        }
+        g.render.dc_texturemid = g.render.dc_texturemid + g.level.sdRowOfs[side]
+        fr g.render.fixedcolormapOfs != -1 {
+            g.render.dc_colormapOfs = g.render.fixedcolormapOfs
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}

@@ -1,0 +1,445 @@
+pull "spill"
+pull "mem"
+pull "../defs/gs" as gs
+pull "../defs/tables" as tables
+pull "../r/r_geom" as rgeom
+pull "../r/r_plane" as rplane
+pull "../r/r_segs" as rsegs
+
+flex facts NF_SUBSECTOR: int = 32768
+
+flex finna clearDrawSegs(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.render.dsP = 0
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna clearClipSegs(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.render.solidsegsFirst[0] = -2147483647
+        g.render.solidsegsLast[0] = -1
+        g.render.solidsegsFirst[1] = g.render.viewwidth
+        g.render.solidsegsLast[1] = 2147483647
+        g.render.solidsegsEnd = 2
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna clipSolidWallSegment(gt: tag gs.GameState, first: int, last: int) {
+    holla g = gt in gs.gsc {
+        lowkey start = 0
+        vibin g.render.solidsegsLast[start] as int < first - 1 {
+            start = start + 1
+        }
+        lowkey handled = cap
+        fr first < g.render.solidsegsFirst[start] as int {
+            fr last < g.render.solidsegsFirst[start] as int - 1 {
+                storeRange(gt, first, last)
+                lowkey nxt = g.render.solidsegsEnd as int
+                g.render.solidsegsEnd = g.render.solidsegsEnd + 1
+                vibin nxt != start {
+                    g.render.solidsegsFirst[nxt] = g.render.solidsegsFirst[nxt - 1]
+                    g.render.solidsegsLast[nxt] = g.render.solidsegsLast[nxt - 1]
+                    nxt = nxt - 1
+                }
+                g.render.solidsegsFirst[nxt] = first as i32
+                g.render.solidsegsLast[nxt] = last as i32
+                handled = nocap
+            } naw {
+                storeRange(gt, first, g.render.solidsegsFirst[start] as int - 1)
+                g.render.solidsegsFirst[start] = first as i32
+            }
+        }
+        fr !handled {
+            fr last <= g.render.solidsegsLast[start] as int {
+                handled = nocap
+            }
+        }
+        fr !handled {
+            lowkey nxt = start
+            lowkey crunched = cap
+            vibin last >= g.render.solidsegsFirst[nxt + 1] as int - 1 {
+                storeRange(gt, g.render.solidsegsLast[nxt] as int + 1, g.render.solidsegsFirst[nxt + 1] as int - 1)
+                nxt = nxt + 1
+                fr last <= g.render.solidsegsLast[nxt] as int {
+                    g.render.solidsegsLast[start] = g.render.solidsegsLast[nxt]
+                    crunched = nocap
+                    dip
+                }
+            }
+            fr !crunched {
+                storeRange(gt, g.render.solidsegsLast[nxt] as int + 1, last)
+                g.render.solidsegsLast[start] = last as i32
+            }
+            fr nxt != start {
+                lowkey newend = g.render.solidsegsEnd as int
+                vibin nocap {
+                    lowkey preNext = nxt
+                    nxt = nxt + 1
+                    fr preNext == newend {
+                        dip
+                    }
+                    start = start + 1
+                    g.render.solidsegsFirst[start] = g.render.solidsegsFirst[nxt]
+                    g.render.solidsegsLast[start] = g.render.solidsegsLast[nxt]
+                }
+                g.render.solidsegsEnd = (start + 1) as i32
+            }
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna clipPassWallSegment(gt: tag gs.GameState, first: int, last: int) {
+    holla g = gt in gs.gsc {
+        lowkey start = 0
+        vibin g.render.solidsegsLast[start] as int < first - 1 {
+            start = start + 1
+        }
+        lowkey done = cap
+        fr first < g.render.solidsegsFirst[start] as int {
+            fr last < g.render.solidsegsFirst[start] as int - 1 {
+                storeRange(gt, first, last)
+                done = nocap
+            } naw {
+                storeRange(gt, first, g.render.solidsegsFirst[start] as int - 1)
+            }
+        }
+        fr !done {
+            fr last <= g.render.solidsegsLast[start] as int {
+                done = nocap
+            }
+        }
+        fr !done {
+            vibin last >= g.render.solidsegsFirst[start + 1] as int - 1 {
+                storeRange(gt, g.render.solidsegsLast[start] as int + 1, g.render.solidsegsFirst[start + 1] as int - 1)
+                start = start + 1
+                fr last <= g.render.solidsegsLast[start] as int {
+                    done = nocap
+                    dip
+                }
+            }
+            fr !done {
+                storeRange(gt, g.render.solidsegsLast[start] as int + 1, last)
+            }
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna storeRange(gt: tag gs.GameState, start: int, stop: int) {
+    rsegs.storeWallRange(gt, start, stop)
+}
+
+flex finna addLine(gt: tag gs.GameState, seg: int) {
+    lowkey v1x: i32 = 0
+    lowkey v1y: i32 = 0
+    lowkey v2x: i32 = 0
+    lowkey v2y: i32 = 0
+    holla g = gt in gs.gsc {
+        g.render.curline = seg as i32
+        v1x = g.level.vtxX[g.level.segV1[seg] as int]
+        v1y = g.level.vtxY[g.level.segV1[seg] as int]
+        v2x = g.level.vtxX[g.level.segV2[seg] as int]
+        v2y = g.level.vtxY[g.level.segV2[seg] as int]
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey angle1 = rgeom.pointToAngle(gt, v1x, v1y)
+    lowkey angle2 = rgeom.pointToAngle(gt, v2x, v2y)
+    lowkey action = 0
+    lowkey x1 = 0
+    lowkey x2 = 0
+    holla g = gt in gs.gsc {
+        lowkey span: u32 = angle1 - angle2
+        fr span >= tables.ANG180 {
+            action = 0
+        } naw {
+            g.render.rw_angle1 = angle1 as i32
+            lowkey a1: u32 = angle1 - g.render.viewangle
+            lowkey a2: u32 = angle2 - g.render.viewangle
+            lowkey twoClip: u32 = g.render.clipangle + g.render.clipangle
+            lowkey reject = cap
+            lowkey tspan: u32 = a1 + g.render.clipangle
+            fr tspan > twoClip {
+                tspan = tspan - twoClip
+                fr tspan >= span {
+                    reject = nocap
+                }
+                a1 = g.render.clipangle
+            }
+            tspan = g.render.clipangle - a2
+            fr tspan > twoClip {
+                tspan = tspan - twoClip
+                fr tspan >= span {
+                    reject = nocap
+                }
+                a2 = 0 - g.render.clipangle
+            }
+            fr reject {
+                action = 0
+            } naw {
+                lowkey i1 = (a1 + tables.ANG90 >> 19) as int
+                lowkey i2 = (a2 + tables.ANG90 >> 19) as int
+                x1 = g.render.viewangletox[i1] as int
+                x2 = g.render.viewangletox[i2] as int
+                fr x1 == x2 {
+                    action = 0
+                } naw {
+                    lowkey bs = g.level.segBack[seg]
+                    g.render.backsector = bs
+                    lowkey fs = g.render.frontsector as int
+                    fr bs == -1 {
+                        action = 2
+                    } naw fr g.level.secCeilH[bs] <= g.level.secFloorH[fs] || g.level.secFloorH[bs] >= g.level.secCeilH[fs] {
+                        action = 2
+                    } naw fr g.level.secCeilH[bs] != g.level.secCeilH[fs] || g.level.secFloorH[bs] != g.level.secFloorH[fs] {
+                        action = 1
+                    } naw fr g.level.secCeilPic[bs] == g.level.secCeilPic[fs] && g.level.secFloorPic[bs] == g.level.secFloorPic[fs] && g.level.secLight[bs] == g.level.secLight[fs] && g.level.sdMidTex[g.level.segSide[seg] as int] as int == 0 {
+                        action = 0
+                    } naw {
+                        action = 1
+                    }
+                }
+            }
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    fr action == 1 {
+        clipPassWallSegment(gt, x1, x2 - 1)
+    } naw fr action == 2 {
+        clipSolidWallSegment(gt, x1, x2 - 1)
+    }
+}
+
+flex finna checkBBox(gt: tag gs.GameState, node: int, child: int) -> bool {
+    lowkey res = cap
+    lowkey cc = checkcoordTable()
+    holla g = gt in gs.gsc {
+        lowkey b = node * 8 + child * 4
+        lowkey bxTop = g.level.nodeBBox[b + 0]
+        lowkey bxBottom = g.level.nodeBBox[b + 1]
+        lowkey bxLeft = g.level.nodeBBox[b + 2]
+        lowkey bxRight = g.level.nodeBBox[b + 3]
+        lowkey boxx = 0
+        fr g.render.viewx <= bxLeft {
+            boxx = 0
+        } naw fr g.render.viewx < bxRight {
+            boxx = 1
+        } naw {
+            boxx = 2
+        }
+        lowkey boxy = 0
+        fr g.render.viewy >= bxTop {
+            boxy = 0
+        } naw fr g.render.viewy > bxBottom {
+            boxy = 1
+        } naw {
+            boxy = 2
+        }
+        lowkey boxpos = (boxy << 2) + boxx
+        fr boxpos == 5 {
+            res = nocap
+        } naw {
+            lowkey cbase = boxpos * 4
+            lowkey x1 = g.level.nodeBBox[b + cc[cbase + 0] as int]
+            lowkey y1 = g.level.nodeBBox[b + cc[cbase + 1] as int]
+            lowkey x2 = g.level.nodeBBox[b + cc[cbase + 2] as int]
+            lowkey y2 = g.level.nodeBBox[b + cc[cbase + 3] as int]
+            res = checkBBoxAngles(gt, x1, y1, x2, y2)
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    bet res
+}
+
+flex finna checkBBoxAngles(gt: tag gs.GameState, x1: i32, y1: i32, x2: i32, y2: i32) -> bool {
+    lowkey a1 = rgeom.pointToAngle(gt, x1, y1)
+    lowkey a2 = rgeom.pointToAngle(gt, x2, y2)
+    lowkey res = cap
+    holla g = gt in gs.gsc {
+        lowkey angle1: u32 = a1 - g.render.viewangle
+        lowkey angle2: u32 = a2 - g.render.viewangle
+        lowkey span: u32 = angle1 - angle2
+        fr span >= tables.ANG180 {
+            res = nocap
+        } naw {
+            lowkey twoClip: u32 = g.render.clipangle + g.render.clipangle
+            lowkey off = cap
+            lowkey tspan: u32 = angle1 + g.render.clipangle
+            fr tspan > twoClip {
+                tspan = tspan - twoClip
+                fr tspan >= span {
+                    off = nocap
+                }
+                angle1 = g.render.clipangle
+            }
+            tspan = g.render.clipangle - angle2
+            fr tspan > twoClip {
+                tspan = tspan - twoClip
+                fr tspan >= span {
+                    off = nocap
+                }
+                angle2 = 0 - g.render.clipangle
+            }
+            fr off {
+                res = cap
+            } naw {
+                lowkey i1 = (angle1 + tables.ANG90 >> 19) as int
+                lowkey i2 = (angle2 + tables.ANG90 >> 19) as int
+                lowkey sx1 = g.render.viewangletox[i1] as int
+                lowkey sx2 = g.render.viewangletox[i2] as int - 1
+                fr sx1 == sx2 + 1 {
+                    res = cap
+                } naw {
+                    lowkey st = 0
+                    vibin g.render.solidsegsLast[st] as int < sx2 {
+                        st = st + 1
+                    }
+                    fr sx1 >= g.render.solidsegsFirst[st] as int && sx2 <= g.render.solidsegsLast[st] as int {
+                        res = cap
+                    } naw {
+                        res = nocap
+                    }
+                }
+            }
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    bet res
+}
+
+flex finna checkcoordTable() -> []i32 {
+    lowkey t = mem.slab[i32](48)
+    t[0] = 3
+    t[1] = 0
+    t[2] = 2
+    t[3] = 1
+    t[4] = 3
+    t[5] = 0
+    t[6] = 2
+    t[7] = 0
+    t[8] = 3
+    t[9] = 1
+    t[10] = 2
+    t[11] = 0
+    t[16] = 2
+    t[17] = 0
+    t[18] = 2
+    t[19] = 1
+    t[24] = 3
+    t[25] = 1
+    t[26] = 3
+    t[27] = 0
+    t[32] = 2
+    t[33] = 0
+    t[34] = 3
+    t[35] = 1
+    t[36] = 2
+    t[37] = 1
+    t[38] = 3
+    t[39] = 1
+    t[40] = 2
+    t[41] = 1
+    t[42] = 3
+    t[43] = 0
+    bet t
+}
+
+flex finna subsector(gt: tag gs.GameState, num: int) {
+    lowkey count = 0
+    lowkey firstline = 0
+    lowkey wantFloor = cap
+    lowkey wantCeil = cap
+    lowkey fh: i32 = 0
+    lowkey ch: i32 = 0
+    lowkey fpic = 0
+    lowkey cpic = 0
+    lowkey light = 0
+    holla g = gt in gs.gsc {
+        g.render.sscount = g.render.sscount + 1
+        lowkey fs = g.level.ssSector[num]
+        g.render.frontsector = fs
+        count = g.level.ssNumLines[num] as int
+        firstline = g.level.ssFirstLine[num] as int
+        fh = g.level.secFloorH[fs as int]
+        ch = g.level.secCeilH[fs as int]
+        fpic = g.level.secFloorPic[fs as int] as int
+        cpic = g.level.secCeilPic[fs as int] as int
+        light = g.level.secLight[fs as int] as int
+        fr fh < g.render.viewz {
+            wantFloor = nocap
+        }
+        fr ch > g.render.viewz || cpic == g.render.skyflatnum as int {
+            wantCeil = nocap
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey fplane = -1
+    lowkey cplane = -1
+    fr wantFloor {
+        fplane = rplane.findPlane(gt, fh, fpic, light)
+    }
+    fr wantCeil {
+        cplane = rplane.findPlane(gt, ch, cpic, light)
+    }
+    holla g = gt in gs.gsc {
+        g.render.floorplane = fplane as i32
+        g.render.ceilingplane = cplane as i32
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey i = 0
+    vibin i < count {
+        addLine(gt, firstline + i)
+        i = i + 1
+    }
+}
+
+flex finna renderBSPNode(gt: tag gs.GameState, bspnum: int) {
+    fr bspnum & NF_SUBSECTOR != 0 {
+        fr bspnum == -1 {
+            subsector(gt, 0)
+        } naw {
+            subsector(gt, bspnum & 32767)
+        }
+        bet
+    }
+    lowkey vx: i32 = 0
+    lowkey vy: i32 = 0
+    holla g = gt in gs.gsc {
+        vx = g.render.viewx
+        vy = g.render.viewy
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey side = rgeom.pointOnSide(gt, vx, vy, bspnum as i32)
+    lowkey child0 = 0
+    lowkey child1 = 0
+    holla g = gt in gs.gsc {
+        child0 = g.level.nodeChild0[bspnum] as int
+        child1 = g.level.nodeChild1[bspnum] as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr side == 0 {
+        renderBSPNode(gt, child0)
+        fr checkBBox(gt, bspnum, 1) {
+            renderBSPNode(gt, child1)
+        }
+    } naw {
+        renderBSPNode(gt, child1)
+        fr checkBBox(gt, bspnum, 0) {
+            renderBSPNode(gt, child0)
+        }
+    }
+}

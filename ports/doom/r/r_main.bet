@@ -1,0 +1,279 @@
+pull "spill"
+pull "../defs/gs" as gs
+pull "../defs/fixed" as fixed
+pull "../defs/tables" as tables
+pull "../defs/think" as think
+pull "../r/r_data" as rdata
+pull "../r/r_sky" as rsky
+pull "../r/r_draw" as rdraw
+pull "../r/r_plane" as rplane
+pull "../r/r_bsp" as rbsp
+
+flex facts SCREENWIDTH: int = 320
+flex facts SCREENHEIGHT: int = 200
+flex facts SBARHEIGHT: int = 32
+flex facts FIELDOFVIEW: int = 2048
+flex facts LIGHTLEVELS: int = 16
+flex facts MAXLIGHTSCALE: int = 48
+flex facts MAXLIGHTZ: int = 128
+flex facts NUMCOLORMAPS: int = 32
+flex facts DISTMAP: int = 2
+
+flex finna initTextureMapping(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        lowkey twoUnit: i32 = fixed.FRACUNIT + fixed.FRACUNIT
+        lowkey negTwoUnit: i32 = 0 - twoUnit
+        lowkey vw: int = g.render.viewwidth as int
+        lowkey focallength: i32 = fixed.fixedDiv(g.render.centerxfrac, g.info.finetangent[2048 + 1024])
+        lowkey i = 0
+        vibin i < 4096 {
+            lowkey ft: i32 = g.info.finetangent[i]
+            lowkey t: int = 0
+            fr ft > twoUnit {
+                t = -1
+            } naw fr ft < negTwoUnit {
+                t = vw + 1
+            } naw {
+                lowkey fm: i32 = fixed.fixedMul(ft, focallength)
+                t = (g.render.centerxfrac - fm + fixed.FRACUNIT - 1 >> 16) as int
+                fr t < -1 {
+                    t = -1
+                } naw fr t > vw + 1 {
+                    t = vw + 1
+                }
+            }
+            g.render.viewangletox[i] = t as i32
+            i = i + 1
+        }
+        lowkey x = 0
+        vibin x <= vw {
+            lowkey k = 0
+            vibin g.render.viewangletox[k] as int > x {
+                k = k + 1
+            }
+            g.render.xtoviewangle[x] = ((k << 19) as int - tables.ANG90 as int) as u32
+            x = x + 1
+        }
+        i = 0
+        vibin i < 4096 {
+            fr g.render.viewangletox[i] as int == -1 {
+                g.render.viewangletox[i] = 0
+            } naw fr g.render.viewangletox[i] as int == vw + 1 {
+                g.render.viewangletox[i] = vw as i32
+            }
+            i = i + 1
+        }
+        g.render.clipangle = g.render.xtoviewangle[0]
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna initLightTables(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        lowkey i = 0
+        vibin i < LIGHTLEVELS {
+            lowkey startmap = (LIGHTLEVELS - 1 - i) * 2 * NUMCOLORMAPS / LIGHTLEVELS
+            lowkey j = 0
+            vibin j < MAXLIGHTZ {
+                lowkey scale: i32 = fixed.fixedDiv((160 * 65536) as i32, (j + 1 << 20) as i32)
+                scale = scale >> 12
+                lowkey level = startmap - scale as int / DISTMAP
+                fr level < 0 {
+                    level = 0
+                }
+                fr level >= NUMCOLORMAPS {
+                    level = NUMCOLORMAPS - 1
+                }
+                g.render.zlight[i * MAXLIGHTZ + j] = (level * 256) as i32
+                j = j + 1
+            }
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna setViewSize(gt: tag gs.GameState, blocks: int, detail: int) {
+    holla g = gt in gs.gsc {
+        g.render.setblocks = blocks as i32
+        g.render.setdetail = detail as i32
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna executeSetViewSize(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        lowkey sb: int = g.render.setblocks as int
+        fr sb == 11 {
+            g.render.scaledviewwidth = SCREENWIDTH as i32
+            g.render.viewheight = SCREENHEIGHT as i32
+        } naw {
+            g.render.scaledviewwidth = (sb * 32) as i32
+            g.render.viewheight = (sb * 168 / 10 & 4294967288) as i32
+        }
+        g.render.detailshift = g.render.setdetail
+        g.render.viewwidth = (g.render.scaledviewwidth as int >> g.render.detailshift as int) as i32
+        g.render.centery = (g.render.viewheight as int / 2) as i32
+        g.render.centerx = (g.render.viewwidth as int / 2) as i32
+        g.render.centerxfrac = (g.render.centerx as int << 16) as i32
+        g.render.centeryfrac = (g.render.centery as int << 16) as i32
+        g.render.projection = g.render.centerxfrac
+        g.render.colfunc = rdraw.drawColumn
+        g.render.basecolfunc = rdraw.drawColumn
+        g.render.fuzzcolfunc = rdraw.drawFuzzColumn
+        g.render.transcolfunc = rdraw.drawTranslatedColumn
+        g.render.spanfunc = rdraw.drawSpan
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey svw = 0
+    lowkey vh = 0
+    holla g = gt in gs.gsc {
+        svw = g.render.scaledviewwidth as int
+        vh = g.render.viewheight as int
+    } ghosted {
+        yeet("gs")
+    }
+    rdraw.initBuffer(gt, svw, vh)
+    initTextureMapping(gt)
+    holla g = gt in gs.gsc {
+        lowkey vw: int = g.render.viewwidth as int
+        lowkey dsh: int = g.render.detailshift as int
+        g.render.pspritescale = (fixed.FRACUNIT as int * vw / SCREENWIDTH) as i32
+        g.render.pspriteiscale = (fixed.FRACUNIT as int * SCREENWIDTH / vw) as i32
+        lowkey i = 0
+        vibin i < SCREENWIDTH {
+            g.render.openings[i] = -1
+            i = i + 1
+        }
+        i = 0
+        vibin i < vw {
+            g.render.openings[SCREENWIDTH + i] = vh as i16
+            i = i + 1
+        }
+        i = 0
+        vibin i < vh {
+            lowkey dy: i32 = ((i - vh / 2 << 16) as int + fixed.FRACUNIT as int / 2) as i32
+            fr dy < 0 {
+                dy = 0 - dy
+            }
+            g.render.yslope[i] = fixed.fixedDiv(((vw << dsh) / 2 * fixed.FRACUNIT as int) as i32, dy)
+            i = i + 1
+        }
+        i = 0
+        vibin i < vw {
+            lowkey fcidx: int = (g.render.xtoviewangle[i] >> 19) as int + 2048
+            lowkey cosadj: i32 = g.info.finesine[fcidx]
+            fr cosadj < 0 {
+                cosadj = 0 - cosadj
+            }
+            g.render.distscale[i] = fixed.fixedDiv(fixed.FRACUNIT, cosadj)
+            i = i + 1
+        }
+        i = 0
+        vibin i < LIGHTLEVELS {
+            lowkey startmap = (LIGHTLEVELS - 1 - i) * 2 * NUMCOLORMAPS / LIGHTLEVELS
+            lowkey j = 0
+            vibin j < MAXLIGHTSCALE {
+                lowkey level = startmap - j * SCREENWIDTH / (vw << dsh) / DISTMAP
+                fr level < 0 {
+                    level = 0
+                }
+                fr level >= NUMCOLORMAPS {
+                    level = NUMCOLORMAPS - 1
+                }
+                g.render.scalelight[i * MAXLIGHTSCALE + j] = (level * 256) as i32
+                j = j + 1
+            }
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    rsky.initSkyMap(gt)
+}
+
+flex finna rInit(gt: tag gs.GameState) {
+    rdata.initData(gt)
+    setViewSize(gt, 11, 0)
+    executeSetViewSize(gt)
+    initLightTables(gt)
+    rsky.initSkyMap(gt)
+    rdraw.initTranslationTables(gt)
+    holla g = gt in gs.gsc {
+        g.render.framecount = 0
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna setupFrame(gt: tag gs.GameState, playerIdx: int) {
+    lowkey mo: tag think.Thinker = ghosted
+    lowkey vz: i32 = 0
+    lowkey exlight: i32 = 0
+    lowkey fcm: int = 0
+    holla g = gt in gs.gsc {
+        g.render.viewplayer = playerIdx as i32
+        mo = g.shell.players[playerIdx].mo
+        vz = g.shell.players[playerIdx].viewz
+        exlight = g.shell.players[playerIdx].extralight
+        fcm = g.shell.players[playerIdx].fixedcolormap as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey haveMo = cap
+    lowkey mx: i32 = 0
+    lowkey my: i32 = 0
+    lowkey mang: u32 = 0
+    holla m = mo in gs.thinkers {
+        mx = m.mobj.x
+        my = m.mobj.y
+        mang = m.mobj.angle
+        haveMo = nocap
+    } ghosted {
+    }
+    holla g = gt in gs.gsc {
+        fr haveMo {
+            g.render.viewx = mx
+            g.render.viewy = my
+            g.render.viewangle = mang + g.render.viewangleoffset as u32
+            g.render.extralight = exlight
+            g.render.viewz = vz
+        }
+        g.render.viewsin = g.info.finesine[(g.render.viewangle >> 19) as int]
+        g.render.viewcos = g.info.finesine[(g.render.viewangle >> 19) as int + 2048]
+        g.render.sscount = 0
+        fr fcm != 0 {
+            g.render.fixedcolormapOfs = (fcm * 256) as i32
+        } naw {
+            g.render.fixedcolormapOfs = -1
+        }
+        g.render.framecount = g.render.framecount + 1
+        g.render.validcount = g.render.validcount + 1
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna renderPlayerView(gt: tag gs.GameState, playerIdx: int) {
+    setupFrame(gt, playerIdx)
+    rbsp.clearClipSegs(gt)
+    rbsp.clearDrawSegs(gt)
+    rplane.clearPlanes(gt)
+    holla g = gt in gs.gsc {
+        g.render.visspriteP = 0
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey numnodes = 0
+    holla g = gt in gs.gsc {
+        numnodes = g.level.numnodes as int
+    } ghosted {
+        yeet("gs")
+    }
+    rbsp.renderBSPNode(gt, numnodes - 1)
+    rplane.drawPlanes(gt)
+}

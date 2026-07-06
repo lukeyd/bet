@@ -396,6 +396,86 @@ flex drip RenderState {
     flex fuzzcolfunc: finna(tag GameState) -> void
     flex transcolfunc: finna(tag GameState) -> void
     flex spanfunc: finna(tag GameState) -> void
+    // ---- P2.6 RenderState render-scratch (r/r_main + r/r_plane + r/r_segs + r/r_bsp + r/r_draw).
+    // Render-only, no cross-package state. Native-safe: scalar fields + fixed-size mem.slab
+    // (allocated in gsInit); NO mutated vec. See CONTRACTS.md "P2.6 RenderState render-scratch".
+    // r_main per-frame POV + bookkeeping
+    flex viewcos: i32
+    flex viewsin: i32
+    flex framecount: i32
+    flex validcount: i32
+    // r_draw framebuffer address LUTs (R_InitBuffer). ylookup[y] = byte offset of row y into
+    // scr0; columnofs[x] = viewwindowx + x. dc_sourceBuf selects the column source slab:
+    // 0 = g.render.texArena (composited), 1 = g.wad.buf (single-patch / flat is always buf).
+    flex ylookup: []i32           // SCREENHEIGHT
+    flex columnofs: []i32         // SCREENWIDTH
+    flex dc_sourceBuf: i32
+    flex fuzzpos: i32
+    // R_DrawTranslatedColumn (player-sprite colour remap; P2.7 sets dc_translationOfs).
+    flex translationtables: []u8  // 3*256 remap tables (R_InitTranslationTables)
+    flex dc_translationOfs: i32   // byte offset into translationtables
+    // r_main projection tables (R_ExecuteSetViewSize)
+    flex yslope: []i32            // SCREENHEIGHT
+    flex distscale: []i32         // SCREENWIDTH
+    flex pspritescale: i32
+    flex pspriteiscale: i32
+    // r_plane scratch (R_MapPlane / R_MakeSpans / R_ClearPlanes)
+    flex spanstart: []i32         // SCREENHEIGHT
+    flex cachedheight: []i32      // SCREENHEIGHT
+    flex cacheddistance: []i32    // SCREENHEIGHT
+    flex cachedxstep: []i32       // SCREENHEIGHT
+    flex cachedystep: []i32       // SCREENHEIGHT
+    flex planeheight: i32
+    flex planezlightOfs: i32      // base index into zlight (light*MAXLIGHTZ)
+    flex basexscale: i32
+    flex baseyscale: i32
+    // r_bsp solidsegs clip list (cliprange_t solidsegs[MAXSEGS], newend). MAXSEGS=32.
+    flex solidsegsFirst: []i32    // MAXSEGS
+    flex solidsegsLast: []i32     // MAXSEGS
+    flex solidsegsEnd: i32        // newend index (one past last valid)
+    // r_bsp/r_segs current line + sectors (curline seg idx; front/back sector idx, -1 none)
+    flex curline: i32
+    flex frontsector: i32
+    flex backsector: i32
+    // r_segs wall-render registers
+    flex rw_x: i32
+    flex rw_stopx: i32
+    flex rw_centerangle: u32
+    flex rw_offset: i32
+    flex rw_scale: i32
+    flex rw_scalestep: i32
+    flex rw_midtexturemid: i32
+    flex rw_toptexturemid: i32
+    flex rw_bottomtexturemid: i32
+    flex worldtop: i32
+    flex worldbottom: i32
+    flex worldhigh: i32
+    flex worldlow: i32
+    flex pixhigh: i32
+    flex pixlow: i32
+    flex pixhighstep: i32
+    flex pixlowstep: i32
+    flex topfrac: i32
+    flex topstep: i32
+    flex bottomfrac: i32
+    flex bottomstep: i32
+    flex segtextured: bool
+    flex markfloor: bool
+    flex markceiling: bool
+    flex maskedtexture: bool
+    flex midtexture: i32
+    flex toptexture: i32
+    flex bottomtexture: i32
+    // walllights: base index into scalelight (light*MAXLIGHTSCALE), or walllightsFixed when
+    // the fixedcolormap is active (all entries == fixedcolormapOfs).
+    flex walllightsFixed: bool
+    flex walllightsBase: i32
+    flex maskedtexturecolOfs: i32 // base offset into openings (mid-masked col table)
+    // r_segs masked-seg-range registers (R_RenderMaskedSegRange — P2.7 sprite/masked clipping)
+    flex spryscale: i32
+    flex sprtopscreen: i32
+    flex mfloorclipOfs: i32       // offset into openings (ds->sprbottomclip)
+    flex mceilingclipOfs: i32     // offset into openings (ds->sprtopclip)
 }
 
 // ---- Hooks: the 7 upward calls that break the p_mobj/p_map/p_spec cycle. Wired at init by
@@ -882,6 +962,18 @@ flex finna gsInit(gt: tag GameState) {
         g.render.zlight = mem.slab[i32](2048)     // LIGHTLEVELS*MAXLIGHTZ
         g.render.colormaps = mem.slab[u8](8704)   // NUMCOLORMAPS*256 = 34*256
         g.render.colormapsLen = 8704
+        // P2.6 render-scratch slabs (fixed-size; zero-inited). SCREENHEIGHT=200, SCREENWIDTH=320.
+        g.render.ylookup = mem.slab[i32](200)
+        g.render.columnofs = mem.slab[i32](320)
+        g.render.yslope = mem.slab[i32](200)
+        g.render.distscale = mem.slab[i32](320)
+        g.render.spanstart = mem.slab[i32](200)
+        g.render.cachedheight = mem.slab[i32](200)
+        g.render.cacheddistance = mem.slab[i32](200)
+        g.render.cachedxstep = mem.slab[i32](200)
+        g.render.cachedystep = mem.slab[i32](200)
+        g.render.solidsegsFirst = mem.slab[i32](32)   // MAXSEGS
+        g.render.solidsegsLast = mem.slab[i32](32)
         // drawsegs/vissprites are fixed arrays (DrawSeg[MAXDRAWSEGS]/VisSprite[MAXVISSPRITES]),
         // zero-inited by cop; dsP/visspriteP are the live counts.
         g.render.fixedcolormapOfs = -1

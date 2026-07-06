@@ -1,0 +1,270 @@
+pull "spill"
+pull "mem"
+pull "str"
+pull "../defs/gs" as gs
+pull "../defs/fixed" as fixed
+
+flex facts SCREENWIDTH: int = 320
+flex facts SCREENHEIGHT: int = 200
+flex facts SBARHEIGHT: int = 32
+
+flex finna drawColumn(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        lowkey count: int = (g.render.dc_yh - g.render.dc_yl) as int
+        fr count >= 0 {
+            lowkey x: int = g.render.dc_x as int
+            lowkey yl: int = g.render.dc_yl as int
+            lowkey dest: int = g.render.ylookup[yl] as int + g.render.columnofs[x] as int
+            lowkey fracstep: i32 = g.render.dc_iscale
+            lowkey frac: i32 = g.render.dc_texturemid + (g.render.dc_yl - g.render.centery) * fracstep
+            lowkey cmapOfs: int = g.render.dc_colormapOfs as int
+            lowkey srcOfs: int = g.render.dc_sourceOfs as int
+            fr g.render.dc_sourceBuf == 1 {
+                vibin count >= 0 {
+                    lowkey px: int = g.wad.buf[srcOfs + (frac >> 16 & 127) as int] as int
+                    g.vid.scr0[dest] = g.render.colormaps[cmapOfs + px]
+                    dest = dest + 320
+                    frac = frac + fracstep
+                    count = count - 1
+                }
+            } naw {
+                vibin count >= 0 {
+                    lowkey px: int = g.render.texArena[srcOfs + (frac >> 16 & 127) as int] as int
+                    g.vid.scr0[dest] = g.render.colormaps[cmapOfs + px]
+                    dest = dest + 320
+                    frac = frac + fracstep
+                    count = count - 1
+                }
+            }
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna drawFuzzColumn(gt: tag gs.GameState) {
+    lowkey fz = fuzzTable()
+    holla g = gt in gs.gsc {
+        lowkey yl: int = g.render.dc_yl as int
+        lowkey yh: int = g.render.dc_yh as int
+        fr yl == 0 {
+            yl = 1
+        }
+        fr yh == (g.render.viewheight - 1) as int {
+            yh = (g.render.viewheight - 2) as int
+        }
+        lowkey count: int = yh - yl
+        fr count >= 0 {
+            lowkey fp: int = g.render.fuzzpos as int
+            lowkey dest: int = g.render.ylookup[yl] as int + g.render.columnofs[g.render.dc_x as int] as int
+            vibin count >= 0 {
+                lowkey nb: int = dest + fz[fp] as int
+                lowkey px: int = g.vid.scr0[nb] as int
+                g.vid.scr0[dest] = g.render.colormaps[1536 + px]
+                fp = fp + 1
+                fr fp == 50 {
+                    fp = 0
+                }
+                dest = dest + 320
+                count = count - 1
+            }
+            g.render.fuzzpos = fp as i32
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna fuzzTable() -> []i32 {
+    lowkey pat = "01010010010001000111101100001010011001111000010010"
+    lowkey t = mem.slab[i32](50)
+    lowkey i = 0
+    vibin i < 50 {
+        fr str.at(pat, i) == 48 {
+            t[i] = 320
+        } naw {
+            t[i] = 0 - 320
+        }
+        i = i + 1
+    }
+    bet t
+}
+
+flex finna drawTranslatedColumn(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        lowkey count: int = (g.render.dc_yh - g.render.dc_yl) as int
+        fr count >= 0 {
+            lowkey x: int = g.render.dc_x as int
+            lowkey yl: int = g.render.dc_yl as int
+            lowkey dest: int = g.render.ylookup[yl] as int + g.render.columnofs[x] as int
+            lowkey fracstep: i32 = g.render.dc_iscale
+            lowkey frac: i32 = g.render.dc_texturemid + (g.render.dc_yl - g.render.centery) * fracstep
+            lowkey cmapOfs: int = g.render.dc_colormapOfs as int
+            lowkey trOfs: int = g.render.dc_translationOfs as int
+            lowkey srcOfs: int = g.render.dc_sourceOfs as int
+            vibin count >= 0 {
+                lowkey raw: int = g.wad.buf[srcOfs + (frac >> 16) as int] as int
+                lowkey px: int = g.render.translationtables[trOfs + raw] as int
+                g.vid.scr0[dest] = g.render.colormaps[cmapOfs + px]
+                dest = dest + 320
+                frac = frac + fracstep
+                count = count - 1
+            }
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna initTranslationTables(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.render.translationtables = mem.slab[u8](768)
+        lowkey i = 0
+        vibin i < 256 {
+            fr i >= 112 {
+                fr i <= 127 {
+                    g.render.translationtables[i] = (96 + (i & 15)) as u8
+                    g.render.translationtables[i + 256] = (64 + (i & 15)) as u8
+                    g.render.translationtables[i + 512] = (32 + (i & 15)) as u8
+                } naw {
+                    g.render.translationtables[i] = i as u8
+                    g.render.translationtables[i + 256] = i as u8
+                    g.render.translationtables[i + 512] = i as u8
+                }
+            } naw {
+                g.render.translationtables[i] = i as u8
+                g.render.translationtables[i + 256] = i as u8
+                g.render.translationtables[i + 512] = i as u8
+            }
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna drawSpan(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        lowkey x1: int = g.render.ds_x1 as int
+        lowkey x2: int = g.render.ds_x2 as int
+        lowkey y: int = g.render.ds_y as int
+        lowkey xfrac: i32 = g.render.ds_xfrac
+        lowkey yfrac: i32 = g.render.ds_yfrac
+        lowkey xstep: i32 = g.render.ds_xstep
+        lowkey ystep: i32 = g.render.ds_ystep
+        lowkey dest: int = g.render.ylookup[y] as int + g.render.columnofs[x1] as int
+        lowkey count: int = x2 - x1
+        lowkey srcOfs: int = g.render.ds_sourceOfs as int
+        lowkey cmapOfs: int = g.render.ds_colormapOfs as int
+        vibin count >= 0 {
+            lowkey spot: int = ((yfrac >> 10 & 4032) + (xfrac >> 16 & 63)) as int
+            lowkey px: int = g.wad.buf[srcOfs + spot] as int
+            g.vid.scr0[dest] = g.render.colormaps[cmapOfs + px]
+            dest = dest + 1
+            xfrac = xfrac + xstep
+            yfrac = yfrac + ystep
+            count = count - 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna initBuffer(gt: tag gs.GameState, width: int, height: int) {
+    holla g = gt in gs.gsc {
+        g.render.viewwindowx = (SCREENWIDTH - width >> 1) as i32
+        lowkey i = 0
+        vibin i < width {
+            g.render.columnofs[i] = (g.render.viewwindowx as int + i) as i32
+            i = i + 1
+        }
+        fr width == SCREENWIDTH {
+            g.render.viewwindowy = 0
+        } naw {
+            g.render.viewwindowy = (SCREENHEIGHT - SBARHEIGHT - height >> 1) as i32
+        }
+        i = 0
+        vibin i < height {
+            g.render.ylookup[i] = ((i + g.render.viewwindowy as int) * SCREENWIDTH) as i32
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna fillBackScreen(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        fr g.render.scaledviewwidth as int == 320 {
+        } naw {
+            lowkey nm = "FLOOR7_2"
+            fr g.shell.gamemode as int == 2 {
+                nm = "GRNROCK"
+            }
+            lowkey lump, ok = g.wad.nameToLump.peep(str.glow(nm))
+            fr ok {
+                lowkey src: int = g.wad.lumpOfs[lump] as int
+                lowkey y = 0
+                lowkey dest = 0
+                vibin y < SCREENHEIGHT - SBARHEIGHT {
+                    lowkey rowbase: int = src + ((y & 63) << 6)
+                    lowkey x = 0
+                    vibin x < 5 {
+                        lowkey k = 0
+                        vibin k < 64 {
+                            g.vid.scr1[dest] = g.wad.buf[rowbase + k]
+                            dest = dest + 1
+                            k = k + 1
+                        }
+                        x = x + 1
+                    }
+                    y = y + 1
+                }
+            }
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna videoErase(gt: tag gs.GameState, ofs: int, count: int) {
+    holla g = gt in gs.gsc {
+        lowkey i = 0
+        vibin i < count {
+            g.vid.scr0[ofs + i] = g.vid.scr1[ofs + i]
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna drawViewBorder(gt: tag gs.GameState) {
+    lowkey doit = cap
+    lowkey top = 0
+    lowkey side = 0
+    lowkey vh = 0
+    holla g = gt in gs.gsc {
+        fr g.render.scaledviewwidth as int != SCREENWIDTH {
+            doit = nocap
+            vh = g.render.viewheight as int
+            top = ((SCREENHEIGHT - SBARHEIGHT - vh) / 2) as int
+            side = ((SCREENWIDTH - g.render.scaledviewwidth as int) / 2) as int
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    fr doit {
+        videoErase(gt, 0, top * SCREENWIDTH + side)
+        lowkey ofs = (vh + top) * SCREENWIDTH - side
+        videoErase(gt, ofs, top * SCREENWIDTH + side)
+        ofs = top * SCREENWIDTH + SCREENWIDTH - side
+        lowkey side2 = side << 1
+        lowkey i = 1
+        vibin i < vh {
+            videoErase(gt, ofs, side2)
+            ofs = ofs + SCREENWIDTH
+            i = i + 1
+        }
+    }
+}

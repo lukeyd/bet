@@ -311,3 +311,46 @@ Six mutated-in-place `vec` fields were therefore converted to fixed arrays + an 
 - Build-once-read vecs are UNCHANGED (still `vec`): `Wad.lumpName`, `TickState.anims`,
   `InfoTables.states/mobjinfo/sfx`, `GameShell.savegameStrings`, `AmState.marks`. Never
   element-mutate these — only `.stack` (append) then read `v[i]`.
+
+## P2.6 RenderState render-scratch (r/r_main + r/r_plane + r/r_segs + r/r_bsp + r/r_draw)
+
+W2/P2.6 (the software BSP rasterizer) added render-only scratch fields to the **RenderState drip
+only** (`defs/gs.bet`) — no cross-package state; every field is `g.render.<name>`. All are scalar
+`flex` fields or fixed-size `mem.slab` allocated in `gsInit` (native-safe: no mutated `vec`). These
+mirror linuxdoom r_main/r_plane/r_segs statics the existing draw-register set did not yet cover:
+
+- **POV/bookkeeping:** `viewcos` `viewsin` (i32) · `framecount` `validcount` (i32).
+- **r_draw address LUTs:** `ylookup` (`[]i32`, SCREENHEIGHT — row byte offset into scr0) ·
+  `columnofs` (`[]i32`, SCREENWIDTH — `viewwindowx + x`) · `dc_sourceBuf` (i32: 1 = `g.wad.buf`,
+  0 = `g.render.texArena`; selects the wall/sprite column source slab) · `fuzzpos` (i32) ·
+  `translationtables` (`[]u8`, 3*256 — R_InitTranslationTables) · `dc_translationOfs` (i32).
+- **r_main projection tables:** `yslope` (`[]i32`, SCREENHEIGHT) · `distscale` (`[]i32`, SCREENWIDTH)
+  · `pspritescale` `pspriteiscale` (i32).
+- **r_plane scratch:** `spanstart` `cachedheight` `cacheddistance` `cachedxstep` `cachedystep`
+  (`[]i32`, SCREENHEIGHT) · `planeheight` (i32) · `planezlightOfs` (i32, base index `light*MAXLIGHTZ`
+  into `zlight`) · `basexscale` `baseyscale` (i32).
+- **r_bsp solidsegs clip list:** `solidsegsFirst` `solidsegsLast` (`[]i32`, MAXSEGS=32) ·
+  `solidsegsEnd` (i32, the `newend` one-past index).
+- **current line/sectors:** `curline` (i32 seg idx) · `frontsector` `backsector` (i32 sector idx,
+  -1 == none).
+- **r_segs wall registers:** `rw_x` `rw_stopx` (i32) · `rw_centerangle` (u32) · `rw_offset` `rw_scale`
+  `rw_scalestep` `rw_midtexturemid` `rw_toptexturemid` `rw_bottomtexturemid` (i32) · `worldtop`
+  `worldbottom` `worldhigh` `worldlow` · `pixhigh` `pixlow` `pixhighstep` `pixlowstep` · `topfrac`
+  `topstep` `bottomfrac` `bottomstep` (all i32) · `segtextured` `markfloor` `markceiling`
+  `maskedtexture` (bool) · `midtexture` `toptexture` `bottomtexture` (i32) · `walllightsFixed` (bool)
+  + `walllightsBase` (i32, base index `light*MAXLIGHTSCALE` into `scalelight`; when
+  `walllightsFixed` the fixed colormap is used) · `maskedtexturecolOfs` (i32, base offset into
+  `openings`).
+- **r_segs masked-seg-range (P2.7 sprite/masked clipping):** `spryscale` `sprtopscreen` (i32) ·
+  `mfloorclipOfs` `mceilingclipOfs` (i32, offsets into `openings`).
+
+**openings reserved regions:** the `[]i16 openings` slab reserves `[0,320)` = `negonearray` (-1) and
+`[320,640)` = `screenheightarray` (viewheight), filled by `R_ExecuteSetViewSize`; `R_ClearPlanes`
+sets `lastopening = 640`. A DrawSeg sprite-clip offset (`sprtopclipOfs`/`sprbottomclipOfs`) of `-1`
+means NULL; `0` = negonearray, `320` = screenheightarray, `>=640` = copied clip. All reads are
+`openings[ofs + x]`.
+
+**colfunc/spanfunc vtable:** wired by `R_ExecuteSetViewSize` to the high-detail r_draw fns
+(`colfunc`/`basecolfunc` = `drawColumn`, `fuzzcolfunc` = `drawFuzzColumn`, `transcolfunc` =
+`drawTranslatedColumn`, `spanfunc` = `drawSpan`). Low-detail (`detailshift != 0`) is SKIPPED, so the
+hot loops call the concrete high-detail fns directly (equivalent since `detailshift == 0` always).
