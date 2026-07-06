@@ -500,6 +500,18 @@ name = "Doom P2.9a: status bar + HUD (st_stuff/st_lib/hu_stuff/hu_lib) — face 
 size = 5
 status = "doing"
 
+[[task]]
+slug = "doom-p27"
+name = "Doom P2.7: render-things (r_things — sprite projection/sort/masked draw + player weapon sprites) — completes the software renderer"
+size = 4
+# DONE. ports/doom/r/r_things.bet ports the GAME half of r_things.c: addSprites/projectSprite,
+# sortVisSprites (next/prev chain), drawSprite/drawVisSprite/drawMaskedColumn, renderMaskedSeg
+# (r_segs column half), drawPlayerSprites/drawPSprite, drawMasked. Seams wired in r_bsp.subsector
+# (addSprites) + r_main.renderPlayerView (drawMasked after drawPlanes). No gs.bet change. Proven by
+# tools/renderthings_smoke.bet -> goldens/renderthings.golden (native: visspriteP=2, far->near sort,
+# scr0 crc 0x98df0334 deterministic). Renderer now draws walls+floors+sprites+psprites.
+status = "done"
+
 # ─────────────────────── Oregon Trail port + the language features it needs ───────────────────────
 # A faithful port of the 1978 MECC Oregon Trail BASIC listing (ports/oregon-trail/). It needs two
 # stdlib intrinsics the language lacked: a seedable RNG and interactive stdin. betfe is intentionally
