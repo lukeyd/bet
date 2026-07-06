@@ -1,0 +1,751 @@
+// s/s_sound.bet — the platform-independent sound engine (linuxdoom-1.10 s_sound.c). Owns the 8
+// mixing channels, priority-based channel allocation/stealing, distance+stereo attenuation, and
+// the music transport bookkeeping. Sits ABOVE i/i_sound (the gg backend) and BELOW the play-sim
+// (which calls startSound at events). Signatures are FROZEN in ports/doom/p-sigs.md ("s/s_sound").
+//
+// PORTED: S_Init, S_Start, S_StartSound, S_StartSoundAtVolume, S_StopSound, S_StartMusic,
+//   S_ChangeMusic, S_StopMusic, S_PauseSound, S_ResumeSound, S_UpdateSounds, S_SetMusicVolume,
+//   S_SetSfxVolume, and the internals S_getChannel / S_StopChannel / S_AdjustSoundParams.
+// MODEL NOTES:
+//   * A channel is FREE iff `sfxId == 0` (SFX_NONE) — mirrors id's `channel->sfxinfo == NULL`.
+//   * `origin` is a `tag think.Thinker` (a null/ghosted tag == id's `NULL` global origin). Sector
+//     soundorg origins (degenmobj_t*) are not thinkers in this port (CONTRACTS flattens them to
+//     secSoundOrg*); positional SECTOR sounds are a future p_spec concern — this API takes mobj
+//     tags (originKind 1) or the null tag (originKind 0). originKind 2 / originSec are reserved.
+//   * `handle`/duration: instead of id's `gametic < handle` hack, we store endTick = gametic +
+//     sfxLenTics[sfx] and test `gametic < endTick` (i_sound.iSoundIsPlaying).
+//   * R_PointToAngle2 (r_main.c, not yet ported) is reimplemented locally via g.info.tantoangle
+//     (sPointToAngle2) so attenuation works before the renderer lands.
+//
+// NATIVE is the correctness target; the channel decisions are deterministic given the scripted
+// input (see tools/sound_smoke.bet → goldens/sound_channels.golden).
+pull "mem"
+pull "vec"
+pull "str"
+pull "../defs/fixed" as fixed
+pull "../defs/doomdef" as doomdef
+pull "../defs/gs" as gs
+pull "../defs/sounds" as sounds
+pull "../defs/think" as think
+pull "../w/w_wad" as w
+pull "../i/i_sound" as isnd
+pull "../util/m_random" as rnd
+
+// ---- constants (s_sound.c #defines) -------------------------------------------------------
+flex facts S_MAX_VOLUME: int = 127
+flex facts NORM_PITCH: int = 128
+flex facts NORM_PRIORITY: int = 64
+flex facts NORM_SEP: int = 128
+flex facts S_CLIPPING_DIST: int = 78643200      // 1200 * 0x10000
+flex facts S_CLOSE_DIST: int = 10485760         // 160 * 0x10000
+flex facts S_ATTENUATOR: int = 1040             // (S_CLIPPING_DIST - S_CLOSE_DIST) >> FRACBITS
+flex facts S_STEREO_SWING: i32 = 6291456        // 96 * 0x10000
+flex facts FRACBITS: int = 16
+flex facts ANGLETOFINESHIFT: int = 19
+
+// ===========================================================================================
+// small helpers
+// ===========================================================================================
+
+// dName — build the "d_<name>" music lump name (S_ChangeMusic's `sprintf(namebuf,"d_%s",...)`).
+// Byte-laid because there is no `str + str`; w_wad upper-cases the query ("d_e1m1" -> "D_E1M1").
+flex finna dName(name: str) -> str {
+    lowkey n = str.len(name)
+    lowkey buf = mem.slab[u8](n + 2)
+    buf[0] = 100        // 'd'
+    buf[1] = 95         // '_'
+    lowkey i = 0
+    vibin i < n {
+        buf[i + 2] = str.at(name, i) as u8
+        i = i + 1
+    }
+    bet str.fromBytesTrust(buf)
+}
+
+// musName — the S_music[] name for a musicenum_t ordinal (sounds.c S_music table; not emitted
+// into defs/sounds, so replicated here — the changeMusic seam needs it to resolve "d_<name>").
+flex finna musName(id: int) -> str {
+    lowkey v = vec.new[str]()
+    v.stack("")  // 0 mus_None
+    v.stack("e1m1")  // 1
+    v.stack("e1m2")  // 2
+    v.stack("e1m3")  // 3
+    v.stack("e1m4")  // 4
+    v.stack("e1m5")  // 5
+    v.stack("e1m6")  // 6
+    v.stack("e1m7")  // 7
+    v.stack("e1m8")  // 8
+    v.stack("e1m9")  // 9
+    v.stack("e2m1")  // 10
+    v.stack("e2m2")  // 11
+    v.stack("e2m3")  // 12
+    v.stack("e2m4")  // 13
+    v.stack("e2m5")  // 14
+    v.stack("e2m6")  // 15
+    v.stack("e2m7")  // 16
+    v.stack("e2m8")  // 17
+    v.stack("e2m9")  // 18
+    v.stack("e3m1")  // 19
+    v.stack("e3m2")  // 20
+    v.stack("e3m3")  // 21
+    v.stack("e3m4")  // 22
+    v.stack("e3m5")  // 23
+    v.stack("e3m6")  // 24
+    v.stack("e3m7")  // 25
+    v.stack("e3m8")  // 26
+    v.stack("e3m9")  // 27
+    v.stack("inter")  // 28
+    v.stack("intro")  // 29
+    v.stack("bunny")  // 30
+    v.stack("victor")  // 31
+    v.stack("introa")  // 32
+    v.stack("runnin")  // 33
+    v.stack("stalks")  // 34
+    v.stack("countd")  // 35
+    v.stack("betwee")  // 36
+    v.stack("doom")  // 37
+    v.stack("the_da")  // 38
+    v.stack("shawn")  // 39
+    v.stack("ddtblu")  // 40
+    v.stack("in_cit")  // 41
+    v.stack("dead")  // 42
+    v.stack("stlks2")  // 43
+    v.stack("theda2")  // 44
+    v.stack("doom2")  // 45
+    v.stack("ddtbl2")  // 46
+    v.stack("runni2")  // 47
+    v.stack("dead2")  // 48
+    v.stack("stlks3")  // 49
+    v.stack("romero")  // 50
+    v.stack("shawn2")  // 51
+    v.stack("messag")  // 52
+    v.stack("count2")  // 53
+    v.stack("ddtbl3")  // 54
+    v.stack("ampie")  // 55
+    v.stack("theda3")  // 56
+    v.stack("adrian")  // 57
+    v.stack("messg2")  // 58
+    v.stack("romer2")  // 59
+    v.stack("tense")  // 60
+    v.stack("shawn3")  // 61
+    v.stack("openin")  // 62
+    v.stack("evil")  // 63
+    v.stack("ultima")  // 64
+    v.stack("read_m")  // 65
+    v.stack("dm2ttl")  // 66
+    v.stack("dm2int")  // 67
+    bet v[id]
+}
+
+// sSlopeDiv — tables.c SlopeDiv with the explicit `(num<<3) as u32` (native+interp identical;
+// see CONTRACTS note 2). Feeds sPointToAngle2's tantoangle lookup.
+flex finna sSlopeDiv(num: u32, den: u32) -> u32 {
+    fr den < 512 {
+        bet 2048
+    }
+    lowkey ans: u32 = ((num << 3) as u32) / (den >> 8)
+    fr ans <= 2048 {
+        bet ans
+    }
+    bet 2048
+}
+
+// sPointToAngle2 — R_PointToAngle2(x1,y1,x2,y2): the binary-angle bearing from (x1,y1) to
+// (x2,y2) via tantoangle[SlopeDiv(...)], octant-folded exactly as r_main.c. Octant results are
+// computed in i64 then folded to u32 (matching the C unsigned wrap). `tan` is g.info.tantoangle.
+flex finna sPointToAngle2(tan: []u32, x1: i32, y1: i32, x2: i32, y2: i32) -> u32 {
+    lowkey x = (x2 as int) - (x1 as int)
+    lowkey y = (y2 as int) - (y1 as int)
+    fr x == 0 && y == 0 {
+        bet 0
+    }
+    fr x >= 0 {
+        fr y >= 0 {
+            fr x > y {
+                lowkey s0 = sSlopeDiv(y as u32, x as u32) as int
+                bet tan[s0]
+            }
+            lowkey s1 = sSlopeDiv(x as u32, y as u32) as int
+            bet (1073741824 - 1 - (tan[s1] as int)) as u32
+        } naw {
+            lowkey yy = 0 - y
+            fr x > yy {
+                lowkey s8 = sSlopeDiv(yy as u32, x as u32) as int
+                bet (0 - (tan[s8] as int)) as u32
+            }
+            lowkey s7 = sSlopeDiv(x as u32, yy as u32) as int
+            bet (3221225472 + (tan[s7] as int)) as u32
+        }
+    }
+    lowkey xx = 0 - x
+    fr y >= 0 {
+        fr xx > y {
+            lowkey s3 = sSlopeDiv(y as u32, xx as u32) as int
+            bet (2147483648 - 1 - (tan[s3] as int)) as u32
+        }
+        lowkey s2 = sSlopeDiv(xx as u32, y as u32) as int
+        bet (1073741824 + (tan[s2] as int)) as u32
+    }
+    lowkey yy2 = 0 - y
+    fr xx > yy2 {
+        lowkey s4 = sSlopeDiv(yy2 as u32, xx as u32) as int
+        bet (2147483648 + (tan[s4] as int)) as u32
+    }
+    lowkey s5 = sSlopeDiv(xx as u32, yy2 as u32) as int
+    bet (3221225472 - 1 - (tan[s5] as int)) as u32
+}
+
+// sAdjustSoundParams — S_AdjustSoundParams: modify (vol, sep) for a source relative to a
+// listener by octagonal distance + bearing. Returns (audible, vol, sep). Not audible (false)
+// when clipped past S_CLIPPING_DIST (except MAP08) or when the computed volume falls to 0.
+flex finna sAdjustSoundParams(gt: tag gs.GameState, listener: tag think.Thinker, source: tag think.Thinker, vol: int, sep: int) -> (bool, int, int) {
+    lowkey lx = 0
+    lowkey ly = 0
+    lowkey langle = 0 as u32
+    holla lm = listener in gs.thinkers {
+        lx = lm.mobj.x as int
+        ly = lm.mobj.y as int
+        langle = lm.mobj.angle
+    } ghosted {
+        yeet("listener")
+    }
+    lowkey sx = 0
+    lowkey sy = 0
+    holla sm = source in gs.thinkers {
+        sx = sm.mobj.x as int
+        sy = sm.mobj.y as int
+    } ghosted {
+        yeet("source")
+    }
+    lowkey approxDist = fixed.aproxDistance((lx - sx) as i32, (ly - sy) as i32) as int
+    lowkey audible = cap
+    lowkey outVol = 0
+    lowkey outSep = sep
+    holla g = gt in gs.gsc {
+        lowkey gamemap = g.shell.gamemap as int
+        lowkey sfxVol = g.sound.sfxVolume as int
+        fr gamemap != 8 && approxDist > S_CLIPPING_DIST {
+            audible = cap
+        } naw {
+            lowkey angU = sPointToAngle2(g.info.tantoangle, lx as i32, ly as i32, sx as i32, sy as i32)
+            lowkey angI = angU as int
+            lowkey langI = langle as int
+            lowkey foldI = 0
+            fr angI > langI {
+                foldI = angI - langI
+            } naw {
+                foldI = angI + (4294967295 - langI)
+            }
+            lowkey fi = foldI >> ANGLETOFINESHIFT
+            outSep = 128 - ((fixed.fixedMul(S_STEREO_SWING, g.info.finesine[fi]) as int) >> FRACBITS)
+            fr approxDist < S_CLOSE_DIST {
+                outVol = sfxVol
+            } naw fr gamemap == 8 {
+                lowkey d = approxDist
+                fr d > S_CLIPPING_DIST {
+                    d = S_CLIPPING_DIST
+                }
+                outVol = 15 + ((sfxVol - 15) * ((S_CLIPPING_DIST - d) >> FRACBITS)) / S_ATTENUATOR
+            } naw {
+                outVol = (sfxVol * ((S_CLIPPING_DIST - approxDist) >> FRACBITS)) / S_ATTENUATOR
+            }
+            audible = outVol > 0
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    bet audible, outVol, outSep
+}
+
+// sStopChannel — S_StopChannel: silence the voice on channel `cnum` (iStopSound) and mark it
+// free (sfxId 0, origin cleared). The usefulness/cache degrade is dropped (gg owns caching).
+flex finna sStopChannel(gt: tag gs.GameState, cnum: int) {
+    lowkey voice = 0
+    lowkey wasUsed = cap
+    holla g = gt in gs.gsc {
+        fr g.sound.channels[cnum].sfxId != 0 {
+            wasUsed = nocap
+            voice = g.sound.channels[cnum].voice as int
+            g.sound.channels[cnum].sfxId = 0
+            g.sound.channels[cnum].originKind = 0
+            g.sound.channels[cnum].originSec = 0
+            g.sound.channels[cnum].voice = 0
+            g.sound.channels[cnum].priority = 0
+            g.sound.channels[cnum].endTick = 0
+            g.sound.channels[cnum].originT = ghosted
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    fr wasUsed {
+        isnd.iStopSound(gt, voice)
+    }
+}
+
+// sGetChannel — S_getChannel: pick a channel for a new sound, or -1 if none free/stealable.
+// Order: (1) first FREE or SAME-ORIGIN channel (same origin is stopped first); (2) else steal
+// the first channel of priority >= the new sound's (lower priority number == more important, so
+// `>=` kicks a less/equally important sound). The chosen channel is marked with the new sfx +
+// origin + priority; the caller fills voice + endTick. A stolen voice is stopped after the holla.
+flex finna sGetChannel(gt: tag gs.GameState, origin: tag think.Thinker, sfxId: int) -> int {
+    lowkey originIsNull = origin == ghosted
+    lowkey result = -1
+    lowkey stopVoice = 0
+    lowkey doStop = cap
+    holla g = gt in gs.gsc {
+        lowkey nchan = g.sound.numChannels as int
+        lowkey newPri = g.info.sfx[sfxId].priority as int
+        lowkey cnum = 0
+        lowkey pick = -1
+        vibin cnum < nchan {
+            fr pick == -1 {
+                fr g.sound.channels[cnum].sfxId == 0 {
+                    pick = cnum
+                } naw fr !originIsNull && g.sound.channels[cnum].originT == origin {
+                    doStop = nocap
+                    stopVoice = g.sound.channels[cnum].voice as int
+                    pick = cnum
+                }
+            }
+            cnum = cnum + 1
+        }
+        fr pick == -1 {
+            lowkey c2 = 0
+            lowkey victim = -1
+            vibin c2 < nchan {
+                fr victim == -1 && (g.sound.channels[c2].priority as int) >= newPri {
+                    victim = c2
+                }
+                c2 = c2 + 1
+            }
+            fr victim != -1 {
+                doStop = nocap
+                stopVoice = g.sound.channels[victim].voice as int
+                pick = victim
+            }
+        }
+        fr pick != -1 {
+            g.sound.channels[pick].sfxId = sfxId as i32
+            g.sound.channels[pick].priority = newPri as i32
+            fr originIsNull {
+                g.sound.channels[pick].originKind = 0
+                g.sound.channels[pick].originT = ghosted
+            } naw {
+                g.sound.channels[pick].originKind = 1
+                g.sound.channels[pick].originT = origin
+            }
+        }
+        result = pick
+    } ghosted {
+        yeet("gs")
+    }
+    fr doStop {
+        isnd.iStopSound(gt, stopVoice)
+    }
+    bet result
+}
+
+// ===========================================================================================
+// public API (FROZEN in p-sigs.md)
+// ===========================================================================================
+
+// sInit — S_Init: set volumes, free all channels, clear the paused flag. (Channel storage is a
+// fixed Channel[8] in SoundState; there is nothing to allocate. Sfx caching is I_InitSound's job
+// — see i_sound.initSound — so lumpnum/usefulness reset is unmodelled: an unloaded sfx has
+// handle 0.)
+flex finna sInit(gt: tag gs.GameState, sfxVolume: int, musicVolume: int) {
+    setSfxVolume(gt, sfxVolume)
+    setMusicVolume(gt, musicVolume)
+    holla g = gt in gs.gsc {
+        lowkey i = 0
+        vibin i < g.sound.numChannels as int {
+            g.sound.channels[i].sfxId = 0
+            g.sound.channels[i].originKind = 0
+            g.sound.channels[i].originSec = 0
+            g.sound.channels[i].voice = 0
+            g.sound.channels[i].priority = 0
+            g.sound.channels[i].endTick = 0
+            g.sound.channels[i].originT = ghosted
+            i = i + 1
+        }
+        g.music.musicPaused = cap
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// sStart — S_Start: kill all playing sounds at level start, then pick + change the level music
+// (commercial: MUS_RUNNIN + map-1; ep<4: MUS_E1M1 + (ep-1)*9 + map-1; ep>=4: the E4 song table).
+flex finna sStart(gt: tag gs.GameState) {
+    lowkey n = 0
+    holla g = gt in gs.gsc {
+        n = g.sound.numChannels as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey cnum = 0
+    vibin cnum < n {
+        sStopChannel(gt, cnum)
+        cnum = cnum + 1
+    }
+    lowkey gm = 0
+    lowkey ep = 0
+    lowkey mp = 0
+    holla g = gt in gs.gsc {
+        g.music.musicPaused = cap
+        gm = g.shell.gamemode as int
+        ep = g.shell.gameepisode as int
+        mp = g.shell.gamemap as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey mnum = 0
+    fr gm == doomdef.GM_COMMERCIAL {
+        mnum = sounds.MUS_RUNNIN + mp - 1
+    } naw fr ep < 4 {
+        mnum = sounds.MUS_E1M1 + (ep - 1) * 9 + mp - 1
+    } naw {
+        lowkey spmus = mem.slab[i32](9)
+        spmus[0] = sounds.MUS_E3M4 as i32
+        spmus[1] = sounds.MUS_E3M2 as i32
+        spmus[2] = sounds.MUS_E3M3 as i32
+        spmus[3] = sounds.MUS_E1M5 as i32
+        spmus[4] = sounds.MUS_E2M7 as i32
+        spmus[5] = sounds.MUS_E2M4 as i32
+        spmus[6] = sounds.MUS_E2M6 as i32
+        spmus[7] = sounds.MUS_E2M5 as i32
+        spmus[8] = sounds.MUS_E1M9 as i32
+        mnum = spmus[mp - 1] as int
+    }
+    changeMusic(gt, mnum, 1)
+    holla g = gt in gs.gsc {
+        g.sound.nextcleanup = 15
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// startSound — S_StartSound: play `soundId` at `origin` using the current sfx volume.
+flex finna startSound(gt: tag gs.GameState, origin: tag think.Thinker, soundId: int) {
+    lowkey sv = 0
+    holla g = gt in gs.gsc {
+        sv = g.sound.sfxVolume as int
+    } ghosted {
+        yeet("gs")
+    }
+    startSoundAtVolume(gt, origin, soundId, sv)
+}
+
+// startSoundAtVolume — S_StartSoundAtVolume: the full event path. Applies the link (alias)
+// volume/pitch tweak, distance/stereo attenuation for non-local origins, the sfx-specific pitch
+// jitter (M_Random), stops any prior sound at this origin, allocates a channel, starts the voice,
+// and records voice + endTick. Silently returns when the sound is inaudible or no channel is free.
+flex finna startSoundAtVolume(gt: tag gs.GameState, origin: tag think.Thinker, soundId: int, volume: int) {
+    fr soundId < 1 || soundId >= sounds.NUMSFX {
+        yeet("bad-sfx-id")
+    }
+    lowkey vol = volume
+    lowkey pitch = NORM_PITCH
+    lowkey sep = NORM_SEP
+    lowkey sfxLink = -1
+    lowkey sfxPitch = 0
+    lowkey sfxVolAdj = 0
+    lowkey sfxVolCur = 0
+    lowkey listener: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        lowkey sfx = g.info.sfx[soundId]
+        sfxLink = sfx.link as int
+        sfxPitch = sfx.pitch as int
+        sfxVolAdj = sfx.volume as int
+        sfxVolCur = g.sound.sfxVolume as int
+        listener = g.shell.players[g.shell.consoleplayer as int].mo
+    } ghosted {
+        yeet("gs")
+    }
+    fr sfxLink != -1 {
+        pitch = sfxPitch
+        vol = vol + sfxVolAdj
+        fr vol < 1 {
+            bet
+        }
+        fr vol > sfxVolCur {
+            vol = sfxVolCur
+        }
+    } naw {
+        pitch = NORM_PITCH
+    }
+    lowkey originNull = origin == ghosted
+    fr !originNull && !(origin == listener) {
+        lowkey aud, av, asep = sAdjustSoundParams(gt, listener, origin, vol, sep)
+        vol = av
+        sep = asep
+        lowkey ox = 0
+        lowkey oy = 0
+        lowkey lxp = 0
+        lowkey lyp = 0
+        holla om = origin in gs.thinkers {
+            ox = om.mobj.x as int
+            oy = om.mobj.y as int
+        } ghosted {
+            yeet("origin")
+        }
+        holla lmo = listener in gs.thinkers {
+            lxp = lmo.mobj.x as int
+            lyp = lmo.mobj.y as int
+        } ghosted {
+            yeet("listener")
+        }
+        fr ox == lxp && oy == lyp {
+            sep = NORM_SEP
+        }
+        fr !aud {
+            bet
+        }
+    } naw {
+        sep = NORM_SEP
+    }
+    fr soundId >= sounds.SFX_SAWUP && soundId <= sounds.SFX_SAWHIT {
+        pitch = pitch + 8 - (rnd.mRandom(gt) & 15)
+        fr pitch < 0 {
+            pitch = 0
+        } naw fr pitch > 255 {
+            pitch = 255
+        }
+    } naw fr soundId != sounds.SFX_ITEMUP && soundId != sounds.SFX_TINK {
+        pitch = pitch + 16 - (rnd.mRandom(gt) & 31)
+        fr pitch < 0 {
+            pitch = 0
+        } naw fr pitch > 255 {
+            pitch = 255
+        }
+    }
+    stopSound(gt, origin)
+    lowkey cnum = sGetChannel(gt, origin, soundId)
+    fr cnum < 0 {
+        bet
+    }
+    lowkey voice = isnd.iStartSound(gt, soundId, vol, sep, pitch)
+    holla g = gt in gs.gsc {
+        g.sound.channels[cnum].voice = voice as i32
+        g.sound.channels[cnum].endTick = (g.shell.gametic as i64) + (g.sound.sfxLenTics[soundId] as i64)
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// stopSound — S_StopSound: stop the (first) in-use channel whose origin matches (both a null
+// origin and a matching mobj tag count — mirrors id's pointer compare, NULL included).
+flex finna stopSound(gt: tag gs.GameState, origin: tag think.Thinker) {
+    lowkey target = -1
+    holla g = gt in gs.gsc {
+        lowkey n = g.sound.numChannels as int
+        lowkey i = 0
+        vibin i < n && target == -1 {
+            fr g.sound.channels[i].sfxId != 0 && g.sound.channels[i].originT == origin {
+                target = i
+            }
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    fr target != -1 {
+        sStopChannel(gt, target)
+    }
+}
+
+// updateSounds — S_UpdateSounds: per-tic, for each in-use channel: free it if its sound has
+// finished; otherwise re-derive moving-origin volume/sep and retune (or free if now inaudible).
+// `listener` is the player mobj (players[consoleplayer].mo).
+flex finna updateSounds(gt: tag gs.GameState, listener: tag think.Thinker) {
+    lowkey n = 0
+    lowkey sv = 0
+    holla g = gt in gs.gsc {
+        n = g.sound.numChannels as int
+        sv = g.sound.sfxVolume as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey cnum = 0
+    vibin cnum < n {
+        lowkey used = cap
+        lowkey sfxId = 0
+        lowkey endTick = 0 as i64
+        lowkey voice = 0
+        lowkey link = -1
+        lowkey sfxVolAdj = 0
+        lowkey origin: tag think.Thinker = ghosted
+        holla g = gt in gs.gsc {
+            fr g.sound.channels[cnum].sfxId != 0 {
+                used = nocap
+                sfxId = g.sound.channels[cnum].sfxId as int
+                endTick = g.sound.channels[cnum].endTick
+                voice = g.sound.channels[cnum].voice as int
+                origin = g.sound.channels[cnum].originT
+                lowkey sfx = g.info.sfx[sfxId]
+                link = sfx.link as int
+                sfxVolAdj = sfx.volume as int
+            }
+        } ghosted {
+            yeet("gs")
+        }
+        fr used {
+            fr isnd.iSoundIsPlaying(gt, endTick) {
+                lowkey volume = sv
+                lowkey sep = NORM_SEP
+                lowkey stopIt = cap
+                fr link != -1 {
+                    volume = sv + sfxVolAdj
+                    fr volume < 1 {
+                        stopIt = nocap
+                    } naw fr volume > sv {
+                        volume = sv
+                    }
+                }
+                fr stopIt {
+                    sStopChannel(gt, cnum)
+                } naw fr !(origin == ghosted) && !(origin == listener) {
+                    lowkey aud, av, asep = sAdjustSoundParams(gt, listener, origin, volume, sep)
+                    fr !aud {
+                        sStopChannel(gt, cnum)
+                    } naw {
+                        isnd.iUpdateSoundParams(gt, voice, av, asep)
+                    }
+                }
+            } naw {
+                sStopChannel(gt, cnum)
+            }
+        }
+        cnum = cnum + 1
+    }
+}
+
+// setMusicVolume — S_SetMusicVolume: store snd_MusicVolume (g.sound.musicVolume per CONTRACTS
+// note 4). The device-side I_SetMusicVolume is a music-seam no-op.
+flex finna setMusicVolume(gt: tag gs.GameState, volume: int) {
+    fr volume < 0 || volume > 127 {
+        yeet("bad-music-volume")
+    }
+    holla g = gt in gs.gsc {
+        g.sound.musicVolume = volume as i32
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// setSfxVolume — S_SetSfxVolume: store snd_SfxVolume.
+flex finna setSfxVolume(gt: tag gs.GameState, volume: int) {
+    fr volume < 0 || volume > 127 {
+        yeet("bad-sfx-volume")
+    }
+    holla g = gt in gs.gsc {
+        g.sound.sfxVolume = volume as i32
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// startMusic — S_StartMusic: change music (non-looping).
+flex finna startMusic(gt: tag gs.GameState, musicId: int) {
+    changeMusic(gt, musicId, 0)
+}
+
+// changeMusic — S_ChangeMusic: resolve the "d_<name>" MUS lump offset+length and store it in
+// MusicState with the new id (the actual OPL/MUS decode is the i_music seam). No-ops if the same
+// track is already playing. iPlaySong is the platform hook the music workstream fills in.
+flex finna changeMusic(gt: tag gs.GameState, musicId: int, looping: int) {
+    fr musicId <= sounds.MUS_NONE || musicId >= sounds.NUMMUSIC {
+        yeet("bad-music-id")
+    }
+    lowkey cur = 0
+    holla g = gt in gs.gsc {
+        cur = g.music.musId as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr cur == musicId {
+        bet
+    }
+    stopMusic(gt)
+    lowkey lump = w.checkNumForName(gt, dName(musName(musicId)))
+    lowkey ofs = -1
+    lowkey len = 0
+    fr lump != -1 {
+        ofs = w.lumpNum(gt, lump)
+        len = w.lumpLength(gt, lump)
+    }
+    holla g = gt in gs.gsc {
+        g.music.musId = musicId as i32
+        g.music.musLumpOfs = ofs
+        g.music.musLumpLen = len
+        g.music.musicPlaying = nocap
+        g.music.musicPaused = cap
+    } ghosted {
+        yeet("gs")
+    }
+    isnd.iPlaySong(gt, musicId, looping)
+}
+
+// stopMusic — S_StopMusic: stop (and unregister) the playing song via the i_music seam.
+flex finna stopMusic(gt: tag gs.GameState) {
+    lowkey playing = cap
+    lowkey paused = cap
+    holla g = gt in gs.gsc {
+        playing = g.music.musicPlaying
+        paused = g.music.musicPaused
+    } ghosted {
+        yeet("gs")
+    }
+    fr playing {
+        fr paused {
+            isnd.iResumeSong(gt)
+        }
+        isnd.iStopSong(gt)
+        holla g = gt in gs.gsc {
+            g.music.musicPlaying = cap
+            g.music.musId = 0
+        } ghosted {
+            yeet("gs")
+        }
+    }
+}
+
+// pauseSound — S_PauseSound: pause the song during game PAUSE.
+flex finna pauseSound(gt: tag gs.GameState) {
+    lowkey playing = cap
+    lowkey paused = cap
+    holla g = gt in gs.gsc {
+        playing = g.music.musicPlaying
+        paused = g.music.musicPaused
+    } ghosted {
+        yeet("gs")
+    }
+    fr playing && !paused {
+        isnd.iPauseSong(gt)
+        holla g = gt in gs.gsc {
+            g.music.musicPaused = nocap
+        } ghosted {
+            yeet("gs")
+        }
+    }
+}
+
+// resumeSound — S_ResumeSound: resume the song after PAUSE.
+flex finna resumeSound(gt: tag gs.GameState) {
+    lowkey playing = cap
+    lowkey paused = cap
+    holla g = gt in gs.gsc {
+        playing = g.music.musicPlaying
+        paused = g.music.musicPaused
+    } ghosted {
+        yeet("gs")
+    }
+    fr playing && paused {
+        isnd.iResumeSong(gt)
+        holla g = gt in gs.gsc {
+            g.music.musicPaused = cap
+        } ghosted {
+            yeet("gs")
+        }
+    }
+}
