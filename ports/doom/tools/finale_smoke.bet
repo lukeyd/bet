@@ -1,0 +1,219 @@
+// tools/finale_smoke.bet — the P2.9c INTERMISSION + FINALE proof. Cops a GameState, gsInit, fills
+// the generated tables + RNG, loads the shareware IWAD, R_InitData (flats/colormaps), HU_Init (the
+// finale text font). Then:
+//   1. populate g.shell.wminfo with a plausible E1M1 -> E1M2 single-player result, WI_Start, run
+//      WI_Ticker enough tics to fully count the stats, WI_Drawer -> crc32(scr0).
+//   2. F_StartFinale (E1 text), run F_Ticker until the whole E1TEXT crawl is revealed (stage still
+//      0), F_Drawer -> crc32(scr0).
+// Both CRCs are self-consistency baselines (deterministic given doom1.wad), committed as
+// goldens/finale.golden.
+//
+// Build+run NATIVE (headless — the interp clones arrays per element read at WAD scale, intractable,
+// like the other WAD smokes):
+//   export LLVM_SYS_180_PREFIX=/opt/homebrew/opt/llvm@18; export LIBRARY_PATH="/opt/homebrew/lib:$LIBRARY_PATH"
+//   cargo build -p driver --features llvm
+//   ./target/debug/bet build ports/doom/tools/finale_smoke.bet --runtime real -o /tmp/finale_smoke
+//   BET_GG_HEADLESS=1 /tmp/finale_smoke
+pull "spill"
+pull "mem"
+pull "str"
+pull "../defs/gs" as gs
+pull "../defs/info" as info
+pull "../defs/sounds" as sounds
+pull "../defs/tables" as tables
+pull "../defs/doomdef" as doomdef
+pull "../util/m_random" as rnd
+pull "../w/w_wad" as wad
+pull "../r/r_data" as rdata
+pull "../s/s_sound" as ssnd
+pull "../hu/hu_stuff" as hu
+pull "../wi/wi_stuff" as wi
+pull "../f/f_finale" as fin
+
+// ---- crc32 (IEEE reflected, poly 0xEDB88320) over scr0 — same as menu_smoke ------------------
+flex finna hex8(v: int) -> str {
+    lowkey val = v & 4294967295
+    lowkey buf = mem.slab[u8](8)
+    lowkey i = 0
+    vibin i < 8 {
+        lowkey nib = val >> 28 - i * 4 & 15
+        fr nib < 10 {
+            buf[i] = (48 + nib) as u8
+        } naw {
+            buf[i] = (87 + nib) as u8
+        }
+        i = i + 1
+    }
+    bet str.fromBytesTrust(buf)
+}
+
+flex finna crcTable() -> []i32 {
+    lowkey tbl = mem.slab[i32](256)
+    lowkey i = 0
+    vibin i < 256 {
+        lowkey c = i
+        lowkey k = 0
+        vibin k < 8 {
+            lowkey lsb = c & 1
+            c = c >> 1
+            fr lsb != 0 {
+                c = c ^ 3988292384
+            }
+            k = k + 1
+        }
+        tbl[i] = c as i32
+        i = i + 1
+    }
+    bet tbl
+}
+
+flex finna crc32Scr0(gt: tag gs.GameState, tbl: []i32) -> int {
+    lowkey crc = 4294967295
+    holla g = gt in gs.gsc {
+        lowkey i = 0
+        vibin i < 64000 {
+            lowkey byte = g.vid.scr0[i] as int
+            crc = crc >> 8 ^ tbl[(crc ^ byte) & 255] as int & 4294967295
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    bet (crc ^ 4294967295) & 4294967295
+}
+
+flex finna countNonzero(gt: tag gs.GameState) -> int {
+    lowkey n = 0
+    holla g = gt in gs.gsc {
+        lowkey i = 0
+        vibin i < 64000 {
+            fr g.vid.scr0[i] as int != 0 {
+                n = n + 1
+            }
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    bet n
+}
+
+finna main() {
+    lowkey g0 = cop gs.GameState{} in gs.gsc
+    gs.gsInit(g0)
+
+    // generated data tables + RNG table (WI_initAnimatedBack draws from M_Random; SFX pitch jitter).
+    holla g = g0 in gs.gsc {
+        info.initStatesAll(g.info.states)
+        info.initMobjinfoAll(g.info.mobjinfo)
+        sounds.initSfxAll(g.info.sfx)
+        g.info.finesine = tables.initFinesineAll(g.info.finesine)
+        g.info.finetangent = tables.initFinetangentAll(g.info.finetangent)
+        g.info.tantoangle = tables.initTantoangleAll(g.info.tantoangle)
+        g.tick.rndtable = rnd.initRndtable(g.tick.rndtable)
+        // single-player shareware shell
+        g.shell.gamemode = doomdef.GM_SHAREWARE as i32
+        g.shell.gameepisode = 1
+        g.shell.gamemap = 1
+        g.shell.consoleplayer = 0
+        g.shell.displayplayer = 0
+        g.shell.playeringame[0] = nocap
+        g.shell.netgame = cap
+        g.shell.deathmatch = 0
+        g.shell.gamestate = doomdef.GS_LEVEL as i32
+    } ghosted {
+        yeet("gs")
+    }
+    rnd.clearRandom(g0)
+
+    wad.initWad(g0, "/Users/lukebaggett/Documents/bet/doom-reference/doom1.wad")
+    ssnd.sInit(g0, 8, 8)          // sfx/music volumes (the counting SFX go through S_StartSound)
+    rdata.initData(g0)            // flats/colormaps (F_TextWrite tiles a flat)
+    hu.huInit(g0)                 // the HU_FONT (F_TextWrite reveals the crawl through it)
+
+    lowkey ctab = crcTable()
+
+    // ---- Phase A: intermission over a faked E1M1 -> E1M2 result ---------------------------------
+    // wminfo: episode 0 (E1), last=E1M1(0), next=E1M2(1); a plausible single-player stat line.
+    holla g = g0 in gs.gsc {
+        g.shell.wminfo.epsd = 0
+        g.shell.wminfo.didsecret = cap
+        g.shell.wminfo.last = 0
+        g.shell.wminfo.next = 1
+        g.shell.wminfo.maxkills = 50
+        g.shell.wminfo.maxitems = 20
+        g.shell.wminfo.maxsecret = 5
+        g.shell.wminfo.maxfrags = 0
+        g.shell.wminfo.partime = 1050          // 30s * TICRATE
+        g.shell.wminfo.pnum = 0
+        g.shell.wminfo.plyr[0].inGame = nocap
+        g.shell.wminfo.plyr[0].skills = 45     // 45/50 kills -> 90%
+        g.shell.wminfo.plyr[0].sitems = 18     // 18/20 items -> 90%
+        g.shell.wminfo.plyr[0].ssecret = 3     // 3/5 secret -> 60%
+        g.shell.wminfo.plyr[0].stime = 3150    // 90s * TICRATE
+    } ghosted {
+        yeet("gs")
+    }
+
+    wi.wiStart(g0)
+    // Run the stat machine to completion: accelerate then tick until StatCount reveals everything.
+    // ~300 tics (SP counts kills+items+secret at +2/tic to 90%, then time/par at +3/tic) is ample.
+    lowkey t = 0
+    vibin t < 400 {
+        wi.wiTicker(g0)
+        t = t + 1
+    }
+    wi.wiDrawer(g0)
+    lowkey crcWi = crc32Scr0(g0, ctab)
+    lowkey nzWi = countNonzero(g0)
+
+    // read back the final counted stat values (should be the true %s + mm:ss).
+    lowkey ck = 0
+    lowkey ci = 0
+    lowkey cs = 0
+    lowkey ctime = 0
+    lowkey cpar = 0
+    lowkey wistate = 0
+    holla g = g0 in gs.gsc {
+        ck = g.wi.cntKills[0] as int
+        ci = g.wi.cntItems[0] as int
+        cs = g.wi.cntSecret[0] as int
+        ctime = g.wi.cntTime as int
+        cpar = g.wi.cntPar as int
+        wistate = g.wi.state as int
+    } ghosted {
+        yeet("gs")
+    }
+    spill.f("WI kills={} items={} secret={} time={} par={} state={} nz={} crc=0x{}\n",
+        ck, ci, cs, ctime, cpar, wistate, nzWi, hex8(crcWi))
+
+    // ---- Phase B: the E1 finale text crawl ------------------------------------------------------
+    fin.startFinale(g0)
+    lowkey textLen = 0
+    holla g = g0 in gs.gsc {
+        textLen = str.len(g.finale.text)
+    } ghosted {
+        yeet("gs")
+    }
+    // reveal the whole crawl: count > textLen*TEXTSPEED + 10 fully reveals it, and staying under
+    // textLen*TEXTSPEED + TEXTWAIT keeps finalestage at 0 (the text screen).
+    lowkey ticks = textLen * 3 + 20
+    lowkey ft = 0
+    vibin ft < ticks {
+        fin.fTicker(g0)
+        ft = ft + 1
+    }
+    fin.fDrawer(g0)
+    lowkey crcFin = crc32Scr0(g0, ctab)
+    lowkey nzFin = countNonzero(g0)
+    lowkey finstage = 0
+    lowkey fincount = 0
+    holla g = g0 in gs.gsc {
+        finstage = g.finale.stage as int
+        fincount = g.finale.count as int
+    } ghosted {
+        yeet("gs")
+    }
+    spill.f("FIN textlen={} count={} stage={} nz={} crc=0x{}\n",
+        textLen, fincount, finstage, nzFin, hex8(crcFin))
+}
