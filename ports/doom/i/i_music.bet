@@ -1,0 +1,257 @@
+// i/i_music.bet — the GLUE that turns the finished OPL2/MUS music DSP core (s/opl, s/mus,
+// s/genmidi) into audible in-engine music through the gg raw audio ring. This is the body of
+// what linuxdoom's I_*Music/I_*Song only stubbed (Linux had no music) — the real thing DMX did.
+//
+// SEAM SHAPE (DAG): s_sound -> i_sound -> i_music -> {opl, mus, genmidi, w_wad, gs}. i_music
+// pulls i_sound's *dependencies* but NOT i_sound, so i_sound calling i_music is acyclic. The
+// five i_sound music stubs (iInitMusic/iPlaySong/iStopSong/iPauseSong/iResumeSong) now forward
+// here; s_sound is untouched (it still just sets g.music.{musId,musLumpOfs,musLumpLen} and calls
+// the i_sound hooks). d_main/g_game additionally call `musicUpdate(gt)` ONCE PER FRAME — the new
+// per-frame seam P2.8 wires into the main loop.
+//
+// STATE: the whole synth lives in g.music (gs.MusicState) — the OPL chip, the decoded MUS event
+// vec, the cached GENMIDI bank, the sequencer voice/channel tables, and a streaming cursor. The
+// music core is "build-then-thread" (mutators return the value, caller rebinds); here we read the
+// handle out of g.music, thread it through a chunk of samples, and write it back — the exact
+// pattern opl/mus prove lowers native. Module-level state is avoided (mutable globals don't lower).
+//
+// OUTPUT: the core renders MONO i16 samples; we duplicate L=R into an interleaved stereo slab and
+// push it to the raw ring via gg.audio (the voice mixer gg.sound/play is SFX-only). Backpressure
+// keeps ~0.25s buffered using gg.pending() so we neither starve nor unboundedly outrun the device.
+//
+// Build+run NATIVE (headless — gg.audio is a no-op, gg.pending() == 0, gg.audioSpec() == 48000/2;
+// the SYNTH still runs and is what's proven):
+//   cargo build -p driver --features llvm && cargo build -p runtime --features gg-desktop
+//   bet build ports/doom/tools/music_smoke.bet --runtime real -o /tmp/music_smoke
+//   BET_GG_HEADLESS=1 /tmp/music_smoke
+// A windowed run (actually audible) drops BET_GG_HEADLESS and needs a gg.show/gg.ticks pacing
+// loop calling musicUpdate each frame (manual check).
+pull "mem"
+pull "vec"
+pull "../defs/gs" as gs
+pull "../s/opl" as opl
+pull "../s/mus" as mus
+pull "../s/genmidi" as genmidi
+pull "../w/w_wad" as w
+
+flex facts TICRATE: int = 35        // video frame rate; the MUS sequencer runs at 140Hz (4x)
+
+// musicInit — I_InitMusic: parse the GENMIDI OPL instrument bank ONCE and cache it in g.music.
+// Idempotent (guarded by musInitted). Needs the IWAD already loaded (initWad); called from
+// i_sound.iInitMusic at I_InitSound time. Absent GENMIDI (never in a real IWAD) leaves the bank
+// empty and musicUpdate silent.
+flex finna musicInit(gt: tag gs.GameState) {
+    lowkey already = cap
+    holla g = gt in gs.gsc {
+        already = g.music.musInitted
+    } ghosted {
+        yeet("gs")
+    }
+    fr already {
+        bet
+    }
+    lowkey lump = w.checkNumForName(gt, "GENMIDI")
+    fr lump == -1 {
+        bet
+    }
+    lowkey ofs = w.lumpNum(gt, lump)
+    lowkey len = w.lumpLength(gt, lump)
+    holla g = gt in gs.gsc {
+        g.music.instrs = genmidi.parseGenmidi(g.wad.buf, ofs, len)
+        g.music.genmidiOfs = ofs
+        g.music.musInitted = nocap
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// musicPlay — I_PlaySong: begin (or restart) playback of the MUS lump s_sound resolved into
+// g.music (musLumpOfs/musLumpLen). Decodes the MUS stream, (re)builds the OPL chip at the device
+// rate, resets the sequencer + streaming cursor, and arms playback. `looping` (1/0) repeats the
+// song at score-end. A missing lump (ofs < 0, e.g. a map with no music) is a silent no-op. Lazily
+// runs musicInit if the GENMIDI bank isn't cached yet.
+flex finna musicPlay(gt: tag gs.GameState, musLumpOfs: int, musLumpLen: int, looping: int) {
+    fr musLumpOfs < 0 {
+        holla g = gt in gs.gsc {
+            g.music.musicPlaying = cap
+        } ghosted {
+            yeet("gs")
+        }
+        bet
+    }
+    lowkey initted = cap
+    holla g = gt in gs.gsc {
+        initted = g.music.musInitted
+    } ghosted {
+        yeet("gs")
+    }
+    fr !initted {
+        musicInit(gt)
+    }
+    lowkey rate, ch = gg.audioSpec()
+    holla g = gt in gs.gsc {
+        g.music.events = mus.decodeMus(g.wad.buf, musLumpOfs, musLumpLen)
+        g.music.chip = opl.oplInit(rate)
+        g.music.seq = mus.newSeq()
+        g.music.seqCursor = 0
+        g.music.delaySamples = 0
+        g.music.musRate = rate as i32
+        g.music.looping = looping as i32
+        g.music.samplesRendered = 0
+        g.music.musicPlaying = nocap
+        g.music.musicPaused = cap
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// musicStop — I_StopSong: halt playback. musicUpdate stops feeding the ring immediately; the
+// samples already queued drain naturally. The chip/events are left in place (cheap; a fresh
+// musicPlay rebuilds them).
+flex finna musicStop(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.music.musicPlaying = cap
+        g.music.musicPaused = cap
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// musicPause — I_PauseSong: suspend rendering (game PAUSE). musicUpdate emits nothing while paused.
+flex finna musicPause(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.music.musicPaused = nocap
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// musicResume — I_ResumeSong: resume rendering after PAUSE.
+flex finna musicResume(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.music.musicPaused = cap
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// musicStep — the streaming core: advance the sequencer/chip persisted in g.music, APPENDING up
+// to `maxSamples` mono i16 samples to `out`, and thread the updated chip/seq/cursor/delay back
+// into g.music. Returns the number of mono samples appended. This is exactly the DMX i_oplmusic
+// service routine, but re-entrant: it renders in chunks (any size) and picks up where it left off,
+// so N calls of size k produce the SAME sample stream as one call of size N*k (the per-sample
+// chip state is threaded — chunk boundaries never affect a sample value; that equivalence is what
+// tools/music_smoke asserts against the batch renderer mus.musToOpl).
+//
+// The per-event delay (140Hz MUS ticks) is converted to samples with the core's samplesPerTick =
+// rate/140, matching mus.musToOpl exactly. At score-end: loop (reset cursor + sequencer) or stop.
+flex finna musicStep(gt: tag gs.GameState, out: vec[int], maxSamples: int) -> int {
+    lowkey rendered = 0
+    holla g = gt in gs.gsc {
+        fr g.music.musicPlaying && !g.music.musicPaused && g.music.musRate > 0 {
+            lowkey rate = g.music.musRate as int
+            lowkey spt = rate / 140
+            lowkey numEvents = g.music.events.gang() as int
+            lowkey cursor = g.music.seqCursor
+            lowkey delay = g.music.delaySamples
+            lowkey looping = g.music.looping as int
+            lowkey ms = mus.MusicState{ chip: g.music.chip, seq: g.music.seq }
+            lowkey stop = cap
+            lowkey applies = 0
+            lowkey applyCap = numEvents * 4 + 64
+            vibin rendered < maxSamples && !stop {
+                fr delay > 0 {
+                    // render up to the frame budget, but not past the next event
+                    lowkey n = delay
+                    fr rendered + n > maxSamples {
+                        n = maxSamples - rendered
+                    }
+                    lowkey c2 = opl.oplRender(ms.chip, out, n)
+                    ms = mus.MusicState{ chip: c2, seq: ms.seq }
+                    rendered = rendered + n
+                    delay = delay - n
+                } naw fr cursor >= numEvents {
+                    // score-end (or empty song): loop or stop
+                    fr looping != 0 && numEvents > 0 {
+                        cursor = 0
+                        ms = mus.MusicState{ chip: ms.chip, seq: mus.newSeq() }
+                        delay = 0
+                        applies = applies + 1
+                        fr applies > applyCap {
+                            stop = nocap
+                        }
+                    } naw {
+                        g.music.musicPlaying = cap
+                        stop = nocap
+                    }
+                } naw {
+                    // apply the next event, then its delay governs the following one
+                    lowkey e = g.music.events[cursor]
+                    ms = mus.applyEvent(ms, g.music.instrs, e)
+                    delay = (e.delay as int) * spt
+                    cursor = cursor + 1
+                    applies = applies + 1
+                    fr applies > applyCap {
+                        stop = nocap
+                    }
+                }
+            }
+            g.music.chip = ms.chip
+            g.music.seq = ms.seq
+            g.music.seqCursor = cursor
+            g.music.delaySamples = delay
+            g.music.samplesRendered = g.music.samplesRendered + rendered
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    bet rendered
+}
+
+// musicUpdate — the PER-FRAME seam (call once per frame from d_main/g_game). Tops up the raw audio
+// ring so music keeps playing between frames. Backpressure: keep ~0.25s of stereo buffered
+// (interleaved i16 == rate/2) using gg.pending(); render only the deficit, capped at two video
+// frames' worth so a starved ring recovers without a spike. Renders MONO via musicStep, duplicates
+// L=R into an interleaved stereo slab, and pushes it with gg.audio. Returns the mono sample count
+// rendered this frame (0 when stopped/paused or the ring is already full enough).
+flex finna musicUpdate(gt: tag gs.GameState) -> int {
+    lowkey playing = cap
+    lowkey paused = cap
+    lowkey rate = 0
+    holla g = gt in gs.gsc {
+        playing = g.music.musicPlaying
+        paused = g.music.musicPaused
+        rate = g.music.musRate as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr !playing || paused || rate <= 0 {
+        bet 0
+    }
+    // target backlog: 0.25s of stereo == rate frames/s * 2 ch * 0.25s == rate/2 interleaved i16.
+    lowkey target = rate / 2
+    lowkey pend = gg.pending()
+    lowkey deficit = target - pend
+    fr deficit <= 0 {
+        bet 0
+    }
+    lowkey monoBudget = deficit / 2                 // interleaved i16 deficit -> mono samples
+    lowkey maxPerFrame = (rate / TICRATE) * 2       // cap: ~2 frames of audio; bounds per-call work
+    fr monoBudget > maxPerFrame {
+        monoBudget = maxPerFrame
+    }
+    lowkey out = vec.new[int]()
+    lowkey n = musicStep(gt, out, monoBudget)
+    fr n > 0 {
+        lowkey buf = mem.slab[i16](n * 2)
+        lowkey i = 0
+        vibin i < n {
+            lowkey v = out[i]
+            buf[i * 2] = v as i16
+            buf[i * 2 + 1] = v as i16
+            i = i + 1
+        }
+        gg.audio(buf, n * 2)
+    }
+    bet n
+}

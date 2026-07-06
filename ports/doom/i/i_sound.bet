@@ -1,6 +1,6 @@
 // i/i_sound.bet — the i_sound.c seam translated from the Linux /dev/dsp DMX mixer to the gg
-// platform audio API (gg.sound/play/tune/stop). SFX ONLY; the music functions are stubs (the
-// OPL/MUS synth is a separate workstream — see the `SEAM: i_music` markers below).
+// platform audio API (gg.sound/play/tune/stop). SFX here; the five music hooks now forward to
+// i/i_music (P2.10), which drives the real OPL2/MUS synth into the gg raw ring (see bottom).
 //
 // PORTED (SFX): I_InitSound (getsfx + pre-cache all DS* lumps → gg.sound handles), I_StartSound
 //   (→ gg.play + gg.tune), I_UpdateSoundParams (→ gg.tune), I_StopSound (→ gg.stop),
@@ -23,6 +23,7 @@ pull "../defs/gs" as gs
 pull "../defs/sounds" as sounds
 pull "../w/w_wad" as w
 pull "../util/bstream" as bstream
+pull "i_music" as imus
 
 flex facts TICRATE: int = 35
 flex facts NORM_PITCH: int = 128
@@ -169,37 +170,39 @@ flex finna iSoundIsPlaying(gt: tag gs.GameState, endTick: i64) -> bool {
 }
 
 // ===========================================================================================
-// MUSIC API — STUBS. linuxdoom's I_*Music were themselves dummies (no music on Linux); the real
-// MUS-sequencer + OPL2 synth is a separate workstream. s_sound owns the MusicState bookkeeping
-// (mus id, paused flag, lump offset) and calls these platform hooks; the music agent replaces
-// the bodies below to actually drive the synth voice.
-//
-// SEAM: i_music (music DSP) wires here. To integrate, the music workstream implements:
-//   iInitMusic  — one-time synth/GENMIDI setup (currently: nothing).
-//   iPlaySong(gt, handle, looping) — begin playback of the MUS lump s_sound resolved into
-//                MusicState (musLumpOfs/musLumpLen); `looping` repeats it. `handle` is the s_sound
-//                song id (== musicId). Currently a no-op.
-//   iStopSong / iPauseSong / iResumeSong — transport control. Currently no-ops.
-// The music agent should read g.music.{musId,musLumpOfs,musLumpLen,genmidiOfs} (all set by
-// s_sound.changeMusic) and render into the gg audio stream (its own gg.sound/play or a mixer
-// callback). No SFX code changes are needed to wire it in.
+// MUSIC API — WIRED (P2.10). linuxdoom's I_*Music were dummies (no music on Linux); these now
+// forward to i/i_music, which drives the real OPL2/MUS synth into the gg raw audio ring. s_sound
+// still owns the transport bookkeeping (musId, paused/playing, lump ofs/len set by changeMusic)
+// and calls these platform hooks; the hooks are the thin i_sound->i_music bridge. The SFX code
+// above is untouched. NOTE the DAG: i_sound pulls i_music (not the reverse) — i_music depends on
+// i_sound's *dependencies* (opl/mus/genmidi/w_wad/gs) but never on i_sound, so this is acyclic.
+// The main loop must additionally call `i_music.musicUpdate(gt)` once per frame to feed the ring.
 // ===========================================================================================
 flex finna iInitMusic(gt: tag gs.GameState) {
-    // SEAM: i_music — synth init. No-op stub.
+    imus.musicInit(gt)
 }
 
 flex finna iPlaySong(gt: tag gs.GameState, handle: int, looping: int) {
-    // SEAM: i_music — begin MUS playback. No-op stub.
+    // s_sound.changeMusic already resolved the "d_<name>" lump into g.music.musLumpOfs/Len.
+    lowkey ofs = 0
+    lowkey len = 0
+    holla g = gt in gs.gsc {
+        ofs = g.music.musLumpOfs
+        len = g.music.musLumpLen
+    } ghosted {
+        yeet("gs")
+    }
+    imus.musicPlay(gt, ofs, len, looping)
 }
 
 flex finna iStopSong(gt: tag gs.GameState) {
-    // SEAM: i_music — stop MUS playback. No-op stub.
+    imus.musicStop(gt)
 }
 
 flex finna iPauseSong(gt: tag gs.GameState) {
-    // SEAM: i_music — pause. No-op stub.
+    imus.musicPause(gt)
 }
 
 flex finna iResumeSong(gt: tag gs.GameState) {
-    // SEAM: i_music — resume. No-op stub.
+    imus.musicResume(gt)
 }
