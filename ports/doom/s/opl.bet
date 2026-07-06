@@ -1,0 +1,567 @@
+// opl.bet — a compact OPL2 (Yamaha YM3812) FM synthesizer, register-accurate at
+// the interface but floating-point in the core. Faithful and listenable, NOT
+// bit-exact (an explicit non-goal of the port) — pitch, envelopes, waveforms and
+// instrument register semantics are correct; the exact DAC/log-sin fixed-point
+// pipeline of the real chip is approximated in f64.
+//
+// 9 channels x 2 operators (modulator -> carrier in FM mode, or additive). Each
+// operator has a phase generator (4 OPL2 waveforms, MULT), a DADSR envelope with
+// KSR rate-scaling and KSL key-scale attenuation, and a total-level.
+//
+// STATE MODEL (interp==compiled) — the crux of this port:
+//   * Read-only tables (sine, gain, rates, maps) are `vec` fields: Rc-backed shared
+//     handles that are cheap to read-index and cheap to copy (handle only) in BOTH
+//     the interpreter and native code.
+//   * Mutable per-operator / per-channel state are FIXED-ARRAY fields (`f64[18]`,
+//     `int[9]`): value types that copy identically in both backends, and whose
+//     ELEMENTS can be assigned natively (a `vec` element cannot — vec is
+//     append-only when lowered).
+//   * The chip is therefore THREADED: every mutator returns the chip and the caller
+//     rebinds (`c = oplWriteReg(c, ..)`). Threading copies the small fixed arrays +
+//     Rc-clones the table handles — cheap, and identical across backends. Per-sample
+//     state changes stay INLINE in `oplRender` (never handed to a mutating helper),
+//     so the hot loop mutates in place. The heavy per-sample math is factored into
+//     PURE helpers that take table `vec`s + scalars and return values.
+pull "spill"
+
+facts SINLEN: int = 1024
+facts ATT_MAX: f64 = 512.0     // envelope attenuation ceiling (~48 dB), 1/64-octave units
+facts OPL_NATIVE: f64 = 49716.0
+facts FM_INDEX: f64 = 0.5      // carrier phase deviation (turns) per unit modulator output
+facts ENV_K: f64 = 16.0        // envelope speed: units/second base (doubles every 4 rate steps)
+facts OUT_SCALE: f64 = 7000.0  // f64 mix (~+/-1 per active channel) -> i16
+
+// The chip. Tables are shared vec handles; state is threaded fixed arrays.
+flex drip OplChip {
+    flex rate: f64
+    // ---- read-only tables (vec handles) ----
+    flex sinT: vec[f64]        // SINLEN sine samples
+    flex gainT: vec[f64]       // gain per attenuation unit (index 0..512)
+    flex incTab: vec[f64]      // per-sample envelope delta per effective rate 0..63
+    flex multTab: vec[f64]     // MULT nibble -> frequency multiplier
+    flex fbTab: vec[f64]       // feedback amount -> modulation turns scale
+    flex pow2Tab: vec[f64]     // 2^n for n=0..20 (F-number scaling)
+    flex kslRom: vec[int]      // KSL base attenuation by fnum top-4-bits
+    flex modOff: vec[int]      // hardware operator offset per channel (modulator)
+    flex carOff: vec[int]      // hardware operator offset per channel (carrier)
+    flex offToOp: vec[int]     // 22-entry: hardware offset -> op index, or -1
+    // ---- mutable state (threaded fixed arrays); op index = channel*2 + role ----
+    flex opPhase: f64[18]      // phase accumulator, TURNS [0,1)
+    flex opEnv: f64[18]        // envelope attenuation, 0 (loud) .. 512 (silent)
+    flex opOut: f64[18]        // last operator output sample (FM + feedback)
+    flex opPrev: f64[18]       // previous output (feedback averaging)
+    flex opStage: int[18]      // 0 off, 1 attack, 2 decay, 3 sustain, 4 release
+    flex opAvekm: int[18]      // reg 0x20: AM|VIB|EGT|KSR|MULT
+    flex opKslTl: int[18]      // reg 0x40: KSL|TL
+    flex opArDr: int[18]       // reg 0x60: AR|DR
+    flex opSlRr: int[18]       // reg 0x80: SL|RR
+    flex opWs: int[18]         // reg 0xE0: waveform 0..3
+    flex chFnum: int[9]        // 10-bit F-number
+    flex chBlock: int[9]       // 0..7 octave
+    flex chKeyOn: int[9]       // 0/1
+    flex chFbCon: int[9]       // reg 0xC0: FEEDBACK|CONNECTION
+}
+
+// -------- small math (no math.* intrinsics on this branch) --------
+
+finna nsqrt(x: f64) -> f64 {
+    fr x <= 0.0 {
+        bet 0.0
+    }
+    lowkey g = x
+    lowkey i = 0
+    vibin i < 40 {
+        g = 0.5 * (g + x / g)
+        i = i + 1
+    }
+    bet g
+}
+
+finna pow2i(n: int) -> f64 {
+    lowkey s = 1.0
+    lowkey i = 0
+    vibin i < n {
+        s = s * 2.0
+        i = i + 1
+    }
+    bet s
+}
+
+finna exp2f(x: f64) -> f64 {
+    lowkey n = x as int
+    fr (n as f64) > x {
+        n = n - 1
+    }
+    lowkey f = x - (n as f64)
+    lowkey y = f * 0.6931471805599453
+    lowkey p = 1.0 + y * (1.0 + y * (0.5 + y * (0.16666666666667 + y * (0.041666666667 + y * 0.0083333333))))
+    lowkey s = 1.0
+    fr n >= 0 {
+        lowkey i = 0
+        vibin i < n {
+            s = s * 2.0
+            i = i + 1
+        }
+    } naw {
+        lowkey i = 0
+        vibin i < (0 - n) {
+            s = s * 0.5
+            i = i + 1
+        }
+    }
+    bet p * s
+}
+
+// sin(2*pi*turn) for any turn, via quadrant folding + Taylor on [0,pi/2].
+finna sinUnit(turn: f64) -> f64 {
+    lowkey t = turn - ((turn as int) as f64)
+    fr t < 0.0 {
+        t = t + 1.0
+    }
+    lowkey sign = 1.0
+    fr t >= 0.5 {
+        t = t - 0.5
+        sign = 0.0 - 1.0
+    }
+    fr t > 0.25 {
+        t = 0.5 - t
+    }
+    lowkey a = t * 6.283185307179586
+    lowkey a2 = a * a
+    lowkey s = a * (1.0 - a2 / 6.0 * (1.0 - a2 / 20.0 * (1.0 - a2 / 42.0 * (1.0 - a2 / 72.0))))
+    bet sign * s
+}
+
+// MIDI note (fractional) -> frequency Hz.
+flex finna midiToHz(m: f64) -> f64 {
+    bet 440.0 * exp2f((m - 69.0) / 12.0)
+}
+
+// 2^n (integer n >= 0) — exported for tools that compute F-numbers.
+flex finna pow2iPub(n: int) -> f64 {
+    bet pow2i(n)
+}
+
+// Fractional part in [0,1) (handles negatives from phase modulation).
+finna frac(x: f64) -> f64 {
+    lowkey f = x - ((x as int) as f64)
+    fr f < 0.0 {
+        f = f + 1.0
+    }
+    bet f
+}
+
+// -------- zero-fill helpers for fixed-array chip fields --------
+finna zf18() -> f64[18] {
+    bet [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+}
+finna zi18() -> int[18] {
+    bet [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+}
+finna zi9() -> int[9] {
+    bet [0, 0, 0, 0, 0, 0, 0, 0, 0]
+}
+
+// -------- init --------
+
+// Build a chip at output sample rate `rate` (Hz). Fills sine/gain/rate tables.
+flex finna oplInit(rate: int) -> OplChip {
+    lowkey sinT = vec.new[f64]()
+    lowkey i = 0
+    vibin i < SINLEN {
+        sinT.stack(sinUnit((i as f64) / (SINLEN as f64)))
+        i = i + 1
+    }
+
+    // gain table: gainT[k] = 2^(-k/64); r = 64th root of 1/2 (six square roots)
+    lowkey gainT = vec.new[f64]()
+    lowkey r = 0.5
+    lowkey s = 0
+    vibin s < 6 {
+        r = nsqrt(r)
+        s = s + 1
+    }
+    lowkey g = 1.0
+    i = 0
+    vibin i < 513 {
+        gainT.stack(g)
+        g = g * r
+        i = i + 1
+    }
+
+    // envelope increment table: incTab[R] = (ENV_K/rate) * 2^(R/4)
+    lowkey p25 = nsqrt(nsqrt(2.0))
+    lowkey p50 = nsqrt(2.0)
+    lowkey q4 = vec.new[f64]()
+    q4.stack(1.0)
+    q4.stack(p25)
+    q4.stack(p50)
+    q4.stack(p50 * p25)
+    lowkey incTab = vec.new[f64]()
+    lowkey base = ENV_K / (rate as f64)
+    i = 0
+    vibin i < 64 {
+        incTab.stack(base * pow2i(i >> 2) * q4[i & 3])
+        i = i + 1
+    }
+
+    lowkey multTab = vec.new[f64]()
+    squad x in [0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 10.0, 12.0, 12.0, 15.0, 15.0] {
+        multTab.stack(x)
+    }
+    lowkey fbTab = vec.new[f64]()
+    squad x in [0.0, 0.0625, 0.125, 0.25, 0.5, 0.75, 1.0, 1.5] {
+        fbTab.stack(x)
+    }
+    lowkey pow2Tab = vec.new[f64]()
+    i = 0
+    vibin i < 21 {
+        pow2Tab.stack(pow2i(i))
+        i = i + 1
+    }
+    lowkey kslRom = vec.new[int]()
+    squad x in [0, 32, 40, 45, 48, 51, 53, 55, 56, 58, 59, 60, 61, 62, 63, 64] {
+        kslRom.stack(x)
+    }
+
+    lowkey modOff = vec.new[int]()
+    squad x in [0, 1, 2, 8, 9, 10, 16, 17, 18] {
+        modOff.stack(x)
+    }
+    lowkey carOff = vec.new[int]()
+    squad x in [3, 4, 5, 11, 12, 13, 19, 20, 21] {
+        carOff.stack(x)
+    }
+    lowkey offToOp = vec.new[int]()
+    i = 0
+    vibin i < 22 {
+        offToOp.stack(0 - 1)
+        i = i + 1
+    }
+    // fill reverse map (vec element assign is interp-only, but this is init and we
+    // rebuild offToOp entries via a fresh vec below to stay native-safe)
+    lowkey offMap = vec.new[int]()
+    i = 0
+    vibin i < 22 {
+        lowkey v = 0 - 1
+        lowkey ch = 0
+        vibin ch < 9 {
+            fr modOff[ch] == i {
+                v = ch * 2
+            }
+            fr carOff[ch] == i {
+                v = ch * 2 + 1
+            }
+            ch = ch + 1
+        }
+        offMap.stack(v)
+        i = i + 1
+    }
+
+    bet OplChip{
+        rate: rate as f64,
+        sinT: sinT,
+        gainT: gainT,
+        incTab: incTab,
+        multTab: multTab,
+        fbTab: fbTab,
+        pow2Tab: pow2Tab,
+        kslRom: kslRom,
+        modOff: modOff,
+        carOff: carOff,
+        offToOp: offMap,
+        opPhase: zf18(),
+        opEnv: zf18(),
+        opOut: zf18(),
+        opPrev: zf18(),
+        opStage: zi18(),
+        opAvekm: zi18(),
+        opKslTl: zi18(),
+        opArDr: zi18(),
+        opSlRr: zi18(),
+        opWs: zi18(),
+        chFnum: zi9(),
+        chBlock: zi9(),
+        chKeyOn: zi9(),
+        chFbCon: zi9()
+    }
+}
+
+// -------- register interface (threaded) --------
+
+// Write one OPL register; returns the updated chip. Decoded by address range like
+// the YM3812. Key-on/off edges reset/release both operators of the channel.
+flex finna oplWriteReg(c: OplChip, reg: int, val: int) -> OplChip {
+    fr reg >= 0x20 && reg <= 0x35 {
+        lowkey off = reg - 0x20
+        lowkey op = c.offToOp[off]
+        fr op >= 0 {
+            c.opAvekm[op] = val
+        }
+    } naw fr reg >= 0x40 && reg <= 0x55 {
+        lowkey off = reg - 0x40
+        lowkey op = c.offToOp[off]
+        fr op >= 0 {
+            c.opKslTl[op] = val
+        }
+    } naw fr reg >= 0x60 && reg <= 0x75 {
+        lowkey off = reg - 0x60
+        lowkey op = c.offToOp[off]
+        fr op >= 0 {
+            c.opArDr[op] = val
+        }
+    } naw fr reg >= 0x80 && reg <= 0x95 {
+        lowkey off = reg - 0x80
+        lowkey op = c.offToOp[off]
+        fr op >= 0 {
+            c.opSlRr[op] = val
+        }
+    } naw fr reg >= 0xE0 && reg <= 0xF5 {
+        lowkey off = reg - 0xE0
+        lowkey op = c.offToOp[off]
+        fr op >= 0 {
+            c.opWs[op] = val & 3
+        }
+    } naw fr reg >= 0xA0 && reg <= 0xA8 {
+        lowkey ch = reg - 0xA0
+        c.chFnum[ch] = (c.chFnum[ch] & 0x300) | (val & 0xFF)
+    } naw fr reg >= 0xB0 && reg <= 0xB8 {
+        lowkey ch = reg - 0xB0
+        c.chFnum[ch] = (c.chFnum[ch] & 0xFF) | ((val & 3) << 8)
+        c.chBlock[ch] = (val >> 2) & 7
+        lowkey newKey = (val >> 5) & 1
+        lowkey oldKey = c.chKeyOn[ch]
+        c.chKeyOn[ch] = newKey
+        lowkey m = ch * 2
+        lowkey cr = ch * 2 + 1
+        fr newKey == 1 && oldKey == 0 {
+            c.opPhase[m] = 0.0
+            c.opPhase[cr] = 0.0
+            c.opEnv[m] = ATT_MAX
+            c.opEnv[cr] = ATT_MAX
+            c.opStage[m] = 1
+            c.opStage[cr] = 1
+            c.opOut[m] = 0.0
+            c.opOut[cr] = 0.0
+            c.opPrev[m] = 0.0
+            c.opPrev[cr] = 0.0
+        } naw fr newKey == 0 && oldKey == 1 {
+            fr c.opStage[m] != 0 {
+                c.opStage[m] = 4
+            }
+            fr c.opStage[cr] != 0 {
+                c.opStage[cr] = 4
+            }
+        }
+    } naw fr reg >= 0xC0 && reg <= 0xC8 {
+        lowkey ch = reg - 0xC0
+        c.chFbCon[ch] = val
+    }
+    bet c
+}
+
+// -------- pure per-sample math (table vecs + scalars in, values out) --------
+
+// 4-bit key-scale number from block + fnum MSB.
+finna keyScaleN(block: int, fnum: int) -> int {
+    bet (block << 1) | ((fnum >> 9) & 1)
+}
+
+// Effective envelope rate 0..63 from a 4-bit rate nibble, KSR bit and key-scale.
+finna effRate(rate4: int, ksr: int, block: int, fnum: int) -> int {
+    fr rate4 == 0 {
+        bet 0
+    }
+    lowkey kc = keyScaleN(block, fnum)
+    lowkey rof = kc >> 2
+    fr ksr == 1 {
+        rof = kc
+    }
+    lowkey r = rate4 * 4 + rof
+    fr r > 63 {
+        r = 63
+    }
+    bet r
+}
+
+// KSL attenuation (units) from block/fnum and the KSL amount bits.
+finna kslUnits(kslTl: int, block: int, fnum: int, kslRom: vec[int]) -> f64 {
+    lowkey amt = (kslTl >> 6) & 3
+    fr amt == 0 {
+        bet 0.0
+    }
+    lowkey ftop = fnum >> 6
+    lowkey ksl = (kslRom[ftop] << 2) - ((8 - block) << 5)
+    fr ksl < 0 {
+        ksl = 0
+    }
+    lowkey sh = 1
+    fr amt == 2 {
+        sh = 2
+    } naw fr amt == 3 {
+        sh = 0
+    }
+    bet ((ksl >> sh) * 2) as f64
+}
+
+// Phase increment (turns/sample) for an operator.
+finna opInc(fnum: int, block: int, mult: f64, pow2Tab: vec[f64], rate: f64) -> f64 {
+    lowkey e = 20 - block
+    lowkey hz = (fnum as f64) * OPL_NATIVE / pow2Tab[e]
+    bet hz * mult / rate
+}
+
+// Linear gain for an attenuation value (units) via table lookup.
+finna gainLookup(gainT: vec[f64], atten: f64) -> f64 {
+    lowkey k = atten as int
+    fr k < 0 {
+        k = 0
+    }
+    fr k > 512 {
+        k = 512
+    }
+    bet gainT[k]
+}
+
+// One operator's raw waveform sample at phase `p` (turns) with modulation, times
+// gain. `atten` is the total attenuation already summed (env + TL + KSL).
+finna operatorOut(sinT: vec[f64], gainT: vec[f64], ws: int, phase: f64, modTurns: f64, atten: f64) -> f64 {
+    lowkey p = frac(phase + modTurns)
+    lowkey idx = (p * (SINLEN as f64)) as int
+    idx = idx & (SINLEN - 1)
+    lowkey sv = sinT[idx]
+    fr ws == 1 {
+        fr p >= 0.5 {
+            sv = 0.0
+        }
+    } naw fr ws == 2 {
+        fr sv < 0.0 {
+            sv = 0.0 - sv
+        }
+    } naw fr ws == 3 {
+        lowkey half = p - (((p * 2.0) as int) as f64) * 0.5
+        fr half >= 0.25 {
+            sv = 0.0
+        } naw {
+            fr sv < 0.0 {
+                sv = 0.0 - sv
+            }
+        }
+    }
+    bet sv * gainLookup(gainT, atten)
+}
+
+// Advance a DADSR envelope one sample. Returns (newEnv, newStage). Pure.
+finna advanceEnv(env: f64, stage: int, arDr: int, slRr: int, avekm: int, block: int, fnum: int, incTab: vec[f64]) -> (f64, int) {
+    lowkey ksr = (avekm >> 4) & 1
+    fr stage == 1 {
+        lowkey ar = (arDr >> 4) & 0xF
+        lowkey e = env - incTab[effRate(ar, ksr, block, fnum)]
+        fr e <= 0.0 {
+            bet 0.0, 2
+        }
+        bet e, 1
+    } naw fr stage == 2 {
+        lowkey dr = arDr & 0xF
+        lowkey sl = (slRr >> 4) & 0xF
+        lowkey susU = (sl as f64) * 32.0
+        fr sl == 15 {
+            susU = ATT_MAX
+        }
+        lowkey e = env + incTab[effRate(dr, ksr, block, fnum)]
+        fr e >= susU {
+            bet susU, 3
+        }
+        bet e, 2
+    } naw fr stage == 3 {
+        lowkey egt = (avekm >> 5) & 1
+        fr egt == 1 {
+            bet env, 3
+        }
+        lowkey rr = slRr & 0xF
+        lowkey e = env + incTab[effRate(rr, ksr, block, fnum)]
+        fr e >= ATT_MAX {
+            bet ATT_MAX, 0
+        }
+        bet e, 3
+    } naw fr stage == 4 {
+        lowkey rr = slRr & 0xF
+        lowkey e = env + incTab[effRate(rr, ksr, block, fnum)]
+        fr e >= ATT_MAX {
+            bet ATT_MAX, 0
+        }
+        bet e, 4
+    }
+    bet env, stage
+}
+
+// -------- render (threaded; per-sample state mutation inline) --------
+
+// Render `numSamples` mono samples, APPENDING i16 values to the shared `out` vec.
+// Returns the updated chip (envelope/phase state persists across chunks). `out` is
+// a vec[int] (append-only, lowers natively); the i_music glue duplicates mono to
+// the gg stereo ring.
+flex finna oplRender(c: OplChip, out: vec[int], numSamples: int) -> OplChip {
+    lowkey i = 0
+    vibin i < numSamples {
+        lowkey acc = 0.0
+        lowkey ch = 0
+        vibin ch < 9 {
+            lowkey m = ch * 2
+            lowkey cr = ch * 2 + 1
+            fr c.opStage[m] != 0 || c.opStage[cr] != 0 {
+                lowkey block = c.chBlock[ch]
+                lowkey fnum = c.chFnum[ch]
+                lowkey fbAmt = (c.chFbCon[ch] >> 1) & 7
+                lowkey conn = c.chFbCon[ch] & 1
+
+                // ---- modulator ----
+                lowkey mEnv, mStage = advanceEnv(c.opEnv[m], c.opStage[m], c.opArDr[m], c.opSlRr[m], c.opAvekm[m], block, fnum, c.incTab)
+                c.opEnv[m] = mEnv
+                c.opStage[m] = mStage
+                lowkey mMult = c.opAvekm[m] & 0xF
+                lowkey mPhase = frac(c.opPhase[m] + opInc(fnum, block, c.multTab[mMult], c.pow2Tab, c.rate))
+                c.opPhase[m] = mPhase
+                lowkey fbInput = 0.0
+                fr fbAmt > 0 {
+                    fbInput = (c.opOut[m] + c.opPrev[m]) * 0.5 * c.fbTab[fbAmt]
+                }
+                lowkey mAtten = mEnv + ((c.opKslTl[m] & 0x3F) as f64) * 8.0 + kslUnits(c.opKslTl[m], block, fnum, c.kslRom)
+                lowkey modSample = operatorOut(c.sinT, c.gainT, c.opWs[m], mPhase, fbInput, mAtten)
+                c.opPrev[m] = c.opOut[m]
+                c.opOut[m] = modSample
+
+                // ---- carrier ----
+                lowkey cEnv, cStage = advanceEnv(c.opEnv[cr], c.opStage[cr], c.opArDr[cr], c.opSlRr[cr], c.opAvekm[cr], block, fnum, c.incTab)
+                c.opEnv[cr] = cEnv
+                c.opStage[cr] = cStage
+                lowkey cMult = c.opAvekm[cr] & 0xF
+                lowkey cPhase = frac(c.opPhase[cr] + opInc(fnum, block, c.multTab[cMult], c.pow2Tab, c.rate))
+                c.opPhase[cr] = cPhase
+                lowkey cAtten = cEnv + ((c.opKslTl[cr] & 0x3F) as f64) * 8.0 + kslUnits(c.opKslTl[cr], block, fnum, c.kslRom)
+                fr conn == 0 {
+                    lowkey carSample = operatorOut(c.sinT, c.gainT, c.opWs[cr], cPhase, modSample * FM_INDEX, cAtten)
+                    c.opPrev[cr] = c.opOut[cr]
+                    c.opOut[cr] = carSample
+                    acc = acc + carSample
+                } naw {
+                    lowkey carSample = operatorOut(c.sinT, c.gainT, c.opWs[cr], cPhase, 0.0, cAtten)
+                    c.opPrev[cr] = c.opOut[cr]
+                    c.opOut[cr] = carSample
+                    acc = acc + modSample + carSample
+                }
+            }
+            ch = ch + 1
+        }
+        lowkey v = (acc * OUT_SCALE) as int
+        fr v > 32767 {
+            v = 32767
+        }
+        fr v < 0 - 32768 {
+            v = 0 - 32768
+        }
+        out.stack(v)
+        i = i + 1
+    }
+    bet c
+}

@@ -14,10 +14,11 @@
 // genmidi_op_t (6 bytes): tremolo, attack, sustain, waveform, scale, level — the
 // raw OPL register bytes for registers 0x20/0x60/0x80/0xE0 and the KSL(0x40 top
 // bits)/TL(0x40 low bits) split. `feedback` is the 0xC0 feedback/connection byte.
+pull "bytes"
 pull "wad"
 
-facts FLAG_FIXED: int = 0x0001
-facts FLAG_2VOICE: int = 0x0004
+flex facts FLAG_FIXED: int = 0x0001
+flex facts FLAG_2VOICE: int = 0x0004
 
 // Raw OPL operator register bytes for one FM operator.
 flex drip GenMidiOp {
@@ -47,29 +48,29 @@ flex drip GenMidiInstr {
 }
 
 // Read a 6-byte genmidi_op_t at `base`.
-finna readOp(buf: vec[int], base: int) -> GenMidiOp {
+finna readOp(buf: []u8, base: int) -> GenMidiOp {
     bet GenMidiOp{
-        tremolo: buf[base + 0],
-        attack: buf[base + 1],
-        sustain: buf[base + 2],
-        waveform: buf[base + 3],
-        scale: buf[base + 4],
-        level: buf[base + 5]
+        tremolo: wad.rdU8(buf, base + 0),
+        attack: wad.rdU8(buf, base + 1),
+        sustain: wad.rdU8(buf, base + 2),
+        waveform: wad.rdU8(buf, base + 3),
+        scale: wad.rdU8(buf, base + 4),
+        level: wad.rdU8(buf, base + 5)
     }
 }
 
 // Read a 16-byte genmidi_voice_t at `base`.
-finna readVoice(buf: vec[int], base: int) -> GenMidiVoice {
+finna readVoice(buf: []u8, base: int) -> GenMidiVoice {
     bet GenMidiVoice{
         modOp: readOp(buf, base + 0),
-        feedback: buf[base + 6],
+        feedback: wad.rdU8(buf, base + 6),
         carOp: readOp(buf, base + 7),
         noteOffset: wad.rdI16(buf, base + 14)
     }
 }
 
 // Parse the GENMIDI lump at `wadBuf[lumpOfs..lumpOfs+lumpLen]` into instruments.
-flex finna parseGenmidi(wadBuf: vec[int], lumpOfs: int, lumpLen: int) -> vec[GenMidiInstr] {
+flex finna parseGenmidi(wadBuf: []u8, lumpOfs: int, lumpLen: int) -> vec[GenMidiInstr] {
     lowkey out = vec.new[GenMidiInstr]()
     lowkey num = (lumpLen - 8) / 68
     lowkey base = lumpOfs + 8
@@ -78,8 +79,8 @@ flex finna parseGenmidi(wadBuf: vec[int], lumpOfs: int, lumpLen: int) -> vec[Gen
         lowkey rec = base + i * 36
         out.stack(GenMidiInstr{
             flags: wad.rdU16(wadBuf, rec + 0),
-            fineTuning: wadBuf[rec + 2],
-            fixedNote: wadBuf[rec + 3],
+            fineTuning: wad.rdU8(wadBuf, rec + 2),
+            fixedNote: wad.rdU8(wadBuf, rec + 3),
             v1: readVoice(wadBuf, rec + 4),
             v2: readVoice(wadBuf, rec + 20)
         })

@@ -6,13 +6,14 @@
 //   ./target/debug/bet run ports/doom/tools/mus_golden.bet > /tmp/mus_bet.txt
 //   diff /tmp/mus_bet.txt ports/doom/goldens/mus_e1m1.golden && echo MATCH
 pull "spill"
+pull "fs"
 pull "../s/wad"
 pull "../s/mus"
 
 facts WAD: str = "/Users/lukebaggett/Documents/bet/doom-reference/doom1.wad"
 
 finna main() {
-    lowkey buf = wad.loadWad(WAD)
+    lowkey buf = fs.peep(WAD)
     lowkey ofs, len = wad.findLump(buf, "D_E1M1")
     fr ofs < 0 {
         spill.it("D_E1M1 not found")
@@ -21,7 +22,7 @@ finna main() {
     lowkey events = mus.decodeMus(buf, ofs, len)
     lowkey tick = 0
     lowkey i = 0
-    vibin i < events.gang() {
+    vibin i < (events.gang() as int) {
         lowkey e = events[i]
         spill.f("{} {} {} {} {}\n", tick, e.typ as int, e.channel as int, e.a as int, e.b as int)
         tick = tick + (e.delay as int)
