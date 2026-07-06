@@ -34,6 +34,14 @@ finna main() {
     ivideo.initGraphics(g0)
     ivideo.setPalette(g0, 0)
     pthink.initThinkers(g0)
+    // Single-player: mark player 1 in-game so P_SpawnPlayer actually spawns the MT_PLAYER
+    // mobj (it bails on !playeringame[pnum]); without this the player start is never spawned,
+    // players[0].mo stays ghosted, and R_SetupFrame leaves the POV at the origin (black frame).
+    holla g = g0 in gs.gsc {
+        g.shell.playeringame[0] = nocap
+    } ghosted {
+        yeet("gs")
+    }
     psetup.setupLevel(g0, 1, 1, 3)
 
     // POV = the spawned player; give it an eye height (P_CalcHeight is P2.4) and skip weapon.
