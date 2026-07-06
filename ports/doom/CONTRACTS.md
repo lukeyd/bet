@@ -287,3 +287,27 @@ floor_e, plat_e, plattype_e, stair_e, result_e, bwhere_e) are defined by **p/p_s
    is native-correct only (CONTRACTS note 2); `tools/goldens.bet` calls `pointToAngle2` for the
    P2A sweep (interp-safe there — the sweep's `|coord| ≤ 0x02000000` never overflows `num<<3`)
    but keeps a local wrap-safe `slopeDivSafe` for the full-range SLOPEDIV grid.
+
+## W1-integration native-safety amendment (vec → fixed-array)
+
+`vec` is **append-only in native codegen** (`vec[i] = …` / `vec[i].field = …` do not lower).
+Six mutated-in-place `vec` fields were therefore converted to fixed arrays + an existing count
+(fixed-array element assignment lowers natively; proven by `gs_selftest`). Downstream code uses
+`arr[i]` reads and `arr[i].field = …` writes via `holla`, bounded by the count / a MAX cap:
+
+| field (drip) | was | now | count / cap |
+|---|---|---|---|
+| `Level.secLinks` | `vec[SecLinks]` | `SecLinks[2048]` | index by sector, cap `MAXSECTORS=2048` |
+| `Level.lineLinks` | `vec[LineLinks]` | `LineLinks[8192]` | index by line, cap `MAXLINES=8192` |
+| `Level.blockLinks` | `vec[TagBox]` | `TagBox[32768]` | index by blockmap cell, cap `MAXBLOCKS=32768` |
+| `RenderState.drawsegs` | `vec[DrawSeg]` | `DrawSeg[256]` | count `dsP`, cap `MAXDRAWSEGS=256` |
+| `RenderState.vissprites` | `vec[VisSprite]` | `VisSprite[128]` | count `visspriteP`, cap `MAXVISSPRITES=128` |
+| `TickState.intercepts` | `vec[Intercept]` | `Intercept[128]` | count `interceptP`, cap `MAXINTERCEPTS=128` |
+
+- Fixed arrays are zero-inited by `cop`; `gsInit` no longer allocates them (the vec.new lines
+  were removed). **p_setup must yeet** if `numsectors > MAXSECTORS`, `numlines > MAXLINES`, or
+  `bmapWidth*bmapHeight > MAXBLOCKS` (shareware maps are far under — this only guards PWADs).
+- The render `drawsegs`/`vissprites` overflow checks stay `yeet` (like vanilla's R_* I_Errors).
+- Build-once-read vecs are UNCHANGED (still `vec`): `Wad.lumpName`, `TickState.anims`,
+  `InfoTables.states/mobjinfo/sfx`, `GameShell.savegameStrings`, `AmState.marks`. Never
+  element-mutate these — only `.stack` (append) then read `v[i]`.

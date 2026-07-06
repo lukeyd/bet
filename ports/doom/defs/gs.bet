@@ -38,6 +38,14 @@ flex facts MAX_DM_STARTS: int = 10
 flex facts BODYQUESIZE: int = 32
 flex facts ITEMQUESIZE: int = 128
 flex facts MAXSPECIALCROSS: int = 8
+flex facts MAXINTERCEPTS: int = 128
+// Per-map-element tag-link caps: hold mutable head tags (soundtarget/thinglist/specialdata/
+// block-chain) that vanilla keeps as pointers in sector_t/line_t. Fixed because `vec` is
+// append-only in native codegen and tags can't live in a scalar `mem.slab`. Shareware maps
+// are far under these; p_setup yeets if a map exceeds them.
+flex facts MAXSECTORS: int = 2048
+flex facts MAXLINES: int = 8192
+flex facts MAXBLOCKS: int = 32768       // blockmap cells (bmapWidth*bmapHeight)
 
 // =========================================================================================
 // Small helper drips
@@ -168,8 +176,9 @@ flex drip Wad {
     flex nameToLump: stash[str, int]
 }
 
-// ---- Level: per-level map geometry as Structure-of-Arrays slabs (p_setup). Sized from
-// lump counts at P_SetupLevel; tag-valued refs live in the *Links vecs. -------------------
+// ---- Level: per-level map geometry as Structure-of-Arrays slabs (p_setup). Scalar slabs
+// sized at P_SetupLevel; tag-valued head refs live in the fixed *Links arrays (index 0..num,
+// capped at MAXSECTORS/MAXLINES/MAXBLOCKS — `vec` can't be element-mutated in native). ----
 flex drip Level {
     flex numvertexes: i32
     flex numsectors: i32
@@ -199,7 +208,7 @@ flex drip Level {
     flex secLineOfs: []i32        // start index into secLinesList
     flex secLineCount: []i32
     flex secLinesList: []i32      // flattened sector->line index lists
-    flex secLinks: vec[SecLinks]  // soundtarget / thinglist / specialdata (1 per sector)
+    flex secLinks: SecLinks[2048]  // soundtarget / thinglist / specialdata (per sector; mutated each tic)
     // sides
     flex sdTexOfs: []i32
     flex sdRowOfs: []i32
@@ -222,7 +231,7 @@ flex drip Level {
     flex lineFront: []i32         // frontsector index
     flex lineBack: []i32          // backsector index, -1 none
     flex lineValid: []i32
-    flex lineLinks: vec[LineLinks]
+    flex lineLinks: LineLinks[8192]     // MAXLINES
     // segs
     flex segV1: []i32
     flex segV2: []i32
@@ -250,7 +259,7 @@ flex drip Level {
     flex bmapOrgX: i32
     flex bmapOrgY: i32
     flex blockmap: []i32          // decoded blockmap (offsets + line lists)
-    flex blockLinks: vec[TagBox]  // per-block thing-chain head (bmapWidth*bmapHeight)
+    flex blockLinks: TagBox[32768]  // per-block thing-chain head (bmapWidth*bmapHeight; mutated each tic)
     // reject matrix: read in place from wad.buf
     flex rejectOfs: int
     flex rejectLen: int
@@ -293,7 +302,7 @@ flex drip RenderState {
     flex xtoviewangle: []u32      // SCREENWIDTH+1
     flex viewangletox: []i32      // FINEANGLES/2
     // drawsegs
-    flex drawsegs: vec[DrawSeg]
+    flex drawsegs: DrawSeg[256]        // MAXDRAWSEGS
     flex dsP: i32
     // visplanes SoA
     flex vpHeight: []i32
@@ -310,7 +319,7 @@ flex drip RenderState {
     flex openings: []i16
     flex lastopening: i32
     // vissprites
-    flex vissprites: vec[VisSprite]
+    flex vissprites: VisSprite[128]      // MAXVISSPRITES
     flex visspriteP: i32
     flex vsprSortedHead: i32
     // per-column clip
@@ -495,7 +504,7 @@ flex drip TickState {
     flex rndtable: []u8               // 256-entry m_random LUT (filled by m_random.initRndtable)
     flex thinkercap: tag think.Thinker // doubly-linked list sentinel (funcId FUNC_CAP)
     // intercepts / path traversal
-    flex intercepts: vec[Intercept]
+    flex intercepts: Intercept[128]      // MAXINTERCEPTS
     flex interceptP: i32
     flex trace: Divline
     // special-line crossing accumulator (p_map)
@@ -873,22 +882,20 @@ flex finna gsInit(gt: tag GameState) {
         g.render.zlight = mem.slab[i32](2048)     // LIGHTLEVELS*MAXLIGHTZ
         g.render.colormaps = mem.slab[u8](8704)   // NUMCOLORMAPS*256 = 34*256
         g.render.colormapsLen = 8704
-        g.render.drawsegs = vec.new[DrawSeg]()
-        g.render.vissprites = vec.new[VisSprite]()
+        // drawsegs/vissprites are fixed arrays (DrawSeg[MAXDRAWSEGS]/VisSprite[MAXVISSPRITES]),
+        // zero-inited by cop; dsP/visspriteP are the live counts.
         g.render.fixedcolormapOfs = -1
         g.render.viewplayer = -1
         // tick
         g.tick.rndtable = mem.slab[u8](256)
-        g.tick.intercepts = vec.new[Intercept]()
+        // intercepts is a fixed Intercept[MAXINTERCEPTS] (interceptP = count).
         g.tick.anims = vec.new[AnimDef]()
         g.tick.ceilingline = -1
         // wad
         g.wad.nameToLump = stash.new[str, int]()
         g.wad.lumpName = vec.new[str]()
-        // level link vecs (slabs are sized at level load)
-        g.level.secLinks = vec.new[SecLinks]()
-        g.level.lineLinks = vec.new[LineLinks]()
-        g.level.blockLinks = vec.new[TagBox]()
+        // level tag-links are fixed arrays (secLinks/lineLinks/blockLinks), zero-inited by cop;
+        // the scalar SoA slabs are sized at level load (p_setup).
         // sound
         g.sound.sfxHandle = mem.slab[i32](256)
         g.sound.sfxLenTics = mem.slab[i32](256)
