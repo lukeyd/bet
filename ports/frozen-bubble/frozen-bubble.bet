@@ -33,7 +33,13 @@ pull "math"
 // ---- asset indices (inlined from the generated assets_gen.bet; `pull` of it is unneeded) ----
 facts TEX_BACKGRND: int = 13
 facts TEX_BUBBLE_1: int = 15        // colored bubbles live at 15,17,19,... (mini variants between)
+facts TEX_FONT_HI: int = 124        // highlighted bitmap-font atlas (968x39, ASCII 33..90)
+facts TEX_FONT: int = 125           // normal bitmap-font atlas (same layout)
+facts TEX_BACK_START: int = 690     // title / main-menu background (640x480)
+facts SND_MUSIC: int = 3198         // SND_FROZEN_MAINZIK_1P — looping 1P soundtrack (stereo)
 facts SND_LAUNCH: int = 3202
+facts SND_MENU_CHANGE: int = 3205   // menu cursor move SFX
+facts SND_MENU_SEL: int = 3206      // menu select SFX
 facts LEVELS_BLOB: int = 3215
 facts TRIG_BLOB: int = 3216
 
@@ -51,6 +57,7 @@ facts COLS: int = 8
 facts MAXROWS: int = 14
 facts RADIUS: int = 16
 facts BUB: int = 32
+facts GLYPH_H: int = 39            // font atlas cell height (px)
 facts ROWH: int = 28                // ROW_SIZE (vertical row stride; rows nestle 4px)
 facts CX0: int = 206                // cell-center x for col 0 of a non-offset row (190 + 16)
 facts CY0: int = 60                 // cell-center y for row 0 at descent 0 (44 + 16)
@@ -82,6 +89,10 @@ facts P_FLY: int = 1
 facts P_WIN: int = 2
 facts P_LOSE: int = 3
 
+// ---- top-level screens (a state machine wrapping the P_* play sub-phases) ----
+facts S_MENU: int = 0               // title / main menu
+facts S_PLAY: int = 1               // the playable core (Win/Lose show as banners within Play)
+
 // ---- event kinds (rt-abi event_kind) ----
 facts EV_NONE: int = 0
 facts EV_KEYDOWN: int = 1
@@ -93,7 +104,9 @@ facts KEY_ESC: int = 27
 facts KEY_SPACE: int = 32
 facts KEY_A: int = 65
 facts KEY_D: int = 68
+facts KEY_ENTER: int = 10
 facts KEY_UP: int = 256
+facts KEY_DOWN: int = 257
 facts KEY_LEFT: int = 258
 facts KEY_RIGHT: int = 259
 
@@ -481,6 +494,74 @@ finna drawAim(coss: vec[int], sins: vec[int], ang: int, descent: int) {
     }
 }
 
+// Draw a string of uppercase ASCII (letters/digits/space) as bitmap glyphs, blitting each glyph's
+// source sub-rectangle out of the font atlas `fontTex` with gg.spriteSub. Proportional advance from
+// the per-glyph width table `fontW`. `fontX`/`fontW` are shared vec handles (indexed by char code);
+// `fontTex` is an already-uploaded texture id, so — unlike the `dat` slab — nothing here reads the
+// 170 MB pack, and the whole thing lives safely in a helper. Unknown glyphs advance without drawing.
+finna drawText(fontTex: int, fontX: vec[int], fontW: vec[int], s: str, x: int, y: int) {
+    lowkey n = str.len(s)
+    lowkey px = x
+    lowkey i = 0
+    vibin i < n {
+        lowkey c = str.at(s, i)
+        fr c == 32 {
+            px = px + 12
+        } naw {
+            lowkey w = fontW[c]
+            fr w > 0 {
+                gg.spriteSub(fontTex, fontX[c], 0, w, GLYPH_H, px, y)
+                px = px + w + 3
+            } naw {
+                px = px + 9
+            }
+        }
+        i = i + 1
+    }
+}
+
+// Draw a non-negative integer as bitmap digits (left to right) via drawText's glyph blitter.
+finna drawInt(fontTex: int, fontX: vec[int], fontW: vec[int], val: int, x: int, y: int) {
+    lowkey v = val
+    fr v < 0 {
+        v = 0
+    }
+    lowkey digs = vec.new[int]()
+    fr v == 0 {
+        digs.stack(0)
+    } naw {
+        vibin v > 0 {
+            digs.stack(v - (v / 10) * 10)
+            v = v / 10
+        }
+    }
+    lowkey px = x
+    lowkey i = digs.gang() as int - 1
+    vibin i >= 0 {
+        lowkey d = digs[i]
+        lowkey code = 48 + d
+        gg.spriteSub(fontTex, fontX[code], 0, fontW[code], GLYPH_H, px, y)
+        px = px + fontW[code] + 3
+        i = i - 1
+    }
+}
+
+// Reset the board to a level layout given as parallel (cellId, color) vecs — shared handles, so no
+// `dat` is passed to this helper (which would deep-copy the pack in the interpreter). Every cell is
+// first tombstoned to empty, then the layout is re-applied. Lets Play be re-entered from the menu.
+finna resetGame(board: stash[int, int], ids: vec[int], colors: vec[int]) {
+    lowkey id = 0
+    vibin id < MAXROWS * COLS {
+        board.put(id, 0)
+        id = id + 1
+    }
+    lowkey i = 0
+    vibin i < ids.gang() {
+        board.put(ids[i], colors[i])
+        i = i + 1
+    }
+}
+
 finna main() {
     // ---- load the baked asset pack (READ ONLY in main; never handed to a helper) ----
     lowkey dat = fs.peep("ports/frozen-bubble/assets.dat")
@@ -492,6 +573,25 @@ finna main() {
     lowkey bgW = bytes.readU32le(dat, bgBase + E_A) as int
     lowkey bgH = bytes.readU32le(dat, bgBase + E_B) as int
     lowkey bgTex = gg.tex(dat, blobOff + bgOff, bgW, bgH)
+
+    // title / main-menu background (full 640x480)
+    lowkey mbBase = HDR + TEX_BACK_START * ENT
+    lowkey mbOff = bytes.readU32le(dat, mbBase + E_OFF) as int
+    lowkey mbW = bytes.readU32le(dat, mbBase + E_A) as int
+    lowkey mbH = bytes.readU32le(dat, mbBase + E_B) as int
+    lowkey menuTex = gg.tex(dat, blobOff + mbOff, mbW, mbH)
+
+    // bitmap-font atlases: normal (fontTex) + highlighted (fontHiTex); identical 968x39 layout
+    lowkey fnBase = HDR + TEX_FONT * ENT
+    lowkey fnOff = bytes.readU32le(dat, fnBase + E_OFF) as int
+    lowkey fnW = bytes.readU32le(dat, fnBase + E_A) as int
+    lowkey fnH = bytes.readU32le(dat, fnBase + E_B) as int
+    lowkey fontTex = gg.tex(dat, blobOff + fnOff, fnW, fnH)
+    lowkey fhBase = HDR + TEX_FONT_HI * ENT
+    lowkey fhOff = bytes.readU32le(dat, fhBase + E_OFF) as int
+    lowkey fhW = bytes.readU32le(dat, fhBase + E_A) as int
+    lowkey fhH = bytes.readU32le(dat, fhBase + E_B) as int
+    lowkey fontHiTex = gg.tex(dat, blobOff + fhOff, fhW, fhH)
 
     // 8 colored bubbles -> bubTex[color] (index 0 unused; colors are 1..8)
     lowkey bubTex = vec.new[int]()
@@ -506,13 +606,35 @@ finna main() {
         bi = bi + 1
     }
 
-    // launch sound
+    // launch sound (one-shot)
     lowkey sndBase = HDR + SND_LAUNCH * ENT
     lowkey sOff = bytes.readU32le(dat, sndBase + E_OFF) as int
     lowkey sLen = bytes.readU32le(dat, sndBase + E_LEN) as int
     lowkey sRate = bytes.readU32le(dat, sndBase + E_A) as int
     lowkey sChan = bytes.readU32le(dat, sndBase + E_B) as int
     lowkey launchSnd = gg.sound(dat, blobOff + sOff, sLen, sChan, sRate)
+
+    // looping background music (stereo) — exercises the mixer's looping-voice path
+    lowkey muBase = HDR + SND_MUSIC * ENT
+    lowkey muOff = bytes.readU32le(dat, muBase + E_OFF) as int
+    lowkey muLen = bytes.readU32le(dat, muBase + E_LEN) as int
+    lowkey muRate = bytes.readU32le(dat, muBase + E_A) as int
+    lowkey muChan = bytes.readU32le(dat, muBase + E_B) as int
+    lowkey musicSnd = gg.sound(dat, blobOff + muOff, muLen, muChan, muRate)
+
+    // menu SFX (one-shots)
+    lowkey mcBase = HDR + SND_MENU_CHANGE * ENT
+    lowkey mcOff = bytes.readU32le(dat, mcBase + E_OFF) as int
+    lowkey mcLen = bytes.readU32le(dat, mcBase + E_LEN) as int
+    lowkey mcRate = bytes.readU32le(dat, mcBase + E_A) as int
+    lowkey mcChan = bytes.readU32le(dat, mcBase + E_B) as int
+    lowkey menuChangeSnd = gg.sound(dat, blobOff + mcOff, mcLen, mcChan, mcRate)
+    lowkey msBase = HDR + SND_MENU_SEL * ENT
+    lowkey msOff = bytes.readU32le(dat, msBase + E_OFF) as int
+    lowkey msLen = bytes.readU32le(dat, msBase + E_LEN) as int
+    lowkey msRate = bytes.readU32le(dat, msBase + E_A) as int
+    lowkey msChan = bytes.readU32le(dat, msBase + E_B) as int
+    lowkey menuSelSnd = gg.sound(dat, blobOff + msOff, msLen, msChan, msRate)
 
     // trig ring -> Q16 cos/sin vecs (shared handles). Stored as i32; sign-convert from u32.
     lowkey coss = vec.new[int]()
@@ -536,8 +658,35 @@ finna main() {
         ti = ti + 1
     }
 
-    // ---- populate the initial board from level 0 of the levels cube ----
-    lowkey board = stash.new[int, int]()
+    // ---- bitmap-font metrics: proportional (x, width) per char, extracted from font.png. Digits
+    // 0-9 and letters A-Z are pixel-verified against the atlas; other codes advance without drawing.
+    // Built into shared vecs indexed by ASCII code so drawText/drawInt just read fontX[c]/fontW[c].
+    lowkey digX: int[10] = [242, 259, 275, 293, 308, 326, 344, 361, 379, 396]
+    lowkey digW: int[10] = [13, 12, 14, 11, 13, 14, 13, 13, 13, 13]
+    lowkey letX: int[26] = [509, 531, 544, 558, 573, 587, 605, 620, 635, 653, 669, 685, 702, 718, 735, 753, 768, 782, 798, 817, 835, 853, 870, 887, 906, 926]
+    lowkey letW: int[26] = [17, 9, 10, 12, 10, 14, 11, 12, 16, 12, 13, 14, 12, 13, 14, 11, 11, 12, 15, 14, 14, 13, 13, 15, 16, 16]
+    lowkey fontX = vec.new[int]()
+    lowkey fontW = vec.new[int]()
+    lowkey cp = 0
+    vibin cp < 128 {
+        lowkey gx = 0
+        lowkey gw = 0
+        fr cp >= 48 && cp <= 57 {
+            gx = digX[cp - 48]
+            gw = digW[cp - 48]
+        } naw fr cp >= 65 && cp <= 90 {
+            gx = letX[cp - 65]
+            gw = letW[cp - 65]
+        }
+        fontX.stack(gx)
+        fontW.stack(gw)
+        cp = cp + 1
+    }
+
+    // ---- level 0 -> parallel (cellId, color) vecs (shared handles), so the board can be reset on a
+    // new game without re-reading `dat` in a helper. Seed the initial board from them too. ----
+    lowkey lvlIds = vec.new[int]()
+    lowkey lvlColors = vec.new[int]()
     lowkey lvlBase = HDR + LEVELS_BLOB * ENT
     lowkey lvlOff = bytes.readU32le(dat, lvlBase + E_OFF) as int
     lowkey lvlCols = bytes.readU32le(dat, lvlBase + E_B) as int
@@ -549,7 +698,8 @@ finna main() {
         vibin lc < lvlCols {
             lowkey cell = dat[lvlPay + lr * lvlCols + lc] as int
             fr cell != 255 {
-                board.put(lr * COLS + lc, cell + 1)
+                lvlIds.stack(lr * COLS + lc)
+                lvlColors.stack(cell + 1)
             }
             lc = lc + 1
         }
@@ -557,6 +707,8 @@ finna main() {
     }
 
     // ---- initial game state ----
+    lowkey board = stash.new[int, int]()
+    resetGame(board, lvlIds, lvlColors)
     lowkey gen = math.cook(SEED)
     lowkey g = Game{
         phase: P_AIM,
@@ -574,24 +726,76 @@ finna main() {
     g.cur = pickColor(board, gen)
     g.next = pickColor(board, gen)
 
+    lowkey screen = S_MENU
+    lowkey menuSel = 0             // 0 = Play, 1 = Quit
+    lowkey gameVoice = 0          // the looping-music voice id while in Play (0 = none)
+
     lowkey leftHeld = 0
     lowkey rightHeld = 0
     lowkey voice = 0
     lowkey running = nocap
     lowkey last = gg.ticks()
     vibin running {
-        // ---- drain input ----
+        // ---- drain input (interpreted per active screen) ----
         lowkey polling = nocap
         vibin polling {
             lowkey kind, code = gg.poll()
             fr kind == EV_NONE {
                 polling = cap
             } naw fr kind == EV_QUIT {
-                running = cap
+                // Esc / window-close: from Play it drops back to the menu (stopping the music);
+                // from the menu it exits the program.
+                fr screen == S_PLAY {
+                    screen = S_MENU
+                    fr gameVoice != 0 {
+                        gg.stop(gameVoice)
+                        gameVoice = 0
+                    }
+                } naw {
+                    running = cap
+                }
                 polling = cap
             } naw fr kind == EV_KEYDOWN {
-                fr code == KEY_ESC {
-                    running = cap
+                fr screen == S_MENU {
+                    fr code == KEY_UP || code == KEY_DOWN {
+                        menuSel = 1 - menuSel
+                        voice = gg.play(menuChangeSnd, 0, 256)
+                    } naw fr code == KEY_ENTER || code == KEY_SPACE {
+                        voice = gg.play(menuSelSnd, 0, 256)
+                        fr menuSel == 0 {
+                            // start a fresh game
+                            gen = math.cook(SEED)
+                            resetGame(board, lvlIds, lvlColors)
+                            g.phase = P_AIM
+                            g.ang = AIM_UP
+                            g.fx = 0
+                            g.fy = 0
+                            g.vx = 0
+                            g.vy = 0
+                            g.shots = 0
+                            g.descent = 0
+                            g.score = 0
+                            g.cur = pickColor(board, gen)
+                            g.next = pickColor(board, gen)
+                            leftHeld = 0
+                            rightHeld = 0
+                            screen = S_PLAY
+                            fr gameVoice == 0 {
+                                gameVoice = gg.play(musicSnd, 1, 160)
+                            }
+                        } naw {
+                            running = cap
+                        }
+                    }
+                } naw fr g.phase == P_WIN || g.phase == P_LOSE {
+                    // Win/Lose banner: any confirm returns to the menu.
+                    fr code == KEY_ENTER || code == KEY_SPACE {
+                        screen = S_MENU
+                        fr gameVoice != 0 {
+                            gg.stop(gameVoice)
+                            gameVoice = 0
+                        }
+                    }
                 } naw fr code == KEY_LEFT || code == KEY_A {
                     leftHeld = 1
                 } naw fr code == KEY_RIGHT || code == KEY_D {
@@ -616,58 +820,83 @@ finna main() {
             }
         }
 
-        // ---- aim (held keys nudge the angle each frame) ----
-        fr g.phase == P_AIM {
-            fr leftHeld == 1 {
-                g.ang = g.ang + AIM_STEP
+        // ---- update (Play only) ----
+        fr screen == S_PLAY {
+            fr g.phase == P_AIM {
+                fr leftHeld == 1 {
+                    g.ang = g.ang + AIM_STEP
+                }
+                fr rightHeld == 1 {
+                    g.ang = g.ang - AIM_STEP
+                }
+                fr g.ang > AIM_MAX {
+                    g.ang = AIM_MAX
+                }
+                fr g.ang < AIM_MIN {
+                    g.ang = AIM_MIN
+                }
             }
-            fr rightHeld == 1 {
-                g.ang = g.ang - AIM_STEP
+            fr g.phase == P_FLY {
+                g = stepFlight(g, board, gen)
             }
-            fr g.ang > AIM_MAX {
-                g.ang = AIM_MAX
-            }
-            fr g.ang < AIM_MIN {
-                g.ang = AIM_MIN
-            }
-        }
-
-        // ---- flight ----
-        fr g.phase == P_FLY {
-            g = stepFlight(g, board, gen)
         }
 
         // ---- draw ----
-        gg.frame(640, 480, CLEAR)
-        gg.sprite(bgTex, 0, 0)
-
-        lowkey r = 0
-        vibin r < MAXROWS {
-            lowkey cc = 0
-            vibin cc < colsInRow(r) {
-                lowkey v = cellColor(board, r * COLS + cc)
-                fr v >= 1 {
-                    gg.sprite(bubTex[v], cellCX(r, cc) - RADIUS, cellCY(r, g.descent) - RADIUS)
-                }
-                cc = cc + 1
+        fr screen == S_MENU {
+            gg.frame(640, 480, CLEAR)
+            gg.sprite(menuTex, 0, 0)
+            drawText(fontHiTex, fontX, fontW, "FROZEN BUBBLE", 170, 70)
+            lowkey pTex = fontTex
+            fr menuSel == 0 {
+                pTex = fontHiTex
             }
-            r = r + 1
-        }
+            lowkey qTex = fontTex
+            fr menuSel == 1 {
+                qTex = fontHiTex
+            }
+            drawText(pTex, fontX, fontW, "PLAY", 268, 250)
+            drawText(qTex, fontX, fontW, "QUIT", 268, 310)
+            drawText(fontTex, fontX, fontW, "UP DOWN ENTER", 196, 420)
+        } naw {
+            gg.frame(640, 480, CLEAR)
+            gg.sprite(bgTex, 0, 0)
 
-        fr g.phase == P_AIM {
-            drawAim(coss, sins, g.ang, g.descent)
-            gg.sprite(bubTex[g.cur], LAUNCH_X - RADIUS, LAUNCH_Y - RADIUS)
-        }
-        fr g.phase == P_FLY {
-            gg.sprite(bubTex[g.cur], (g.fx / Q16) - RADIUS, (g.fy / Q16) - RADIUS)
-        }
-        gg.sprite(bubTex[g.next], NEXT_X, NEXT_Y)
+            lowkey r = 0
+            vibin r < MAXROWS {
+                lowkey cc = 0
+                vibin cc < colsInRow(r) {
+                    lowkey v = cellColor(board, r * COLS + cc)
+                    fr v >= 1 {
+                        gg.sprite(bubTex[v], cellCX(r, cc) - RADIUS, cellCY(r, g.descent) - RADIUS)
+                    }
+                    cc = cc + 1
+                }
+                r = r + 1
+            }
 
-        fr g.phase == P_WIN {
-            gg.rect(160, 200, 320, 80, WIN_COL)
-        }
-        fr g.phase == P_LOSE {
-            gg.rect(160, 200, 320, 80, LOSE_COL)
+            fr g.phase == P_AIM {
+                drawAim(coss, sins, g.ang, g.descent)
+                gg.sprite(bubTex[g.cur], LAUNCH_X - RADIUS, LAUNCH_Y - RADIUS)
+            }
+            fr g.phase == P_FLY {
+                gg.sprite(bubTex[g.cur], (g.fx / Q16) - RADIUS, (g.fy / Q16) - RADIUS)
+            }
+            gg.sprite(bubTex[g.next], NEXT_X, NEXT_Y)
+
+            // ---- HUD (left margin, clear of the x>=190 playfield) ----
+            drawText(fontTex, fontX, fontW, "SCORE", 36, 58)
+            drawInt(fontTex, fontX, fontW, g.score, 36, 98)
+            drawText(fontTex, fontX, fontW, "SHOTS", 36, 168)
+            drawInt(fontTex, fontX, fontW, g.shots, 36, 208)
+
+            fr g.phase == P_WIN {
+                drawText(fontHiTex, fontX, fontW, "YOU WIN", 236, 188)
+                drawText(fontTex, fontX, fontW, "PRESS ENTER", 214, 250)
+            }
+            fr g.phase == P_LOSE {
+                drawText(fontHiTex, fontX, fontW, "GAME OVER", 220, 188)
+                drawText(fontTex, fontX, fontW, "PRESS ENTER", 214, 250)
+            }
         }
 
         gg.flush()
