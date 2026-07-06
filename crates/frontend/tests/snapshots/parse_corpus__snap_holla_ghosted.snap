@@ -273,15 +273,16 @@ Program {
                             span: 411..428,
                         },
                         Stmt {
-                            kind: Evict(
-                                Expr {
+                            kind: Evict {
+                                crib: Expr {
                                     kind: Name {
                                         name: "enemies",
                                         generics: [],
                                     },
                                     span: 463..470,
                                 },
-                            ),
+                                tag: None,
+                            },
                             span: 457..470,
                         },
                         Stmt {

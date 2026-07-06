@@ -324,7 +324,10 @@ pub enum Stmt {
     /// generation, so the freed tag (and every copy of it) ghosts while all other slots'
     /// tags stay live. The slot returns to the crib's free pool for reuse by a later `cop`.
     /// A stale/null tag is a no-op.
-    EvictSlot { crib: Operand, tag: Operand },
+    EvictSlot {
+        crib: Operand,
+        tag: Operand,
+    },
     Nop,
 }
 

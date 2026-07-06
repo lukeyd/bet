@@ -443,6 +443,23 @@ impl<'c> Cg<'c> {
                     .map_err(lower_err)?;
                 Ok(())
             }
+            // `evict tag in crib` — free one slot. The tag rides as `i64` exactly as in
+            // `bet_holla_check` (the C ABI coerces the two-`u32` `rt_abi::Tag` to one
+            // 64-bit register on our targets).
+            Stmt::EvictSlot { crib, tag } => {
+                let crib_v = self.lower_operand(func, locals, crib)?.into_pointer_value();
+                let tag_v = self.lower_operand(func, locals, tag)?.into_int_value();
+                let evict_slot = self.get_or_add(
+                    "bet_evict_slot",
+                    self.cx
+                        .void_type()
+                        .fn_type(&[self.ptr_ty().into(), self.cx.i64_type().into()], false),
+                );
+                self.builder
+                    .build_call(evict_slot, &[crib_v.into(), tag_v.into()], "")
+                    .map_err(lower_err)?;
+                Ok(())
+            }
         }
     }
 
@@ -1355,6 +1372,10 @@ impl<'c> Cg<'c> {
             // generation=0), which packs to `0xFFFF_FFFF` as an `i64` and always resolves as
             // ghosted. Other (contextual) uses of `ghosted` are not supported yet.
             Const::Ghosted => Ok(self.cx.i64_type().const_int(0xFFFF_FFFF, false).into()),
+            // A null pointer: the zero-default for handle-shaped struct fields (fn values,
+            // `vec`/`stash`/`rng` handles, raw pointers). Safe to hold/overwrite; a crash
+            // only on use, like any zeroed handle in C.
+            Const::NullPtr => Ok(self.ptr_ty().const_null().into()),
             Const::FnRef(fid) => Ok(self.funcs[fid.index()]
                 .as_global_value()
                 .as_pointer_value()

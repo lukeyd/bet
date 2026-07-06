@@ -340,9 +340,20 @@ impl AstDump {
                     self.block(d + 2, b);
                 }
             }
-            StmtKind::Evict(e) => {
-                self.line(d, "evict");
-                self.expr(d + 1, e);
+            StmtKind::Evict { crib, tag } => {
+                // The whole-crib form keeps its historical one-child dump shape; the
+                // single-slot form gets a distinct head (tag first, then crib).
+                match tag {
+                    None => {
+                        self.line(d, "evict");
+                        self.expr(d + 1, crib);
+                    }
+                    Some(t) => {
+                        self.line(d, "evict-slot");
+                        self.expr(d + 1, t);
+                        self.expr(d + 1, crib);
+                    }
+                }
             }
             StmtKind::Slide(e) => {
                 self.line(d, "slide");

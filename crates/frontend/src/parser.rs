@@ -553,7 +553,21 @@ impl<'a> Parser<'a> {
             Some(Token::Sheesh) => self.sheesh_stmt()?,
             Some(Token::Evict) => {
                 self.pos += 1;
-                StmtKind::Evict(self.expr()?)
+                // `evict <crib>` frees the whole crib; `evict <tag> in <crib>` frees one slot.
+                // Same shape as `holla`'s `<tag> in <crib>`: expression parsing stops at `in`
+                // (only the `cop`/`.trust()` forms embed one, and neither is an evict operand).
+                let first = self.expr()?;
+                if self.eat(&Token::In) {
+                    StmtKind::Evict {
+                        crib: self.expr()?,
+                        tag: Some(first),
+                    }
+                } else {
+                    StmtKind::Evict {
+                        crib: first,
+                        tag: None,
+                    }
+                }
             }
             Some(Token::Slide) => {
                 self.pos += 1;

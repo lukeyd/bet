@@ -319,7 +319,7 @@ fn trust(tag: Expr, crib: Expr) -> Expr {
     })
 }
 fn evict(crib: Expr) -> Stmt {
-    st(StmtKind::Evict(crib))
+    st(StmtKind::Evict { crib, tag: None })
 }
 /// `yikes.new(msg)` — construct an error value.
 fn yikes_new(msg: &str) -> Expr {

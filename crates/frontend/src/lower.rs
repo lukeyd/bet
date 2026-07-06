@@ -610,6 +610,70 @@ impl LowerCtx {
         sid
     }
 
+    /// The zero value of ANY field-shaped type, for zero-defaulting omitted fields in a
+    /// struct literal / `cop T{}` (spec §5). Scalars are their literal zeros; a `tag` is the
+    /// null tag (always ghosted); handle-shaped types (fn values, `vec`/`stash`/`rng`, raw
+    /// pointers) are the null pointer — safe to hold and overwrite, a crash only on use; a
+    /// slice is the empty `{ null, 0 }` fat value; nested drips and fixed arrays recurse.
+    /// May emit statements (aggregate temps) into the current block.
+    fn zero_value(&mut self, ty: TyId) -> Result<Operand, String> {
+        Ok(match self.m.ty(ty).clone() {
+            TyKind::Int { .. } => Operand::Const(Const::Int(0, ty)),
+            TyKind::F32 | TyKind::F64 => Operand::Const(Const::Float(0.0, ty)),
+            TyKind::Bool => Operand::Const(Const::Bool(false)),
+            TyKind::Str => Operand::Const(Const::Str(String::new())),
+            TyKind::Tag(_) => Operand::Const(Const::Ghosted),
+            TyKind::FnPtr(_)
+            | TyKind::Map(_, _)
+            | TyKind::Vec(_)
+            | TyKind::Rng
+            | TyKind::RawPtr
+            | TyKind::Crib(_) => Operand::Const(Const::NullPtr),
+            TyKind::Slice(elem) => {
+                let tmp = self.new_local(ty);
+                let usize_t = self.m.t_int(IntWidth::W64, false);
+                self.fb().assign(
+                    Place::local(tmp),
+                    Rvalue::MakeSlice {
+                        data: Operand::Const(Const::NullPtr),
+                        len: Operand::Const(Const::Int(0, usize_t)),
+                        elem,
+                    },
+                );
+                Operand::Copy(Place::local(tmp))
+            }
+            TyKind::Struct(sid) => {
+                let field_tys: Vec<TyId> =
+                    self.m.struct_def(sid).fields.iter().map(|f| f.ty).collect();
+                let mut ops = Vec::with_capacity(field_tys.len());
+                for fty in field_tys {
+                    ops.push(self.zero_value(fty)?);
+                }
+                let tmp = self.new_local(ty);
+                self.fb().assign(
+                    Place::local(tmp),
+                    Rvalue::Aggregate(AggKind::Struct(sid), ops),
+                );
+                Operand::Copy(Place::local(tmp))
+            }
+            TyKind::Array(elem, n) => {
+                let z = self.zero_value(elem)?;
+                let ops = vec![z; n as usize];
+                let tmp = self.new_local(ty);
+                self.fb().assign(
+                    Place::local(tmp),
+                    Rvalue::Aggregate(AggKind::Array(elem), ops),
+                );
+                Operand::Copy(Place::local(tmp))
+            }
+            other => {
+                return Err(format!(
+                    "a field of type {other:?} has no zero value; initialize it explicitly"
+                ));
+            }
+        })
+    }
+
     /// The zero value of a scalar/`str` type, for the leading slots of a `bounce` early return.
     fn zero_operand(&mut self, ty: TyId) -> Result<Operand, String> {
         Ok(match self.m.ty(ty) {
@@ -1004,9 +1068,23 @@ impl LowerCtx {
                 live,
                 ghosted,
             } => self.lower_holla(binding, tag, crib, live, ghosted),
-            StmtKind::Evict(e) => {
-                let (op, _) = self.lower_expr(e, None)?;
-                self.fb().evict(op);
+            StmtKind::Evict { crib, tag } => {
+                let (crib_op, crib_ty) = self.lower_expr(crib, None)?;
+                match tag {
+                    // `evict crib` — whole-crib mass free.
+                    None => self.fb().evict(crib_op),
+                    // `evict tag in crib` — free one slot (rt-abi `bet_evict_slot`).
+                    Some(t) => {
+                        if !matches!(self.m.ty(crib_ty), TyKind::Crib(_)) {
+                            return Err("`evict .. in ..` needs a crib after `in`".to_string());
+                        }
+                        let (tag_op, tag_ty) = self.lower_expr(t, None)?;
+                        if !matches!(self.m.ty(tag_ty), TyKind::Tag(_)) {
+                            return Err("`evict .. in ..` needs a tag before `in`".to_string());
+                        }
+                        self.fb().evict_slot(crib_op, tag_op);
+                    }
+                }
                 Ok(())
             }
             StmtKind::Bet(vals) => self.lower_bet(vals),
@@ -3388,6 +3466,54 @@ impl LowerCtx {
                 );
                 Ok((Operand::Copy(Place::local(result)), slice_ty))
             }
+            // `fs.drop(path, data)` — write a `[]u8` to a file (create-or-truncate), `nocap`
+            // on success. The write sibling of `fs.peep`: both project the `str`/slice fat
+            // values into (ptr, len) pairs for the runtime (`bet_fs_write`).
+            ("fs", "drop") => {
+                if args.len() != 2 {
+                    return Err("`fs.drop` takes a path string and a []u8".into());
+                }
+                let rawptr = self.m.intern_ty(TyKind::RawPtr);
+                let usize_t = self.m.t_int(IntWidth::W64, false);
+                let boolt = self.m.t_bool();
+                let strt = self.m.t_str();
+                let u8t = self.m.t_int(IntWidth::W8, false);
+                let slice_ty = self.m.intern_ty(TyKind::Slice(u8t));
+                let (path, _) = self.lower_expr(&args[0].value, Some(strt))?;
+                let (data, data_ty) = self.lower_expr(&args[1].value, Some(slice_ty))?;
+                if !matches!(self.m.ty(data_ty), TyKind::Slice(e) if *e == u8t) {
+                    return Err("`fs.drop` data must be a []u8".into());
+                }
+                let pp = self.new_local(rawptr);
+                self.fb()
+                    .assign(Place::local(pp), Rvalue::StrPtr(path.clone()));
+                let pl = self.new_local(usize_t);
+                self.fb().assign(Place::local(pl), Rvalue::StrLen(path));
+                let dp = self.new_local(rawptr);
+                self.fb()
+                    .assign(Place::local(dp), Rvalue::SlicePtr(data.clone()));
+                let dl = self.new_local(usize_t);
+                self.fb().assign(Place::local(dl), Rvalue::SliceLen(data));
+                let ext = self.get_extern(
+                    "bet_fs_write",
+                    vec![rawptr, usize_t, rawptr, usize_t],
+                    vec![boolt],
+                );
+                let ok = self.new_local(boolt);
+                self.fb().assign(
+                    Place::local(ok),
+                    Rvalue::Call(
+                        Callee::Extern(ext),
+                        vec![
+                            Operand::Copy(Place::local(pp)),
+                            Operand::Copy(Place::local(pl)),
+                            Operand::Copy(Place::local(dp)),
+                            Operand::Copy(Place::local(dl)),
+                        ],
+                    ),
+                );
+                Ok((Operand::Copy(Place::local(ok)), boolt))
+            }
             // `sys.argc()` — the process argument count, as an `int`.
             ("sys", "argc") => {
                 if !args.is_empty() {
@@ -4263,17 +4389,16 @@ impl LowerCtx {
             .iter()
             .map(|f| (f.name.clone(), f.ty))
             .collect();
-        // Build operands in declaration order, matching each field by name.
+        // Build operands in declaration order, matching each field by name; an omitted
+        // field zero-defaults (spec §5 — `zero_value` for the rules).
         let mut ops = Vec::with_capacity(field_tys.len());
         for (fname, fty) in &field_tys {
-            let init = lit
-                .fields
-                .iter()
-                .find(|fi| &fi.name == fname)
-                .ok_or_else(|| {
-                    format!("struct literal `{}` is missing field `{fname}`", lit.name)
-                })?;
-            let (op, _) = self.lower_expr(&init.value, Some(*fty))?;
+            let op = match lit.fields.iter().find(|fi| &fi.name == fname) {
+                Some(init) => self.lower_expr(&init.value, Some(*fty))?.0,
+                None => self.zero_value(*fty).map_err(|why| {
+                    format!("`{}` field `{fname}` cannot zero-default: {why}", lit.name)
+                })?,
+            };
             ops.push(op);
         }
         let sty = self.m.intern_ty(TyKind::Struct(sid));
@@ -4308,14 +4433,20 @@ impl LowerCtx {
                     .iter()
                     .map(|f| (f.name.clone(), f.ty))
                     .collect();
+                // Every declared field is written into the fresh slot, an omitted one as its
+                // zero default (spec §5) — a reused slot must never leak its previous
+                // occupant's bytes through `cop T{}`.
                 let mut fields = Vec::with_capacity(field_tys.len());
                 for (idx, (fname, fty)) in field_tys.iter().enumerate() {
-                    let fi = lit
-                        .fields
-                        .iter()
-                        .find(|fi| &fi.name == fname)
-                        .ok_or_else(|| format!("`cop {}` is missing field `{fname}`", lit.name))?;
-                    let (op, _) = self.lower_expr(&fi.value, Some(*fty))?;
+                    let op = match lit.fields.iter().find(|fi| &fi.name == fname) {
+                        Some(fi) => self.lower_expr(&fi.value, Some(*fty))?.0,
+                        None => self.zero_value(*fty).map_err(|why| {
+                            format!(
+                                "`cop {}` field `{fname}` cannot zero-default: {why}",
+                                lit.name
+                            )
+                        })?,
+                    };
                     fields.push((idx as u32, op));
                 }
                 bump_struct = Some(sid);

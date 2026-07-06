@@ -82,7 +82,11 @@ fn evict_slot_frees_one_slot_and_bumps_generation() {
         assert_ne!(c.generation, a.generation, "generation must advance");
         *(bet_holla_check(crib, c) as *mut i64) = 9;
         assert_eq!(id_of(crib, c), 9);
-        assert_eq!(id_of(crib, a), -1, "the stale tag never sees the new occupant");
+        assert_eq!(
+            id_of(crib, a),
+            -1,
+            "the stale tag never sees the new occupant"
+        );
 
         // A per-slot evict on a bump crib is a harmless no-op.
         let bump = bet_crib_new_bump(64);

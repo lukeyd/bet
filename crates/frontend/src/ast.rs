@@ -269,8 +269,13 @@ pub enum StmtKind {
         body: Block,
         recover: Option<(String, Block)>,
     },
-    /// `evict crib`.
-    Evict(Expr),
+    /// `evict crib` (whole-crib mass-free) / `evict tag in crib` (free a single slot: the
+    /// tag's slot is marked unoccupied and its generation bumped, so the tag — and every
+    /// copy of it — ghosts, and the slot is reusable by a later `cop`; a stale tag no-ops).
+    Evict {
+        crib: Expr,
+        tag: Option<Expr>,
+    },
     /// `slide call()` — spawn a task.
     Slide(Expr),
     /// `bet v, ...` — return zero or more values.

@@ -475,7 +475,10 @@ impl Resolver<'_> {
                 };
                 StmtKind::Sheesh { body, recover }
             }
-            StmtKind::Evict(e) => StmtKind::Evict(self.expr(e)?),
+            StmtKind::Evict { crib, tag } => StmtKind::Evict {
+                crib: self.expr(crib)?,
+                tag: tag.map(|t| self.expr(t)).transpose()?,
+            },
             StmtKind::Slide(e) => StmtKind::Slide(self.expr(e)?),
             StmtKind::Bet(es) => StmtKind::Bet(self.exprs(es)?),
             StmtKind::Bounce(e) => StmtKind::Bounce(self.expr(e)?),

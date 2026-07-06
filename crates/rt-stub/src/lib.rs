@@ -1012,9 +1012,8 @@ mod tests {
         let path_str = path.to_str().unwrap();
         let data = [0x42u8, 0x45, 0x54, 0x00, 0xFF];
 
-        let ok = unsafe {
-            bet_fs_write(path_str.as_ptr(), path_str.len(), data.as_ptr(), data.len())
-        };
+        let ok =
+            unsafe { bet_fs_write(path_str.as_ptr(), path_str.len(), data.as_ptr(), data.len()) };
         assert!(ok, "writing into the temp dir should succeed");
 
         let mut out_len: usize = 0;

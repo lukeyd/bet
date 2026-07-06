@@ -131,12 +131,28 @@ impl Arena {
             s.live = false;
         }
     }
+
+    /// Free ONE slot (`evict tag in crib`): iff the tag is still live (same validity rule as
+    /// `holla`), mark the slot free and bump its generation so every outstanding copy of the
+    /// tag ghosts and the slot is reusable by a later `cop`. A stale tag is a safe no-op.
+    fn evict_slot(&mut self, slot: usize, generation: u64) {
+        if let Some(s) = self.slots.get_mut(slot)
+            && s.live
+            && s.generation == generation
+        {
+            s.live = false;
+            s.generation = s.generation.wrapping_add(1);
+        }
+    }
 }
 
 /// The interpreter: declaration tables, arenas, and the captured output buffer.
 pub struct Interp<'p> {
     funcs: HashMap<String, &'p FnDecl>,
     methods: HashMap<(String, String), &'p FnDecl>,
+    /// Every `drip` declaration, so a struct literal with omitted fields can zero-default
+    /// them (the `cop GameState{}` pattern — spec §5 zero-defaults).
+    drips: HashMap<String, &'p frontend::ast::DripDecl>,
     variants: HashMap<String, VariantInfo>,
     globals: HashMap<String, Value>,
     /// Names declared via `extern "C" finna` — resolved to a small built-in shim table so the
@@ -158,6 +174,7 @@ impl<'p> Interp<'p> {
         let mut me = Interp {
             funcs: HashMap::new(),
             methods: HashMap::new(),
+            drips: HashMap::new(),
             variants: HashMap::new(),
             globals: HashMap::new(),
             externs: std::collections::HashSet::new(),
@@ -170,6 +187,9 @@ impl<'p> Interp<'p> {
         for item in &program.items {
             match item {
                 Item::Func(f) => me.register_fn(f),
+                Item::Drip(d) => {
+                    me.drips.insert(d.name.clone(), d);
+                }
                 Item::Moods(m) => {
                     for v in &m.variants {
                         me.variants.insert(
@@ -426,10 +446,33 @@ impl<'p> Interp<'p> {
                 ghosted,
             } => self.exec_holla(env, binding, tag, crib, live, ghosted),
             StmtKind::Sheesh { body, recover } => self.exec_sheesh(env, body, recover),
-            StmtKind::Evict(e) => {
-                let id = self.eval_crib(env, e)?;
-                if let Some(arena) = self.arenas.get_mut(&id) {
-                    arena.evict();
+            StmtKind::Evict { crib, tag } => {
+                let id = self.eval_crib(env, crib)?;
+                match tag {
+                    // `evict crib` — whole-crib mass free.
+                    None => {
+                        if let Some(arena) = self.arenas.get_mut(&id) {
+                            arena.evict();
+                        }
+                    }
+                    // `evict tag in crib` — free one slot. A null tag (`ghosted`, the
+                    // compiled Tag::NULL) and a stale tag are safe no-ops.
+                    Some(t) => match self.eval_expr(env, t)? {
+                        Value::Tag {
+                            slot, generation, ..
+                        } => {
+                            if let Some(arena) = self.arenas.get_mut(&id) {
+                                arena.evict_slot(slot, generation);
+                            }
+                        }
+                        Value::Ghosted => {}
+                        other => {
+                            return Err(RunError::Type(format!(
+                                "`evict .. in ..` needs a tag, got {}",
+                                other.type_name()
+                            )));
+                        }
+                    },
                 }
                 Ok(Flow::Normal)
             }
@@ -462,6 +505,9 @@ impl<'p> Interp<'p> {
             Value::Tag {
                 slot, generation, ..
             } => (slot, generation),
+            // A null tag (`ghosted` stored in a tag position — the compiled `Tag::NULL`,
+            // and the zero-default of an omitted `tag` field) always resolves as ghosted.
+            Value::Ghosted => return self.exec_block(env, ghosted),
             other => {
                 return Err(RunError::Type(format!(
                     "`holla` needs a tag, got {}",
@@ -985,7 +1031,84 @@ impl<'p> Interp<'p> {
             let val = self.eval_expr(env, &f.value)?;
             fields.insert(f.name.clone(), val);
         }
+        // Omitted fields zero-default (`cop GameState{}` — spec §5): ints 0, floats 0.0,
+        // bools cap, strs "", nested drips recursively zeroed, fixed arrays zeroed, tags and
+        // handle-shaped fields (vec/stash/rng/fn/crib) null (`ghosted` here; the compiled
+        // path's null handle) — safe to hold and overwrite, a crash only on use.
+        if let Some(decl) = self.drips.get(lit.name.as_str()).copied() {
+            let subst: HashMap<&str, &Type> = decl
+                .generics
+                .iter()
+                .map(String::as_str)
+                .zip(lit.generics.iter())
+                .collect();
+            for fd in &decl.fields {
+                if !fields.contains_key(&fd.name) {
+                    let v = self.zero_default(&fd.ty, &subst).map_err(|why| {
+                        RunError::Type(format!(
+                            "`{}` field `{}` cannot zero-default ({why}); initialize it \
+                             explicitly",
+                            lit.name, fd.name
+                        ))
+                    })?;
+                    fields.insert(fd.name.clone(), v);
+                }
+            }
+        }
         Ok(Value::Struct { ty, fields })
+    }
+
+    /// The zero value for a struct field's declared type (see [`Self::eval_struct_lit`]).
+    /// `subst` maps the enclosing drip's generic parameter names to the literal's type args.
+    /// Errors (with a reason) on a type with no meaningful zero — a `moods` sum, or an
+    /// unsubstituted type parameter.
+    fn zero_default(&self, ty: &Type, subst: &HashMap<&str, &Type>) -> Result<Value, String> {
+        match &ty.kind {
+            TypeKind::Named(name, args) => {
+                if let Some(&sub) = subst.get(name.as_str()) {
+                    return self.zero_default(sub, &HashMap::new());
+                }
+                match name.as_str() {
+                    "int" | "uint" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32"
+                    | "u64" => Ok(Value::Int(0)),
+                    "float" | "f32" | "f64" => Ok(Value::Float(0.0)),
+                    "bool" => Ok(Value::Bool(false)),
+                    "str" => Ok(Value::Str(String::new())),
+                    // Runtime-backed handles: null until a real one is assigned.
+                    "vec" | "stash" | "rng" => Ok(Value::Ghosted),
+                    _ => match self.drips.get(name.as_str()) {
+                        // A nested drip zeroes recursively, under its own substitution.
+                        Some(decl) => {
+                            let inner: HashMap<&str, &Type> = decl
+                                .generics
+                                .iter()
+                                .map(String::as_str)
+                                .zip(args.iter())
+                                .collect();
+                            let mut fields = BTreeMap::new();
+                            for fd in &decl.fields {
+                                fields.insert(fd.name.clone(), self.zero_default(&fd.ty, &inner)?);
+                            }
+                            Ok(Value::Struct {
+                                ty: name.clone(),
+                                fields,
+                            })
+                        }
+                        None => Err(format!("`{name}` has no zero value")),
+                    },
+                }
+            }
+            TypeKind::Slice(_) => Ok(Value::Array(Vec::new())),
+            TypeKind::Array(elem, n) => {
+                let z = self.zero_default(elem, subst)?;
+                Ok(Value::Array(vec![z; *n as usize]))
+            }
+            // A null tag: always resolves as ghosted under `holla` (and `evict .. in ..`).
+            TypeKind::Tag(_) => Ok(Value::Ghosted),
+            // Null handles: assignable later, a crash only on use.
+            TypeKind::Crib(_) | TypeKind::Fn(..) => Ok(Value::Ghosted),
+            TypeKind::RawPtr => Ok(Value::Int(0)),
+        }
     }
 
     // ---- calls (may yield 0..n values) ---------------------------------------
@@ -1646,7 +1769,9 @@ impl<'p> Interp<'p> {
     }
 
     /// `fs` intrinsics. `fs.peep(path)` reads the whole file as `[]u8` (empty on any error),
-    /// mirroring the runtime `bet_fs_read` used by the compiled path.
+    /// mirroring the runtime `bet_fs_read` used by the compiled path. `fs.drop(path, data)`
+    /// writes a `[]u8` to a file (create-or-truncate), returning `nocap` on success —
+    /// mirroring `bet_fs_write`.
     fn call_fs(&mut self, env: &mut Env, method: &str, args: &[Arg]) -> Result<Value, RunError> {
         let vals = self.eval_args(env, args)?;
         match (method, vals.as_slice()) {
@@ -1658,6 +1783,25 @@ impl<'p> Interp<'p> {
             },
             ("peep", _) => Err(RunError::Type(
                 "`fs.peep` takes a single path string".into(),
+            )),
+            ("drop", [Value::Str(path), Value::Array(data)]) => {
+                let mut bytes = Vec::with_capacity(data.len());
+                for v in data {
+                    match v {
+                        Value::Int(b) => bytes.push(*b as u8),
+                        Value::Byte(b) => bytes.push(*b),
+                        other => {
+                            return Err(RunError::Type(format!(
+                                "`fs.drop` data must be []u8, found a {} element",
+                                other.type_name()
+                            )));
+                        }
+                    }
+                }
+                Ok(Value::Bool(std::fs::write(path, bytes).is_ok()))
+            }
+            ("drop", _) => Err(RunError::Type(
+                "`fs.drop` takes a path string and a []u8".into(),
             )),
             (other, _) => Err(RunError::Unsupported(format!("fs.{other}"))),
         }

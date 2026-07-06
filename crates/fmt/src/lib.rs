@@ -349,10 +349,14 @@ impl Formatter {
                     }
                 }
             }
-            StmtKind::Evict(e) => {
+            StmtKind::Evict { crib, tag } => {
                 self.indent(ind);
                 self.out.push_str("evict ");
-                self.expr(e, false);
+                if let Some(t) = tag {
+                    self.expr(t, false);
+                    self.out.push_str(" in ");
+                }
+                self.expr(crib, false);
                 self.out.push('\n');
             }
             StmtKind::Slide(e) => {

@@ -258,9 +258,13 @@ fn norm_stmt(s: &mut Stmt) {
                 norm_block(b);
             }
         }
-        StmtKind::Evict(e) | StmtKind::Slide(e) | StmtKind::Bounce(e) | StmtKind::Yeet(e) => {
-            norm_expr(e)
+        StmtKind::Evict { crib, tag } => {
+            norm_expr(crib);
+            if let Some(t) = tag {
+                norm_expr(t);
+            }
         }
+        StmtKind::Slide(e) | StmtKind::Bounce(e) | StmtKind::Yeet(e) => norm_expr(e),
         StmtKind::Bet(vs) => {
             for v in vs {
                 norm_expr(v);
