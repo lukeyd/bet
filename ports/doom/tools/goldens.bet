@@ -1,0 +1,370 @@
+// tools/goldens.bet — the bet twin of the C-generated golden vectors. `cargo xtask
+// doom-verify --goldens` runs this under the interpreter and diffs its stdout, section by
+// section, against ports/doom/goldens/{fixed,random,angle,tables}.golden. Each section is a
+// `#GOLDEN <name>` marker line followed by that golden's exact lines.
+//
+// Reproduces id's own code paths through the ported modules: defs/fixed (FixedMul/FixedDiv),
+// util/m_random (P_Random + rndtable), defs/tables (finesine/finetangent/tantoangle fillers),
+// plus a local SlopeDiv + R_PointToAngle for the angle section. The crc32 is the pipeline-wide
+// IEEE-802.3 reflected variant (poly 0xEDB88320, init/xorout 0xFFFFFFFF), tables fed
+// little-endian — matching crates/xtask/src/doom.rs::crc32 and the C generators.
+//
+// NB the local `slopeDivSafe` adds an explicit `(num << 3) as u32` cast that the generated
+// tables.slopeDiv omits: tables.slopeDiv is native-correct (u32 wraps natively) but the twin
+// runs under the interpreter, where the wrap needs the cast. Both yield identical NATIVE
+// values; this is purely an interp-safety measure for the harness. See CONTRACTS.md.
+pull "spill"
+pull "mem"
+pull "str"
+pull "../defs/fixed" as fixed
+pull "../defs/tables" as tables
+pull "../defs/gs" as gs
+pull "../util/m_random" as rnd
+
+// 8-digit lowercase hex of the low 32 bits of v (two's complement for negatives).
+flex finna hex8(v: int) -> str {
+    lowkey val = v & 4294967295
+    lowkey buf = mem.slab[u8](8)
+    lowkey i = 0
+    vibin i < 8 {
+        lowkey nib = (val >> (28 - i * 4)) & 15
+        fr nib < 10 {
+            buf[i] = (48 + nib) as u8
+        } naw {
+            buf[i] = (87 + nib) as u8
+        }
+        i = i + 1
+    }
+    bet str.fromBytesTrust(buf)
+}
+
+// Build the 256-entry crc32 lookup table (poly 0xEDB88320) once.
+flex finna crcTable() -> []i32 {
+    lowkey tbl = mem.slab[i32](256)
+    lowkey i = 0
+    vibin i < 256 {
+        lowkey c = i
+        lowkey k = 0
+        vibin k < 8 {
+            lowkey lsb = c & 1
+            c = c >> 1
+            fr lsb != 0 {
+                c = c ^ 3988292384
+            }
+            k = k + 1
+        }
+        tbl[i] = c as i32
+        i = i + 1
+    }
+    bet tbl
+}
+
+// crc32 of a []i32 table via the lookup table, each entry serialized little-endian.
+flex finna crc32I32(tbl: []i32, t: []i32, n: int) -> int {
+    lowkey crc = 4294967295
+    lowkey i = 0
+    vibin i < n {
+        lowkey v = (t[i] as int) & 4294967295
+        lowkey b = 0
+        vibin b < 4 {
+            lowkey byte = (v >> (b * 8)) & 255
+            crc = (crc >> 8) ^ ((tbl[((crc ^ byte) & 255)] as int) & 4294967295)
+            b = b + 1
+        }
+        i = i + 1
+    }
+    bet (crc ^ 4294967295) & 4294967295
+}
+
+// crc32 of a []u32 table (same serialization).
+flex finna crc32U32(tbl: []i32, t: []u32, n: int) -> int {
+    lowkey crc = 4294967295
+    lowkey i = 0
+    vibin i < n {
+        lowkey v = (t[i] as int) & 4294967295
+        lowkey b = 0
+        vibin b < 4 {
+            lowkey byte = (v >> (b * 8)) & 255
+            crc = (crc >> 8) ^ ((tbl[((crc ^ byte) & 255)] as int) & 4294967295)
+            b = b + 1
+        }
+        i = i + 1
+    }
+    bet (crc ^ 4294967295) & 4294967295
+}
+
+// Interp-safe SlopeDiv (tables.c) — the `as u32` forces the u32 wrap of `num<<3`.
+flex finna slopeDivSafe(num: u32, den: u32) -> u32 {
+    fr den < 512 {
+        bet 2048
+    }
+    lowkey ans: u32 = ((num << 3) as u32) / (den >> 8)
+    fr ans <= 2048 {
+        bet ans
+    }
+    bet 2048
+}
+
+// R_PointToAngle (r_main.c) with viewx=viewy=0, computed via tantoangle[SlopeDiv(...)].
+// The octant results are computed in i64 then folded to u32 (matches the C unsigned wrap,
+// incl. octant 8's `-tantoangle[...]`).
+flex finna pointToAngle(tan: []u32, x: i32, y: i32) -> u32 {
+    fr x == 0 && y == 0 {
+        bet 0
+    }
+    fr x >= 0 {
+        fr y >= 0 {
+            fr x > y {
+                lowkey s0 = slopeDivSafe(y as u32, x as u32) as int
+                bet tan[s0]
+            }
+            lowkey s1 = slopeDivSafe(x as u32, y as u32) as int
+            bet (1073741824 - 1 - (tan[s1] as int)) as u32
+        } naw {
+            lowkey yy = 0 - y
+            fr x > yy {
+                lowkey s8 = slopeDivSafe(yy as u32, x as u32) as int
+                bet (0 - (tan[s8] as int)) as u32
+            }
+            lowkey s7 = slopeDivSafe(x as u32, yy as u32) as int
+            bet (3221225472 + (tan[s7] as int)) as u32
+        }
+    }
+    lowkey xx = 0 - x
+    fr y >= 0 {
+        fr xx > y {
+            lowkey s3 = slopeDivSafe(y as u32, xx as u32) as int
+            bet (2147483648 - 1 - (tan[s3] as int)) as u32
+        }
+        lowkey s2 = slopeDivSafe(xx as u32, y as u32) as int
+        bet (1073741824 + (tan[s2] as int)) as u32
+    }
+    lowkey yy2 = 0 - y
+    fr xx > yy2 {
+        lowkey s4 = slopeDivSafe(yy2 as u32, xx as u32) as int
+        bet (2147483648 + (tan[s4] as int)) as u32
+    }
+    lowkey s5 = slopeDivSafe(xx as u32, yy2 as u32) as int
+    bet (3221225472 - 1 - (tan[s5] as int)) as u32
+}
+
+// ---- section emitters --------------------------------------------------------------------
+
+flex finna emitFixed() {
+    spill.it("#GOLDEN fixed")
+    lowkey mul = mem.slab[i32](20)
+    mul[0] = 0
+    mul[1] = 1
+    mul[2] = -1
+    mul[3] = 2
+    mul[4] = -2
+    mul[5] = 17
+    mul[6] = 0x3FFF
+    mul[7] = 0x4000
+    mul[8] = 0x8000
+    mul[9] = 0x10000
+    mul[10] = -0x10000
+    mul[11] = 0x18000
+    mul[12] = 0x28000
+    mul[13] = 0x40000
+    mul[14] = 6553600
+    mul[15] = -6553600
+    mul[16] = 0x12345678
+    mul[17] = -0x12345678
+    mul[18] = 0x7FFFFFFF
+    mul[19] = -2147483648
+    lowkey i = 0
+    vibin i < 20 {
+        lowkey j = 0
+        vibin j < 20 {
+            spill.it("FIXEDMUL a=" + hex8(mul[i] as int) + " b=" + hex8(mul[j] as int) + " r=" + hex8(fixed.fixedMul(mul[i], mul[j]) as int))
+            j = j + 1
+        }
+        i = i + 1
+    }
+    lowkey dv = mem.slab[i32](16)
+    dv[0] = 0
+    dv[1] = 1
+    dv[2] = -1
+    dv[3] = 2
+    dv[4] = 0x3FFF
+    dv[5] = 0x4000
+    dv[6] = 0x8000
+    dv[7] = 0x10000
+    dv[8] = -0x10000
+    dv[9] = 0x18000
+    dv[10] = 0x40000
+    dv[11] = 6553600
+    dv[12] = -6553600
+    dv[13] = 0x12345678
+    dv[14] = -0x12345678
+    dv[15] = 0x7FFFFFFF
+    i = 0
+    vibin i < 16 {
+        lowkey j = 0
+        vibin j < 16 {
+            spill.it("FIXEDDIV a=" + hex8(dv[i] as int) + " b=" + hex8(dv[j] as int) + " r=" + hex8(fixed.fixedDiv(dv[i], dv[j]) as int))
+            j = j + 1
+        }
+        i = i + 1
+    }
+    // div edge pairs
+    lowkey ea = mem.slab[i32](8)
+    lowkey eb = mem.slab[i32](8)
+    ea[0] = 0
+    eb[0] = 0
+    ea[1] = 5
+    eb[1] = 0
+    ea[2] = -5
+    eb[2] = 0
+    ea[3] = -2147483648
+    eb[3] = -2147483648
+    ea[4] = -2147483648
+    eb[4] = 0x10000
+    ea[5] = 0x7FFFFFFF
+    eb[5] = 1
+    ea[6] = 0x7FFFFFFF
+    eb[6] = -1
+    ea[7] = 1
+    eb[7] = 0x7FFFFFFF
+    i = 0
+    vibin i < 8 {
+        spill.it("FIXEDDIV a=" + hex8(ea[i] as int) + " b=" + hex8(eb[i] as int) + " r=" + hex8(fixed.fixedDiv(ea[i], eb[i]) as int))
+        i = i + 1
+    }
+}
+
+// The whole random section runs inside ONE holla: opening a holla on the GameState crib
+// deep-clones the value under the interpreter, so calling m_random.pRandom (a holla each) in
+// a 2000-iteration loop would clone the state 2000 times. We instead inline P_Random's exact
+// body — prndindex = (prndindex+1)&0xff; rndtable[prndindex] — which is the identity this
+// golden verifies (native still calls m_random.pRandom; see CONTRACTS.md).
+flex finna emitRandom(gt: tag gs.GameState) {
+    spill.it("#GOLDEN random")
+    holla g = gt in gs.gsc {
+        lowkey i = 0
+        vibin i < 256 {
+            spill.it("RNDTABLE i=" + hex8(i) + " v=" + hex8(g.tick.rndtable[i] as int))
+            i = i + 1
+        }
+        // first 2000 P_Random() calls (prndindex starts at 0)
+        lowkey n = 0
+        vibin n < 2000 {
+            g.tick.prndindex = (g.tick.prndindex + 1) & 255
+            lowkey v = g.tick.rndtable[g.tick.prndindex] as int
+            spill.it("PRANDOM n=" + hex8(n) + " i=" + hex8(g.tick.prndindex) + " v=" + hex8(v))
+            n = n + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna emitAngle(tan: []u32) {
+    spill.it("#GOLDEN angle")
+    lowkey sl = mem.slab[u32](17)
+    sl[0] = 0
+    sl[1] = 1
+    sl[2] = 3
+    sl[3] = 255
+    sl[4] = 511
+    sl[5] = 512
+    sl[6] = 513
+    sl[7] = 1024
+    sl[8] = 2047
+    sl[9] = 2048
+    sl[10] = 4096
+    sl[11] = 65535
+    sl[12] = 65536
+    sl[13] = 123456
+    sl[14] = 2147483647
+    sl[15] = 2147483648
+    sl[16] = 4294967295
+    lowkey i = 0
+    vibin i < 17 {
+        lowkey j = 0
+        vibin j < 17 {
+            spill.it("SLOPEDIV n=" + hex8(sl[i] as int) + " d=" + hex8(sl[j] as int) + " r=" + hex8(slopeDivSafe(sl[i], sl[j]) as int))
+            j = j + 1
+        }
+        i = i + 1
+    }
+    lowkey p = mem.slab[i32](13)
+    p[0] = 0
+    p[1] = 1
+    p[2] = -1
+    p[3] = 64
+    p[4] = -64
+    p[5] = 1000
+    p[6] = -1000
+    p[7] = 65536
+    p[8] = -65536
+    p[9] = 123456
+    p[10] = -123456
+    p[11] = 33554432
+    p[12] = -33554432
+    i = 0
+    vibin i < 13 {
+        lowkey j = 0
+        vibin j < 13 {
+            spill.it("P2A x=" + hex8(p[i] as int) + " y=" + hex8(p[j] as int) + " a=" + hex8(pointToAngle(tan, p[i], p[j]) as int))
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+// dumpTableI32/dumpTableU32: TABLECRC + every-256th TABLEVAL (+ last entry if not aligned).
+flex finna dumpTableI32(tbl: []i32, name: str, t: []i32, n: int) {
+    spill.it("TABLECRC t=" + name + " n=" + hex8(n) + " crc=" + hex8(crc32I32(tbl, t, n)))
+    lowkey i = 0
+    vibin i < n {
+        spill.it("TABLEVAL t=" + name + " i=" + hex8(i) + " v=" + hex8(t[i] as int))
+        i = i + 256
+    }
+    fr (n - 1) & 255 != 0 {
+        spill.it("TABLEVAL t=" + name + " i=" + hex8(n - 1) + " v=" + hex8(t[n - 1] as int))
+    }
+}
+
+flex finna dumpTableU32(tbl: []i32, name: str, t: []u32, n: int) {
+    spill.it("TABLECRC t=" + name + " n=" + hex8(n) + " crc=" + hex8(crc32U32(tbl, t, n)))
+    lowkey i = 0
+    vibin i < n {
+        spill.it("TABLEVAL t=" + name + " i=" + hex8(i) + " v=" + hex8(t[i] as int))
+        i = i + 256
+    }
+    fr (n - 1) & 255 != 0 {
+        spill.it("TABLEVAL t=" + name + " i=" + hex8(n - 1) + " v=" + hex8(t[n - 1] as int))
+    }
+}
+
+finna main() {
+    // Fill the math tables once (value-thread the slab rebinds).
+    lowkey finesine = mem.slab[i32](10240)
+    finesine = tables.initFinesineAll(finesine)
+    lowkey finetan = mem.slab[i32](4096)
+    finetan = tables.initFinetangentAll(finetan)
+    lowkey tanto = mem.slab[u32](2049)
+    tanto = tables.initTantoangleAll(tanto)
+
+    // A GameState just for the RNG index (gs owns prndindex). We do NOT call gsInit: the twin
+    // only needs the rndtable, and skipping the megabyte slab allocations keeps the two
+    // interpreter hollas (which deep-clone the crib value) cheap.
+    lowkey g0 = cop gs.GameState{} in gs.gsc
+    holla g = g0 in gs.gsc {
+        g.tick.rndtable = rnd.initRndtable(mem.slab[u8](256))
+    } ghosted {
+        yeet("gs")
+    }
+
+    lowkey ctab = crcTable()
+
+    emitFixed()
+    emitRandom(g0)
+    emitAngle(tanto)
+    spill.it("#GOLDEN tables")
+    dumpTableI32(ctab, "finesine", finesine, 10240)
+    dumpTableI32(ctab, "finetangent", finetan, 4096)
+    dumpTableU32(ctab, "tantoangle", tanto, 2049)
+}
