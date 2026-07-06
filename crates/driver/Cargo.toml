@@ -27,6 +27,12 @@ default = []
 # Forward codegen to the backend. The default build stays LLVM-free; `bet build` without this
 # feature reports a clean runtime error instead of failing to compile.
 llvm = ["backend/llvm"]
+# Forward the real desktop gg backend (window/audio/input) to the interpreter, so
+# `bet run <game>.bet` presents an actual window — the documented
+# `cargo run -p driver --features "llvm,gg-desktop" -- run <game>.bet` invocation.
+# The COMPILED path is unaffected: `bet build --runtime real` links `libruntime.a` by
+# name; that archive gets its window by building `-p runtime --features gg-desktop`.
+gg-desktop = ["interp/gg-desktop"]
 
 [lints]
 workspace = true
