@@ -529,7 +529,7 @@ finna drawText(fontTex: int, fontX: vec[int], fontW: vec[int], s: str, x: int, y
         } naw {
             lowkey w = fontW[c]
             fr w > 0 {
-                gg.spriteSub(fontTex, fontX[c], 0, w, GLYPH_H, px, y)
+                gg.spriteSub(fontTex, fontX[c], 1, w, GLYPH_H - 1, px, y)
                 px = px + w + 3
             } naw {
                 px = px + 9
@@ -567,7 +567,7 @@ finna drawInt(fontTex: int, fontX: vec[int], fontW: vec[int], val: int, x: int, 
     vibin i >= 0 {
         lowkey d = digs[i]
         lowkey code = 48 + d
-        gg.spriteSub(fontTex, fontX[code], 0, fontW[code], GLYPH_H, px, y)
+        gg.spriteSub(fontTex, fontX[code], 1, fontW[code], GLYPH_H - 1, px, y)
         px = px + fontW[code] + 3
         i = i - 1
     }
@@ -685,29 +685,50 @@ finna main() {
         ti = ti + 1
     }
 
-    // ---- bitmap-font metrics: proportional (x, width) per char, extracted from font.png. Digits
-    // 0-9 and letters A-Z are pixel-verified against the atlas; other codes advance without drawing.
-    // Built into shared vecs indexed by ASCII code so drawText/drawInt just read fontX[c]/fontW[c].
-    lowkey digX: int[10] = [242, 259, 275, 293, 308, 326, 344, 361, 379, 396]
-    lowkey digW: int[10] = [13, 12, 14, 11, 13, 14, 13, 13, 13, 13]
-    lowkey letX: int[26] = [509, 531, 544, 558, 573, 587, 605, 620, 635, 653, 669, 685, 702, 718, 735, 753, 768, 782, 798, 817, 835, 853, 870, 887, 906, 926]
-    lowkey letW: int[26] = [17, 9, 10, 12, 10, 14, 11, 12, 16, 12, 13, 14, 12, 13, 14, 11, 11, 12, 15, 14, 14, 13, 13, 15, 16, 16]
+    // ---- bitmap-font metrics via SFont (SDLx::SFont): font.png is an SFont atlas. Row 0 is a marker
+    // row; the separator color is pixel (0,0). Each contiguous run of row-0 columns differing from the
+    // separator is one glyph, mapped to ASCII 33,34,... in order. Glyph pixels live in rows 1..fnH-1,
+    // so drawText/drawInt blit from srcY=1. Parsed here in main from `dat` (never handed to a helper).
     lowkey fontX = vec.new[int]()
     lowkey fontW = vec.new[int]()
     lowkey cp = 0
-    vibin cp < 128 {
-        lowkey gx = 0
-        lowkey gw = 0
-        fr cp >= 48 && cp <= 57 {
-            gx = digX[cp - 48]
-            gw = digW[cp - 48]
-        } naw fr cp >= 65 && cp <= 90 {
-            gx = letX[cp - 65]
-            gw = letW[cp - 65]
-        }
-        fontX.stack(gx)
-        fontW.stack(gw)
+    vibin cp < 33 {
+        fontX.stack(0)
+        fontW.stack(0)
         cp = cp + 1
+    }
+    lowkey fpx = blobOff + fnOff
+    lowkey sepR = dat[fpx] as int
+    lowkey sepG = dat[fpx + 1] as int
+    lowkey sepB = dat[fpx + 2] as int
+    lowkey sepA = dat[fpx + 3] as int
+    lowkey sx = 0
+    vibin sx < fnW {
+        lowkey pidx = fpx + sx * 4
+        fr dat[pidx] as int == sepR && dat[pidx + 1] as int == sepG && dat[pidx + 2] as int == sepB && dat[pidx + 3] as int == sepA {
+            sx = sx + 1
+        } naw {
+            lowkey gstart = sx
+            lowkey run = 1
+            vibin run == 1 {
+                fr sx >= fnW {
+                    run = 0
+                } naw {
+                    lowkey qidx = fpx + sx * 4
+                    fr dat[qidx] as int == sepR && dat[qidx + 1] as int == sepG && dat[qidx + 2] as int == sepB && dat[qidx + 3] as int == sepA {
+                        run = 0
+                    } naw {
+                        sx = sx + 1
+                    }
+                }
+            }
+            fontX.stack(gstart)
+            fontW.stack(sx - gstart)
+        }
+    }
+    vibin fontX.gang() as int < 128 {
+        fontX.stack(0)
+        fontW.stack(0)
     }
 
     // ---- level 0 -> parallel (cellId, color) vecs (shared handles), so the board can be reset on a
