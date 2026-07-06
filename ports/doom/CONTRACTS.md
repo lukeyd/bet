@@ -1,0 +1,237 @@
+# DOOM → bet — FROZEN CONTRACTS (W1.1)
+
+This file is the single lookup every downstream package uses to find where a C global lives
+in the ported engine. **All engine state lives in one crib-resident `gs.GameState`** (module
+`ports/doom/defs/gs.bet`, crib `gs.gsc`), and all mobjs/thinkers in `gs.thinkers`. Every
+stateful engine function takes `gt: tag gs.GameState` first and opens exactly one
+
+```
+holla g = gt in gs.gsc { ... } ghosted { yeet("gs") }
+```
+
+Amendments to field names/shapes go through this file (W1.1-owned) — 11 downstream packages
+depend on it.
+
+## Conventions
+
+- `fixed_t` → `i32`; `angle_t` → `u32`; C `int` in sim/render → `i32`; `int` (i64) only for
+  safe indices/counters. Map cross-refs (sector/line/side/vertex/seg/subsector/node) → raw
+  `i32` indices into the `Level` SoA slabs; mobj/thinker cross-refs → `tag think.Thinker`.
+- **Native-first.** `bet build --runtime real` is the correctness target. Native shares slab
+  backing across calls (so mutating helpers may take slices); native is strict about operand
+  widths (add `as i32`/`as int` casts when mixing) — the interpreter is lenient (i128).
+- **Interpreter caveat:** a `holla` on `gs.gsc` deep-clones the whole GameState. Avoid opening
+  a fresh gsc holla per iteration in hot interp paths; native holla is a pointer (free).
+- The `evict t in gs.thinkers` op frees one thinker slot (gen bump → stale tags ghost).
+
+## Naming decisions (C name → bet field, where they differ)
+
+| C name | bet field | reason |
+|---|---|---|
+| `sector->tag`, `plat->tag`, `ceiling->tag` | `SectorAction.secTag` | `tag` is a bet keyword |
+| `wbplayerstruct_t.in` | `WbPlayer.inGame` | `in` is a bet keyword |
+| `state_t.action` (fn ptr) | `info.State.actionId` + `GameState.actions.a*` | data → id + fn-value field |
+| `mobj_t.info` / `mobj_t.state` | recomputed from `Mobj.typeIdx` / `Mobj.stateIdx` | no back-pointers |
+| `sector_t*` in thinkers | `SectorAction.secnum` (i32 index) | no pointers |
+| clip/list pointers in render | i32 indices/byte-offsets into slabs | no pointers |
+
+## GameState top-level groups
+
+`g.wad g.level g.render g.hooks g.actions g.tick g.shell g.events g.sound g.music g.vid
+g.info g.menu g.hud g.stbar g.am g.wi g.finale g.wipe g.net`
+
+---
+
+## doomstat.h globals → field path
+
+| C global | bet field path |
+|---|---|
+| `gamemode` | `g.shell.gamemode` (GM_*) |
+| `gamemission` | `g.shell.gamemission` |
+| `language` | `g.shell.language` |
+| `modifiedgame` | `g.shell.modifiedgame` |
+| `nomonsters` / `respawnparm` / `fastparm` / `devparm` | `g.shell.nomonsters` / `.respawnparm` / `.fastparm` / `.devparm` |
+| `startskill` / `startepisode` / `startmap` | `g.shell.startskill` / `.startepisode` / `.startmap` |
+| `autostart` | `g.shell.autostart` |
+| `gameskill` / `gameepisode` / `gamemap` | `g.shell.gameskill` / `.gameepisode` / `.gamemap` |
+| `respawnmonsters` | `g.shell.respawnmonsters` |
+| `netgame` | `g.shell.netgame` |
+| `deathmatch` | `g.shell.deathmatch` |
+| `snd_SfxVolume` / `snd_MusicVolume` | `g.sound.sfxVolume` / `g.music`? → `g.sound.musicVolume` |
+| `statusbaractive` | `g.shell.statusbaractive` |
+| `automapactive` | `g.shell.automapactive` (mirror `g.am.active`) |
+| `menuactive` | `g.shell.menuactive` (mirror `g.menu.menuactive`) |
+| `paused` | `g.shell.paused` |
+| `viewactive` / `nodrawers` / `noblit` | `g.shell.viewactive` / `.nodrawers` / `.noblit` |
+| `viewwindowx` / `viewwindowy` | `g.render.viewwindowx` / `.viewwindowy` |
+| `viewheight` / `viewwidth` / `scaledviewwidth` | `g.render.viewheight` / `.viewwidth` / `.scaledviewwidth` |
+| `viewangleoffset` | `g.render.viewangleoffset` |
+| `consoleplayer` / `displayplayer` | `g.shell.consoleplayer` / `.displayplayer` |
+| `totalkills` / `totalitems` / `totalsecret` | `g.shell.totalkills` / `.totalitems` / `.totalsecret` |
+| `levelstarttic` | `g.shell.levelstarttic` |
+| `leveltime` | `g.tick.leveltime` |
+| `usergame` | `g.shell.usergame` |
+| `demoplayback` / `demorecording` / `singledemo` | `g.shell.demoplayback` / `.demorecording` / `.singledemo` |
+| `gamestate` | `g.shell.gamestate` (GS_*) |
+| `gametic` | `g.shell.gametic` (canonical) |
+| `players[MAXPLAYERS]` | `g.shell.players` (Player[4]) |
+| `playeringame[MAXPLAYERS]` | `g.shell.playeringame` (bool[4]) |
+| `deathmatchstarts` / `deathmatch_p` | `g.shell.deathmatchstarts` (MapThing[10]) / `g.shell.deathmatchP` (index) |
+| `playerstarts[MAXPLAYERS]` | `g.shell.playerstarts` (MapThing[4]) |
+| `wminfo` | `g.shell.wminfo` (WbStart) |
+| `maxammo[NUMAMMO]` | `g.shell.maxammo` (i32[4]) |
+| `precache` | `g.shell.precache` |
+| `wipegamestate` | `g.shell.wipegamestate` (-1 forces wipe) |
+| `mouseSensitivity` | `g.shell.mouseSensitivity` |
+| `singletics` | `g.shell.singletics` |
+| `bodyqueslot` | `g.tick.bodyqueslot` |
+| `skyflatnum` | `g.render.skyflatnum` |
+| `doomcom` / `netbuffer` | `g.net.dc*` / `g.net.nb*` (flattened, see NetState) |
+| `localcmds[BACKUPTICS]` | `g.net.localcmds` (Ticcmd[12]) |
+| `rndindex` | `g.tick.rndindex` |
+| `maketic` | `g.net.maketic` |
+| `nettics[MAXNETNODES]` | `g.net.nettics` (i32[8]) |
+| `netcmds[MAXPLAYERS][BACKUPTICS]` | `g.net.netcmds` (Ticcmd[48], index `player*12 + (tic%12)`) |
+| `ticdup` | `g.net.ticdup` |
+
+## r_state.h globals → field path
+
+| C global | bet field path |
+|---|---|
+| `viewx` / `viewy` / `viewz` | `g.render.viewx` / `.viewy` / `.viewz` |
+| `viewangle` | `g.render.viewangle` (u32) |
+| `viewplayer` | `g.render.viewplayer` (player index) |
+| `clipangle` | `g.render.clipangle` (u32) |
+| `viewangletox[FINEANGLES/2]` | `g.render.viewangletox` (i32[], 4096) |
+| `xtoviewangle[SCREENWIDTH+1]` | `g.render.xtoviewangle` (u32[], 321) |
+| `rw_distance` / `rw_normalangle` / `rw_angle1` | `g.render.rw_distance` / `.rw_normalangle` / `.rw_angle1` |
+| `sscount` | `g.render.sscount` |
+| `floorplane` / `ceilingplane` | `g.render.floorplane` / `.ceilingplane` (visplane indices) |
+| `numvertexes` / `numsectors` / `numsides` / `numlines` / `numsubsectors` / `numsegs` / `numnodes` | `g.level.num*` |
+| `vertexes` / `sectors` / `sides` / `lines` / `segs` / `subsectors` / `nodes` | `g.level.*` SoA slabs (below) |
+| `colormaps` | `g.render.colormaps` ([]u8 arena); colormap refs are byte offsets |
+| `textureheight` / `spritewidth` / `spriteoffset` / `spritetopoffset` | **P1.4 r_data** — add to RenderState via amendment |
+| `flattranslation` / `texturetranslation` | **P1.4 r_data** — amendment |
+| `firstflat` / `firstspritelump` / `lastspritelump` / `numspritelumps` | **P1.4 r_data** — amendment |
+| `sprites` / `numsprites` | **P1.4 r_data** — amendment |
+
+> **Note (P1.4):** texture/flat/sprite composite tables (r_data.c) are intentionally NOT in the
+> frozen RenderState yet — P1.4 owns r_data and adds `texArenaOfs`, `textureheight[]`,
+> `spritewidth[]`, `spriteoffset[]`, `spritetopoffset[]`, `flattranslation[]`,
+> `texturetranslation[]`, `sprites` (SoA), `firstflat`/`firstspritelump`/… via a CONTRACTS
+> amendment. Composites precompute into one `[]u8` arena; render regs reference it by offset.
+
+## r_defs.h runtime structs → Level SoA slabs
+
+All are parallel-indexed `[]i32`/`[]u32` slabs (index = the array index C used); tag-valued
+refs are in the `*Links` vecs. Sized at `p/p_setup` (P2.5).
+
+**vertex_t[i]:** `g.level.vtxX[i]` `vtxY[i]` (fixed).
+
+**sector_t[i]:** `secFloorH[i]` `secCeilH[i]` (fixed) · `secFloorPic[i]` `secCeilPic[i]`
+`secLight[i]` `secSpecial[i]` `secTag[i]` · `secSoundTrav[i]` (soundtraversed) · `secValid[i]`
+(validcount) · soundorg `secSoundOrgX/Y/Z[i]` · `secBlockBox[i*4 + 0..3]` · sector→lines list
+`secLineOfs[i]`/`secLineCount[i]` indexing `secLinesList[]` · **soundtarget / thinglist /
+specialdata** → `g.level.secLinks[i].{soundtarget,thinglist,specialT}` (vec[SecLinks]).
+
+**side_t[i]:** `sdTexOfs[i]` `sdRowOfs[i]` (fixed) · `sdTopTex[i]` `sdBotTex[i]` `sdMidTex[i]`
+· `sdSector[i]`.
+
+**line_t[i]:** `lineV1[i]` `lineV2[i]` (vertex idx) · `lineDx[i]` `lineDy[i]` (fixed) ·
+`lineFlags[i]` `lineSpecial[i]` `lineTag[i]` · sidenum[2] → `lineSide0[i]`/`lineSide1[i]`
+(-1 one-sided) · `lineBBox[i*4 + 0..3]` · `lineSlopetype[i]` · `lineFront[i]`/`lineBack[i]`
+(sector idx, -1 none) · `lineValid[i]` · **specialdata** → `g.level.lineLinks[i].specialT`.
+
+**seg_t[i]:** `segV1[i]` `segV2[i]` · `segOffset[i]` (fixed) · `segAngle[i]` (u32) ·
+`segSide[i]` (sidedef) · `segLine[i]` (linedef) · `segFront[i]`/`segBack[i]` (-1 one-sided).
+
+**subsector_t[i]:** `ssSector[i]` `ssNumLines[i]` `ssFirstLine[i]`.
+
+**node_t[i]:** `nodeX[i]` `nodeY[i]` `nodeDx[i]` `nodeDy[i]` (fixed) · `nodeBBox[i*8 + child*4
++ 0..3]` · children[2] → `nodeChild0[i]`/`nodeChild1[i]` (NF_SUBSECTOR bit kept in the value).
+
+**drawseg_t** → `g.render.drawsegs` (vec[DrawSeg]); `curline`→seg idx, clip pointers→openings
+offsets. **visplane_t** → `g.render` SoA `vpHeight/vpPicnum/vpLight/vpMinX/vpMaxX` + `vpTop`/
+`vpBottom` ([]u8 stride `VPSTRIDE=322`, MAXVISPLANES=128). **vissprite_t** → `g.render.vissprites`
+(vec[VisSprite]; prev/next = intra-array indices). **lighttable_t*** everywhere → byte offset
+into `g.render.colormaps`.
+
+## p_local.h globals → field path
+
+| C global | bet field path |
+|---|---|
+| `thinkercap` | `g.tick.thinkercap` (tag think.Thinker) |
+| `itemrespawnque[ITEMQUESIZE]` / `itemrespawntime[]` | `g.tick.itemrespawnque` (MapThing[128]) / `.itemrespawntime` (i32[128]) |
+| `iquehead` / `iquetail` | `g.tick.iquehead` / `.iquetail` |
+| `intercepts[MAXINTERCEPTS]` / `intercept_p` | `g.tick.intercepts` (vec[Intercept]) / `.interceptP` |
+| `trace` | `g.tick.trace` (Divline) |
+| `opentop`/`openbottom`/`openrange`/`lowfloor` | `g.tick.opentop`/`.openbottom`/`.openrange`/`.lowfloor` |
+| `floatok` | `g.tick.floatok` |
+| `tmfloorz`/`tmceilingz` | `g.tick.tmfloorz`/`.tmceilingz` |
+| `tmbbox`/`tmx`/`tmy`/`tmflags`/`tmdropoffz` | `g.tick.tmbbox` (i32[4]) / `.tmx`/`.tmy`/`.tmflags`/`.tmdropoffz` |
+| `ceilingline` | `g.tick.ceilingline` (line idx, -1) |
+| `spechit[]` / `numspechit` | `g.tick.spechit` (i32[8]) / `.numspechit` |
+| `linetarget` | `g.tick.linetarget` (tag) |
+| `attackrange`/`aimslope`/`shootz`/`la_damage`/`topslope`/`bottomslope`/`shootthing` | `g.tick.*` (LineAttack/AimLineAttack regs) |
+| `bombsource`/`bombspot`/`bombdamage` | `g.tick.*` (RadiusAttack) |
+| `crushchange`/`nofit` | `g.tick.crushchange`/`.nofit` (ChangeSector) |
+| `rejectmatrix` | `g.level.rejectOfs`/`.rejectLen` (read in place from `g.wad.buf`) |
+| `blockmap`/`blockmaplump` | `g.level.blockmap` (decoded []i32) |
+| `bmapwidth`/`bmapheight`/`bmaporgx`/`bmaporgy` | `g.level.bmapWidth`/`.bmapHeight`/`.bmapOrgX`/`.bmapOrgY` |
+| `blocklinks` | `g.level.blockLinks` (vec[TagBox], per-block thing-chain head) |
+| `maxammo[]` / `clipammo[]` (p_inter) | `g.shell.maxammo` / `g.shell.clipammo` |
+
+## p_spec.h → SectorAction (one flat union) + active lists
+
+The door/ceiling/floor/plat/light thinker payloads all map to one `think.SectorAction` embedded
+in the `Thinker`; the active thinker is selected by `Thinker.funcId` (FUNC_*). `sector_t*`→
+`secnum`; the *_e sub-type → `kind`. Field map:
+
+- **vldoor_t:** type→`kind` · topheight→`topheight` · speed→`speed` · direction→`direction` ·
+  topwait→`topwait` · topcountdown→`topcountdown`. (funcId FUNC_DOOR)
+- **ceiling_t:** type→`kind` · bottomheight→`bottomheight` · topheight→`topheight` · speed→
+  `speed` · crush→`crush` · direction→`direction` · tag→`secTag` · olddirection→`olddirection`.
+  (FUNC_CEILING)
+- **floormove_t:** type→`kind` · crush→`crush` · direction→`direction` · newspecial→`newspecial`
+  · texture→`texture` · floordestheight→`floordestheight` · speed→`speed`. (FUNC_FLOOR)
+- **plat_t:** speed→`speed` · low→`low` · high→`high` · wait→`wait` · count→`count` · status→
+  `status` · oldstatus→`oldstatus` · crush→`crush` · tag→`secTag` · type→`kind`. (FUNC_PLAT)
+- **lightflash_t:** count→`count` · maxlight→`maxlight` · minlight→`minlight` · maxtime→
+  `maxtime` · mintime→`mintime`. (FUNC_FLASH)
+- **strobe_t:** count→`count` · minlight→`minlight` · maxlight→`maxlight` · darktime→`darktime`
+  · brighttime→`brighttime`. (FUNC_STROBE)
+- **glow_t:** minlight→`minlight` · maxlight→`maxlight` · direction→`direction`. (FUNC_GLOW)
+- **fireflicker_t:** count→`count` · maxlight→`maxlight` · minlight→`minlight`. (FUNC_FLICKER)
+
+Active-thinker lists: `activeceilings[MAXCEILINGS]`→`g.tick.activeceilings` (TagBox[30]) ·
+`activeplats[MAXPLATS]`→`g.tick.activeplats` (TagBox[30]) · `buttonlist[MAXBUTTONS]`→
+`g.tick.buttonlist` (Button[16]) · `braintargets[32]`/`numbraintargets`→
+`g.tick.braintargets`/`.numbraintargets` · `bodyque[BODYQUESIZE]`→`g.tick.bodyque` (TagBox[32]).
+Texture anims (`anims`) → `g.tick.anims` (vec[AnimDef]). The `*_e` enums (vldoor_e, ceiling_e,
+floor_e, plat_e, plattype_e, stair_e, result_e, bwhere_e) are defined by **p/p_spec (P2.3)**.
+
+## Uncertain / decisions flagged
+
+1. **FixedDiv2 uses the f64 double path** (`c = (double)a/(double)b*FRACUNIT`) exactly as
+   linuxdoom `m_fixed.c` (the `#if 0` i64 path is disabled). Matches the committed
+   `fixed.golden` AND the doomgeneric/linuxdoom oracle. Native lowers as sitofp/fdiv/fmul/
+   fptosi. FixedDiv's abs() is taken in i64 (widen `a` first), which reproduces the golden's
+   INT_MIN edge (`FixedDiv(INT_MIN,INT_MIN)→FRACUNIT`, clamp NOT taken).
+2. **`tables.slopeDiv` (generated) is native-correct only.** Its `(num<<3)` relies on native
+   u32 wrap; the interpreter does not wrap it. `goldens.bet` uses a local `slopeDivSafe` with an
+   explicit `(num<<3) as u32` for the interp harness. Both give identical native values. If a
+   future interp path needs SlopeDiv, add the cast to the generator.
+3. **`gametic` canonical home is `g.shell.gametic`** (d_net/g_game drive it). `g.tick` holds
+   `leveltime` and the RNG; it does NOT duplicate gametic.
+4. **`snd_MusicVolume`** stored at `g.sound.musicVolume` (SoundState), not MusicState, to keep
+   both volumes together. `snd_*Device` fields not modelled (Linux DMX card indices, unused on gg).
+5. **Ticcmd wire widths:** `forwardmove`/`sidemove` are logically signed 8-bit, `angleturn`/
+   `consistancy` signed 16-bit, `chatchar`/`buttons` unsigned 8-bit; stored as i32, masked by
+   d_net/g_game on encode/decode (demo compat).
+6. **RenderState draw registers** cover the vanilla `dc_*`/`ds_*`/`rw_*` set needed by the
+   sim/basic renderer. P2.6/P2.7 may add render-only scratch (e.g. `mfloorclip`/`mceilingclip`
+   base offsets, `spryscale`, `topfrac`) via amendment — these carry no cross-package state.
+7. **`degenmobj_t` soundorg** (sector sound origin) is flattened to `secSoundOrgX/Y/Z` (its
+   thinker field is unused in id's code).
+8. **`Mobj.player`** is a player index (−1 none), NOT a tag; `Player.mo` is a `tag think.Thinker`.
+   `Mobj.subsector` is a subsector index (−1 none).
