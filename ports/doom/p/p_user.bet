@@ -1,0 +1,583 @@
+// p/p_user.bet — the player's per-tic logic (linuxdoom-1.10 p_user.c): P_PlayerThink (build from
+// the ticcmd: noclip, chainsaw run-forward, death, movement, specials, weapon change, use lines,
+// psprites, powerup counters, colormap), P_MovePlayer, P_CalcHeight (sets players[].viewz — the eye
+// height + view bob; this is the POV the renderer reads), P_DeathThink, P_Thrust.
+//
+// onground: id keeps a file-static `onground`, set by P_MovePlayer/P_DeathThink and read by
+// P_CalcHeight. There is no module global here, so P_CalcHeight recomputes it as (mo->z <=
+// mo->floorz) — identical within a tic (z is not changed between MovePlayer and CalcHeight; z moves
+// in P_ZMovement, which runs later in P_RunThinkers). The only divergence is during teleport
+// reactiontime (MovePlayer skipped); viewz never feeds the sim RNG, so this cannot desync a demo.
+//
+// No P_Random here (weapon-fire RNG lives in the psprite actions). NATIVE is the correctness target.
+pull "../defs/gs" as gs
+pull "../defs/think" as think
+pull "../defs/fixed" as fixed
+pull "../defs/tables" as tables
+pull "../defs/doomdef" as doomdef
+pull "../defs/info" as info
+pull "../defs/player" as pdef
+pull "../r/r_geom" as rgeom
+pull "../p/p_mobj" as pmobj
+pull "../p/p_map" as pmap
+pull "../p/p_pspr" as ppspr
+pull "../p/p_spec" as pspec
+
+// ---- constants (p_user.c / tables.h) ------------------------------------------------------
+flex facts FRACUNIT: i32 = 65536
+flex facts VIEWHEIGHT: i32 = 2686976        // 41*FRACUNIT
+flex facts MAXBOB: i32 = 1048576            // 0x100000
+flex facts INVERSECOLORMAP: int = 32
+flex facts ANG5: u32 = 59652323             // ANG90/18
+flex facts NEGANG5: u32 = 4235314973        // (unsigned)(-ANG5)
+
+// P_Thrust — accelerate the player's mobj along `angle` by `move`.
+flex finna pThrust(gt: tag gs.GameState, pi: int, angle: u32, move: i32) {
+    lowkey fine: int = (angle >> 19) as int
+    lowkey mo: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        mo = g.shell.players[pi].mo
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey dmx: i32 = 0
+    lowkey dmy: i32 = 0
+    holla g = gt in gs.gsc {
+        dmx = fixed.fixedMul(move, g.info.finesine[fine + 2048])
+        dmy = fixed.fixedMul(move, g.info.finesine[fine])
+    } ghosted {
+        yeet("gs")
+    }
+    holla m = mo in gs.thinkers {
+        m.mobj.momx = (m.mobj.momx as int + dmx as int) as i32
+        m.mobj.momy = (m.mobj.momy as int + dmy as int) as i32
+    } ghosted {
+        yeet("mo")
+    }
+}
+
+// P_CalcHeight — walking/running eye-height + bob; writes players[pi].viewz.
+flex finna calcHeight(gt: tag gs.GameState, pi: int) {
+    lowkey mo: tag think.Thinker = ghosted
+    lowkey cheats: int = 0
+    lowkey leveltime: int = 0
+    holla g = gt in gs.gsc {
+        mo = g.shell.players[pi].mo
+        cheats = g.shell.players[pi].cheats as int
+        leveltime = g.tick.leveltime as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey momx: i32 = 0
+    lowkey momy: i32 = 0
+    lowkey z: i32 = 0
+    lowkey floorz: i32 = 0
+    lowkey ceilingz: i32 = 0
+    holla m = mo in gs.thinkers {
+        momx = m.mobj.momx
+        momy = m.mobj.momy
+        z = m.mobj.z
+        floorz = m.mobj.floorz
+        ceilingz = m.mobj.ceilingz
+    } ghosted {
+        yeet("mo")
+    }
+    // regular movement bobbing
+    lowkey bob: int = (fixed.fixedMul(momx, momx) as int + fixed.fixedMul(momy, momy) as int)
+    bob = bob >> 2
+    fr bob > (MAXBOB as int) {
+        bob = MAXBOB as int
+    }
+    holla g = gt in gs.gsc {
+        g.shell.players[pi].bob = bob as i32
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey onground: bool = (z <= floorz)
+    fr (cheats & pdef.CF_NOMOMENTUM) != 0 || !onground {
+        lowkey vh: int = 0
+        holla g = gt in gs.gsc {
+            vh = g.shell.players[pi].viewheight as int
+        } ghosted {
+            yeet("gs")
+        }
+        lowkey viewz: int = z as int + VIEWHEIGHT as int
+        lowkey cap4: int = ceilingz as int - 4 * 65536
+        fr viewz > cap4 {
+            viewz = cap4
+        }
+        // id overwrites the clamped value (the clamp is discarded here)
+        viewz = z as int + vh
+        holla g = gt in gs.gsc {
+            g.shell.players[pi].viewz = viewz as i32
+        } ghosted {
+            yeet("gs")
+        }
+        bet
+    }
+    lowkey angle: int = (409 * leveltime) & 8191     // (FINEANGLES/20*leveltime)&FINEMASK
+    lowkey bob2: i32 = 0
+    holla g = gt in gs.gsc {
+        bob2 = fixed.fixedMul((bob >> 1) as i32, g.info.finesine[angle])
+    } ghosted {
+        yeet("gs")
+    }
+    // move viewheight (living player)
+    lowkey playerstate: int = 0
+    holla g = gt in gs.gsc {
+        playerstate = g.shell.players[pi].playerstate as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr playerstate == pdef.PST_LIVE {
+        holla g = gt in gs.gsc {
+            lowkey vh: int = g.shell.players[pi].viewheight as int + g.shell.players[pi].deltaviewheight as int
+            fr vh > (VIEWHEIGHT as int) {
+                vh = VIEWHEIGHT as int
+                g.shell.players[pi].deltaviewheight = 0
+            }
+            fr vh < (VIEWHEIGHT as int / 2) {
+                vh = VIEWHEIGHT as int / 2
+                fr g.shell.players[pi].deltaviewheight as int <= 0 {
+                    g.shell.players[pi].deltaviewheight = 1
+                }
+            }
+            g.shell.players[pi].viewheight = vh as i32
+            fr g.shell.players[pi].deltaviewheight as int != 0 {
+                lowkey dv: int = g.shell.players[pi].deltaviewheight as int + (65536 / 4)
+                fr dv == 0 {
+                    dv = 1
+                }
+                g.shell.players[pi].deltaviewheight = dv as i32
+            }
+        } ghosted {
+            yeet("gs")
+        }
+    }
+    lowkey vh2: int = 0
+    holla g = gt in gs.gsc {
+        vh2 = g.shell.players[pi].viewheight as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey viewz: int = z as int + vh2 + bob2 as int
+    lowkey cap4: int = ceilingz as int - 4 * 65536
+    fr viewz > cap4 {
+        viewz = cap4
+    }
+    holla g = gt in gs.gsc {
+        g.shell.players[pi].viewz = viewz as i32
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// P_MovePlayer — apply the ticcmd turn + thrust; enter the run animation if moving.
+flex finna movePlayer(gt: tag gs.GameState, pi: int) {
+    lowkey mo: tag think.Thinker = ghosted
+    lowkey angleturn: int = 0
+    lowkey forwardmove: int = 0
+    lowkey sidemove: int = 0
+    holla g = gt in gs.gsc {
+        mo = g.shell.players[pi].mo
+        angleturn = g.shell.players[pi].cmd.angleturn as int
+        forwardmove = g.shell.players[pi].cmd.forwardmove as int
+        sidemove = g.shell.players[pi].cmd.sidemove as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey mangle: u32 = 0
+    lowkey z: i32 = 0
+    lowkey floorz: i32 = 0
+    holla m = mo in gs.thinkers {
+        m.mobj.angle = (m.mobj.angle as int + (angleturn << 16)) as u32
+        mangle = m.mobj.angle
+        z = m.mobj.z
+        floorz = m.mobj.floorz
+    } ghosted {
+        yeet("mo")
+    }
+    lowkey onground: bool = (z <= floorz)
+    fr forwardmove != 0 && onground {
+        pThrust(gt, pi, mangle, (forwardmove * 2048) as i32)
+    }
+    fr sidemove != 0 && onground {
+        pThrust(gt, pi, (mangle - tables.ANG90), (sidemove * 2048) as i32)
+    }
+    fr forwardmove != 0 || sidemove != 0 {
+        lowkey moState: int = 0
+        holla m = mo in gs.thinkers {
+            moState = m.mobj.stateIdx as int
+        } ghosted {
+            yeet("mo")
+        }
+        fr moState == info.S_PLAY {
+            pmobj.setMobjState(gt, mo, info.S_PLAY_RUN1)
+        }
+    }
+}
+
+// P_DeathThink — fall on your face when dying; face the killer; reborn on USE.
+flex finna deathThink(gt: tag gs.GameState, pi: int) {
+    ppspr.movePsprites(gt, pi)
+    lowkey mo: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        mo = g.shell.players[pi].mo
+    } ghosted {
+        yeet("gs")
+    }
+    holla g = gt in gs.gsc {
+        lowkey vh: int = g.shell.players[pi].viewheight as int
+        fr vh > (6 * 65536) {
+            vh = vh - 65536
+        }
+        fr vh < (6 * 65536) {
+            vh = 6 * 65536
+        }
+        g.shell.players[pi].viewheight = vh as i32
+        g.shell.players[pi].deltaviewheight = 0
+    } ghosted {
+        yeet("gs")
+    }
+    calcHeight(gt, pi)
+    lowkey attacker: tag think.Thinker = ghosted
+    lowkey mx: i32 = 0
+    lowkey my: i32 = 0
+    lowkey mangle: u32 = 0
+    holla m = mo in gs.thinkers {
+        mx = m.mobj.x
+        my = m.mobj.y
+        mangle = m.mobj.angle
+    } ghosted {
+        yeet("mo")
+    }
+    holla g = gt in gs.gsc {
+        attacker = g.shell.players[pi].attacker
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey faceKiller: bool = cap
+    fr !(attacker == ghosted) && !(attacker == mo) {
+        faceKiller = nocap
+    }
+    fr faceKiller {
+        lowkey axx: i32 = 0
+        lowkey ayy: i32 = 0
+        holla a = attacker in gs.thinkers {
+            axx = a.mobj.x
+            ayy = a.mobj.y
+        } ghosted {
+            yeet("attacker")
+        }
+        lowkey angle: u32 = 0
+        holla g = gt in gs.gsc {
+            angle = rgeom.pointToAngle2(g.info.tantoangle, mx, my, axx, ayy)
+        } ghosted {
+            yeet("gs")
+        }
+        lowkey delta: u32 = angle - mangle
+        fr delta < ANG5 || delta > NEGANG5 {
+            // looking at killer: fade damage flash down
+            holla m = mo in gs.thinkers {
+                m.mobj.angle = angle
+            } ghosted {
+                yeet("mo")
+            }
+            holla g = gt in gs.gsc {
+                fr g.shell.players[pi].damagecount as int != 0 {
+                    g.shell.players[pi].damagecount = (g.shell.players[pi].damagecount as int - 1) as i32
+                }
+            } ghosted {
+                yeet("gs")
+            }
+        } naw fr delta < tables.ANG180 {
+            holla m = mo in gs.thinkers {
+                m.mobj.angle = m.mobj.angle + ANG5
+            } ghosted {
+                yeet("mo")
+            }
+        } naw {
+            holla m = mo in gs.thinkers {
+                m.mobj.angle = m.mobj.angle - ANG5
+            } ghosted {
+                yeet("mo")
+            }
+        }
+    } naw {
+        holla g = gt in gs.gsc {
+            fr g.shell.players[pi].damagecount as int != 0 {
+                g.shell.players[pi].damagecount = (g.shell.players[pi].damagecount as int - 1) as i32
+            }
+        } ghosted {
+            yeet("gs")
+        }
+    }
+    lowkey buttons: int = 0
+    holla g = gt in gs.gsc {
+        buttons = g.shell.players[pi].cmd.buttons as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr (buttons & doomdef.BT_USE) != 0 {
+        holla g = gt in gs.gsc {
+            g.shell.players[pi].playerstate = pdef.PST_REBORN as i32
+        } ghosted {
+            yeet("gs")
+        }
+    }
+}
+
+// P_PlayerThink — the player's whole per-tic update.
+flex finna playerThink(gt: tag gs.GameState, pi: int) {
+    lowkey mo: tag think.Thinker = ghosted
+    lowkey cheats: int = 0
+    holla g = gt in gs.gsc {
+        mo = g.shell.players[pi].mo
+        cheats = g.shell.players[pi].cheats as int
+    } ghosted {
+        yeet("gs")
+    }
+    // noclip cheat
+    holla m = mo in gs.thinkers {
+        fr (cheats & pdef.CF_NOCLIP) != 0 {
+            m.mobj.flags = (m.mobj.flags as int | think.MF_NOCLIP) as i32
+        } naw {
+            m.mobj.flags = (m.mobj.flags as int & ~think.MF_NOCLIP) as i32
+        }
+    } ghosted {
+        yeet("mo")
+    }
+    // chainsaw run-forward after MF_JUSTATTACKED
+    lowkey moflags: int = 0
+    holla m = mo in gs.thinkers {
+        moflags = m.mobj.flags as int
+    } ghosted {
+        yeet("mo")
+    }
+    fr (moflags & think.MF_JUSTATTACKED) != 0 {
+        holla g = gt in gs.gsc {
+            g.shell.players[pi].cmd.angleturn = 0
+            g.shell.players[pi].cmd.forwardmove = (51200 / 512) as i32   // 0xc800/512 = 100
+            g.shell.players[pi].cmd.sidemove = 0
+        } ghosted {
+            yeet("gs")
+        }
+        holla m = mo in gs.thinkers {
+            m.mobj.flags = (m.mobj.flags as int & ~think.MF_JUSTATTACKED) as i32
+        } ghosted {
+            yeet("mo")
+        }
+    }
+    lowkey playerstate: int = 0
+    holla g = gt in gs.gsc {
+        playerstate = g.shell.players[pi].playerstate as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr playerstate == pdef.PST_DEAD {
+        deathThink(gt, pi)
+        bet
+    }
+    // move around (reactiontime blocks movement briefly after a teleport)
+    lowkey reactiontime: int = 0
+    holla m = mo in gs.thinkers {
+        reactiontime = m.mobj.reactiontime as int
+    } ghosted {
+        yeet("mo")
+    }
+    fr reactiontime != 0 {
+        holla m = mo in gs.thinkers {
+            m.mobj.reactiontime = (reactiontime - 1) as i32
+        } ghosted {
+            yeet("mo")
+        }
+    } naw {
+        movePlayer(gt, pi)
+    }
+    calcHeight(gt, pi)
+    // special sector
+    lowkey sub: int = 0
+    holla m = mo in gs.thinkers {
+        sub = m.mobj.subsector as int
+    } ghosted {
+        yeet("mo")
+    }
+    lowkey special: int = 0
+    holla g = gt in gs.gsc {
+        special = g.level.secSpecial[g.level.ssSector[sub] as int] as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr special != 0 {
+        pspec.playerInSpecialSector(gt, pi)
+    }
+    // weapon change
+    lowkey buttons: int = 0
+    holla g = gt in gs.gsc {
+        buttons = g.shell.players[pi].cmd.buttons as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr (buttons & doomdef.BT_SPECIAL) != 0 {
+        buttons = 0
+        holla g = gt in gs.gsc {
+            g.shell.players[pi].cmd.buttons = 0
+        } ghosted {
+            yeet("gs")
+        }
+    }
+    fr (buttons & doomdef.BT_CHANGE) != 0 {
+        weaponChange(gt, pi, buttons)
+    }
+    // use
+    fr (buttons & doomdef.BT_USE) != 0 {
+        lowkey usedown: bool = cap
+        holla g = gt in gs.gsc {
+            usedown = g.shell.players[pi].usedown
+        } ghosted {
+            yeet("gs")
+        }
+        fr !usedown {
+            pmap.useLines(gt, pi)
+            holla g = gt in gs.gsc {
+                g.shell.players[pi].usedown = nocap
+            } ghosted {
+                yeet("gs")
+            }
+        }
+    } naw {
+        holla g = gt in gs.gsc {
+            g.shell.players[pi].usedown = cap
+        } ghosted {
+            yeet("gs")
+        }
+    }
+    ppspr.movePsprites(gt, pi)
+    powerCounters(gt, pi)
+}
+
+// weapon-change selection (the BT_CHANGE arm of P_PlayerThink)
+flex finna weaponChange(gt: tag gs.GameState, pi: int, buttons: int) {
+    lowkey newweapon: int = (buttons & doomdef.BT_WEAPONMASK) >> doomdef.BT_WEAPONSHIFT
+    lowkey gamemode: int = 0
+    lowkey ready: int = 0
+    lowkey owSaw: bool = cap
+    lowkey owSSG: bool = cap
+    lowkey strength: int = 0
+    holla g = gt in gs.gsc {
+        gamemode = g.shell.gamemode as int
+        ready = g.shell.players[pi].readyweapon as int
+        owSaw = g.shell.players[pi].weaponowned[doomdef.WP_CHAINSAW]
+        owSSG = g.shell.players[pi].weaponowned[doomdef.WP_SUPERSHOTGUN]
+        strength = g.shell.players[pi].powers[doomdef.PW_STRENGTH] as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr newweapon == doomdef.WP_FIST && owSaw && !(ready == doomdef.WP_CHAINSAW && strength != 0) {
+        newweapon = doomdef.WP_CHAINSAW
+    }
+    fr gamemode == doomdef.GM_COMMERCIAL && newweapon == doomdef.WP_SHOTGUN && owSSG && ready != doomdef.WP_SUPERSHOTGUN {
+        newweapon = doomdef.WP_SUPERSHOTGUN
+    }
+    lowkey owNew: bool = cap
+    holla g = gt in gs.gsc {
+        owNew = g.shell.players[pi].weaponowned[newweapon]
+    } ghosted {
+        yeet("gs")
+    }
+    fr owNew && newweapon != ready {
+        fr (newweapon != doomdef.WP_PLASMA && newweapon != doomdef.WP_BFG) || gamemode != doomdef.GM_SHAREWARE {
+            holla g = gt in gs.gsc {
+                g.shell.players[pi].pendingweapon = newweapon as i32
+            } ghosted {
+                yeet("gs")
+            }
+        }
+    }
+}
+
+// time-dependent powerup counters + damage/bonus flash + fixed colormap (P_PlayerThink tail)
+flex finna powerCounters(gt: tag gs.GameState, pi: int) {
+    lowkey mo: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        mo = g.shell.players[pi].mo
+    } ghosted {
+        yeet("gs")
+    }
+    holla g = gt in gs.gsc {
+        fr g.shell.players[pi].powers[doomdef.PW_STRENGTH] as int != 0 {
+            g.shell.players[pi].powers[doomdef.PW_STRENGTH] = (g.shell.players[pi].powers[doomdef.PW_STRENGTH] as int + 1) as i32
+        }
+        fr g.shell.players[pi].powers[doomdef.PW_INVULNERABILITY] as int != 0 {
+            g.shell.players[pi].powers[doomdef.PW_INVULNERABILITY] = (g.shell.players[pi].powers[doomdef.PW_INVULNERABILITY] as int - 1) as i32
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    // invisibility: on reaching 0, drop MF_SHADOW
+    lowkey invis: int = 0
+    holla g = gt in gs.gsc {
+        invis = g.shell.players[pi].powers[doomdef.PW_INVISIBILITY] as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr invis != 0 {
+        invis = invis - 1
+        holla g = gt in gs.gsc {
+            g.shell.players[pi].powers[doomdef.PW_INVISIBILITY] = invis as i32
+        } ghosted {
+            yeet("gs")
+        }
+        fr invis == 0 {
+            holla m = mo in gs.thinkers {
+                m.mobj.flags = (m.mobj.flags as int & ~think.MF_SHADOW) as i32
+            } ghosted {
+                yeet("mo")
+            }
+        }
+    }
+    holla g = gt in gs.gsc {
+        fr g.shell.players[pi].powers[doomdef.PW_INFRARED] as int != 0 {
+            g.shell.players[pi].powers[doomdef.PW_INFRARED] = (g.shell.players[pi].powers[doomdef.PW_INFRARED] as int - 1) as i32
+        }
+        fr g.shell.players[pi].powers[doomdef.PW_IRONFEET] as int != 0 {
+            g.shell.players[pi].powers[doomdef.PW_IRONFEET] = (g.shell.players[pi].powers[doomdef.PW_IRONFEET] as int - 1) as i32
+        }
+        fr g.shell.players[pi].damagecount as int != 0 {
+            g.shell.players[pi].damagecount = (g.shell.players[pi].damagecount as int - 1) as i32
+        }
+        fr g.shell.players[pi].bonuscount as int != 0 {
+            g.shell.players[pi].bonuscount = (g.shell.players[pi].bonuscount as int - 1) as i32
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    // fixed colormap from powers
+    lowkey invul: int = 0
+    lowkey infra: int = 0
+    holla g = gt in gs.gsc {
+        invul = g.shell.players[pi].powers[doomdef.PW_INVULNERABILITY] as int
+        infra = g.shell.players[pi].powers[doomdef.PW_INFRARED] as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey fc: int = 0
+    fr invul != 0 {
+        fr invul > (4 * 32) || (invul & 8) != 0 {
+            fc = INVERSECOLORMAP
+        } naw {
+            fc = 0
+        }
+    } naw fr infra != 0 {
+        fr infra > (4 * 32) || (infra & 8) != 0 {
+            fc = 1
+        } naw {
+            fc = 0
+        }
+    }
+    holla g = gt in gs.gsc {
+        g.shell.players[pi].fixedcolormap = fc as i32
+    } ghosted {
+        yeet("gs")
+    }
+}

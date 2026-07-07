@@ -1,0 +1,1021 @@
+// p/p_pspr.bet — player weapon/psprite state machine + the 22 weapon `A_*` actions
+// (linuxdoom-1.10 p_pspr.c) plus A_BFGSpray (a MOBJ action that lives in p_pspr.c). The 22 psprite
+// actions are `finna(gt, playerIdx: int, pspIdx: int) -> void` (dispatched via p_think.runPsprAction
+// off the Actions drip); A_BFGSpray is a mobj action (via runAction). p_action.wireActions installs
+// them and the g.hooks.dropWeapon seam.
+//
+// PORTED (p_pspr.c): P_SetPsprite, P_CalcSwing, P_BringUpWeapon, P_CheckAmmo, P_FireWeapon,
+//   P_DropWeapon, A_WeaponReady, A_ReFire, A_CheckReload, A_Lower, A_Raise, A_GunFlash, A_Punch,
+//   A_Saw, A_FireMissile, A_FireBFG, A_FirePlasma, P_BulletSlope, P_GunShot, A_FirePistol,
+//   A_FireShotgun, A_FireShotgun2, A_FireCGun, A_Light0/1/2, A_BFGSpray, A_BFGsound,
+//   P_SetupPsprites, P_MovePsprites; plus A_OpenShotgun2/A_LoadShotgun2/A_CloseShotgun2 (p_enemy.c
+//   in id — kept here with the other weapon actions) and the weaponinfo[] table (d_items.c).
+//
+// RNG / DEMO-SYNC: every P_Random is rnd.pRandom in verbatim order. The pellet-spread loops
+// (A_FireShotgun/A_FireShotgun2/A_FirePistol via P_GunShot) are a demo-sync hotspot: damage,
+// then angle-spread (minuend then subtrahend), then (shotgun2) the slope jitter — matching the
+// linuxdoom statement/arg evaluation order. NATIVE is the correctness target.
+pull "../defs/gs" as gs
+pull "../defs/think" as think
+pull "../defs/fixed" as fixed
+pull "../defs/tables" as tables
+pull "../defs/doomdef" as doomdef
+pull "../defs/info" as info
+pull "../defs/sounds" as sounds
+pull "../defs/player" as pdef
+pull "../util/m_random" as rnd
+pull "../r/r_geom" as rgeom
+pull "../s/s_sound" as ssnd
+pull "../p/p_mobj" as pmobj
+pull "../p/p_map" as pmap
+pull "../p/p_think" as pthink
+pull "../p/p_inter" as pinter
+pull "../p/p_enemy" as penemy
+
+// ---- constants (p_pspr.c / p_local.h / tables.h) ------------------------------------------
+flex facts FRACUNIT: i32 = 65536
+flex facts LOWERSPEED: i32 = 393216         // FRACUNIT*6
+flex facts RAISESPEED: i32 = 393216         // FRACUNIT*6
+flex facts WEAPONBOTTOM: i32 = 8388608      // 128*FRACUNIT
+flex facts WEAPONTOP: i32 = 2097152         // 32*FRACUNIT
+flex facts BFGCELLS: int = 40
+flex facts MELEERANGE: i32 = 4194304        // 64*FRACUNIT
+flex facts MISSILERANGE: i32 = 134217728    // 32*64*FRACUNIT
+flex facts AIMRANGE: i32 = 67108864         // 16*64*FRACUNIT
+flex facts FINEMASK: int = 8191             // FINEANGLES-1
+flex facts ANG90D20: u32 = 53687091         // ANG90/20
+flex facts ANG90D21: u32 = 51130563         // ANG90/21
+flex facts NEGANG90D20: u32 = 4241280205    // (unsigned)(-ANG90/20)
+flex facts ANG90D40: u32 = 26843545         // ANG90/40
+
+// ---- weaponinfo[] table (d_items.c): ammo / up / down / ready / atk / flash per weapontype -
+flex finna wiAmmo(w: int) -> int {
+    fr w == doomdef.WP_FIST { bet doomdef.AM_NOAMMO }
+    fr w == doomdef.WP_PISTOL { bet doomdef.AM_CLIP }
+    fr w == doomdef.WP_SHOTGUN { bet doomdef.AM_SHELL }
+    fr w == doomdef.WP_CHAINGUN { bet doomdef.AM_CLIP }
+    fr w == doomdef.WP_MISSILE { bet doomdef.AM_MISL }
+    fr w == doomdef.WP_PLASMA { bet doomdef.AM_CELL }
+    fr w == doomdef.WP_BFG { bet doomdef.AM_CELL }
+    fr w == doomdef.WP_CHAINSAW { bet doomdef.AM_NOAMMO }
+    bet doomdef.AM_SHELL          // supershotgun
+}
+flex finna wiUpstate(w: int) -> int {
+    fr w == doomdef.WP_FIST { bet info.S_PUNCHUP }
+    fr w == doomdef.WP_PISTOL { bet info.S_PISTOLUP }
+    fr w == doomdef.WP_SHOTGUN { bet info.S_SGUNUP }
+    fr w == doomdef.WP_CHAINGUN { bet info.S_CHAINUP }
+    fr w == doomdef.WP_MISSILE { bet info.S_MISSILEUP }
+    fr w == doomdef.WP_PLASMA { bet info.S_PLASMAUP }
+    fr w == doomdef.WP_BFG { bet info.S_BFGUP }
+    fr w == doomdef.WP_CHAINSAW { bet info.S_SAWUP }
+    bet info.S_DSGUNUP
+}
+flex finna wiDownstate(w: int) -> int {
+    fr w == doomdef.WP_FIST { bet info.S_PUNCHDOWN }
+    fr w == doomdef.WP_PISTOL { bet info.S_PISTOLDOWN }
+    fr w == doomdef.WP_SHOTGUN { bet info.S_SGUNDOWN }
+    fr w == doomdef.WP_CHAINGUN { bet info.S_CHAINDOWN }
+    fr w == doomdef.WP_MISSILE { bet info.S_MISSILEDOWN }
+    fr w == doomdef.WP_PLASMA { bet info.S_PLASMADOWN }
+    fr w == doomdef.WP_BFG { bet info.S_BFGDOWN }
+    fr w == doomdef.WP_CHAINSAW { bet info.S_SAWDOWN }
+    bet info.S_DSGUNDOWN
+}
+flex finna wiReadystate(w: int) -> int {
+    fr w == doomdef.WP_FIST { bet info.S_PUNCH }
+    fr w == doomdef.WP_PISTOL { bet info.S_PISTOL }
+    fr w == doomdef.WP_SHOTGUN { bet info.S_SGUN }
+    fr w == doomdef.WP_CHAINGUN { bet info.S_CHAIN }
+    fr w == doomdef.WP_MISSILE { bet info.S_MISSILE }
+    fr w == doomdef.WP_PLASMA { bet info.S_PLASMA }
+    fr w == doomdef.WP_BFG { bet info.S_BFG }
+    fr w == doomdef.WP_CHAINSAW { bet info.S_SAW }
+    bet info.S_DSGUN
+}
+flex finna wiAtkstate(w: int) -> int {
+    fr w == doomdef.WP_FIST { bet info.S_PUNCH1 }
+    fr w == doomdef.WP_PISTOL { bet info.S_PISTOL1 }
+    fr w == doomdef.WP_SHOTGUN { bet info.S_SGUN1 }
+    fr w == doomdef.WP_CHAINGUN { bet info.S_CHAIN1 }
+    fr w == doomdef.WP_MISSILE { bet info.S_MISSILE1 }
+    fr w == doomdef.WP_PLASMA { bet info.S_PLASMA1 }
+    fr w == doomdef.WP_BFG { bet info.S_BFG1 }
+    fr w == doomdef.WP_CHAINSAW { bet info.S_SAW1 }
+    bet info.S_DSGUN1
+}
+flex finna wiFlashstate(w: int) -> int {
+    fr w == doomdef.WP_FIST { bet info.S_NULL }
+    fr w == doomdef.WP_PISTOL { bet info.S_PISTOLFLASH }
+    fr w == doomdef.WP_SHOTGUN { bet info.S_SGUNFLASH1 }
+    fr w == doomdef.WP_CHAINGUN { bet info.S_CHAINFLASH1 }
+    fr w == doomdef.WP_MISSILE { bet info.S_MISSILEFLASH1 }
+    fr w == doomdef.WP_PLASMA { bet info.S_PLASMAFLASH1 }
+    fr w == doomdef.WP_BFG { bet info.S_BFGFLASH1 }
+    fr w == doomdef.WP_CHAINSAW { bet info.S_NULL }
+    bet info.S_DSGUNFLASH1
+}
+
+// ---- small readers ------------------------------------------------------------------------
+flex finna playerMo(gt: tag gs.GameState, pi: int) -> tag think.Thinker {
+    lowkey mo: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        mo = g.shell.players[pi].mo
+    } ghosted {
+        yeet("gs")
+    }
+    bet mo
+}
+flex finna noLineTarget(gt: tag gs.GameState) -> bool {
+    lowkey isNull: bool = cap
+    holla g = gt in gs.gsc {
+        fr g.tick.linetarget == ghosted {
+            isNull = nocap
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    bet isNull
+}
+flex finna lineTargetOf(gt: tag gs.GameState) -> tag think.Thinker {
+    lowkey t: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        t = g.tick.linetarget
+    } ghosted {
+        yeet("gs")
+    }
+    bet t
+}
+
+// ===========================================================================================
+// P_SetPsprite — enter psprite `position` into state `stnum`, stamping sprite/tics/offset and
+// running each state's action, following 0-tic chains. stnum 0 removes the psprite (stateIdx=-1).
+// ===========================================================================================
+flex finna setPsprite(gt: tag gs.GameState, pi: int, position: int, stnum: int) {
+    lowkey st: int = stnum
+    lowkey brk: bool = cap
+    vibin !brk {
+        fr st == 0 {
+            // object removed itself
+            holla g = gt in gs.gsc {
+                g.shell.players[pi].psprites[position].stateIdx = -1
+            } ghosted {
+                yeet("gs")
+            }
+            brk = nocap
+        } naw {
+            lowkey tics: int = 0
+            lowkey actId: int = 0
+            lowkey misc1: int = 0
+            lowkey misc2: int = 0
+            holla g = gt in gs.gsc {
+                lowkey s = g.info.states[st]
+                tics = s.tics as int
+                actId = s.actionId as int
+                misc1 = s.misc1 as int
+                misc2 = s.misc2 as int
+            } ghosted {
+                yeet("gs")
+            }
+            holla g = gt in gs.gsc {
+                g.shell.players[pi].psprites[position].stateIdx = st as i32
+                g.shell.players[pi].psprites[position].tics = tics as i32
+                fr misc1 != 0 {
+                    g.shell.players[pi].psprites[position].sx = (misc1 << 16) as i32
+                    g.shell.players[pi].psprites[position].sy = (misc2 << 16) as i32
+                }
+            } ghosted {
+                yeet("gs")
+            }
+            fr actId != info.AID_NONE {
+                pthink.runPsprAction(gt, actId, pi, position)
+                lowkey removed: bool = cap
+                holla g = gt in gs.gsc {
+                    fr g.shell.players[pi].psprites[position].stateIdx == -1 {
+                        removed = nocap
+                    }
+                } ghosted {
+                    yeet("gs")
+                }
+                fr removed {
+                    brk = nocap
+                }
+            }
+            fr !brk {
+                // stnum = psp->state->nextstate; loop while (!psp->tics) — re-read after the action
+                lowkey curTics: int = 0
+                holla g = gt in gs.gsc {
+                    lowkey curSt = g.shell.players[pi].psprites[position].stateIdx as int
+                    st = g.info.states[curSt].nextstate as int
+                    curTics = g.shell.players[pi].psprites[position].tics as int
+                } ghosted {
+                    yeet("gs")
+                }
+                fr curTics != 0 {
+                    brk = nocap
+                }
+            }
+        }
+    }
+}
+
+// P_CalcSwing — (kept for parity; swingx/swingy are unused by the renderer path here)
+flex finna calcSwing(gt: tag gs.GameState, pi: int) {
+    lowkey swing: int = 0
+    lowkey leveltime: int = 0
+    holla g = gt in gs.gsc {
+        swing = g.shell.players[pi].bob as int
+        leveltime = g.tick.leveltime as int
+    } ghosted {
+        yeet("gs")
+    }
+    // FINEANGLES/70*leveltime & FINEMASK — no external effect retained; left as documentation.
+    lowkey ignore: int = swing
+    ignore = (117 * leveltime) & FINEMASK
+}
+
+// P_BringUpWeapon — start raising the pending weapon from the bottom of the screen.
+flex finna bringUpWeapon(gt: tag gs.GameState, pi: int) {
+    lowkey pending: int = 0
+    lowkey ready: int = 0
+    holla g = gt in gs.gsc {
+        pending = g.shell.players[pi].pendingweapon as int
+        ready = g.shell.players[pi].readyweapon as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr pending == doomdef.WP_NOCHANGE {
+        pending = ready
+    }
+    fr pending == doomdef.WP_CHAINSAW {
+        ssnd.startSound(gt, playerMo(gt, pi), sounds.SFX_SAWUP)
+    }
+    lowkey newstate: int = wiUpstate(pending)
+    holla g = gt in gs.gsc {
+        g.shell.players[pi].pendingweapon = doomdef.WP_NOCHANGE as i32
+        g.shell.players[pi].psprites[think.PS_WEAPON].sy = WEAPONBOTTOM
+    } ghosted {
+        yeet("gs")
+    }
+    setPsprite(gt, pi, think.PS_WEAPON, newstate)
+}
+
+// P_CheckAmmo — enough ammo to shoot? if not, pick the next weapon and lower the current one.
+flex finna checkAmmo(gt: tag gs.GameState, pi: int) -> bool {
+    lowkey ready: int = 0
+    holla g = gt in gs.gsc {
+        ready = g.shell.players[pi].readyweapon as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey ammo: int = wiAmmo(ready)
+    lowkey count: int = 1
+    fr ready == doomdef.WP_BFG {
+        count = BFGCELLS
+    } naw fr ready == doomdef.WP_SUPERSHOTGUN {
+        count = 2
+    }
+    lowkey haveAmmo: int = 0
+    fr ammo != doomdef.AM_NOAMMO {
+        holla g = gt in gs.gsc {
+            haveAmmo = g.shell.players[pi].ammo[ammo] as int
+        } ghosted {
+            yeet("gs")
+        }
+    }
+    fr ammo == doomdef.AM_NOAMMO || haveAmmo >= count {
+        bet nocap
+    }
+    // out of ammo: pick a weapon to change to (single pass — the last else always sets one)
+    lowkey gamemode: int = 0
+    lowkey owPlasma: bool = cap
+    lowkey owSSG: bool = cap
+    lowkey owChain: bool = cap
+    lowkey owShotgun: bool = cap
+    lowkey owSaw: bool = cap
+    lowkey owMissile: bool = cap
+    lowkey owBFG: bool = cap
+    lowkey aClip: int = 0
+    lowkey aShell: int = 0
+    lowkey aCell: int = 0
+    lowkey aMisl: int = 0
+    holla g = gt in gs.gsc {
+        gamemode = g.shell.gamemode as int
+        owPlasma = g.shell.players[pi].weaponowned[doomdef.WP_PLASMA]
+        owSSG = g.shell.players[pi].weaponowned[doomdef.WP_SUPERSHOTGUN]
+        owChain = g.shell.players[pi].weaponowned[doomdef.WP_CHAINGUN]
+        owShotgun = g.shell.players[pi].weaponowned[doomdef.WP_SHOTGUN]
+        owSaw = g.shell.players[pi].weaponowned[doomdef.WP_CHAINSAW]
+        owMissile = g.shell.players[pi].weaponowned[doomdef.WP_MISSILE]
+        owBFG = g.shell.players[pi].weaponowned[doomdef.WP_BFG]
+        aClip = g.shell.players[pi].ammo[doomdef.AM_CLIP] as int
+        aShell = g.shell.players[pi].ammo[doomdef.AM_SHELL] as int
+        aCell = g.shell.players[pi].ammo[doomdef.AM_CELL] as int
+        aMisl = g.shell.players[pi].ammo[doomdef.AM_MISL] as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey pending: int = doomdef.WP_FIST
+    fr owPlasma && aCell != 0 && gamemode != doomdef.GM_SHAREWARE {
+        pending = doomdef.WP_PLASMA
+    } naw fr owSSG && aShell > 2 && gamemode == doomdef.GM_COMMERCIAL {
+        pending = doomdef.WP_SUPERSHOTGUN
+    } naw fr owChain && aClip != 0 {
+        pending = doomdef.WP_CHAINGUN
+    } naw fr owShotgun && aShell != 0 {
+        pending = doomdef.WP_SHOTGUN
+    } naw fr aClip != 0 {
+        pending = doomdef.WP_PISTOL
+    } naw fr owSaw {
+        pending = doomdef.WP_CHAINSAW
+    } naw fr owMissile && aMisl != 0 {
+        pending = doomdef.WP_MISSILE
+    } naw fr owBFG && aCell > 40 && gamemode != doomdef.GM_SHAREWARE {
+        pending = doomdef.WP_BFG
+    }
+    holla g = gt in gs.gsc {
+        g.shell.players[pi].pendingweapon = pending as i32
+    } ghosted {
+        yeet("gs")
+    }
+    setPsprite(gt, pi, think.PS_WEAPON, wiDownstate(ready))
+    bet cap
+}
+
+// P_FireWeapon — begin the attack: enter S_PLAY_ATK1, the weapon's atkstate, alert monsters.
+flex finna fireWeapon(gt: tag gs.GameState, pi: int) {
+    fr !checkAmmo(gt, pi) {
+        bet
+    }
+    lowkey mo: tag think.Thinker = playerMo(gt, pi)
+    pmobj.setMobjState(gt, mo, info.S_PLAY_ATK1)
+    lowkey ready: int = 0
+    holla g = gt in gs.gsc {
+        ready = g.shell.players[pi].readyweapon as int
+    } ghosted {
+        yeet("gs")
+    }
+    setPsprite(gt, pi, think.PS_WEAPON, wiAtkstate(ready))
+    penemy.noiseAlert(gt, mo, mo)
+}
+
+// P_DropWeapon — dead player: lower the weapon away (wired to g.hooks.dropWeapon).
+flex finna dropWeapon(gt: tag gs.GameState, pi: int) {
+    lowkey ready: int = 0
+    holla g = gt in gs.gsc {
+        ready = g.shell.players[pi].readyweapon as int
+    } ghosted {
+        yeet("gs")
+    }
+    setPsprite(gt, pi, think.PS_WEAPON, wiDownstate(ready))
+}
+
+// ===========================================================================================
+// A_WeaponReady / A_ReFire / A_CheckReload / A_Lower / A_Raise / A_GunFlash
+// ===========================================================================================
+flex finna aWeaponReady(gt: tag gs.GameState, pi: int, pspIdx: int) {
+    lowkey mo: tag think.Thinker = playerMo(gt, pi)
+    // get out of attack state
+    lowkey moState: int = 0
+    holla m = mo in gs.thinkers {
+        moState = m.mobj.stateIdx as int
+    } ghosted {
+        yeet("mo")
+    }
+    fr moState == info.S_PLAY_ATK1 || moState == info.S_PLAY_ATK2 {
+        pmobj.setMobjState(gt, mo, info.S_PLAY)
+    }
+    lowkey ready: int = 0
+    lowkey pspState: int = 0
+    holla g = gt in gs.gsc {
+        ready = g.shell.players[pi].readyweapon as int
+        pspState = g.shell.players[pi].psprites[pspIdx].stateIdx as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr ready == doomdef.WP_CHAINSAW && pspState == info.S_SAW {
+        ssnd.startSound(gt, mo, sounds.SFX_SAWIDL)
+    }
+    // change weapon if pending, or player dead -> put weapon away
+    lowkey pending: int = 0
+    lowkey health: int = 0
+    holla g = gt in gs.gsc {
+        pending = g.shell.players[pi].pendingweapon as int
+        health = g.shell.players[pi].health as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr pending != doomdef.WP_NOCHANGE || health == 0 {
+        setPsprite(gt, pi, think.PS_WEAPON, wiDownstate(ready))
+        bet
+    }
+    // check for fire (missile launcher + bfg do not auto-fire)
+    lowkey buttons: int = 0
+    lowkey attackdown: bool = cap
+    holla g = gt in gs.gsc {
+        buttons = g.shell.players[pi].cmd.buttons as int
+        attackdown = g.shell.players[pi].attackdown
+    } ghosted {
+        yeet("gs")
+    }
+    fr (buttons & doomdef.BT_ATTACK) != 0 {
+        fr !attackdown || (ready != doomdef.WP_MISSILE && ready != doomdef.WP_BFG) {
+            holla g = gt in gs.gsc {
+                g.shell.players[pi].attackdown = nocap
+            } ghosted {
+                yeet("gs")
+            }
+            fireWeapon(gt, pi)
+            bet
+        }
+    } naw {
+        holla g = gt in gs.gsc {
+            g.shell.players[pi].attackdown = cap
+        } ghosted {
+            yeet("gs")
+        }
+    }
+    // bob the weapon based on movement speed
+    lowkey leveltime: int = 0
+    lowkey bob: i32 = 0
+    holla g = gt in gs.gsc {
+        leveltime = g.tick.leveltime as int
+        bob = g.shell.players[pi].bob
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey angle: int = (128 * leveltime) & FINEMASK
+    lowkey sx: i32 = 0
+    lowkey angle2: int = angle & 4095      // FINEANGLES/2-1
+    lowkey sy: i32 = 0
+    holla g = gt in gs.gsc {
+        sx = (FRACUNIT as int + fixed.fixedMul(bob, g.info.finesine[angle + 2048]) as int) as i32
+        sy = (WEAPONTOP as int + fixed.fixedMul(bob, g.info.finesine[angle2]) as int) as i32
+    } ghosted {
+        yeet("gs")
+    }
+    holla g = gt in gs.gsc {
+        g.shell.players[pi].psprites[pspIdx].sx = sx
+        g.shell.players[pi].psprites[pspIdx].sy = sy
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna aReFire(gt: tag gs.GameState, pi: int, pspIdx: int) {
+    lowkey buttons: int = 0
+    lowkey pending: int = 0
+    lowkey health: int = 0
+    holla g = gt in gs.gsc {
+        buttons = g.shell.players[pi].cmd.buttons as int
+        pending = g.shell.players[pi].pendingweapon as int
+        health = g.shell.players[pi].health as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr (buttons & doomdef.BT_ATTACK) != 0 && pending == doomdef.WP_NOCHANGE && health != 0 {
+        holla g = gt in gs.gsc {
+            g.shell.players[pi].refire = (g.shell.players[pi].refire as int + 1) as i32
+        } ghosted {
+            yeet("gs")
+        }
+        fireWeapon(gt, pi)
+    } naw {
+        holla g = gt in gs.gsc {
+            g.shell.players[pi].refire = 0
+        } ghosted {
+            yeet("gs")
+        }
+        checkAmmo(gt, pi)
+    }
+}
+
+flex finna aCheckReload(gt: tag gs.GameState, pi: int, pspIdx: int) {
+    checkAmmo(gt, pi)
+}
+
+flex finna aLower(gt: tag gs.GameState, pi: int, pspIdx: int) {
+    holla g = gt in gs.gsc {
+        g.shell.players[pi].psprites[pspIdx].sy = (g.shell.players[pi].psprites[pspIdx].sy as int + LOWERSPEED as int) as i32
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey sy: int = 0
+    lowkey playerstate: int = 0
+    lowkey health: int = 0
+    holla g = gt in gs.gsc {
+        sy = g.shell.players[pi].psprites[pspIdx].sy as int
+        playerstate = g.shell.players[pi].playerstate as int
+        health = g.shell.players[pi].health as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr sy < WEAPONBOTTOM {
+        bet        // still lowering
+    }
+    fr playerstate == pdef.PST_DEAD {
+        holla g = gt in gs.gsc {
+            g.shell.players[pi].psprites[pspIdx].sy = WEAPONBOTTOM
+        } ghosted {
+            yeet("gs")
+        }
+        bet        // don't bring weapon back up
+    }
+    fr health == 0 {
+        // player is dead, keep weapon off screen
+        setPsprite(gt, pi, think.PS_WEAPON, info.S_NULL)
+        bet
+    }
+    holla g = gt in gs.gsc {
+        g.shell.players[pi].readyweapon = g.shell.players[pi].pendingweapon
+    } ghosted {
+        yeet("gs")
+    }
+    bringUpWeapon(gt, pi)
+}
+
+flex finna aRaise(gt: tag gs.GameState, pi: int, pspIdx: int) {
+    holla g = gt in gs.gsc {
+        g.shell.players[pi].psprites[pspIdx].sy = (g.shell.players[pi].psprites[pspIdx].sy as int - RAISESPEED as int) as i32
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey sy: int = 0
+    holla g = gt in gs.gsc {
+        sy = g.shell.players[pi].psprites[pspIdx].sy as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr sy > WEAPONTOP {
+        bet
+    }
+    lowkey ready: int = 0
+    holla g = gt in gs.gsc {
+        g.shell.players[pi].psprites[pspIdx].sy = WEAPONTOP
+        ready = g.shell.players[pi].readyweapon as int
+    } ghosted {
+        yeet("gs")
+    }
+    setPsprite(gt, pi, think.PS_WEAPON, wiReadystate(ready))
+}
+
+flex finna aGunFlash(gt: tag gs.GameState, pi: int, pspIdx: int) {
+    pmobj.setMobjState(gt, playerMo(gt, pi), info.S_PLAY_ATK2)
+    lowkey ready: int = 0
+    holla g = gt in gs.gsc {
+        ready = g.shell.players[pi].readyweapon as int
+    } ghosted {
+        yeet("gs")
+    }
+    setPsprite(gt, pi, think.PS_FLASH, wiFlashstate(ready))
+}
+
+// ===========================================================================================
+// weapon attacks
+// ===========================================================================================
+flex finna aPunch(gt: tag gs.GameState, pi: int, pspIdx: int) {
+    lowkey damage: int = ((rnd.pRandom(gt) % 10) + 1) << 1
+    lowkey strength: int = 0
+    holla g = gt in gs.gsc {
+        strength = g.shell.players[pi].powers[doomdef.PW_STRENGTH] as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr strength != 0 {
+        damage = damage * 10
+    }
+    lowkey mo: tag think.Thinker = playerMo(gt, pi)
+    lowkey angle: u32 = 0
+    holla m = mo in gs.thinkers {
+        angle = m.mobj.angle
+    } ghosted {
+        yeet("mo")
+    }
+    lowkey r1: int = rnd.pRandom(gt)
+    lowkey r2: int = rnd.pRandom(gt)
+    angle = (angle as int + ((r1 - r2) << 18)) as u32
+    lowkey slope: i32 = pmap.aimLineAttack(gt, mo, angle, MELEERANGE)
+    pmap.lineAttack(gt, mo, angle, MELEERANGE, slope, damage)
+    // turn to face target
+    fr !noLineTarget(gt) {
+        ssnd.startSound(gt, mo, sounds.SFX_PUNCH)
+        lowkey lt: tag think.Thinker = lineTargetOf(gt)
+        lowkey mx: i32 = 0
+        lowkey my: i32 = 0
+        holla m = mo in gs.thinkers {
+            mx = m.mobj.x
+            my = m.mobj.y
+        } ghosted {
+            yeet("mo")
+        }
+        lowkey ltx: i32 = 0
+        lowkey lty: i32 = 0
+        holla l = lt in gs.thinkers {
+            ltx = l.mobj.x
+            lty = l.mobj.y
+        } ghosted {
+            yeet("lt")
+        }
+        lowkey na: u32 = 0
+        holla g = gt in gs.gsc {
+            na = rgeom.pointToAngle2(g.info.tantoangle, mx, my, ltx, lty)
+        } ghosted {
+            yeet("gs")
+        }
+        holla m = mo in gs.thinkers {
+            m.mobj.angle = na
+        } ghosted {
+            yeet("mo")
+        }
+    }
+}
+
+flex finna aSaw(gt: tag gs.GameState, pi: int, pspIdx: int) {
+    lowkey damage: int = 2 * ((rnd.pRandom(gt) % 10) + 1)
+    lowkey mo: tag think.Thinker = playerMo(gt, pi)
+    lowkey angle: u32 = 0
+    holla m = mo in gs.thinkers {
+        angle = m.mobj.angle
+    } ghosted {
+        yeet("mo")
+    }
+    lowkey r1: int = rnd.pRandom(gt)
+    lowkey r2: int = rnd.pRandom(gt)
+    angle = (angle as int + ((r1 - r2) << 18)) as u32
+    // meleerange+1 so the puff doesn't skip the flash
+    lowkey rng: i32 = (MELEERANGE as int + 1) as i32
+    lowkey slope: i32 = pmap.aimLineAttack(gt, mo, angle, rng)
+    pmap.lineAttack(gt, mo, angle, rng, slope, damage)
+    fr noLineTarget(gt) {
+        ssnd.startSound(gt, mo, sounds.SFX_SAWFUL)
+        bet
+    }
+    ssnd.startSound(gt, mo, sounds.SFX_SAWHIT)
+    // turn to face target
+    lowkey lt: tag think.Thinker = lineTargetOf(gt)
+    lowkey mx: i32 = 0
+    lowkey my: i32 = 0
+    lowkey moAngle: u32 = 0
+    holla m = mo in gs.thinkers {
+        mx = m.mobj.x
+        my = m.mobj.y
+        moAngle = m.mobj.angle
+    } ghosted {
+        yeet("mo")
+    }
+    lowkey ltx: i32 = 0
+    lowkey lty: i32 = 0
+    holla l = lt in gs.thinkers {
+        ltx = l.mobj.x
+        lty = l.mobj.y
+    } ghosted {
+        yeet("lt")
+    }
+    lowkey na: u32 = 0
+    holla g = gt in gs.gsc {
+        na = rgeom.pointToAngle2(g.info.tantoangle, mx, my, ltx, lty)
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey diff: u32 = na - moAngle
+    lowkey newAngle: u32 = moAngle
+    fr diff > tables.ANG180 {
+        fr diff < NEGANG90D20 {
+            newAngle = na + ANG90D21
+        } naw {
+            newAngle = moAngle - ANG90D20
+        }
+    } naw {
+        fr diff > ANG90D20 {
+            newAngle = na - ANG90D21
+        } naw {
+            newAngle = moAngle + ANG90D20
+        }
+    }
+    holla m = mo in gs.thinkers {
+        m.mobj.angle = newAngle
+        m.mobj.flags = (m.mobj.flags as int | think.MF_JUSTATTACKED) as i32
+    } ghosted {
+        yeet("mo")
+    }
+}
+
+flex finna aFireMissile(gt: tag gs.GameState, pi: int, pspIdx: int) {
+    decAmmo(gt, pi, 1)
+    pmobj.spawnPlayerMissile(gt, playerMo(gt, pi), info.MT_ROCKET)
+}
+
+flex finna aFireBFG(gt: tag gs.GameState, pi: int, pspIdx: int) {
+    decAmmo(gt, pi, BFGCELLS)
+    pmobj.spawnPlayerMissile(gt, playerMo(gt, pi), info.MT_BFG)
+}
+
+flex finna aFirePlasma(gt: tag gs.GameState, pi: int, pspIdx: int) {
+    decAmmo(gt, pi, 1)
+    lowkey ready: int = 0
+    holla g = gt in gs.gsc {
+        ready = g.shell.players[pi].readyweapon as int
+    } ghosted {
+        yeet("gs")
+    }
+    setPsprite(gt, pi, think.PS_FLASH, wiFlashstate(ready) + (rnd.pRandom(gt) & 1))
+    pmobj.spawnPlayerMissile(gt, playerMo(gt, pi), info.MT_PLASMA)
+}
+
+// decAmmo — player->ammo[weaponinfo[readyweapon].ammo] -= n
+flex finna decAmmo(gt: tag gs.GameState, pi: int, n: int) {
+    lowkey ready: int = 0
+    holla g = gt in gs.gsc {
+        ready = g.shell.players[pi].readyweapon as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey a: int = wiAmmo(ready)
+    holla g = gt in gs.gsc {
+        g.shell.players[pi].ammo[a] = (g.shell.players[pi].ammo[a] as int - n) as i32
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// P_BulletSlope — aim at the target within a small angular spread; returns the slope.
+flex finna bulletSlope(gt: tag gs.GameState, mo: tag think.Thinker) -> i32 {
+    lowkey an: u32 = 0
+    holla m = mo in gs.thinkers {
+        an = m.mobj.angle
+    } ghosted {
+        yeet("mo")
+    }
+    lowkey slope: i32 = pmap.aimLineAttack(gt, mo, an, AIMRANGE)
+    fr noLineTarget(gt) {
+        an = (an as int + (1 << 26)) as u32
+        slope = pmap.aimLineAttack(gt, mo, an, AIMRANGE)
+        fr noLineTarget(gt) {
+            an = (an as int - (2 << 26)) as u32
+            slope = pmap.aimLineAttack(gt, mo, an, AIMRANGE)
+        }
+    }
+    bet slope
+}
+
+// P_GunShot — one hitscan (damage 5*(rnd%3+1)), optionally angled by a random spread.
+flex finna gunShot(gt: tag gs.GameState, mo: tag think.Thinker, accurate: bool, slope: i32) {
+    lowkey damage: int = 5 * ((rnd.pRandom(gt) % 3) + 1)
+    lowkey angle: u32 = 0
+    holla m = mo in gs.thinkers {
+        angle = m.mobj.angle
+    } ghosted {
+        yeet("mo")
+    }
+    fr !accurate {
+        lowkey r1: int = rnd.pRandom(gt)
+        lowkey r2: int = rnd.pRandom(gt)
+        angle = (angle as int + ((r1 - r2) << 18)) as u32
+    }
+    pmap.lineAttack(gt, mo, angle, MISSILERANGE, slope, damage)
+}
+
+flex finna aFirePistol(gt: tag gs.GameState, pi: int, pspIdx: int) {
+    lowkey mo: tag think.Thinker = playerMo(gt, pi)
+    ssnd.startSound(gt, mo, sounds.SFX_PISTOL)
+    pmobj.setMobjState(gt, mo, info.S_PLAY_ATK2)
+    decAmmo(gt, pi, 1)
+    lowkey ready: int = 0
+    lowkey refire: int = 0
+    holla g = gt in gs.gsc {
+        ready = g.shell.players[pi].readyweapon as int
+        refire = g.shell.players[pi].refire as int
+    } ghosted {
+        yeet("gs")
+    }
+    setPsprite(gt, pi, think.PS_FLASH, wiFlashstate(ready))
+    lowkey slope: i32 = bulletSlope(gt, mo)
+    gunShot(gt, mo, refire == 0, slope)
+}
+
+flex finna aFireShotgun(gt: tag gs.GameState, pi: int, pspIdx: int) {
+    lowkey mo: tag think.Thinker = playerMo(gt, pi)
+    ssnd.startSound(gt, mo, sounds.SFX_SHOTGN)
+    pmobj.setMobjState(gt, mo, info.S_PLAY_ATK2)
+    decAmmo(gt, pi, 1)
+    lowkey ready: int = 0
+    holla g = gt in gs.gsc {
+        ready = g.shell.players[pi].readyweapon as int
+    } ghosted {
+        yeet("gs")
+    }
+    setPsprite(gt, pi, think.PS_FLASH, wiFlashstate(ready))
+    lowkey slope: i32 = bulletSlope(gt, mo)
+    lowkey i: int = 0
+    vibin i < 7 {
+        gunShot(gt, mo, cap, slope)
+        i = i + 1
+    }
+}
+
+flex finna aFireShotgun2(gt: tag gs.GameState, pi: int, pspIdx: int) {
+    lowkey mo: tag think.Thinker = playerMo(gt, pi)
+    ssnd.startSound(gt, mo, sounds.SFX_DSHTGN)
+    pmobj.setMobjState(gt, mo, info.S_PLAY_ATK2)
+    decAmmo(gt, pi, 2)
+    lowkey ready: int = 0
+    holla g = gt in gs.gsc {
+        ready = g.shell.players[pi].readyweapon as int
+    } ghosted {
+        yeet("gs")
+    }
+    setPsprite(gt, pi, think.PS_FLASH, wiFlashstate(ready))
+    lowkey slope: i32 = bulletSlope(gt, mo)
+    lowkey moAngle: u32 = 0
+    holla m = mo in gs.thinkers {
+        moAngle = m.mobj.angle
+    } ghosted {
+        yeet("mo")
+    }
+    lowkey i: int = 0
+    vibin i < 20 {
+        lowkey damage: int = 5 * ((rnd.pRandom(gt) % 3) + 1)
+        lowkey r1: int = rnd.pRandom(gt)
+        lowkey r2: int = rnd.pRandom(gt)
+        lowkey angle: u32 = (moAngle as int + ((r1 - r2) << 19)) as u32
+        lowkey r3: int = rnd.pRandom(gt)
+        lowkey r4: int = rnd.pRandom(gt)
+        lowkey slope2: i32 = (slope as int + ((r3 - r4) << 5)) as i32
+        pmap.lineAttack(gt, mo, angle, MISSILERANGE, slope2, damage)
+        i = i + 1
+    }
+}
+
+flex finna aFireCGun(gt: tag gs.GameState, pi: int, pspIdx: int) {
+    lowkey mo: tag think.Thinker = playerMo(gt, pi)
+    ssnd.startSound(gt, mo, sounds.SFX_PISTOL)
+    lowkey ready: int = 0
+    holla g = gt in gs.gsc {
+        ready = g.shell.players[pi].readyweapon as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey a: int = wiAmmo(ready)
+    lowkey have: int = 0
+    holla g = gt in gs.gsc {
+        have = g.shell.players[pi].ammo[a] as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr have == 0 {
+        bet
+    }
+    pmobj.setMobjState(gt, mo, info.S_PLAY_ATK2)
+    decAmmo(gt, pi, 1)
+    // flashstate + (psp->state - &states[S_CHAIN1]) — alternate chaingun flash frames
+    lowkey pspState: int = 0
+    holla g = gt in gs.gsc {
+        pspState = g.shell.players[pi].psprites[pspIdx].stateIdx as int
+    } ghosted {
+        yeet("gs")
+    }
+    setPsprite(gt, pi, think.PS_FLASH, wiFlashstate(ready) + (pspState - info.S_CHAIN1))
+    lowkey refire: int = 0
+    holla g = gt in gs.gsc {
+        refire = g.shell.players[pi].refire as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey slope: i32 = bulletSlope(gt, mo)
+    gunShot(gt, mo, refire == 0, slope)
+}
+
+flex finna aLight0(gt: tag gs.GameState, pi: int, pspIdx: int) {
+    holla g = gt in gs.gsc {
+        g.shell.players[pi].extralight = 0
+    } ghosted {
+        yeet("gs")
+    }
+}
+flex finna aLight1(gt: tag gs.GameState, pi: int, pspIdx: int) {
+    holla g = gt in gs.gsc {
+        g.shell.players[pi].extralight = 1
+    } ghosted {
+        yeet("gs")
+    }
+}
+flex finna aLight2(gt: tag gs.GameState, pi: int, pspIdx: int) {
+    holla g = gt in gs.gsc {
+        g.shell.players[pi].extralight = 2
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// A_BFGSpray — MOBJ action: spawn a BFG hit on every monster in a 90-degree fan from the ball.
+flex finna aBFGSpray(gt: tag gs.GameState, mo: tag think.Thinker) {
+    lowkey moAngle: u32 = 0
+    lowkey source: tag think.Thinker = ghosted
+    holla m = mo in gs.thinkers {
+        moAngle = m.mobj.angle
+        source = m.mobj.target
+    } ghosted {
+        yeet("mo")
+    }
+    lowkey i: int = 0
+    vibin i < 40 {
+        lowkey an: u32 = ((moAngle - (tables.ANG90 / 2)) as int + (ANG90D40 as int) * i) as u32
+        pmap.aimLineAttack(gt, source, an, AIMRANGE)
+        fr !noLineTarget(gt) {
+            lowkey lt: tag think.Thinker = lineTargetOf(gt)
+            lowkey lx: i32 = 0
+            lowkey ly: i32 = 0
+            lowkey lz: i32 = 0
+            lowkey lheight: i32 = 0
+            holla l = lt in gs.thinkers {
+                lx = l.mobj.x
+                ly = l.mobj.y
+                lz = l.mobj.z
+                lheight = l.mobj.height
+            } ghosted {
+                yeet("lt")
+            }
+            pmobj.spawnMobj(gt, lx, ly, (lz as int + (lheight as int >> 2)) as i32, info.MT_EXTRABFG)
+            lowkey damage: int = 0
+            lowkey j: int = 0
+            vibin j < 15 {
+                damage = damage + (rnd.pRandom(gt) & 7) + 1
+                j = j + 1
+            }
+            pinter.damageMobj(gt, lt, source, source, damage)
+        }
+        i = i + 1
+    }
+}
+
+flex finna aBFGsound(gt: tag gs.GameState, pi: int, pspIdx: int) {
+    ssnd.startSound(gt, playerMo(gt, pi), sounds.SFX_BFG)
+}
+
+// A_OpenShotgun2 / A_LoadShotgun2 / A_CloseShotgun2 (id: p_enemy.c) — super shotgun reload sfx.
+flex finna aOpenShotgun2(gt: tag gs.GameState, pi: int, pspIdx: int) {
+    ssnd.startSound(gt, playerMo(gt, pi), sounds.SFX_DBOPN)
+}
+flex finna aLoadShotgun2(gt: tag gs.GameState, pi: int, pspIdx: int) {
+    ssnd.startSound(gt, playerMo(gt, pi), sounds.SFX_DBLOAD)
+}
+flex finna aCloseShotgun2(gt: tag gs.GameState, pi: int, pspIdx: int) {
+    ssnd.startSound(gt, playerMo(gt, pi), sounds.SFX_DBCLS)
+    aReFire(gt, pi, pspIdx)
+}
+
+// ===========================================================================================
+// P_SetupPsprites / P_MovePsprites
+// ===========================================================================================
+flex finna setupPsprites(gt: tag gs.GameState, pi: int) {
+    // remove all psprites
+    holla g = gt in gs.gsc {
+        g.shell.players[pi].psprites[think.PS_WEAPON].stateIdx = -1
+        g.shell.players[pi].psprites[think.PS_FLASH].stateIdx = -1
+        g.shell.players[pi].pendingweapon = g.shell.players[pi].readyweapon
+    } ghosted {
+        yeet("gs")
+    }
+    bringUpWeapon(gt, pi)
+}
+
+flex finna movePsprites(gt: tag gs.GameState, pi: int) {
+    lowkey i: int = 0
+    vibin i < think.NUMPSPRITES {
+        lowkey stateIdx: int = 0
+        lowkey tics: int = 0
+        holla g = gt in gs.gsc {
+            stateIdx = g.shell.players[pi].psprites[i].stateIdx as int
+            tics = g.shell.players[pi].psprites[i].tics as int
+        } ghosted {
+            yeet("gs")
+        }
+        fr stateIdx != -1 {         // a -1 (null) state means not active
+            fr tics != -1 {         // a -1 tic count never changes
+                lowkey nt: int = tics - 1
+                holla g = gt in gs.gsc {
+                    g.shell.players[pi].psprites[i].tics = nt as i32
+                } ghosted {
+                    yeet("gs")
+                }
+                fr nt == 0 {
+                    lowkey nextstate: int = 0
+                    holla g = gt in gs.gsc {
+                        nextstate = g.info.states[stateIdx].nextstate as int
+                    } ghosted {
+                        yeet("gs")
+                    }
+                    setPsprite(gt, pi, i, nextstate)
+                }
+            }
+        }
+        i = i + 1
+    }
+    // flash sprite tracks the weapon sprite offset
+    holla g = gt in gs.gsc {
+        g.shell.players[pi].psprites[think.PS_FLASH].sx = g.shell.players[pi].psprites[think.PS_WEAPON].sx
+        g.shell.players[pi].psprites[think.PS_FLASH].sy = g.shell.players[pi].psprites[think.PS_WEAPON].sy
+    } ghosted {
+        yeet("gs")
+    }
+}
