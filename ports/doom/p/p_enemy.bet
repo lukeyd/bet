@@ -1,0 +1,2570 @@
+// p/p_enemy.bet — monster AI + the 52 mobj `A_*` action functions (linuxdoom-1.10 p_enemy.c,
+// plus A_PlayerScream from p_user.c which takes a mobj_t*). Signatures FROZEN in p-sigs.md: every
+// mobj action is `finna(gt, actor: tag think.Thinker) -> void`; the `a`+A_* naming maps to the
+// Actions drip fields, dispatched via p_think.runAction. p_action.wireActions installs them.
+//
+// PORTED (p_enemy.c): P_RecursiveSound, P_NoiseAlert, P_CheckMeleeRange, P_CheckMissileRange,
+//   P_Move, P_TryWalk, P_NewChaseDir, P_LookForPlayers, PIT_VileCheck, A_KeenDie, A_Look, A_Chase,
+//   A_FaceTarget, A_PosAttack, A_SPosAttack, A_CPosAttack, A_CPosRefire, A_SpidRefire, A_BspiAttack,
+//   A_TroopAttack, A_SargAttack, A_HeadAttack, A_CyberAttack, A_BruisAttack, A_SkelMissile, A_Tracer,
+//   A_SkelWhoosh, A_SkelFist, A_VileChase, A_VileStart, A_StartFire, A_FireCrackle, A_Fire,
+//   A_VileTarget, A_VileAttack, A_FatRaise, A_FatAttack1/2/3, A_SkullAttack, A_PainShootSkull,
+//   A_PainAttack, A_PainDie, A_Scream, A_XScream, A_Pain, A_Fall, A_Explode, A_BossDeath, A_Hoof,
+//   A_Metal, A_BabyMetal, A_BrainAwake, A_BrainPain, A_BrainScream, A_BrainExplode, A_BrainDie,
+//   A_BrainSpit, A_SpawnSound, A_SpawnFly, A_PlayerScream.
+//
+// RNG / DEMO-SYNC: every P_Random is rnd.pRandom (the play RNG, prndindex); the call ORDER is
+// verbatim. `(P_Random() - P_Random())` evaluates left-to-right (first call = minuend). This is THE
+// demo-sync hotspot — the aim/attack/chase P_Random ordering is the definitive W3 oracle check.
+//
+// SEAMS: G_ExitLevel (A_BossDeath/A_BrainDie) sets g.shell.gameaction = GA_COMPLETED directly (that
+// is all G_ExitLevel observably does; secretexit is not modelled). Movement calls P_TryMove through
+// g.hooks.tryMove; P_UseSpecialLine through g.hooks.useSpecialLine. Aim/attack/sight/radius call
+// p_map directly. NATIVE is the correctness target.
+pull "../defs/gs" as gs
+pull "../defs/think" as think
+pull "../defs/fixed" as fixed
+pull "../defs/tables" as tables
+pull "../defs/doomdef" as doomdef
+pull "../defs/info" as info
+pull "../defs/sounds" as sounds
+pull "../util/m_random" as rnd
+pull "../r/r_geom" as rgeom
+pull "../s/s_sound" as ssnd
+pull "../p/p_mobj" as pmobj
+pull "../p/p_map" as pmap
+pull "../p/p_maputl" as pmaputl
+pull "../p/p_inter" as pinter
+pull "../p/p_doors" as pdoors
+pull "../p/p_floor" as pfloor
+
+// ---- constants (p_enemy.c / p_local.h / tables.h) -----------------------------------------
+flex facts FRACUNIT: i32 = 65536
+flex facts MELEERANGE: i32 = 4194304        // 64*FRACUNIT
+flex facts MISSILERANGE: i32 = 134217728    // 32*64*FRACUNIT
+flex facts FLOATSPEED: i32 = 262144         // FRACUNIT*4
+flex facts MAXRADIUS: i32 = 2097152         // 32*FRACUNIT
+flex facts MAPBLOCKSHIFT: i32 = 23          // FRACBITS + 7
+flex facts SKULLSPEED: i32 = 1310720        // 20*FRACUNIT
+flex facts FATSPREAD: u32 = 134217728       // ANG90/8 = 0x08000000
+flex facts TRACEANGLE: u32 = 201326592      // 0x0c000000
+flex facts MAXPLAYERS: int = 4
+// dirtype_t (DI_*): 0..7 compass, 8 = DI_NODIR.
+flex facts DI_NODIR: int = 8
+
+// ---- P_NewChaseDir LUTs (p_enemy.c opposite[]/diags[]/xspeed[]/yspeed[]) ------------------
+flex finna oppositeDir(d: int) -> int {
+    fr d == 0 { bet 4 }
+    fr d == 1 { bet 5 }
+    fr d == 2 { bet 6 }
+    fr d == 3 { bet 7 }
+    fr d == 4 { bet 0 }
+    fr d == 5 { bet 1 }
+    fr d == 6 { bet 2 }
+    fr d == 7 { bet 3 }
+    bet 8
+}
+flex finna diagDir(i: int) -> int {
+    fr i == 0 { bet 3 }
+    fr i == 1 { bet 1 }
+    fr i == 2 { bet 5 }
+    bet 7
+}
+// xspeed[8] = {FRACUNIT,47000,0,-47000,-FRACUNIT,-47000,0,47000}
+flex finna xspeedOf(d: int) -> i32 {
+    fr d == 0 { bet FRACUNIT }
+    fr d == 1 { bet 47000 }
+    fr d == 2 { bet 0 }
+    fr d == 3 { bet (0 - 47000) as i32 }
+    fr d == 4 { bet (0 - FRACUNIT) as i32 }
+    fr d == 5 { bet (0 - 47000) as i32 }
+    fr d == 6 { bet 0 }
+    bet 47000
+}
+// yspeed[8] = {0,47000,FRACUNIT,47000,0,-47000,-FRACUNIT,-47000}
+flex finna yspeedOf(d: int) -> i32 {
+    fr d == 0 { bet 0 }
+    fr d == 1 { bet 47000 }
+    fr d == 2 { bet FRACUNIT }
+    fr d == 3 { bet 47000 }
+    fr d == 4 { bet 0 }
+    fr d == 5 { bet (0 - 47000) as i32 }
+    fr d == 6 { bet (0 - FRACUNIT) as i32 }
+    bet (0 - 47000) as i32
+}
+
+flex finna eAbs(x: i32) -> i32 {
+    fr x < 0 {
+        bet (0 - x) as i32
+    }
+    bet x
+}
+
+// ---- hook trampolines: read the fn-value out of g.hooks, call after closing the holla ------
+flex finna callTryMove(gt: tag gs.GameState, thing: tag think.Thinker, x: i32, y: i32) -> bool {
+    lowkey fn: finna(tag gs.GameState, tag think.Thinker, i32, i32) -> bool = ghosted
+    holla g = gt in gs.gsc {
+        fn = g.hooks.tryMove
+    } ghosted {
+        yeet("gs")
+    }
+    bet fn(gt, thing, x, y)
+}
+flex finna callUseSpecialLine(gt: tag gs.GameState, thing: tag think.Thinker, line: i32, side: i32) -> bool {
+    lowkey fn: finna(tag gs.GameState, tag think.Thinker, i32, i32) -> bool = ghosted
+    holla g = gt in gs.gsc {
+        fn = g.hooks.useSpecialLine
+    } ghosted {
+        yeet("gs")
+    }
+    bet fn(gt, thing, line, side)
+}
+
+// ---- small readers ------------------------------------------------------------------------
+flex finna targetOf(gt: tag gs.GameState, actor: tag think.Thinker) -> tag think.Thinker {
+    lowkey t: tag think.Thinker = ghosted
+    holla a = actor in gs.thinkers {
+        t = a.mobj.target
+    } ghosted {
+        yeet("actor")
+    }
+    bet t
+}
+flex finna infoRadius(gt: tag gs.GameState, typ: int) -> i32 {
+    lowkey r: i32 = 0
+    holla g = gt in gs.gsc {
+        r = g.info.mobjinfo[typ].radius
+    } ghosted {
+        yeet("gs")
+    }
+    bet r
+}
+
+// ===========================================================================================
+// P_RecursiveSound / P_NoiseAlert — flood monsters awake through open, non-sound-blocking lines.
+// ===========================================================================================
+flex finna recursiveSound(gt: tag gs.GameState, sec: int, soundblocks: int, target: tag think.Thinker) {
+    lowkey vc: int = 0
+    lowkey st: int = 0
+    holla g = gt in gs.gsc {
+        vc = g.tick.validcount as int
+        st = g.level.secSoundTrav[sec] as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey secvc: int = 0
+    holla g = gt in gs.gsc {
+        secvc = g.level.secValid[sec] as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr secvc == vc && st <= soundblocks + 1 {
+        bet
+    }
+    holla g = gt in gs.gsc {
+        g.level.secValid[sec] = vc as i32
+        g.level.secSoundTrav[sec] = (soundblocks + 1) as i32
+        g.level.secLinks[sec].soundtarget = target
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey n: int = 0
+    holla g = gt in gs.gsc {
+        n = g.level.secLineCount[sec] as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey i: int = 0
+    vibin i < n {
+        lowkey check: int = 0
+        holla g = gt in gs.gsc {
+            check = g.level.secLinesList[g.level.secLineOfs[sec] as int + i] as int
+        } ghosted {
+            yeet("gs")
+        }
+        lowkey flags: int = 0
+        holla g = gt in gs.gsc {
+            flags = g.level.lineFlags[check] as int
+        } ghosted {
+            yeet("gs")
+        }
+        fr (flags & doomdef.ML_TWOSIDED) != 0 {
+            pmaputl.lineOpening(gt, check as i32)
+            lowkey openrange: i32 = 0
+            holla g = gt in gs.gsc {
+                openrange = g.tick.openrange
+            } ghosted {
+                yeet("gs")
+            }
+            fr openrange > 0 {
+                // other = the sector on the far side of `check`
+                lowkey s0: int = 0
+                lowkey s1: int = 0
+                holla g = gt in gs.gsc {
+                    lowkey sd0 = g.level.lineSide0[check] as int
+                    lowkey sd1 = g.level.lineSide1[check] as int
+                    s0 = g.level.sdSector[sd0] as int
+                    s1 = g.level.sdSector[sd1] as int
+                } ghosted {
+                    yeet("gs")
+                }
+                lowkey other: int = s1
+                fr s0 != sec {
+                    other = s0
+                }
+                fr (flags & doomdef.ML_SOUNDBLOCK) != 0 {
+                    fr soundblocks == 0 {
+                        recursiveSound(gt, other, 1, target)
+                    }
+                } naw {
+                    recursiveSound(gt, other, soundblocks, target)
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+flex finna noiseAlert(gt: tag gs.GameState, target: tag think.Thinker, emitter: tag think.Thinker) {
+    holla g = gt in gs.gsc {
+        g.tick.validcount = g.tick.validcount + 1
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey sub: int = 0
+    holla e = emitter in gs.thinkers {
+        sub = e.mobj.subsector as int
+    } ghosted {
+        yeet("emitter")
+    }
+    lowkey sec: int = 0
+    holla g = gt in gs.gsc {
+        sec = g.level.ssSector[sub] as int
+    } ghosted {
+        yeet("gs")
+    }
+    recursiveSound(gt, sec, 0, target)
+}
+
+// ===========================================================================================
+// range / sight helpers
+// ===========================================================================================
+flex finna checkMeleeRange(gt: tag gs.GameState, actor: tag think.Thinker) -> bool {
+    lowkey pl: tag think.Thinker = targetOf(gt, actor)
+    fr pl == ghosted {
+        bet cap
+    }
+    lowkey ax: i32 = 0
+    lowkey ay: i32 = 0
+    holla a = actor in gs.thinkers {
+        ax = a.mobj.x
+        ay = a.mobj.y
+    } ghosted {
+        yeet("actor")
+    }
+    lowkey px: i32 = 0
+    lowkey py: i32 = 0
+    lowkey ptyp: int = 0
+    holla p = pl in gs.thinkers {
+        px = p.mobj.x
+        py = p.mobj.y
+        ptyp = p.mobj.typeIdx as int
+    } ghosted {
+        yeet("pl")
+    }
+    lowkey dist: i32 = fixed.aproxDistance((px as int - ax as int) as i32, (py as int - ay as int) as i32)
+    lowkey pr: i32 = infoRadius(gt, ptyp)
+    // MELEERANGE - 20*FRACUNIT + pl->info->radius
+    lowkey lim: int = (MELEERANGE as int) - (20 * 65536) + (pr as int)
+    fr (dist as int) >= lim {
+        bet cap
+    }
+    fr !pmap.checkSight(gt, actor, pl) {
+        bet cap
+    }
+    bet nocap
+}
+
+flex finna checkMissileRange(gt: tag gs.GameState, actor: tag think.Thinker) -> bool {
+    lowkey target: tag think.Thinker = targetOf(gt, actor)
+    fr !pmap.checkSight(gt, actor, target) {
+        bet cap
+    }
+    lowkey flags: int = 0
+    lowkey reactiontime: int = 0
+    lowkey ax: i32 = 0
+    lowkey ay: i32 = 0
+    lowkey typ: int = 0
+    holla a = actor in gs.thinkers {
+        flags = a.mobj.flags as int
+        reactiontime = a.mobj.reactiontime as int
+        ax = a.mobj.x
+        ay = a.mobj.y
+        typ = a.mobj.typeIdx as int
+    } ghosted {
+        yeet("actor")
+    }
+    fr (flags & think.MF_JUSTHIT) != 0 {
+        // target just hit us; fight back
+        holla a = actor in gs.thinkers {
+            a.mobj.flags = (flags & ~think.MF_JUSTHIT) as i32
+        } ghosted {
+            yeet("actor")
+        }
+        bet nocap
+    }
+    fr reactiontime != 0 {
+        bet cap
+    }
+    lowkey tx: i32 = 0
+    lowkey ty: i32 = 0
+    holla t = target in gs.thinkers {
+        tx = t.mobj.x
+        ty = t.mobj.y
+    } ghosted {
+        yeet("target")
+    }
+    lowkey dist: int = fixed.aproxDistance((ax as int - tx as int) as i32, (ay as int - ty as int) as i32) as int
+    dist = dist - (64 * 65536)
+    lowkey meleestate: int = 0
+    holla g = gt in gs.gsc {
+        meleestate = g.info.mobjinfo[typ].meleestate as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr meleestate == 0 {
+        dist = dist - (128 * 65536)
+    }
+    dist = dist >> 16
+    fr typ == info.MT_VILE {
+        fr dist > (14 * 64) {
+            bet cap
+        }
+    }
+    fr typ == info.MT_UNDEAD {
+        fr dist < 196 {
+            bet cap
+        }
+        dist = dist >> 1
+    }
+    fr typ == info.MT_CYBORG || typ == info.MT_SPIDER || typ == info.MT_SKULL {
+        dist = dist >> 1
+    }
+    fr dist > 200 {
+        dist = 200
+    }
+    fr typ == info.MT_CYBORG && dist > 160 {
+        dist = 160
+    }
+    fr rnd.pRandom(gt) < dist {
+        bet cap
+    }
+    bet nocap
+}
+
+// ===========================================================================================
+// movement
+// ===========================================================================================
+flex finna setMovedir(gt: tag gs.GameState, actor: tag think.Thinker, d: int) {
+    holla a = actor in gs.thinkers {
+        a.mobj.movedir = d as i32
+    } ghosted {
+        yeet("actor")
+    }
+}
+
+// P_Move — step actor by info->speed*[xy]speed[movedir] through the tryMove hook; on a blocked
+// step float upward (MF_FLOAT) or try to open any special lines crossed. false if truly blocked.
+flex finna pMove(gt: tag gs.GameState, actor: tag think.Thinker) -> bool {
+    lowkey movedir: int = 0
+    lowkey x: i32 = 0
+    lowkey y: i32 = 0
+    lowkey typ: int = 0
+    holla a = actor in gs.thinkers {
+        movedir = a.mobj.movedir as int
+        x = a.mobj.x
+        y = a.mobj.y
+        typ = a.mobj.typeIdx as int
+    } ghosted {
+        yeet("actor")
+    }
+    fr movedir == DI_NODIR {
+        bet cap
+    }
+    lowkey speed: int = 0
+    holla g = gt in gs.gsc {
+        speed = g.info.mobjinfo[typ].speed as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey tryx: i32 = (x as int + speed * (xspeedOf(movedir) as int)) as i32
+    lowkey tryy: i32 = (y as int + speed * (yspeedOf(movedir) as int)) as i32
+    lowkey tryOk: bool = callTryMove(gt, actor, tryx, tryy)
+    fr !tryOk {
+        // open any specials / float
+        lowkey flags: int = 0
+        lowkey z: i32 = 0
+        holla a = actor in gs.thinkers {
+            flags = a.mobj.flags as int
+            z = a.mobj.z
+        } ghosted {
+            yeet("actor")
+        }
+        lowkey floatok: bool = cap
+        lowkey tmfloorz: i32 = 0
+        holla g = gt in gs.gsc {
+            floatok = g.tick.floatok
+            tmfloorz = g.tick.tmfloorz
+        } ghosted {
+            yeet("gs")
+        }
+        fr (flags & think.MF_FLOAT) != 0 && floatok {
+            lowkey nz: i32 = (z as int + FLOATSPEED as int) as i32
+            fr z >= tmfloorz {
+                nz = (z as int - FLOATSPEED as int) as i32
+            }
+            holla a = actor in gs.thinkers {
+                a.mobj.z = nz
+                a.mobj.flags = (a.mobj.flags as int | think.MF_INFLOAT) as i32
+            } ghosted {
+                yeet("actor")
+            }
+            bet nocap
+        }
+        lowkey numspechit: int = 0
+        holla g = gt in gs.gsc {
+            numspechit = g.tick.numspechit as int
+        } ghosted {
+            yeet("gs")
+        }
+        fr numspechit == 0 {
+            bet cap
+        }
+        setMovedir(gt, actor, DI_NODIR)
+        lowkey good: bool = cap
+        lowkey k: int = numspechit
+        vibin k > 0 {
+            k = k - 1
+            lowkey ld: int = 0
+            holla g = gt in gs.gsc {
+                ld = g.tick.spechit[k] as int
+            } ghosted {
+                yeet("gs")
+            }
+            fr callUseSpecialLine(gt, actor, ld as i32, 0) {
+                good = nocap
+            }
+        }
+        bet good
+    } naw {
+        holla a = actor in gs.thinkers {
+            a.mobj.flags = (a.mobj.flags as int & ~think.MF_INFLOAT) as i32
+        } ghosted {
+            yeet("actor")
+        }
+    }
+    // land on the floor unless floating
+    lowkey flags2: int = 0
+    lowkey floorz: i32 = 0
+    holla a = actor in gs.thinkers {
+        flags2 = a.mobj.flags as int
+        floorz = a.mobj.floorz
+    } ghosted {
+        yeet("actor")
+    }
+    fr (flags2 & think.MF_FLOAT) == 0 {
+        holla a = actor in gs.thinkers {
+            a.mobj.z = floorz
+        } ghosted {
+            yeet("actor")
+        }
+    }
+    bet nocap
+}
+
+// P_TryWalk — P_Move then, on success, pick a fresh movecount.
+flex finna pTryWalk(gt: tag gs.GameState, actor: tag think.Thinker) -> bool {
+    fr !pMove(gt, actor) {
+        bet cap
+    }
+    lowkey mc: int = rnd.pRandom(gt) & 15
+    holla a = actor in gs.thinkers {
+        a.mobj.movecount = mc as i32
+    } ghosted {
+        yeet("actor")
+    }
+    bet nocap
+}
+
+// P_NewChaseDir — choose a new movedir toward the target, preferring the diagonal / axis that
+// closes distance, avoiding a direct turnaround, then falling back to a directional search.
+flex finna pNewChaseDir(gt: tag gs.GameState, actor: tag think.Thinker) {
+    lowkey target: tag think.Thinker = targetOf(gt, actor)
+    fr target == ghosted {
+        bet
+    }
+    lowkey olddir: int = 0
+    lowkey ax: i32 = 0
+    lowkey ay: i32 = 0
+    holla a = actor in gs.thinkers {
+        olddir = a.mobj.movedir as int
+        ax = a.mobj.x
+        ay = a.mobj.y
+    } ghosted {
+        yeet("actor")
+    }
+    lowkey turnaround: int = oppositeDir(olddir)
+    lowkey tx: i32 = 0
+    lowkey ty: i32 = 0
+    holla t = target in gs.thinkers {
+        tx = t.mobj.x
+        ty = t.mobj.y
+    } ghosted {
+        yeet("target")
+    }
+    lowkey deltax: int = tx as int - ax as int
+    lowkey deltay: int = ty as int - ay as int
+    lowkey ten: int = 10 * 65536
+    lowkey d1: int = DI_NODIR
+    fr deltax > ten {
+        d1 = 0            // DI_EAST
+    } naw fr deltax < (0 - ten) {
+        d1 = 4            // DI_WEST
+    }
+    lowkey d2: int = DI_NODIR
+    fr deltay < (0 - ten) {
+        d2 = 6            // DI_SOUTH
+    } naw fr deltay > ten {
+        d2 = 2            // DI_NORTH
+    }
+    // try direct diagonal route
+    fr d1 != DI_NODIR && d2 != DI_NODIR {
+        lowkey p: int = 0
+        fr deltay < 0 {
+            p = p + 2
+        }
+        fr deltax > 0 {
+            p = p + 1
+        }
+        lowkey diag: int = diagDir(p)
+        setMovedir(gt, actor, diag)
+        fr diag != turnaround && pTryWalk(gt, actor) {
+            bet
+        }
+    }
+    // try other directions
+    fr rnd.pRandom(gt) > 200 || eAbs((deltay) as i32) > eAbs((deltax) as i32) {
+        lowkey tdir: int = d1
+        d1 = d2
+        d2 = tdir
+    }
+    fr d1 == turnaround {
+        d1 = DI_NODIR
+    }
+    fr d2 == turnaround {
+        d2 = DI_NODIR
+    }
+    fr d1 != DI_NODIR {
+        setMovedir(gt, actor, d1)
+        fr pTryWalk(gt, actor) {
+            bet
+        }
+    }
+    fr d2 != DI_NODIR {
+        setMovedir(gt, actor, d2)
+        fr pTryWalk(gt, actor) {
+            bet
+        }
+    }
+    // no direct path: pick another direction
+    fr olddir != DI_NODIR {
+        setMovedir(gt, actor, olddir)
+        fr pTryWalk(gt, actor) {
+            bet
+        }
+    }
+    // randomly determine direction of search
+    lowkey found: bool = cap
+    fr (rnd.pRandom(gt) & 1) != 0 {
+        lowkey tdir: int = 0            // DI_EAST
+        vibin tdir <= 7 && !found {     // .. DI_SOUTHEAST
+            fr tdir != turnaround {
+                setMovedir(gt, actor, tdir)
+                fr pTryWalk(gt, actor) {
+                    found = nocap
+                }
+            }
+            tdir = tdir + 1
+        }
+    } naw {
+        lowkey tdir: int = 7            // DI_SOUTHEAST
+        vibin tdir >= 0 && !found {     // .. DI_EAST (loop guard tdir != DI_EAST-1)
+            fr tdir != turnaround {
+                setMovedir(gt, actor, tdir)
+                fr pTryWalk(gt, actor) {
+                    found = nocap
+                }
+            }
+            tdir = tdir - 1
+        }
+    }
+    fr found {
+        bet
+    }
+    fr turnaround != DI_NODIR {
+        setMovedir(gt, actor, turnaround)
+        fr pTryWalk(gt, actor) {
+            bet
+        }
+    }
+    setMovedir(gt, actor, DI_NODIR)
+}
+
+// P_LookForPlayers — scan up to two players; target the first alive, visible one (front-180 only
+// unless allaround). Advances actor->lastlook each pass (mod 4). Returns true if a target was set.
+flex finna lookForPlayers(gt: tag gs.GameState, actor: tag think.Thinker, allaround: bool) -> bool {
+    lowkey ax: i32 = 0
+    lowkey ay: i32 = 0
+    lowkey aangle: u32 = 0
+    lowkey lastlook: int = 0
+    holla a = actor in gs.thinkers {
+        ax = a.mobj.x
+        ay = a.mobj.y
+        aangle = a.mobj.angle
+        lastlook = a.mobj.lastlook as int
+    } ghosted {
+        yeet("actor")
+    }
+    lowkey c: int = 0
+    lowkey stop: int = (lastlook - 1) & 3
+    lowkey result: bool = cap
+    lowkey looping: bool = nocap
+    vibin looping {
+        lowkey pig: bool = cap
+        holla g = gt in gs.gsc {
+            pig = g.shell.playeringame[lastlook]
+        } ghosted {
+            yeet("gs")
+        }
+        lowkey skipThis: bool = cap
+        fr !pig {
+            skipThis = nocap
+        }
+        fr !skipThis {
+            fr c == 2 || lastlook == stop {
+                looping = cap        // done looking (return false)
+            } naw {
+                c = c + 1
+                lowkey phealth: int = 0
+                lowkey pmo: tag think.Thinker = ghosted
+                holla g = gt in gs.gsc {
+                    phealth = g.shell.players[lastlook].health as int
+                    pmo = g.shell.players[lastlook].mo
+                } ghosted {
+                    yeet("gs")
+                }
+                fr phealth <= 0 {
+                    skipThis = nocap
+                }
+                fr !skipThis {
+                    fr !pmap.checkSight(gt, actor, pmo) {
+                        skipThis = nocap
+                    }
+                    fr !skipThis {
+                        lowkey behind: bool = cap
+                        fr !allaround {
+                            lowkey mx: i32 = 0
+                            lowkey my: i32 = 0
+                            holla m = pmo in gs.thinkers {
+                                mx = m.mobj.x
+                                my = m.mobj.y
+                            } ghosted {
+                                yeet("pmo")
+                            }
+                            lowkey an: u32 = 0
+                            holla g = gt in gs.gsc {
+                                an = rgeom.pointToAngle2(g.info.tantoangle, ax, ay, mx, my)
+                            } ghosted {
+                                yeet("gs")
+                            }
+                            an = an - aangle
+                            fr an > tables.ANG90 && an < tables.ANG270 {
+                                lowkey dist: i32 = fixed.aproxDistance((mx as int - ax as int) as i32, (my as int - ay as int) as i32)
+                                fr dist > MELEERANGE {
+                                    behind = nocap    // behind back
+                                }
+                            }
+                        }
+                        fr !behind {
+                            holla a = actor in gs.thinkers {
+                                a.mobj.target = pmo
+                            } ghosted {
+                                yeet("actor")
+                            }
+                            result = nocap
+                            looping = cap
+                        } naw {
+                            skipThis = nocap
+                        }
+                    }
+                }
+            }
+        }
+        fr looping {
+            lastlook = (lastlook + 1) & 3
+            holla a = actor in gs.thinkers {
+                a.mobj.lastlook = lastlook as i32
+            } ghosted {
+                yeet("actor")
+            }
+        }
+    }
+    bet result
+}
+
+// ===========================================================================================
+// A_Look / A_Chase / A_FaceTarget
+// ===========================================================================================
+flex finna aLook(gt: tag gs.GameState, actor: tag think.Thinker) {
+    lowkey sub: int = 0
+    lowkey typ: int = 0
+    holla a = actor in gs.thinkers {
+        a.mobj.threshold = 0        // any shot will wake up
+        sub = a.mobj.subsector as int
+        typ = a.mobj.typeIdx as int
+    } ghosted {
+        yeet("actor")
+    }
+    lowkey targ: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        targ = g.level.secLinks[g.level.ssSector[sub] as int].soundtarget
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey seeyou: bool = cap
+    fr !(targ == ghosted) {
+        lowkey tflags: int = 0
+        holla t = targ in gs.thinkers {
+            tflags = t.mobj.flags as int
+        } ghosted {
+            yeet("targ")
+        }
+        fr (tflags & think.MF_SHOOTABLE) != 0 {
+            holla a = actor in gs.thinkers {
+                a.mobj.target = targ
+            } ghosted {
+                yeet("actor")
+            }
+            lowkey aflags: int = 0
+            holla a = actor in gs.thinkers {
+                aflags = a.mobj.flags as int
+            } ghosted {
+                yeet("actor")
+            }
+            fr (aflags & think.MF_AMBUSH) != 0 {
+                fr pmap.checkSight(gt, actor, targ) {
+                    seeyou = nocap
+                }
+            } naw {
+                seeyou = nocap
+            }
+        }
+    }
+    fr !seeyou {
+        fr !lookForPlayers(gt, actor, cap) {
+            bet
+        }
+    }
+    // go into chase state
+    lowkey seesound: int = 0
+    lowkey seestate: int = 0
+    holla g = gt in gs.gsc {
+        seesound = g.info.mobjinfo[typ].seesound as int
+        seestate = g.info.mobjinfo[typ].seestate as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr seesound != 0 {
+        lowkey sound: int = seesound
+        fr seesound == sounds.SFX_POSIT1 || seesound == sounds.SFX_POSIT2 || seesound == sounds.SFX_POSIT3 {
+            sound = sounds.SFX_POSIT1 + (rnd.pRandom(gt) % 3)
+        } naw fr seesound == sounds.SFX_BGSIT1 || seesound == sounds.SFX_BGSIT2 {
+            sound = sounds.SFX_BGSIT1 + (rnd.pRandom(gt) % 2)
+        }
+        fr typ == info.MT_SPIDER || typ == info.MT_CYBORG {
+            ssnd.startSound(gt, ghosted, sound)       // full volume
+        } naw {
+            ssnd.startSound(gt, actor, sound)
+        }
+    }
+    pmobj.setMobjState(gt, actor, seestate)
+}
+
+flex finna aChase(gt: tag gs.GameState, actor: tag think.Thinker) {
+    lowkey reactiontime: int = 0
+    lowkey threshold: int = 0
+    lowkey movedir: int = 0
+    lowkey typ: int = 0
+    holla a = actor in gs.thinkers {
+        reactiontime = a.mobj.reactiontime as int
+        threshold = a.mobj.threshold as int
+        movedir = a.mobj.movedir as int
+        typ = a.mobj.typeIdx as int
+    } ghosted {
+        yeet("actor")
+    }
+    fr reactiontime != 0 {
+        holla a = actor in gs.thinkers {
+            a.mobj.reactiontime = (reactiontime - 1) as i32
+        } ghosted {
+            yeet("actor")
+        }
+    }
+    // modify target threshold
+    fr threshold != 0 {
+        lowkey target: tag think.Thinker = targetOf(gt, actor)
+        lowkey clear: bool = cap
+        fr target == ghosted {
+            clear = nocap
+        } naw {
+            lowkey th: int = 0
+            holla t = target in gs.thinkers {
+                th = t.mobj.health as int
+            } ghosted {
+                yeet("target")
+            }
+            fr th <= 0 {
+                clear = nocap
+            }
+        }
+        holla a = actor in gs.thinkers {
+            fr clear {
+                a.mobj.threshold = 0
+            } naw {
+                a.mobj.threshold = (threshold - 1) as i32
+            }
+        } ghosted {
+            yeet("actor")
+        }
+    }
+    // turn towards movement direction if not there yet
+    fr movedir < 8 {
+        holla a = actor in gs.thinkers {
+            lowkey ang: u32 = a.mobj.angle & ((7 << 29) as u32)
+            a.mobj.angle = ang
+            lowkey d: u32 = ang - (((movedir as u32) << 29))
+            lowkey delta: i32 = d as i32
+            fr delta > 0 {
+                a.mobj.angle = ang - (tables.ANG90 / 2)
+            } naw fr delta < 0 {
+                a.mobj.angle = ang + (tables.ANG90 / 2)
+            }
+        } ghosted {
+            yeet("actor")
+        }
+    }
+    // no (shootable) target: look for a new one, else return to spawnstate
+    lowkey target2: tag think.Thinker = targetOf(gt, actor)
+    lowkey haveShootable: bool = cap
+    fr !(target2 == ghosted) {
+        lowkey tflags: int = 0
+        holla t = target2 in gs.thinkers {
+            tflags = t.mobj.flags as int
+        } ghosted {
+            yeet("target2")
+        }
+        fr (tflags & think.MF_SHOOTABLE) != 0 {
+            haveShootable = nocap
+        }
+    }
+    fr !haveShootable {
+        fr lookForPlayers(gt, actor, nocap) {
+            bet
+        }
+        lowkey spawnstate: int = 0
+        holla g = gt in gs.gsc {
+            spawnstate = g.info.mobjinfo[typ].spawnstate as int
+        } ghosted {
+            yeet("gs")
+        }
+        pmobj.setMobjState(gt, actor, spawnstate)
+        bet
+    }
+    // do not attack twice in a row
+    lowkey aflags: int = 0
+    holla a = actor in gs.thinkers {
+        aflags = a.mobj.flags as int
+    } ghosted {
+        yeet("actor")
+    }
+    fr (aflags & think.MF_JUSTATTACKED) != 0 {
+        holla a = actor in gs.thinkers {
+            a.mobj.flags = (aflags & ~think.MF_JUSTATTACKED) as i32
+        } ghosted {
+            yeet("actor")
+        }
+        lowkey gameskill: int = 0
+        lowkey fastparm: bool = cap
+        holla g = gt in gs.gsc {
+            gameskill = g.shell.gameskill as int
+            fastparm = g.shell.fastparm
+        } ghosted {
+            yeet("gs")
+        }
+        fr gameskill != doomdef.SK_NIGHTMARE && !fastparm {
+            pNewChaseDir(gt, actor)
+        }
+        bet
+    }
+    // melee attack
+    lowkey meleestate: int = 0
+    lowkey missilestate: int = 0
+    lowkey attacksound: int = 0
+    holla g = gt in gs.gsc {
+        meleestate = g.info.mobjinfo[typ].meleestate as int
+        missilestate = g.info.mobjinfo[typ].missilestate as int
+        attacksound = g.info.mobjinfo[typ].attacksound as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr meleestate != 0 && checkMeleeRange(gt, actor) {
+        fr attacksound != 0 {
+            ssnd.startSound(gt, actor, attacksound)
+        }
+        pmobj.setMobjState(gt, actor, meleestate)
+        bet
+    }
+    // missile attack
+    lowkey didMissile: bool = cap
+    fr missilestate != 0 {
+        lowkey gameskill: int = 0
+        lowkey fastparm: bool = cap
+        lowkey movecount: int = 0
+        holla g = gt in gs.gsc {
+            gameskill = g.shell.gameskill as int
+            fastparm = g.shell.fastparm
+        } ghosted {
+            yeet("gs")
+        }
+        holla a = actor in gs.thinkers {
+            movecount = a.mobj.movecount as int
+        } ghosted {
+            yeet("actor")
+        }
+        lowkey nomissile: bool = cap
+        fr gameskill < doomdef.SK_NIGHTMARE && !fastparm && movecount != 0 {
+            nomissile = nocap
+        }
+        fr !nomissile {
+            fr !checkMissileRange(gt, actor) {
+                nomissile = nocap
+            }
+        }
+        fr !nomissile {
+            pmobj.setMobjState(gt, actor, missilestate)
+            holla a = actor in gs.thinkers {
+                a.mobj.flags = (a.mobj.flags as int | think.MF_JUSTATTACKED) as i32
+            } ghosted {
+                yeet("actor")
+            }
+            didMissile = nocap
+        }
+    }
+    fr didMissile {
+        bet
+    }
+    // possibly choose another target (netgame)
+    lowkey netgame: bool = cap
+    holla g = gt in gs.gsc {
+        netgame = g.shell.netgame
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey thr2: int = 0
+    holla a = actor in gs.thinkers {
+        thr2 = a.mobj.threshold as int
+    } ghosted {
+        yeet("actor")
+    }
+    fr netgame && thr2 == 0 {
+        lowkey tgt: tag think.Thinker = targetOf(gt, actor)
+        fr !pmap.checkSight(gt, actor, tgt) {
+            fr lookForPlayers(gt, actor, nocap) {
+                bet
+            }
+        }
+    }
+    // chase towards player
+    lowkey mc2: int = 0
+    holla a = actor in gs.thinkers {
+        mc2 = (a.mobj.movecount as int) - 1
+        a.mobj.movecount = mc2 as i32
+    } ghosted {
+        yeet("actor")
+    }
+    fr mc2 < 0 || !pMove(gt, actor) {
+        pNewChaseDir(gt, actor)
+    }
+    // make active sound
+    lowkey activesound: int = 0
+    holla g = gt in gs.gsc {
+        activesound = g.info.mobjinfo[typ].activesound as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr activesound != 0 && rnd.pRandom(gt) < 3 {
+        ssnd.startSound(gt, actor, activesound)
+    }
+}
+
+flex finna aFaceTarget(gt: tag gs.GameState, actor: tag think.Thinker) {
+    lowkey target: tag think.Thinker = targetOf(gt, actor)
+    fr target == ghosted {
+        bet
+    }
+    lowkey ax: i32 = 0
+    lowkey ay: i32 = 0
+    holla a = actor in gs.thinkers {
+        a.mobj.flags = (a.mobj.flags as int & ~think.MF_AMBUSH) as i32
+        ax = a.mobj.x
+        ay = a.mobj.y
+    } ghosted {
+        yeet("actor")
+    }
+    lowkey tx: i32 = 0
+    lowkey ty: i32 = 0
+    lowkey tflags: int = 0
+    holla t = target in gs.thinkers {
+        tx = t.mobj.x
+        ty = t.mobj.y
+        tflags = t.mobj.flags as int
+    } ghosted {
+        yeet("target")
+    }
+    lowkey an: u32 = 0
+    holla g = gt in gs.gsc {
+        an = rgeom.pointToAngle2(g.info.tantoangle, ax, ay, tx, ty)
+    } ghosted {
+        yeet("gs")
+    }
+    fr (tflags & think.MF_SHADOW) != 0 {
+        lowkey r1: int = rnd.pRandom(gt)
+        lowkey r2: int = rnd.pRandom(gt)
+        an = (an as int + ((r1 - r2) << 21)) as u32
+    }
+    holla a = actor in gs.thinkers {
+        a.mobj.angle = an
+    } ghosted {
+        yeet("actor")
+    }
+}
+
+// ===========================================================================================
+// hitscan / melee attacks
+// ===========================================================================================
+flex finna aPosAttack(gt: tag gs.GameState, actor: tag think.Thinker) {
+    fr targetOf(gt, actor) == ghosted {
+        bet
+    }
+    aFaceTarget(gt, actor)
+    lowkey angle: u32 = 0
+    holla a = actor in gs.thinkers {
+        angle = a.mobj.angle
+    } ghosted {
+        yeet("actor")
+    }
+    lowkey slope: i32 = pmap.aimLineAttack(gt, actor, angle, MISSILERANGE)
+    ssnd.startSound(gt, actor, sounds.SFX_PISTOL)
+    lowkey r1: int = rnd.pRandom(gt)
+    lowkey r2: int = rnd.pRandom(gt)
+    lowkey ang: u32 = (angle as int + ((r1 - r2) << 20)) as u32
+    lowkey damage: int = ((rnd.pRandom(gt) % 5) + 1) * 3
+    pmap.lineAttack(gt, actor, ang, MISSILERANGE, slope, damage)
+}
+
+flex finna aSPosAttack(gt: tag gs.GameState, actor: tag think.Thinker) {
+    fr targetOf(gt, actor) == ghosted {
+        bet
+    }
+    ssnd.startSound(gt, actor, sounds.SFX_SHOTGN)
+    aFaceTarget(gt, actor)
+    lowkey bangle: u32 = 0
+    holla a = actor in gs.thinkers {
+        bangle = a.mobj.angle
+    } ghosted {
+        yeet("actor")
+    }
+    lowkey slope: i32 = pmap.aimLineAttack(gt, actor, bangle, MISSILERANGE)
+    lowkey i: int = 0
+    vibin i < 3 {
+        lowkey r1: int = rnd.pRandom(gt)
+        lowkey r2: int = rnd.pRandom(gt)
+        lowkey ang: u32 = (bangle as int + ((r1 - r2) << 20)) as u32
+        lowkey damage: int = ((rnd.pRandom(gt) % 5) + 1) * 3
+        pmap.lineAttack(gt, actor, ang, MISSILERANGE, slope, damage)
+        i = i + 1
+    }
+}
+
+flex finna aCPosAttack(gt: tag gs.GameState, actor: tag think.Thinker) {
+    fr targetOf(gt, actor) == ghosted {
+        bet
+    }
+    ssnd.startSound(gt, actor, sounds.SFX_SHOTGN)
+    aFaceTarget(gt, actor)
+    lowkey bangle: u32 = 0
+    holla a = actor in gs.thinkers {
+        bangle = a.mobj.angle
+    } ghosted {
+        yeet("actor")
+    }
+    lowkey slope: i32 = pmap.aimLineAttack(gt, actor, bangle, MISSILERANGE)
+    lowkey r1: int = rnd.pRandom(gt)
+    lowkey r2: int = rnd.pRandom(gt)
+    lowkey ang: u32 = (bangle as int + ((r1 - r2) << 20)) as u32
+    lowkey damage: int = ((rnd.pRandom(gt) % 5) + 1) * 3
+    pmap.lineAttack(gt, actor, ang, MISSILERANGE, slope, damage)
+}
+
+flex finna aCPosRefire(gt: tag gs.GameState, actor: tag think.Thinker) {
+    aFaceTarget(gt, actor)
+    fr rnd.pRandom(gt) < 40 {
+        bet
+    }
+    refireCheck(gt, actor)
+}
+flex finna aSpidRefire(gt: tag gs.GameState, actor: tag think.Thinker) {
+    aFaceTarget(gt, actor)
+    fr rnd.pRandom(gt) < 10 {
+        bet
+    }
+    refireCheck(gt, actor)
+}
+// shared tail of A_CPosRefire / A_SpidRefire: drop back to seestate if the target is lost.
+flex finna refireCheck(gt: tag gs.GameState, actor: tag think.Thinker) {
+    lowkey target: tag think.Thinker = targetOf(gt, actor)
+    lowkey lost: bool = cap
+    fr target == ghosted {
+        lost = nocap
+    } naw {
+        lowkey th: int = 0
+        holla t = target in gs.thinkers {
+            th = t.mobj.health as int
+        } ghosted {
+            yeet("target")
+        }
+        fr th <= 0 {
+            lost = nocap
+        } naw fr !pmap.checkSight(gt, actor, target) {
+            lost = nocap
+        }
+    }
+    fr lost {
+        lowkey typ: int = 0
+        lowkey seestate: int = 0
+        holla a = actor in gs.thinkers {
+            typ = a.mobj.typeIdx as int
+        } ghosted {
+            yeet("actor")
+        }
+        holla g = gt in gs.gsc {
+            seestate = g.info.mobjinfo[typ].seestate as int
+        } ghosted {
+            yeet("gs")
+        }
+        pmobj.setMobjState(gt, actor, seestate)
+    }
+}
+
+flex finna aBspiAttack(gt: tag gs.GameState, actor: tag think.Thinker) {
+    lowkey target: tag think.Thinker = targetOf(gt, actor)
+    fr target == ghosted {
+        bet
+    }
+    aFaceTarget(gt, actor)
+    pmobj.spawnMissile(gt, actor, target, info.MT_ARACHPLAZ)
+}
+
+flex finna aTroopAttack(gt: tag gs.GameState, actor: tag think.Thinker) {
+    lowkey target: tag think.Thinker = targetOf(gt, actor)
+    fr target == ghosted {
+        bet
+    }
+    aFaceTarget(gt, actor)
+    fr checkMeleeRange(gt, actor) {
+        ssnd.startSound(gt, actor, sounds.SFX_CLAW)
+        lowkey damage: int = ((rnd.pRandom(gt) % 8) + 1) * 3
+        pinter.damageMobj(gt, target, actor, actor, damage)
+        bet
+    }
+    pmobj.spawnMissile(gt, actor, target, info.MT_TROOPSHOT)
+}
+
+flex finna aSargAttack(gt: tag gs.GameState, actor: tag think.Thinker) {
+    lowkey target: tag think.Thinker = targetOf(gt, actor)
+    fr target == ghosted {
+        bet
+    }
+    aFaceTarget(gt, actor)
+    fr checkMeleeRange(gt, actor) {
+        lowkey damage: int = ((rnd.pRandom(gt) % 10) + 1) * 4
+        pinter.damageMobj(gt, target, actor, actor, damage)
+    }
+}
+
+flex finna aHeadAttack(gt: tag gs.GameState, actor: tag think.Thinker) {
+    lowkey target: tag think.Thinker = targetOf(gt, actor)
+    fr target == ghosted {
+        bet
+    }
+    aFaceTarget(gt, actor)
+    fr checkMeleeRange(gt, actor) {
+        lowkey damage: int = ((rnd.pRandom(gt) % 6) + 1) * 10
+        pinter.damageMobj(gt, target, actor, actor, damage)
+        bet
+    }
+    pmobj.spawnMissile(gt, actor, target, info.MT_HEADSHOT)
+}
+
+flex finna aCyberAttack(gt: tag gs.GameState, actor: tag think.Thinker) {
+    lowkey target: tag think.Thinker = targetOf(gt, actor)
+    fr target == ghosted {
+        bet
+    }
+    aFaceTarget(gt, actor)
+    pmobj.spawnMissile(gt, actor, target, info.MT_ROCKET)
+}
+
+flex finna aBruisAttack(gt: tag gs.GameState, actor: tag think.Thinker) {
+    lowkey target: tag think.Thinker = targetOf(gt, actor)
+    fr target == ghosted {
+        bet
+    }
+    fr checkMeleeRange(gt, actor) {
+        ssnd.startSound(gt, actor, sounds.SFX_CLAW)
+        lowkey damage: int = ((rnd.pRandom(gt) % 8) + 1) * 10
+        pinter.damageMobj(gt, target, actor, actor, damage)
+        bet
+    }
+    pmobj.spawnMissile(gt, actor, target, info.MT_BRUISERSHOT)
+}
+
+// ===========================================================================================
+// Revenant (skeleton) — A_SkelMissile / A_Tracer / A_SkelWhoosh / A_SkelFist
+// ===========================================================================================
+flex finna aSkelMissile(gt: tag gs.GameState, actor: tag think.Thinker) {
+    lowkey target: tag think.Thinker = targetOf(gt, actor)
+    fr target == ghosted {
+        bet
+    }
+    aFaceTarget(gt, actor)
+    holla a = actor in gs.thinkers {
+        a.mobj.z = (a.mobj.z as int + 16 * 65536) as i32     // spawn missile higher
+    } ghosted {
+        yeet("actor")
+    }
+    lowkey mo: tag think.Thinker = pmobj.spawnMissile(gt, actor, target, info.MT_TRACER)
+    holla a = actor in gs.thinkers {
+        a.mobj.z = (a.mobj.z as int - 16 * 65536) as i32
+    } ghosted {
+        yeet("actor")
+    }
+    holla m = mo in gs.thinkers {
+        m.mobj.x = (m.mobj.x as int + m.mobj.momx as int) as i32
+        m.mobj.y = (m.mobj.y as int + m.mobj.momy as int) as i32
+        m.mobj.tracer = target
+    } ghosted {
+        yeet("mo")
+    }
+}
+
+flex finna aTracer(gt: tag gs.GameState, actor: tag think.Thinker) {
+    lowkey gametic: int = 0
+    holla g = gt in gs.gsc {
+        gametic = g.shell.gametic as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr (gametic & 3) != 0 {
+        bet
+    }
+    lowkey ax: i32 = 0
+    lowkey ay: i32 = 0
+    lowkey az: i32 = 0
+    lowkey amomx: i32 = 0
+    lowkey amomy: i32 = 0
+    holla a = actor in gs.thinkers {
+        ax = a.mobj.x
+        ay = a.mobj.y
+        az = a.mobj.z
+        amomx = a.mobj.momx
+        amomy = a.mobj.momy
+    } ghosted {
+        yeet("actor")
+    }
+    // puff of smoke behind the rocket
+    pmobj.spawnPuff(gt, ax, ay, az)
+    lowkey th: tag think.Thinker = pmobj.spawnMobj(gt, (ax as int - amomx as int) as i32, (ay as int - amomy as int) as i32, az, info.MT_SMOKE)
+    lowkey j: int = rnd.pRandom(gt) & 3
+    holla s = th in gs.thinkers {
+        s.mobj.momz = FRACUNIT
+        lowkey nt: int = (s.mobj.tics as int) - j
+        fr nt < 1 {
+            nt = 1
+        }
+        s.mobj.tics = nt as i32
+    } ghosted {
+        yeet("th")
+    }
+    // adjust direction toward the tracer target
+    lowkey dest: tag think.Thinker = ghosted
+    holla a = actor in gs.thinkers {
+        dest = a.mobj.tracer
+    } ghosted {
+        yeet("actor")
+    }
+    fr dest == ghosted {
+        bet
+    }
+    lowkey dhealth: int = 0
+    lowkey dx: i32 = 0
+    lowkey dy: i32 = 0
+    lowkey dz: i32 = 0
+    holla d = dest in gs.thinkers {
+        dhealth = d.mobj.health as int
+        dx = d.mobj.x
+        dy = d.mobj.y
+        dz = d.mobj.z
+    } ghosted {
+        yeet("dest")
+    }
+    fr dhealth <= 0 {
+        bet
+    }
+    lowkey exact: u32 = 0
+    holla g = gt in gs.gsc {
+        exact = rgeom.pointToAngle2(g.info.tantoangle, ax, ay, dx, dy)
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey aangle: u32 = 0
+    holla a = actor in gs.thinkers {
+        aangle = a.mobj.angle
+    } ghosted {
+        yeet("actor")
+    }
+    fr exact != aangle {
+        fr (exact - aangle) > tables.ANG180 {
+            aangle = aangle - TRACEANGLE
+            fr (exact - aangle) < tables.ANG180 {
+                aangle = exact
+            }
+        } naw {
+            aangle = aangle + TRACEANGLE
+            fr (exact - aangle) > tables.ANG180 {
+                aangle = exact
+            }
+        }
+    }
+    lowkey speed: i32 = 0
+    lowkey typ: int = 0
+    holla a = actor in gs.thinkers {
+        a.mobj.angle = aangle
+        typ = a.mobj.typeIdx as int
+    } ghosted {
+        yeet("actor")
+    }
+    holla g = gt in gs.gsc {
+        speed = g.info.mobjinfo[typ].speed
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey fine: int = (aangle >> 19) as int
+    lowkey mx: i32 = 0
+    lowkey my: i32 = 0
+    holla g = gt in gs.gsc {
+        mx = fixed.fixedMul(speed, g.info.finesine[fine + 2048])
+        my = fixed.fixedMul(speed, g.info.finesine[fine])
+    } ghosted {
+        yeet("gs")
+    }
+    // change slope
+    lowkey dist: int = fixed.aproxDistance((dx as int - ax as int) as i32, (dy as int - ay as int) as i32) as int
+    dist = dist / (speed as int)
+    fr dist < 1 {
+        dist = 1
+    }
+    lowkey slope: int = ((dz as int + 40 * 65536) - az as int) / dist
+    holla a = actor in gs.thinkers {
+        a.mobj.momx = mx
+        a.mobj.momy = my
+        lowkey mz: int = a.mobj.momz as int
+        fr slope < mz {
+            a.mobj.momz = (mz - (FRACUNIT / 8)) as i32
+        } naw {
+            a.mobj.momz = (mz + (FRACUNIT / 8)) as i32
+        }
+    } ghosted {
+        yeet("actor")
+    }
+}
+
+flex finna aSkelWhoosh(gt: tag gs.GameState, actor: tag think.Thinker) {
+    fr targetOf(gt, actor) == ghosted {
+        bet
+    }
+    aFaceTarget(gt, actor)
+    ssnd.startSound(gt, actor, sounds.SFX_SKESWG)
+}
+
+flex finna aSkelFist(gt: tag gs.GameState, actor: tag think.Thinker) {
+    lowkey target: tag think.Thinker = targetOf(gt, actor)
+    fr target == ghosted {
+        bet
+    }
+    aFaceTarget(gt, actor)
+    fr checkMeleeRange(gt, actor) {
+        lowkey damage: int = ((rnd.pRandom(gt) % 10) + 1) * 6
+        ssnd.startSound(gt, actor, sounds.SFX_SKEPCH)
+        pinter.damageMobj(gt, target, actor, actor, damage)
+    }
+}
+
+// ===========================================================================================
+// Archvile — PIT_VileCheck / A_VileChase / A_VileStart / A_Fire / A_VileTarget / A_VileAttack
+// ===========================================================================================
+flex finna pitVileCheck(gt: tag gs.GameState, thing: tag think.Thinker) -> bool {
+    lowkey flags: int = 0
+    lowkey tics: int = 0
+    lowkey typ: int = 0
+    lowkey tx: i32 = 0
+    lowkey ty: i32 = 0
+    holla t = thing in gs.thinkers {
+        flags = t.mobj.flags as int
+        tics = t.mobj.tics as int
+        typ = t.mobj.typeIdx as int
+        tx = t.mobj.x
+        ty = t.mobj.y
+    } ghosted {
+        yeet("thing")
+    }
+    fr (flags & think.MF_CORPSE) == 0 {
+        bet nocap        // not a monster
+    }
+    fr tics != -1 {
+        bet nocap        // not lying still yet
+    }
+    lowkey raisestate: int = 0
+    lowkey vileRadius: i32 = 0
+    holla g = gt in gs.gsc {
+        raisestate = g.info.mobjinfo[typ].raisestate as int
+        vileRadius = g.info.mobjinfo[info.MT_VILE].radius
+    } ghosted {
+        yeet("gs")
+    }
+    fr raisestate == info.S_NULL {
+        bet nocap        // no raise state
+    }
+    lowkey maxdist: int = infoRadius(gt, typ) as int + vileRadius as int
+    lowkey vtx: i32 = 0
+    lowkey vty: i32 = 0
+    holla g = gt in gs.gsc {
+        vtx = g.tick.viletryx
+        vty = g.tick.viletryy
+    } ghosted {
+        yeet("gs")
+    }
+    fr eAbs((tx as int - vtx as int) as i32) as int > maxdist || eAbs((ty as int - vty as int) as i32) as int > maxdist {
+        bet nocap        // not actually touching
+    }
+    holla g = gt in gs.gsc {
+        g.tick.corpsehit = thing
+    } ghosted {
+        yeet("gs")
+    }
+    holla t = thing in gs.thinkers {
+        t.mobj.momx = 0
+        t.mobj.momy = 0
+        t.mobj.height = (t.mobj.height as int << 2) as i32
+    } ghosted {
+        yeet("thing")
+    }
+    lowkey check: bool = pmap.checkPosition(gt, thing, tx, ty)
+    holla t = thing in gs.thinkers {
+        t.mobj.height = (t.mobj.height as int >> 2) as i32
+    } ghosted {
+        yeet("thing")
+    }
+    fr !check {
+        bet nocap        // doesn't fit here
+    }
+    bet cap              // got one, stop checking
+}
+
+flex finna aVileChase(gt: tag gs.GameState, actor: tag think.Thinker) {
+    lowkey movedir: int = 0
+    lowkey ax: i32 = 0
+    lowkey ay: i32 = 0
+    lowkey typ: int = 0
+    holla a = actor in gs.thinkers {
+        movedir = a.mobj.movedir as int
+        ax = a.mobj.x
+        ay = a.mobj.y
+        typ = a.mobj.typeIdx as int
+    } ghosted {
+        yeet("actor")
+    }
+    lowkey raised: bool = cap
+    fr movedir != DI_NODIR {
+        lowkey speed: int = 0
+        lowkey bmox: i32 = 0
+        lowkey bmoy: i32 = 0
+        holla g = gt in gs.gsc {
+            speed = g.info.mobjinfo[typ].speed as int
+            bmox = g.level.bmapOrgX
+            bmoy = g.level.bmapOrgY
+        } ghosted {
+            yeet("gs")
+        }
+        lowkey vtx: i32 = (ax as int + speed * (xspeedOf(movedir) as int)) as i32
+        lowkey vty: i32 = (ay as int + speed * (yspeedOf(movedir) as int)) as i32
+        holla g = gt in gs.gsc {
+            g.tick.viletryx = vtx
+            g.tick.viletryy = vty
+        } ghosted {
+            yeet("gs")
+        }
+        lowkey r2: int = (MAXRADIUS as int) * 2
+        lowkey xl: int = ((vtx as int - bmox as int - r2) >> MAPBLOCKSHIFT)
+        lowkey xh: int = ((vtx as int - bmox as int + r2) >> MAPBLOCKSHIFT)
+        lowkey yl: int = ((vty as int - bmoy as int - r2) >> MAPBLOCKSHIFT)
+        lowkey yh: int = ((vty as int - bmoy as int + r2) >> MAPBLOCKSHIFT)
+        fr !pmap.blockThingsBox(gt, xl, xh, yl, yh, pitVileCheck) {
+            // got one — heal it
+            lowkey corpsehit: tag think.Thinker = ghosted
+            holla g = gt in gs.gsc {
+                corpsehit = g.tick.corpsehit
+            } ghosted {
+                yeet("gs")
+            }
+            // face the corpse (temporarily retarget)
+            lowkey temp: tag think.Thinker = targetOf(gt, actor)
+            holla a = actor in gs.thinkers {
+                a.mobj.target = corpsehit
+            } ghosted {
+                yeet("actor")
+            }
+            aFaceTarget(gt, actor)
+            holla a = actor in gs.thinkers {
+                a.mobj.target = temp
+            } ghosted {
+                yeet("actor")
+            }
+            pmobj.setMobjState(gt, actor, info.S_VILE_HEAL1)
+            ssnd.startSound(gt, corpsehit, sounds.SFX_SLOP)
+            lowkey ctyp: int = 0
+            holla c = corpsehit in gs.thinkers {
+                ctyp = c.mobj.typeIdx as int
+            } ghosted {
+                yeet("corpsehit")
+            }
+            lowkey craise: int = 0
+            lowkey cflags: int = 0
+            lowkey chealth: int = 0
+            holla g = gt in gs.gsc {
+                craise = g.info.mobjinfo[ctyp].raisestate as int
+                cflags = g.info.mobjinfo[ctyp].flags as int
+                chealth = g.info.mobjinfo[ctyp].spawnhealth as int
+            } ghosted {
+                yeet("gs")
+            }
+            pmobj.setMobjState(gt, corpsehit, craise)
+            holla c = corpsehit in gs.thinkers {
+                c.mobj.height = (c.mobj.height as int << 2) as i32
+                c.mobj.flags = cflags as i32
+                c.mobj.health = chealth as i32
+                c.mobj.target = ghosted
+            } ghosted {
+                yeet("corpsehit")
+            }
+            raised = nocap
+        }
+    }
+    fr !raised {
+        aChase(gt, actor)
+    }
+}
+
+flex finna aVileStart(gt: tag gs.GameState, actor: tag think.Thinker) {
+    ssnd.startSound(gt, actor, sounds.SFX_VILATK)
+}
+
+// A_Fire — keep the archvile hellfire in front of the target unless the vile loses sight.
+flex finna aFire(gt: tag gs.GameState, actor: tag think.Thinker) {
+    lowkey dest: tag think.Thinker = ghosted
+    lowkey vileT: tag think.Thinker = ghosted
+    holla a = actor in gs.thinkers {
+        dest = a.mobj.tracer
+        vileT = a.mobj.target
+    } ghosted {
+        yeet("actor")
+    }
+    fr dest == ghosted {
+        bet
+    }
+    fr !pmap.checkSight(gt, vileT, dest) {
+        bet
+    }
+    lowkey dangle: u32 = 0
+    lowkey dx: i32 = 0
+    lowkey dy: i32 = 0
+    lowkey dz: i32 = 0
+    holla d = dest in gs.thinkers {
+        dangle = d.mobj.angle
+        dx = d.mobj.x
+        dy = d.mobj.y
+        dz = d.mobj.z
+    } ghosted {
+        yeet("dest")
+    }
+    lowkey an: int = (dangle >> 19) as int
+    pmaputl.unsetThingPosition(gt, actor)
+    lowkey nx: i32 = 0
+    lowkey ny: i32 = 0
+    holla g = gt in gs.gsc {
+        nx = (dx as int + fixed.fixedMul((24 * 65536) as i32, g.info.finesine[an + 2048]) as int) as i32
+        ny = (dy as int + fixed.fixedMul((24 * 65536) as i32, g.info.finesine[an]) as int) as i32
+    } ghosted {
+        yeet("gs")
+    }
+    holla a = actor in gs.thinkers {
+        a.mobj.x = nx
+        a.mobj.y = ny
+        a.mobj.z = dz
+    } ghosted {
+        yeet("actor")
+    }
+    pmaputl.setThingPosition(gt, actor)
+}
+
+flex finna aStartFire(gt: tag gs.GameState, actor: tag think.Thinker) {
+    ssnd.startSound(gt, actor, sounds.SFX_FLAMST)
+    aFire(gt, actor)
+}
+flex finna aFireCrackle(gt: tag gs.GameState, actor: tag think.Thinker) {
+    ssnd.startSound(gt, actor, sounds.SFX_FLAME)
+    aFire(gt, actor)
+}
+
+flex finna aVileTarget(gt: tag gs.GameState, actor: tag think.Thinker) {
+    lowkey target: tag think.Thinker = targetOf(gt, actor)
+    fr target == ghosted {
+        bet
+    }
+    aFaceTarget(gt, actor)
+    // NB: id passes target->x as BOTH x and y here (an id bug, preserved for demo compat).
+    lowkey txx: i32 = 0
+    lowkey tz: i32 = 0
+    holla t = target in gs.thinkers {
+        txx = t.mobj.x
+        tz = t.mobj.z
+    } ghosted {
+        yeet("target")
+    }
+    lowkey fog: tag think.Thinker = pmobj.spawnMobj(gt, txx, txx, tz, info.MT_FIRE)
+    holla a = actor in gs.thinkers {
+        a.mobj.tracer = fog
+    } ghosted {
+        yeet("actor")
+    }
+    holla f = fog in gs.thinkers {
+        f.mobj.target = actor
+        f.mobj.tracer = target
+    } ghosted {
+        yeet("fog")
+    }
+    aFire(gt, fog)
+}
+
+flex finna aVileAttack(gt: tag gs.GameState, actor: tag think.Thinker) {
+    lowkey target: tag think.Thinker = targetOf(gt, actor)
+    fr target == ghosted {
+        bet
+    }
+    aFaceTarget(gt, actor)
+    fr !pmap.checkSight(gt, actor, target) {
+        bet
+    }
+    ssnd.startSound(gt, actor, sounds.SFX_BAREXP)
+    pinter.damageMobj(gt, target, actor, actor, 20)
+    lowkey tmass: int = 0
+    lowkey ttyp: int = 0
+    holla t = target in gs.thinkers {
+        ttyp = t.mobj.typeIdx as int
+    } ghosted {
+        yeet("target")
+    }
+    holla g = gt in gs.gsc {
+        tmass = g.info.mobjinfo[ttyp].mass as int
+    } ghosted {
+        yeet("gs")
+    }
+    holla t = target in gs.thinkers {
+        t.mobj.momz = ((1000 * 65536) / tmass) as i32
+    } ghosted {
+        yeet("target")
+    }
+    lowkey aangle: u32 = 0
+    lowkey fire: tag think.Thinker = ghosted
+    holla a = actor in gs.thinkers {
+        aangle = a.mobj.angle
+        fire = a.mobj.tracer
+    } ghosted {
+        yeet("actor")
+    }
+    fr fire == ghosted {
+        bet
+    }
+    lowkey an: int = (aangle >> 19) as int
+    lowkey tx: i32 = 0
+    lowkey ty: i32 = 0
+    holla t = target in gs.thinkers {
+        tx = t.mobj.x
+        ty = t.mobj.y
+    } ghosted {
+        yeet("target")
+    }
+    holla f = fire in gs.thinkers {
+        f.mobj.x = (tx as int - fixed.fixedMul((24 * 65536) as i32, ffcos(gt, an)) as int) as i32
+        f.mobj.y = (ty as int - fixed.fixedMul((24 * 65536) as i32, ffsin(gt, an)) as int) as i32
+    } ghosted {
+        yeet("fire")
+    }
+    pmap.radiusAttack(gt, fire, actor, 70)
+}
+// finecosine/finesine readers (used where a value is needed mid-expression outside a gsc holla)
+flex finna ffcos(gt: tag gs.GameState, fine: int) -> i32 {
+    lowkey v: i32 = 0
+    holla g = gt in gs.gsc {
+        v = g.info.finesine[fine + 2048]
+    } ghosted {
+        yeet("gs")
+    }
+    bet v
+}
+flex finna ffsin(gt: tag gs.GameState, fine: int) -> i32 {
+    lowkey v: i32 = 0
+    holla g = gt in gs.gsc {
+        v = g.info.finesine[fine]
+    } ghosted {
+        yeet("gs")
+    }
+    bet v
+}
+
+// ===========================================================================================
+// Mancubus — A_FatRaise / A_FatAttack1/2/3
+// ===========================================================================================
+flex finna aFatRaise(gt: tag gs.GameState, actor: tag think.Thinker) {
+    aFaceTarget(gt, actor)
+    ssnd.startSound(gt, actor, sounds.SFX_MANATK)
+}
+
+// helper: set a freshly-spawned fatshot's momentum from its (adjusted) angle.
+flex finna fatShotMom(gt: tag gs.GameState, mo: tag think.Thinker) {
+    lowkey typ: int = 0
+    lowkey an: int = 0
+    holla m = mo in gs.thinkers {
+        typ = m.mobj.typeIdx as int
+        an = (m.mobj.angle >> 19) as int
+    } ghosted {
+        yeet("mo")
+    }
+    lowkey speed: i32 = 0
+    holla g = gt in gs.gsc {
+        speed = g.info.mobjinfo[typ].speed
+    } ghosted {
+        yeet("gs")
+    }
+    holla m = mo in gs.thinkers {
+        m.mobj.momx = fixed.fixedMul(speed, ffcos(gt, an))
+        m.mobj.momy = fixed.fixedMul(speed, ffsin(gt, an))
+    } ghosted {
+        yeet("mo")
+    }
+}
+
+flex finna aFatAttack1(gt: tag gs.GameState, actor: tag think.Thinker) {
+    lowkey target: tag think.Thinker = targetOf(gt, actor)
+    aFaceTarget(gt, actor)
+    holla a = actor in gs.thinkers {
+        a.mobj.angle = a.mobj.angle + FATSPREAD
+    } ghosted {
+        yeet("actor")
+    }
+    pmobj.spawnMissile(gt, actor, target, info.MT_FATSHOT)
+    lowkey mo: tag think.Thinker = pmobj.spawnMissile(gt, actor, target, info.MT_FATSHOT)
+    holla m = mo in gs.thinkers {
+        m.mobj.angle = m.mobj.angle + FATSPREAD
+    } ghosted {
+        yeet("mo")
+    }
+    fatShotMom(gt, mo)
+}
+flex finna aFatAttack2(gt: tag gs.GameState, actor: tag think.Thinker) {
+    lowkey target: tag think.Thinker = targetOf(gt, actor)
+    aFaceTarget(gt, actor)
+    holla a = actor in gs.thinkers {
+        a.mobj.angle = a.mobj.angle - FATSPREAD
+    } ghosted {
+        yeet("actor")
+    }
+    pmobj.spawnMissile(gt, actor, target, info.MT_FATSHOT)
+    lowkey mo: tag think.Thinker = pmobj.spawnMissile(gt, actor, target, info.MT_FATSHOT)
+    holla m = mo in gs.thinkers {
+        m.mobj.angle = m.mobj.angle - (FATSPREAD * 2)
+    } ghosted {
+        yeet("mo")
+    }
+    fatShotMom(gt, mo)
+}
+flex finna aFatAttack3(gt: tag gs.GameState, actor: tag think.Thinker) {
+    lowkey target: tag think.Thinker = targetOf(gt, actor)
+    aFaceTarget(gt, actor)
+    lowkey mo1: tag think.Thinker = pmobj.spawnMissile(gt, actor, target, info.MT_FATSHOT)
+    holla m = mo1 in gs.thinkers {
+        m.mobj.angle = m.mobj.angle - (FATSPREAD / 2)
+    } ghosted {
+        yeet("mo1")
+    }
+    fatShotMom(gt, mo1)
+    lowkey mo2: tag think.Thinker = pmobj.spawnMissile(gt, actor, target, info.MT_FATSHOT)
+    holla m = mo2 in gs.thinkers {
+        m.mobj.angle = m.mobj.angle + (FATSPREAD / 2)
+    } ghosted {
+        yeet("mo2")
+    }
+    fatShotMom(gt, mo2)
+}
+
+// ===========================================================================================
+// Lost Soul / Pain Elemental — A_SkullAttack / A_PainShootSkull / A_PainAttack / A_PainDie
+// ===========================================================================================
+flex finna aSkullAttack(gt: tag gs.GameState, actor: tag think.Thinker) {
+    lowkey dest: tag think.Thinker = targetOf(gt, actor)
+    fr dest == ghosted {
+        bet
+    }
+    lowkey typ: int = 0
+    holla a = actor in gs.thinkers {
+        a.mobj.flags = (a.mobj.flags as int | think.MF_SKULLFLY) as i32
+        typ = a.mobj.typeIdx as int
+    } ghosted {
+        yeet("actor")
+    }
+    lowkey attacksound: int = 0
+    holla g = gt in gs.gsc {
+        attacksound = g.info.mobjinfo[typ].attacksound as int
+    } ghosted {
+        yeet("gs")
+    }
+    ssnd.startSound(gt, actor, attacksound)
+    aFaceTarget(gt, actor)
+    lowkey ax: i32 = 0
+    lowkey ay: i32 = 0
+    lowkey az: i32 = 0
+    lowkey an: int = 0
+    holla a = actor in gs.thinkers {
+        ax = a.mobj.x
+        ay = a.mobj.y
+        az = a.mobj.z
+        an = (a.mobj.angle >> 19) as int
+    } ghosted {
+        yeet("actor")
+    }
+    lowkey mx: i32 = fixed.fixedMul(SKULLSPEED, ffcos(gt, an))
+    lowkey my: i32 = fixed.fixedMul(SKULLSPEED, ffsin(gt, an))
+    lowkey dx: i32 = 0
+    lowkey dy: i32 = 0
+    lowkey dz: i32 = 0
+    lowkey dheight: i32 = 0
+    holla d = dest in gs.thinkers {
+        dx = d.mobj.x
+        dy = d.mobj.y
+        dz = d.mobj.z
+        dheight = d.mobj.height
+    } ghosted {
+        yeet("dest")
+    }
+    lowkey dist: int = fixed.aproxDistance((dx as int - ax as int) as i32, (dy as int - ay as int) as i32) as int
+    dist = dist / (SKULLSPEED as int)
+    fr dist < 1 {
+        dist = 1
+    }
+    holla a = actor in gs.thinkers {
+        a.mobj.momx = mx
+        a.mobj.momy = my
+        a.mobj.momz = (((dz as int + (dheight as int >> 1)) - az as int) / dist) as i32
+    } ghosted {
+        yeet("actor")
+    }
+}
+
+// A_PainShootSkull — spawn a lost soul at `angle` and launch it (if under the 21-skull cap).
+flex finna painShootSkull(gt: tag gs.GameState, actor: tag think.Thinker, angle: u32) {
+    // count lost souls currently on the level
+    lowkey count: int = countMobjType(gt, info.MT_SKULL)
+    fr count > 20 {
+        bet
+    }
+    lowkey an: int = (angle >> 19) as int
+    lowkey ax: i32 = 0
+    lowkey ay: i32 = 0
+    lowkey az: i32 = 0
+    lowkey atyp: int = 0
+    holla a = actor in gs.thinkers {
+        ax = a.mobj.x
+        ay = a.mobj.y
+        az = a.mobj.z
+        atyp = a.mobj.typeIdx as int
+    } ghosted {
+        yeet("actor")
+    }
+    lowkey skullRadius: i32 = 0
+    holla g = gt in gs.gsc {
+        skullRadius = g.info.mobjinfo[info.MT_SKULL].radius
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey aRadius: i32 = infoRadius(gt, atyp)
+    // prestep = 4*FRACUNIT + 3*(actor->info->radius + skull->info->radius)/2
+    lowkey prestep: int = (4 * 65536) + 3 * (aRadius as int + skullRadius as int) / 2
+    lowkey x: i32 = (ax as int + fixed.fixedMul(prestep as i32, ffcos(gt, an)) as int) as i32
+    lowkey y: i32 = (ay as int + fixed.fixedMul(prestep as i32, ffsin(gt, an)) as int) as i32
+    lowkey z: i32 = (az as int + 8 * 65536) as i32
+    lowkey newmobj: tag think.Thinker = pmobj.spawnMobj(gt, x, y, z, info.MT_SKULL)
+    lowkey nx: i32 = 0
+    lowkey ny: i32 = 0
+    holla n = newmobj in gs.thinkers {
+        nx = n.mobj.x
+        ny = n.mobj.y
+    } ghosted {
+        yeet("newmobj")
+    }
+    fr !callTryMove(gt, newmobj, nx, ny) {
+        // kill it immediately
+        pinter.damageMobj(gt, newmobj, actor, actor, 10000)
+        bet
+    }
+    lowkey atgt: tag think.Thinker = targetOf(gt, actor)
+    holla n = newmobj in gs.thinkers {
+        n.mobj.target = atgt
+    } ghosted {
+        yeet("newmobj")
+    }
+    aSkullAttack(gt, newmobj)
+}
+
+flex finna aPainAttack(gt: tag gs.GameState, actor: tag think.Thinker) {
+    fr targetOf(gt, actor) == ghosted {
+        bet
+    }
+    aFaceTarget(gt, actor)
+    lowkey angle: u32 = 0
+    holla a = actor in gs.thinkers {
+        angle = a.mobj.angle
+    } ghosted {
+        yeet("actor")
+    }
+    painShootSkull(gt, actor, angle)
+}
+
+flex finna aPainDie(gt: tag gs.GameState, actor: tag think.Thinker) {
+    aFall(gt, actor)
+    lowkey angle: u32 = 0
+    holla a = actor in gs.thinkers {
+        angle = a.mobj.angle
+    } ghosted {
+        yeet("actor")
+    }
+    painShootSkull(gt, actor, angle + tables.ANG90)
+    painShootSkull(gt, actor, angle + tables.ANG180)
+    painShootSkull(gt, actor, angle + tables.ANG270)
+}
+
+// ===========================================================================================
+// death / pain / misc sound actions
+// ===========================================================================================
+flex finna aScream(gt: tag gs.GameState, actor: tag think.Thinker) {
+    lowkey typ: int = 0
+    holla a = actor in gs.thinkers {
+        typ = a.mobj.typeIdx as int
+    } ghosted {
+        yeet("actor")
+    }
+    lowkey deathsound: int = 0
+    holla g = gt in gs.gsc {
+        deathsound = g.info.mobjinfo[typ].deathsound as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr deathsound == 0 {
+        bet
+    }
+    lowkey sound: int = deathsound
+    fr deathsound == sounds.SFX_PODTH1 || deathsound == sounds.SFX_PODTH2 || deathsound == sounds.SFX_PODTH3 {
+        sound = sounds.SFX_PODTH1 + (rnd.pRandom(gt) % 3)
+    } naw fr deathsound == sounds.SFX_BGDTH1 || deathsound == sounds.SFX_BGDTH2 {
+        sound = sounds.SFX_BGDTH1 + (rnd.pRandom(gt) % 2)
+    }
+    fr typ == info.MT_SPIDER || typ == info.MT_CYBORG {
+        ssnd.startSound(gt, ghosted, sound)
+    } naw {
+        ssnd.startSound(gt, actor, sound)
+    }
+}
+
+flex finna aXScream(gt: tag gs.GameState, actor: tag think.Thinker) {
+    ssnd.startSound(gt, actor, sounds.SFX_SLOP)
+}
+
+flex finna aPain(gt: tag gs.GameState, actor: tag think.Thinker) {
+    lowkey typ: int = 0
+    holla a = actor in gs.thinkers {
+        typ = a.mobj.typeIdx as int
+    } ghosted {
+        yeet("actor")
+    }
+    lowkey painsound: int = 0
+    holla g = gt in gs.gsc {
+        painsound = g.info.mobjinfo[typ].painsound as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr painsound != 0 {
+        ssnd.startSound(gt, actor, painsound)
+    }
+}
+
+flex finna aFall(gt: tag gs.GameState, actor: tag think.Thinker) {
+    // on ground, can be walked over
+    holla a = actor in gs.thinkers {
+        a.mobj.flags = (a.mobj.flags as int & ~think.MF_SOLID) as i32
+    } ghosted {
+        yeet("actor")
+    }
+}
+
+flex finna aExplode(gt: tag gs.GameState, actor: tag think.Thinker) {
+    lowkey src: tag think.Thinker = targetOf(gt, actor)
+    pmap.radiusAttack(gt, actor, src, 128)
+}
+
+flex finna aPlayerScream(gt: tag gs.GameState, actor: tag think.Thinker) {
+    lowkey sound: int = sounds.SFX_PLDETH
+    lowkey gamemode: int = 0
+    lowkey health: int = 0
+    holla a = actor in gs.thinkers {
+        health = a.mobj.health as int
+    } ghosted {
+        yeet("actor")
+    }
+    holla g = gt in gs.gsc {
+        gamemode = g.shell.gamemode as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr gamemode == doomdef.GM_COMMERCIAL && health < (0 - 50) {
+        sound = sounds.SFX_PDIEHI
+    }
+    ssnd.startSound(gt, actor, sound)
+}
+
+// ===========================================================================================
+// boss / brain / keen — thinker-list scans + exit triggers
+// ===========================================================================================
+// countMobjType — number of live FUNC_MOBJ thinkers of a given type on the level.
+flex finna countMobjType(gt: tag gs.GameState, typ: int) -> int {
+    lowkey capT: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        capT = g.tick.thinkercap
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey cur: tag think.Thinker = ghosted
+    holla c = capT in gs.thinkers {
+        cur = c.next
+    } ghosted {
+        yeet("cap")
+    }
+    lowkey n: int = 0
+    vibin !(cur == capT) {
+        lowkey fid: int = 0
+        lowkey mtyp: int = 0
+        lowkey nxt: tag think.Thinker = ghosted
+        holla t = cur in gs.thinkers {
+            fid = t.funcId as int
+            mtyp = t.mobj.typeIdx as int
+            nxt = t.next
+        } ghosted {
+            yeet("cur")
+        }
+        fr fid == think.FUNC_MOBJ && mtyp == typ {
+            n = n + 1
+        }
+        cur = nxt
+    }
+    bet n
+}
+
+// A_KeenDie — DOOM II map 32: fall, then if all Commander Keens are dead, open tag-666 doors.
+flex finna aKeenDie(gt: tag gs.GameState, mo: tag think.Thinker) {
+    aFall(gt, mo)
+    lowkey myTyp: int = 0
+    holla m = mo in gs.thinkers {
+        myTyp = m.mobj.typeIdx as int
+    } ghosted {
+        yeet("mo")
+    }
+    lowkey alive: int = countAliveOfTypeExcept(gt, myTyp, mo)
+    fr alive > 0 {
+        bet        // another Keen not dead
+    }
+    pdoors.evDoDoorTag(gt, 666, psu666DoorOpen())
+}
+flex finna psu666DoorOpen() -> int {
+    bet 3       // vldoor_e `open` == DOOR_OPEN
+}
+
+// countAliveOfTypeExcept — count FUNC_MOBJ nodes of `typ` with health>0, excluding `self`.
+flex finna countAliveOfTypeExcept(gt: tag gs.GameState, typ: int, self: tag think.Thinker) -> int {
+    lowkey capT: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        capT = g.tick.thinkercap
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey cur: tag think.Thinker = ghosted
+    holla c = capT in gs.thinkers {
+        cur = c.next
+    } ghosted {
+        yeet("cap")
+    }
+    lowkey n: int = 0
+    vibin !(cur == capT) {
+        lowkey fid: int = 0
+        lowkey mtyp: int = 0
+        lowkey mhp: int = 0
+        lowkey nxt: tag think.Thinker = ghosted
+        holla t = cur in gs.thinkers {
+            fid = t.funcId as int
+            mtyp = t.mobj.typeIdx as int
+            mhp = t.mobj.health as int
+            nxt = t.next
+        } ghosted {
+            yeet("cur")
+        }
+        fr fid == think.FUNC_MOBJ && !(cur == self) && mtyp == typ && mhp > 0 {
+            n = n + 1
+        }
+        cur = nxt
+    }
+    bet n
+}
+
+// A_BossDeath — on the designated boss level, when the last boss of this type dies, trigger the
+// level's special effect (door/floor) or exit the level.
+flex finna aBossDeath(gt: tag gs.GameState, mo: tag think.Thinker) {
+    lowkey gamemode: int = 0
+    lowkey gamemap: int = 0
+    lowkey gameepisode: int = 0
+    holla g = gt in gs.gsc {
+        gamemode = g.shell.gamemode as int
+        gamemap = g.shell.gamemap as int
+        gameepisode = g.shell.gameepisode as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey typ: int = 0
+    holla m = mo in gs.thinkers {
+        typ = m.mobj.typeIdx as int
+    } ghosted {
+        yeet("mo")
+    }
+    lowkey ok: bool = cap
+    fr gamemode == doomdef.GM_COMMERCIAL {
+        fr gamemap == 7 && (typ == info.MT_FATSO || typ == info.MT_BABY) {
+            ok = nocap
+        }
+    } naw {
+        fr gameepisode == 1 {
+            fr gamemap == 8 && typ == info.MT_BRUISER {
+                ok = nocap
+            }
+        } naw fr gameepisode == 2 {
+            fr gamemap == 8 && typ == info.MT_CYBORG {
+                ok = nocap
+            }
+        } naw fr gameepisode == 3 {
+            fr gamemap == 8 && typ == info.MT_SPIDER {
+                ok = nocap
+            }
+        } naw fr gameepisode == 4 {
+            fr gamemap == 6 && typ == info.MT_CYBORG {
+                ok = nocap
+            } naw fr gamemap == 8 && typ == info.MT_SPIDER {
+                ok = nocap
+            }
+        } naw {
+            fr gamemap == 8 {
+                ok = nocap
+            }
+        }
+    }
+    fr !ok {
+        bet
+    }
+    // make sure a player is alive for victory
+    lowkey anyAlive: bool = cap
+    lowkey i: int = 0
+    vibin i < MAXPLAYERS && !anyAlive {
+        lowkey pig: bool = cap
+        lowkey ph: int = 0
+        holla g = gt in gs.gsc {
+            pig = g.shell.playeringame[i]
+            ph = g.shell.players[i].health as int
+        } ghosted {
+            yeet("gs")
+        }
+        fr pig && ph > 0 {
+            anyAlive = nocap
+        }
+        i = i + 1
+    }
+    fr !anyAlive {
+        bet        // no one left alive, do not end game
+    }
+    // all bosses of this type dead?
+    lowkey alive: int = countAliveOfTypeExcept(gt, typ, mo)
+    fr alive > 0 {
+        bet
+    }
+    // victory
+    fr gamemode == doomdef.GM_COMMERCIAL {
+        fr gamemap == 7 {
+            fr typ == info.MT_FATSO {
+                pfloor.evDoFloorTag(gt, 666, psuFloorLowerToLowest())
+                bet
+            }
+            fr typ == info.MT_BABY {
+                pfloor.evDoFloorTag(gt, 667, psuFloorRaiseToTexture())
+                bet
+            }
+        }
+    } naw {
+        fr gameepisode == 1 {
+            pfloor.evDoFloorTag(gt, 666, psuFloorLowerToLowest())
+            bet
+        } naw fr gameepisode == 4 {
+            fr gamemap == 6 {
+                pdoors.evDoDoorTag(gt, 666, psuDoorBlazeOpen())
+                bet
+            } naw fr gamemap == 8 {
+                pfloor.evDoFloorTag(gt, 666, psuFloorLowerToLowest())
+                bet
+            }
+        }
+    }
+    exitLevel(gt)
+}
+flex finna psuFloorLowerToLowest() -> int {
+    bet 1       // floor_e lowerFloorToLowest == FLOOR_LOWERFLOORTOLOWEST
+}
+flex finna psuFloorRaiseToTexture() -> int {
+    bet 5       // floor_e raiseToTexture == FLOOR_RAISETOTEXTURE
+}
+flex finna psuDoorBlazeOpen() -> int {
+    bet 6       // vldoor_e blazeOpen == DOOR_BLAZEOPEN
+}
+// G_ExitLevel: observably sets gameaction = ga_completed (secretexit not modelled here).
+flex finna exitLevel(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.shell.gameaction = doomdef.GA_COMPLETED as i32
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna aHoof(gt: tag gs.GameState, mo: tag think.Thinker) {
+    ssnd.startSound(gt, mo, sounds.SFX_HOOF)
+    aChase(gt, mo)
+}
+flex finna aMetal(gt: tag gs.GameState, mo: tag think.Thinker) {
+    ssnd.startSound(gt, mo, sounds.SFX_METAL)
+    aChase(gt, mo)
+}
+flex finna aBabyMetal(gt: tag gs.GameState, mo: tag think.Thinker) {
+    ssnd.startSound(gt, mo, sounds.SFX_BSPWLK)
+    aChase(gt, mo)
+}
+
+// A_BrainAwake — collect the boss-brain target spots; play the wakeup sound.
+flex finna aBrainAwake(gt: tag gs.GameState, mo: tag think.Thinker) {
+    lowkey capT: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        g.tick.numbraintargets = 0
+        g.tick.brainTargetOn = 0
+        capT = g.tick.thinkercap
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey cur: tag think.Thinker = ghosted
+    holla c = capT in gs.thinkers {
+        cur = c.next
+    } ghosted {
+        yeet("cap")
+    }
+    lowkey num: int = 0
+    vibin !(cur == capT) {
+        lowkey fid: int = 0
+        lowkey mtyp: int = 0
+        lowkey nxt: tag think.Thinker = ghosted
+        holla t = cur in gs.thinkers {
+            fid = t.funcId as int
+            mtyp = t.mobj.typeIdx as int
+            nxt = t.next
+        } ghosted {
+            yeet("cur")
+        }
+        fr fid == think.FUNC_MOBJ && mtyp == info.MT_BOSSTARGET {
+            holla g = gt in gs.gsc {
+                g.tick.braintargets[num].t = cur
+            } ghosted {
+                yeet("gs")
+            }
+            num = num + 1
+        }
+        cur = nxt
+    }
+    holla g = gt in gs.gsc {
+        g.tick.numbraintargets = num as i32
+    } ghosted {
+        yeet("gs")
+    }
+    ssnd.startSound(gt, ghosted, sounds.SFX_BOSSIT)
+}
+
+flex finna aBrainPain(gt: tag gs.GameState, mo: tag think.Thinker) {
+    ssnd.startSound(gt, ghosted, sounds.SFX_BOSPN)
+}
+
+flex finna aBrainScream(gt: tag gs.GameState, mo: tag think.Thinker) {
+    lowkey mx: i32 = 0
+    lowkey my: i32 = 0
+    holla m = mo in gs.thinkers {
+        mx = m.mobj.x
+        my = m.mobj.y
+    } ghosted {
+        yeet("mo")
+    }
+    lowkey x: int = mx as int - 196 * 65536
+    lowkey xend: int = mx as int + 320 * 65536
+    vibin x < xend {
+        lowkey y: int = my as int - 320 * 65536
+        lowkey z: int = 128 + rnd.pRandom(gt) * 2 * 65536
+        lowkey th: tag think.Thinker = pmobj.spawnMobj(gt, x as i32, y as i32, z as i32, info.MT_ROCKET)
+        lowkey momz: int = rnd.pRandom(gt) * 512
+        holla t = th in gs.thinkers {
+            t.mobj.momz = momz as i32
+        } ghosted {
+            yeet("th")
+        }
+        pmobj.setMobjState(gt, th, info.S_BRAINEXPLODE1)
+        lowkey j: int = rnd.pRandom(gt) & 7
+        holla t = th in gs.thinkers {
+            lowkey nt: int = (t.mobj.tics as int) - j
+            fr nt < 1 {
+                nt = 1
+            }
+            t.mobj.tics = nt as i32
+        } ghosted {
+            yeet("th")
+        }
+        x = x + 65536 * 8
+    }
+    ssnd.startSound(gt, ghosted, sounds.SFX_BOSDTH)
+}
+
+flex finna aBrainExplode(gt: tag gs.GameState, mo: tag think.Thinker) {
+    lowkey mx: i32 = 0
+    lowkey my: i32 = 0
+    holla m = mo in gs.thinkers {
+        mx = m.mobj.x
+        my = m.mobj.y
+    } ghosted {
+        yeet("mo")
+    }
+    lowkey r1: int = rnd.pRandom(gt)
+    lowkey r2: int = rnd.pRandom(gt)
+    lowkey x: int = mx as int + (r1 - r2) * 2048
+    lowkey y: int = my as int
+    lowkey z: int = 128 + rnd.pRandom(gt) * 2 * 65536
+    lowkey th: tag think.Thinker = pmobj.spawnMobj(gt, x as i32, y as i32, z as i32, info.MT_ROCKET)
+    lowkey momz: int = rnd.pRandom(gt) * 512
+    holla t = th in gs.thinkers {
+        t.mobj.momz = momz as i32
+    } ghosted {
+        yeet("th")
+    }
+    pmobj.setMobjState(gt, th, info.S_BRAINEXPLODE1)
+    lowkey j: int = rnd.pRandom(gt) & 7
+    holla t = th in gs.thinkers {
+        lowkey nt: int = (t.mobj.tics as int) - j
+        fr nt < 1 {
+            nt = 1
+        }
+        t.mobj.tics = nt as i32
+    } ghosted {
+        yeet("th")
+    }
+}
+
+flex finna aBrainDie(gt: tag gs.GameState, mo: tag think.Thinker) {
+    exitLevel(gt)
+}
+
+flex finna aBrainSpit(gt: tag gs.GameState, mo: tag think.Thinker) {
+    lowkey easy: int = 0
+    lowkey gameskill: int = 0
+    holla g = gt in gs.gsc {
+        easy = (g.tick.brainEasy as int) ^ 1
+        g.tick.brainEasy = easy as i32
+        gameskill = g.shell.gameskill as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr gameskill <= doomdef.SK_EASY && easy == 0 {
+        bet
+    }
+    // shoot a cube at the current target spot
+    lowkey targ: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        lowkey on: int = g.tick.brainTargetOn as int
+        targ = g.tick.braintargets[on].t
+        lowkey nb: int = g.tick.numbraintargets as int
+        g.tick.brainTargetOn = ((on + 1) % nb) as i32
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey newmobj: tag think.Thinker = pmobj.spawnMissile(gt, mo, targ, info.MT_SPAWNSHOT)
+    lowkey ty: i32 = 0
+    holla t = targ in gs.thinkers {
+        ty = t.mobj.y
+    } ghosted {
+        yeet("targ")
+    }
+    lowkey my: i32 = 0
+    holla m = mo in gs.thinkers {
+        my = m.mobj.y
+    } ghosted {
+        yeet("mo")
+    }
+    lowkey nmomy: i32 = 0
+    lowkey nstate: int = 0
+    holla n = newmobj in gs.thinkers {
+        n.mobj.target = targ
+        nmomy = n.mobj.momy
+        nstate = n.mobj.stateIdx as int
+    } ghosted {
+        yeet("newmobj")
+    }
+    lowkey stateTics: int = 0
+    holla g = gt in gs.gsc {
+        stateTics = g.info.states[nstate].tics as int
+    } ghosted {
+        yeet("gs")
+    }
+    holla n = newmobj in gs.thinkers {
+        n.mobj.reactiontime = (((ty as int - my as int) / (nmomy as int)) / stateTics) as i32
+    } ghosted {
+        yeet("newmobj")
+    }
+    ssnd.startSound(gt, ghosted, sounds.SFX_BOSPIT)
+}
+
+// A_SpawnFly — the travelling brain cube: on arrival, teleport-fog + spawn a random monster and
+// remove the cube.
+flex finna aSpawnFly(gt: tag gs.GameState, mo: tag think.Thinker) {
+    lowkey rt: int = 0
+    holla m = mo in gs.thinkers {
+        rt = (m.mobj.reactiontime as int) - 1
+        m.mobj.reactiontime = rt as i32
+    } ghosted {
+        yeet("mo")
+    }
+    fr rt != 0 {
+        bet        // still flying
+    }
+    lowkey targ: tag think.Thinker = targetOf(gt, mo)
+    lowkey tx: i32 = 0
+    lowkey ty: i32 = 0
+    lowkey tz: i32 = 0
+    holla t = targ in gs.thinkers {
+        tx = t.mobj.x
+        ty = t.mobj.y
+        tz = t.mobj.z
+    } ghosted {
+        yeet("targ")
+    }
+    lowkey fog: tag think.Thinker = pmobj.spawnMobj(gt, tx, ty, tz, info.MT_SPAWNFIRE)
+    ssnd.startSound(gt, fog, sounds.SFX_TELEPT)
+    // randomly select a monster type (decreasing likelihood)
+    lowkey r: int = rnd.pRandom(gt)
+    lowkey typ: int = info.MT_BRUISER
+    fr r < 50 {
+        typ = info.MT_TROOP
+    } naw fr r < 90 {
+        typ = info.MT_SERGEANT
+    } naw fr r < 120 {
+        typ = info.MT_SHADOWS
+    } naw fr r < 130 {
+        typ = info.MT_PAIN
+    } naw fr r < 160 {
+        typ = info.MT_HEAD
+    } naw fr r < 162 {
+        typ = info.MT_VILE
+    } naw fr r < 172 {
+        typ = info.MT_UNDEAD
+    } naw fr r < 192 {
+        typ = info.MT_BABY
+    } naw fr r < 222 {
+        typ = info.MT_FATSO
+    } naw fr r < 246 {
+        typ = info.MT_KNIGHT
+    }
+    lowkey newmobj: tag think.Thinker = pmobj.spawnMobj(gt, tx, ty, tz, typ)
+    fr lookForPlayers(gt, newmobj, nocap) {
+        lowkey seestate: int = 0
+        holla g = gt in gs.gsc {
+            seestate = g.info.mobjinfo[typ].seestate as int
+        } ghosted {
+            yeet("gs")
+        }
+        pmobj.setMobjState(gt, newmobj, seestate)
+    }
+    lowkey nx: i32 = 0
+    lowkey ny: i32 = 0
+    holla n = newmobj in gs.thinkers {
+        nx = n.mobj.x
+        ny = n.mobj.y
+    } ghosted {
+        yeet("newmobj")
+    }
+    pmap.teleportMove(gt, newmobj, nx, ny)      // telefrag anything in this spot
+    pmobj.removeMobj(gt, mo)                     // remove the cube
+}
+
+flex finna aSpawnSound(gt: tag gs.GameState, mo: tag think.Thinker) {
+    ssnd.startSound(gt, mo, sounds.SFX_BOSCUB)
+    aSpawnFly(gt, mo)
+}
