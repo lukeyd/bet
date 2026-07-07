@@ -2,3 +2,6 @@
 # Without this alias, `cargo xtask` errors "no such subcommand" on a fresh clone.
 [alias]
 xtask = "run --quiet --package xtask --"
+# DOOM-port tooling is behind xtask's non-default `doom` feature (keeps the large port out of the
+# default workspace build gate). This alias runs it with the feature on: `cargo xtask-doom doom-verify …`.
+xtask-doom = "run --quiet --package xtask --features doom --"

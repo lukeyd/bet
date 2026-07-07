@@ -23,5 +23,13 @@ toml           = { workspace = true }
 image  = { version = "0.25", default-features = false, features = ["png", "gif", "bmp"] }
 lewton = "0.10"
 
+[features]
+# The DOOM port's dev tooling (`doom-gen`/`doom-golden-gen`/`doom-verify`/`doom-coverage`/
+# `doom-oracle`) is a large, port-specific subsystem. It is OFF by default so the port never
+# enters the workspace build gate: `cargo build/clippy/nextest --workspace` (what CI runs) skips
+# the `doom_*` modules and their unit tests entirely. Run the tooling with the feature on, e.g.
+# `cargo run -q -p xtask --features doom -- doom-verify ...` (or the `xtask-doom` cargo alias).
+doom = []
+
 [lints]
 workspace = true

@@ -20,11 +20,20 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 
 mod bake_fb;
+// The DOOM port's dev tooling is gated behind the non-default `doom` feature so the port never
+// enters the workspace build gate (see xtask/Cargo.toml). Off by default, these modules and their
+// unit tests are not compiled or run by `cargo build/clippy/nextest --workspace`.
+#[cfg(feature = "doom")]
 mod doom;
+#[cfg(feature = "doom")]
 mod doom_coverage;
+#[cfg(feature = "doom")]
 mod doom_gen;
+#[cfg(feature = "doom")]
 mod doom_golden;
+#[cfg(feature = "doom")]
 mod doom_oracle;
+#[cfg(feature = "doom")]
 mod doom_verify;
 
 const USAGE: &str = "\
@@ -72,11 +81,27 @@ fn main() -> ExitCode {
         "corpus" => corpus(rest),
         "selfhost" => selfhost(&workspace_root()),
         "bake-frozen-bubble" => bake_fb::run(rest),
+        #[cfg(feature = "doom")]
         "doom-gen" => doom_gen::run(rest, &workspace_root()),
+        #[cfg(feature = "doom")]
         "doom-golden-gen" => doom_golden::run(rest, &workspace_root()),
+        #[cfg(feature = "doom")]
         "doom-verify" => doom_verify::run(rest, &workspace_root()),
+        #[cfg(feature = "doom")]
         "doom-coverage" => doom_coverage::run(rest, &workspace_root()),
+        #[cfg(feature = "doom")]
         "doom-oracle" => doom_oracle::run(rest, &workspace_root()),
+        // Without the `doom` feature the port tooling isn't compiled in (keeps the DOOM port out
+        // of the workspace build gate). Point the user at the feature flag instead of "unknown".
+        #[cfg(not(feature = "doom"))]
+        "doom-gen" | "doom-golden-gen" | "doom-verify" | "doom-coverage" | "doom-oracle" => {
+            eprintln!(
+                "xtask: `{cmd}` is DOOM-port tooling, gated behind the non-default `doom` feature \
+                 (keeps the port out of the workspace build gate).\n       Run it with: cargo run \
+                 -q -p xtask --features doom -- {cmd} ...   (or: cargo xtask-doom {cmd} ...)"
+            );
+            return ExitCode::FAILURE;
+        }
         "dist" => stub_cmd("dist", "release-artifact packaging for the 6 targets"),
         "" => {
             eprintln!("{USAGE}");
