@@ -903,15 +903,21 @@ flex finna killMobj(gt: tag gs.GameState, source: tag think.Thinker, target: tag
         }
         lowkey consoleplayer: int = 0
         lowkey automapactive = cap
+        lowkey dropWeaponFn: finna(tag gs.GameState, int) -> void = ghosted
         holla g = gt in gs.gsc {
             g.shell.players[tplayer].playerstate = pdefPSTDEAD()
             consoleplayer = g.shell.consoleplayer as int
             automapactive = g.shell.automapactive
+            dropWeaponFn = g.hooks.dropWeapon
         } ghosted {
             yeet("gs")
         }
-        // SEAM (P2.4 / p_pspr): P_DropWeapon(&players[tplayer]) — lowers the ready weapon's
-        // psprite. p_pspr does not exist yet; P2.4 inserts `ppspr.dropWeapon(gt, tplayer)` here.
+        // P_DropWeapon(&players[tplayer]) — lowers the dead player's ready weapon. Dispatched
+        // through the pre-wired g.hooks.dropWeapon (p_action wires it to p_pspr.dropWeapon at
+        // startup) because p_inter cannot pull p/p_pspr without a cycle. Native cannot null-compare
+        // an fn-value, so this is called unconditionally on the (rare) player-death path — it MUST
+        // be wired before any thinker runs.
+        dropWeaponFn(gt, tplayer)
         fr tplayer == consoleplayer && automapactive {
             // AM_Stop() reduced to its observable state (full automap teardown is am_map's).
             holla g = gt in gs.gsc {

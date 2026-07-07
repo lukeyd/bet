@@ -175,10 +175,23 @@ flex finna newFloorThinker(gt: tag gs.GameState, sec: int, floortype: int) -> ta
 }
 
 flex finna evDoFloor(gt: tag gs.GameState, line: int, floortype: int) -> int {
+    lowkey tag: int = 0
+    holla g = gt in gs.gsc {
+        tag = g.level.lineTag[line] as int
+    } ghosted {
+        yeet("gs")
+    }
+    bet evDoFloorTag(gt, tag, floortype)
+}
+
+// evDoFloorTag — EV_DoFloor keyed on a sector tag directly (p_specutil.findSectorFromTag). The
+// junk-line boss-death triggers (p_enemy A_BossDeath) call this with tag 666/667, which have no
+// real linedef.
+flex finna evDoFloorTag(gt: tag gs.GameState, tag: int, floortype: int) -> int {
     lowkey secnum: int = -1
     lowkey rtn: int = 0
     vibin nocap {
-        secnum = psu.findSectorFromLineTag(gt, line, secnum)
+        secnum = psu.findSectorFromTag(gt, tag, secnum)
         fr secnum < 0 {
             dip
         }
