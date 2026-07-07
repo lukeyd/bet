@@ -566,21 +566,28 @@ flex finna tryMove(gt: tag gs.GameState, thing: tag think.Thinker, x: i32, y: i3
     pmaputl.unsetThingPosition(gt, thing)
     lowkey oldx: i32 = 0
     lowkey oldy: i32 = 0
+    // Read the tm interval into locals FIRST, then write the mobj through a top-level holla.
+    // Writing t.mobj.x/y inside a nested `holla ... in gs.thinkers` (itself inside `holla ...
+    // in gs.gsc`) does not reliably commit the store in native lowering — the position write
+    // was intermittently lost, which showed up as a stale demo-sync fingerprint one tic after
+    // a P_SlideMove (the mobj was actually moved, but a later read saw the pre-move value).
+    lowkey tmfloorz2: i32 = 0
+    lowkey tmceilingz2: i32 = 0
     holla g = gt in gs.gsc {
-        lowkey tmfloorz = g.tick.tmfloorz
-        lowkey tmceilingz = g.tick.tmceilingz
-        holla t = thing in gs.thinkers {
-            oldx = t.mobj.x
-            oldy = t.mobj.y
-            t.mobj.floorz = tmfloorz
-            t.mobj.ceilingz = tmceilingz
-            t.mobj.x = x
-            t.mobj.y = y
-        } ghosted {
-            yeet("thing")
-        }
+        tmfloorz2 = g.tick.tmfloorz
+        tmceilingz2 = g.tick.tmceilingz
     } ghosted {
         yeet("gs")
+    }
+    holla t = thing in gs.thinkers {
+        oldx = t.mobj.x
+        oldy = t.mobj.y
+        t.mobj.floorz = tmfloorz2
+        t.mobj.ceilingz = tmceilingz2
+        t.mobj.x = x
+        t.mobj.y = y
+    } ghosted {
+        yeet("thing")
     }
     pmaputl.setThingPosition(gt, thing)
     // special-line crossings (skip if teleport / noclip)

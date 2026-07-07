@@ -71,3 +71,27 @@ my+newy)`; track it in locals `ux`/`uy` and pass `ux+nmx, uy+nmy` to the along-m
   and 2402/2402), stable across repeated runs.
 
 ---
+
+## demo1 tic 60 — P_TryMove wrote mo->x/y inside a NESTED `holla` (lost write)
+
+- **symptom**: after the slide fixes, demo1 still diverged in X/Y, at a P_SlideMove tic —
+  but the divergence *floated* between builds (tic 60 / line 278 vs. tic ~2748 / line
+  2966) and only ever affected ~2 isolated tics, with every later tic re-aligning. Adding
+  ANY debug read to `emitSyncTic`/`slideMove` made it vanish. Classic non-determinism.
+- **root cause**: the actual mobj store was correct (the *next* tic read the right
+  position, matching the oracle) — only the fingerprint's read was intermittently stale by
+  exactly the "move up to the wall" displacement. The write itself was the problem:
+  `P_TryMove` set `t.mobj.x = x; t.mobj.y = y` **inside a nested `holla`**
+  (`holla t = thing in gs.thinkers` nested inside `holla g = gt in gs.gsc`). Per the
+  repo's known bet gotcha, a store to a `tag` field inside a nested `holla` does not
+  reliably commit in native lowering, so a later read (e.g. `emitSyncTic` reading
+  `players[0].mo`) could observe the pre-move value. demo2/demo3 only "passed" because
+  their reads happened to land after the write committed.
+- **fix**: un-nest the write in `tryMove` (`ports/doom/p/p_map.bet`) — read `tmfloorz`/
+  `tmceilingz` into locals inside the `gs.gsc` holla, close it, then write
+  `t.mobj.x/y/floorz/ceilingz` through a **top-level** `holla t = thing in gs.thinkers`.
+- **result**: the P_SlideMove position divergences are gone and *deterministic*. demo2 and
+  demo3 still match ALL tics; demo1 advances to tic 2748 (line 2966), where the remaining
+  divergence is an **RNG-order** issue (R off by one) — a different class, logged next.
+
+---
