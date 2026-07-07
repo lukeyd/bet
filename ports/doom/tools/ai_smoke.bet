@@ -1,0 +1,229 @@
+// tools/ai_smoke.bet — the P2.4 SIM-AI proof (p_enemy + p_pspr + p_user + p_tick + p_action).
+// Cops a GameState, fills the generated tables, loads the shareware IWAD, runs R_InitData +
+// p_think.initThinkers, then **p_action.wireActions** (now ALL 74 actions + every hook are live),
+// and setupLevel(E1M1, skill 3) with playeringame[0] set and -nomonsters (so the ONLY monster
+// thinker is the one we spawn — an isolated, deterministic A_Chase trace). Then:
+//
+//  (a) A_Chase movement trace: spawn a MT_POSSESSED near the player, give it the player as its
+//      target, put it in its seestate, and run p_think.runThinkers for 50 tics — dumping its
+//      (stateIdx, movedir, x>>16, y>>16) each tic. RNG is seeded by clearRandom right before, so
+//      the trace is deterministic (given the seeded prndindex).
+//  (b) Weapon-fire test: give the player the pistol + clip, P_SetupPsprites, then P_FireWeapon
+//      (via the psprite state chain -> A_FirePistol -> P_BulletSlope + P_GunShot -> hitscan). Dump
+//      the psprite (weapon/flash) state sequence + ammo + prndindex (the RNG advance proves the
+//      hitscan traversed and hit level geometry).
+//
+// Build+run NATIVE (headless); the interpreter clones an array per element read (WAD-scale
+// intractable), exactly like setup_smoke:
+//   cargo build -p driver --features llvm ; cargo build -p runtime --features gg-desktop
+//   bet build ports/doom/tools/ai_smoke.bet --runtime real -o /tmp/ai_smoke
+//   BET_GG_HEADLESS=1 /tmp/ai_smoke
+pull "spill"
+pull "../defs/gs" as gs
+pull "../defs/think" as think
+pull "../defs/info" as info
+pull "../defs/sounds" as sounds
+pull "../defs/tables" as tables
+pull "../defs/doomdef" as doomdef
+pull "../util/m_random" as rnd
+pull "../w/w_wad" as wad
+pull "../r/r_data" as rdata
+pull "../p/p_think" as pthink
+pull "../p/p_setup" as psetup
+pull "../p/p_action" as paction
+pull "../p/p_mobj" as pmobj
+pull "../p/p_map" as pmap
+pull "../p/p_pspr" as ppspr
+
+finna main() {
+    lowkey g0 = cop gs.GameState{} in gs.gsc
+    gs.gsInit(g0)
+
+    holla g = g0 in gs.gsc {
+        info.initStatesAll(g.info.states)
+        info.initMobjinfoAll(g.info.mobjinfo)
+        sounds.initSfxAll(g.info.sfx)
+        g.info.finesine = tables.initFinesineAll(g.info.finesine)
+        g.info.finetangent = tables.initFinetangentAll(g.info.finetangent)
+        g.info.tantoangle = tables.initTantoangleAll(g.info.tantoangle)
+        g.tick.rndtable = rnd.initRndtable(g.tick.rndtable)
+        g.shell.gamemode = doomdef.GM_SHAREWARE as i32
+        g.shell.gameskill = doomdef.SK_HARD as i32
+        g.shell.gameepisode = 1
+        g.shell.gamemap = 1
+        g.shell.consoleplayer = 0
+        g.shell.displayplayer = 0
+        g.shell.playeringame[0] = nocap
+        g.shell.netgame = cap
+        g.shell.deathmatch = 0
+        g.shell.nomonsters = nocap        // isolate the A_Chase trace to our one monster
+    } ghosted {
+        yeet("gs")
+    }
+    rnd.clearRandom(g0)
+
+    wad.initWad(g0, "/Users/lukebaggett/Documents/bet/doom-reference/doom1.wad")
+    rdata.initData(g0)
+    pthink.initThinkers(g0)
+    paction.wireActions(g0)               // <-- the whole dispatch is now LIVE
+    psetup.setupLevel(g0, 1, 1, doomdef.SK_HARD)
+
+    spill.f("== SIM-AI smoke (p_enemy + p_pspr + p_user + p_tick + p_action) ==\n")
+
+    // player mobj position (spawned by setupLevel)
+    lowkey pmo: tag think.Thinker = ghosted
+    holla g = g0 in gs.gsc {
+        pmo = g.shell.players[0].mo
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey px: i32 = 0
+    lowkey py: i32 = 0
+    holla m = pmo in gs.thinkers {
+        px = m.mobj.x
+        py = m.mobj.y
+    } ghosted {
+        yeet("pmo")
+    }
+    spill.f("player mo at ({}, {})\n", (px >> 16) as int, (py >> 16) as int)
+
+    // ============================================================================
+    // (a) A_Chase movement trace
+    // ============================================================================
+    spill.f("-- A: A_Chase trace (MT_POSSESSED chasing the player) --\n")
+    // Spawn the monster in the player's (open) subsector, then probe the 4 cardinals for open
+    // space (P_CheckPosition consumes no RNG) and relocate it there, so it has room to walk toward
+    // the player it targets. This keeps the trace deterministic and shows real A_Chase movement.
+    lowkey mob = pmobj.spawnMobj(g0, px, py, think.ONFLOORZ, info.MT_POSSESSED)
+    lowkey off = (128 * 65536) as int
+    lowkey ox: i32 = px
+    lowkey oy: i32 = py
+    lowkey found = cap
+    fr !found && pmap.checkPosition(g0, mob, (px as int + off) as i32, py) {
+        ox = (px as int + off) as i32
+        oy = py
+        found = nocap
+    }
+    fr !found && pmap.checkPosition(g0, mob, (px as int - off) as i32, py) {
+        ox = (px as int - off) as i32
+        oy = py
+        found = nocap
+    }
+    fr !found && pmap.checkPosition(g0, mob, px, (py as int + off) as i32) {
+        ox = px
+        oy = (py as int + off) as i32
+        found = nocap
+    }
+    fr !found && pmap.checkPosition(g0, mob, px, (py as int - off) as i32) {
+        ox = px
+        oy = (py as int - off) as i32
+        found = nocap
+    }
+    pmap.teleportMove(g0, mob, ox, oy)
+    holla m = mob in gs.thinkers {
+        m.mobj.target = pmo
+        m.mobj.reactiontime = 0
+    } ghosted {
+        yeet("mob")
+    }
+    spill.f("monster at ({}, {}) targeting player\n", (ox >> 16) as int, (oy >> 16) as int)
+    rnd.clearRandom(g0)                   // seed prndindex = 0 for a deterministic trace
+    pmobj.setMobjState(g0, mob, info.S_POSS_RUN1)   // enter the chase (runs A_Chase)
+    dumpChase(g0, mob, 0)
+    lowkey t = 1
+    vibin t <= 50 {
+        pthink.runThinkers(g0)
+        dumpChase(g0, mob, t)
+        t = t + 1
+    }
+
+    // ============================================================================
+    // (b) Weapon-fire test (pistol -> A_FirePistol hitscan)
+    // ============================================================================
+    spill.f("-- B: P_FireWeapon (pistol) --\n")
+    holla g = g0 in gs.gsc {
+        g.shell.players[0].health = 100
+        g.shell.players[0].readyweapon = doomdef.WP_PISTOL as i32
+        g.shell.players[0].pendingweapon = doomdef.WP_NOCHANGE as i32
+        g.shell.players[0].ammo[doomdef.AM_CLIP] = 50
+        g.shell.players[0].attackdown = cap
+        g.shell.players[0].refire = 0
+    } ghosted {
+        yeet("gs")
+    }
+    ppspr.setupPsprites(g0, 0)
+    dumpWeapon(g0, "after setupPsprites")
+    ppspr.fireWeapon(g0, 0)               // P_FireWeapon: enters S_PISTOL1 (pre-fire frame)
+    dumpWeapon(g0, "after fireWeapon  ")
+    // cycle the psprite chain; A_FirePistol fires on S_PISTOL2 -> ammo drops + RNG advances (the
+    // hitscan traversed level geometry). Buttons released so it fires once then returns to ready.
+    holla g = g0 in gs.gsc {
+        g.shell.players[0].cmd.buttons = 0
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey k = 1
+    vibin k <= 10 {
+        ppspr.movePsprites(g0, 0)
+        dumpWeapon(g0, "movePsprites tic ")
+        k = k + 1
+    }
+
+    spill.f("== done ==\n")
+}
+
+// dumpChase — print the possessed's (stateIdx, movedir, x, y in map units) for one tic.
+flex finna dumpChase(gt: tag gs.GameState, mob: tag think.Thinker, tic: int) {
+    lowkey st: int = 0
+    lowkey md: int = 0
+    lowkey x: int = 0
+    lowkey y: int = 0
+    holla m = mob in gs.thinkers {
+        st = m.mobj.stateIdx as int
+        md = m.mobj.movedir as int
+        x = (m.mobj.x >> 16) as int
+        y = (m.mobj.y >> 16) as int
+    } ghosted {
+        yeet("mob")
+    }
+    lowkey ri: int = 0
+    holla g = gt in gs.gsc {
+        ri = g.tick.prndindex as int
+    } ghosted {
+        yeet("gs")
+    }
+    spill.f("  t={} st={} movedir={} x={} y={} rnd={}\n", tic, st, md, x, y, ri)
+}
+
+// dumpWeapon — print the player's weapon + flash psprite states + ammo + prndindex (so the
+// A_FirePistol hitscan is visible as the tic where ammo drops and prndindex advances).
+flex finna dumpWeapon(gt: tag gs.GameState, label: str) {
+    lowkey w: int = 0
+    lowkey f: int = 0
+    holla g = gt in gs.gsc {
+        w = g.shell.players[0].psprites[think.PS_WEAPON].stateIdx as int
+        f = g.shell.players[0].psprites[think.PS_FLASH].stateIdx as int
+    } ghosted {
+        yeet("gs")
+    }
+    spill.f("  {}: weaponSt={} flashSt={} clip={} rnd={}\n", label, w, f, readAmmo(gt), readRnd(gt))
+}
+
+flex finna readRnd(gt: tag gs.GameState) -> int {
+    lowkey ri: int = 0
+    holla g = gt in gs.gsc {
+        ri = g.tick.prndindex as int
+    } ghosted {
+        yeet("gs")
+    }
+    bet ri
+}
+flex finna readAmmo(gt: tag gs.GameState) -> int {
+    lowkey a: int = 0
+    holla g = gt in gs.gsc {
+        a = g.shell.players[0].ammo[doomdef.AM_CLIP] as int
+    } ghosted {
+        yeet("gs")
+    }
+    bet a
+}

@@ -1,0 +1,69 @@
+== SIM-AI smoke (p_enemy + p_pspr + p_user + p_tick + p_action) ==
+player mo at (1056, -3616)
+-- A: A_Chase trace (MT_POSSESSED chasing the player) --
+monster at (1056, -3488) targeting player
+  t=0 st=184 movedir=0 x=1056 y=-3488 rnd=1
+  t=1 st=184 movedir=0 x=1056 y=-3488 rnd=1
+  t=2 st=184 movedir=0 x=1056 y=-3488 rnd=1
+  t=3 st=184 movedir=0 x=1056 y=-3488 rnd=1
+  t=4 st=184 movedir=0 x=1056 y=-3488 rnd=1
+  t=5 st=184 movedir=0 x=1056 y=-3488 rnd=1
+  t=6 st=184 movedir=0 x=1056 y=-3488 rnd=1
+  t=7 st=184 movedir=0 x=1056 y=-3488 rnd=1
+  t=8 st=184 movedir=0 x=1056 y=-3488 rnd=1
+  t=9 st=184 movedir=0 x=1056 y=-3488 rnd=1
+  t=10 st=185 movedir=0 x=1056 y=-3488 rnd=8
+  t=11 st=185 movedir=0 x=1056 y=-3488 rnd=8
+  t=12 st=185 movedir=0 x=1056 y=-3488 rnd=8
+  t=13 st=185 movedir=0 x=1056 y=-3488 rnd=8
+  t=14 st=185 movedir=0 x=1056 y=-3488 rnd=8
+  t=15 st=185 movedir=0 x=1056 y=-3488 rnd=8
+  t=16 st=185 movedir=0 x=1056 y=-3488 rnd=8
+  t=17 st=185 movedir=0 x=1056 y=-3488 rnd=8
+  t=18 st=186 movedir=0 x=1056 y=-3488 rnd=8
+  t=19 st=186 movedir=0 x=1056 y=-3488 rnd=8
+  t=20 st=186 movedir=0 x=1056 y=-3488 rnd=8
+  t=21 st=186 movedir=0 x=1056 y=-3488 rnd=8
+  t=22 st=186 movedir=0 x=1056 y=-3488 rnd=8
+  t=23 st=186 movedir=0 x=1056 y=-3488 rnd=8
+  t=24 st=186 movedir=0 x=1056 y=-3488 rnd=8
+  t=25 st=186 movedir=0 x=1056 y=-3488 rnd=8
+  t=26 st=176 movedir=6 x=1056 y=-3496 rnd=10
+  t=27 st=176 movedir=6 x=1056 y=-3496 rnd=10
+  t=28 st=176 movedir=6 x=1056 y=-3496 rnd=10
+  t=29 st=176 movedir=6 x=1056 y=-3496 rnd=10
+  t=30 st=177 movedir=6 x=1056 y=-3504 rnd=11
+  t=31 st=177 movedir=6 x=1056 y=-3504 rnd=11
+  t=32 st=177 movedir=6 x=1056 y=-3504 rnd=11
+  t=33 st=177 movedir=6 x=1056 y=-3504 rnd=11
+  t=34 st=178 movedir=6 x=1056 y=-3512 rnd=12
+  t=35 st=178 movedir=6 x=1056 y=-3512 rnd=12
+  t=36 st=178 movedir=6 x=1056 y=-3512 rnd=12
+  t=37 st=178 movedir=6 x=1056 y=-3512 rnd=12
+  t=38 st=179 movedir=6 x=1056 y=-3520 rnd=13
+  t=39 st=179 movedir=6 x=1056 y=-3520 rnd=13
+  t=40 st=179 movedir=6 x=1056 y=-3520 rnd=13
+  t=41 st=179 movedir=6 x=1056 y=-3520 rnd=13
+  t=42 st=180 movedir=6 x=1056 y=-3528 rnd=14
+  t=43 st=180 movedir=6 x=1056 y=-3528 rnd=14
+  t=44 st=180 movedir=6 x=1056 y=-3528 rnd=14
+  t=45 st=180 movedir=6 x=1056 y=-3528 rnd=14
+  t=46 st=181 movedir=6 x=1056 y=-3536 rnd=15
+  t=47 st=181 movedir=6 x=1056 y=-3536 rnd=15
+  t=48 st=181 movedir=6 x=1056 y=-3536 rnd=15
+  t=49 st=181 movedir=6 x=1056 y=-3536 rnd=15
+  t=50 st=182 movedir=6 x=1056 y=-3544 rnd=16
+-- B: P_FireWeapon (pistol) --
+  after setupPsprites: weaponSt=12 flashSt=-1 clip=50 rnd=16
+  after fireWeapon  : weaponSt=13 flashSt=-1 clip=50 rnd=16
+  movePsprites tic : weaponSt=13 flashSt=-1 clip=50 rnd=16
+  movePsprites tic : weaponSt=13 flashSt=-1 clip=50 rnd=16
+  movePsprites tic : weaponSt=13 flashSt=-1 clip=50 rnd=16
+  movePsprites tic : weaponSt=14 flashSt=17 clip=49 rnd=22
+  movePsprites tic : weaponSt=14 flashSt=17 clip=49 rnd=22
+  movePsprites tic : weaponSt=14 flashSt=17 clip=49 rnd=22
+  movePsprites tic : weaponSt=14 flashSt=17 clip=49 rnd=22
+  movePsprites tic : weaponSt=14 flashSt=17 clip=49 rnd=22
+  movePsprites tic : weaponSt=14 flashSt=17 clip=49 rnd=22
+  movePsprites tic : weaponSt=15 flashSt=-1 clip=49 rnd=22
+== done ==

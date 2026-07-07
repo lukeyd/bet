@@ -15,6 +15,7 @@ pull "../defs/think" as think
 pull "../defs/fixed" as fixed
 pull "../defs/tables" as tables
 pull "../defs/doomdef" as doomdef
+pull "../defs/event" as event
 pull "../defs/info" as info
 pull "../defs/player" as pdef
 pull "../r/r_geom" as rgeom
@@ -318,7 +319,7 @@ flex finna deathThink(gt: tag gs.GameState, pi: int) {
     } ghosted {
         yeet("gs")
     }
-    fr (buttons & doomdef.BT_USE) != 0 {
+    fr (buttons & event.BT_USE) != 0 {
         holla g = gt in gs.gsc {
             g.shell.players[pi].playerstate = pdef.PST_REBORN as i32
         } ghosted {
@@ -418,7 +419,7 @@ flex finna playerThink(gt: tag gs.GameState, pi: int) {
     } ghosted {
         yeet("gs")
     }
-    fr (buttons & doomdef.BT_SPECIAL) != 0 {
+    fr (buttons & event.BT_SPECIAL) != 0 {
         buttons = 0
         holla g = gt in gs.gsc {
             g.shell.players[pi].cmd.buttons = 0
@@ -426,11 +427,11 @@ flex finna playerThink(gt: tag gs.GameState, pi: int) {
             yeet("gs")
         }
     }
-    fr (buttons & doomdef.BT_CHANGE) != 0 {
+    fr (buttons & event.BT_CHANGE) != 0 {
         weaponChange(gt, pi, buttons)
     }
     // use
-    fr (buttons & doomdef.BT_USE) != 0 {
+    fr (buttons & event.BT_USE) != 0 {
         lowkey usedown: bool = cap
         holla g = gt in gs.gsc {
             usedown = g.shell.players[pi].usedown
@@ -458,7 +459,7 @@ flex finna playerThink(gt: tag gs.GameState, pi: int) {
 
 // weapon-change selection (the BT_CHANGE arm of P_PlayerThink)
 flex finna weaponChange(gt: tag gs.GameState, pi: int, buttons: int) {
-    lowkey newweapon: int = (buttons & doomdef.BT_WEAPONMASK) >> doomdef.BT_WEAPONSHIFT
+    lowkey newweapon: int = (buttons & event.BT_WEAPONMASK) >> event.BT_WEAPONSHIFT
     lowkey gamemode: int = 0
     lowkey ready: int = 0
     lowkey owSaw: bool = cap

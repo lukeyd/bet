@@ -20,6 +20,7 @@ pull "../defs/think" as think
 pull "../defs/fixed" as fixed
 pull "../defs/tables" as tables
 pull "../defs/doomdef" as doomdef
+pull "../defs/event" as event
 pull "../defs/info" as info
 pull "../defs/sounds" as sounds
 pull "../defs/player" as pdef
@@ -418,7 +419,7 @@ flex finna aWeaponReady(gt: tag gs.GameState, pi: int, pspIdx: int) {
     } ghosted {
         yeet("gs")
     }
-    fr (buttons & doomdef.BT_ATTACK) != 0 {
+    fr (buttons & event.BT_ATTACK) != 0 {
         fr !attackdown || (ready != doomdef.WP_MISSILE && ready != doomdef.WP_BFG) {
             holla g = gt in gs.gsc {
                 g.shell.players[pi].attackdown = nocap
@@ -473,7 +474,7 @@ flex finna aReFire(gt: tag gs.GameState, pi: int, pspIdx: int) {
     } ghosted {
         yeet("gs")
     }
-    fr (buttons & doomdef.BT_ATTACK) != 0 && pending == doomdef.WP_NOCHANGE && health != 0 {
+    fr (buttons & event.BT_ATTACK) != 0 && pending == doomdef.WP_NOCHANGE && health != 0 {
         holla g = gt in gs.gsc {
             g.shell.players[pi].refire = (g.shell.players[pi].refire as int + 1) as i32
         } ghosted {
@@ -510,7 +511,7 @@ flex finna aLower(gt: tag gs.GameState, pi: int, pspIdx: int) {
     } ghosted {
         yeet("gs")
     }
-    fr sy < WEAPONBOTTOM {
+    fr sy < (WEAPONBOTTOM as int) {
         bet        // still lowering
     }
     fr playerstate == pdef.PST_DEAD {
@@ -546,7 +547,7 @@ flex finna aRaise(gt: tag gs.GameState, pi: int, pspIdx: int) {
     } ghosted {
         yeet("gs")
     }
-    fr sy > WEAPONTOP {
+    fr sy > (WEAPONTOP as int) {
         bet
     }
     lowkey ready: int = 0

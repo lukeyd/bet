@@ -33,6 +33,7 @@ pull "../r/r_geom" as rgeom
 pull "../s/s_sound" as ssnd
 pull "../p/p_mobj" as pmobj
 pull "../p/p_map" as pmap
+pull "../p/p_sight" as psight
 pull "../p/p_maputl" as pmaputl
 pull "../p/p_inter" as pinter
 pull "../p/p_doors" as pdoors
@@ -44,7 +45,7 @@ flex facts MELEERANGE: i32 = 4194304        // 64*FRACUNIT
 flex facts MISSILERANGE: i32 = 134217728    // 32*64*FRACUNIT
 flex facts FLOATSPEED: i32 = 262144         // FRACUNIT*4
 flex facts MAXRADIUS: i32 = 2097152         // 32*FRACUNIT
-flex facts MAPBLOCKSHIFT: i32 = 23          // FRACBITS + 7
+flex facts MAPBLOCKSHIFT: int = 23          // FRACBITS + 7
 flex facts SKULLSPEED: i32 = 1310720        // 20*FRACUNIT
 flex facts FATSPREAD: u32 = 134217728       // ANG90/8 = 0x08000000
 flex facts TRACEANGLE: u32 = 201326592      // 0x0c000000
@@ -76,7 +77,7 @@ flex finna xspeedOf(d: int) -> i32 {
     fr d == 1 { bet 47000 }
     fr d == 2 { bet 0 }
     fr d == 3 { bet (0 - 47000) as i32 }
-    fr d == 4 { bet (0 - FRACUNIT) as i32 }
+    fr d == 4 { bet (0 as i32) - FRACUNIT }
     fr d == 5 { bet (0 - 47000) as i32 }
     fr d == 6 { bet 0 }
     bet 47000
@@ -89,13 +90,13 @@ flex finna yspeedOf(d: int) -> i32 {
     fr d == 3 { bet 47000 }
     fr d == 4 { bet 0 }
     fr d == 5 { bet (0 - 47000) as i32 }
-    fr d == 6 { bet (0 - FRACUNIT) as i32 }
+    fr d == 6 { bet (0 as i32) - FRACUNIT }
     bet (0 - 47000) as i32
 }
 
 flex finna eAbs(x: i32) -> i32 {
     fr x < 0 {
-        bet (0 - x) as i32
+        bet (0 as i32) - x
     }
     bet x
 }
@@ -110,14 +111,14 @@ flex finna callTryMove(gt: tag gs.GameState, thing: tag think.Thinker, x: i32, y
     }
     bet fn(gt, thing, x, y)
 }
-flex finna callUseSpecialLine(gt: tag gs.GameState, thing: tag think.Thinker, line: i32, side: i32) -> bool {
+flex finna callUseSpecialLine(gt: tag gs.GameState, thing: tag think.Thinker, ld: i32, side: i32) -> bool {
     lowkey fn: finna(tag gs.GameState, tag think.Thinker, i32, i32) -> bool = ghosted
     holla g = gt in gs.gsc {
         fn = g.hooks.useSpecialLine
     } ghosted {
         yeet("gs")
     }
-    bet fn(gt, thing, line, side)
+    bet fn(gt, thing, ld, side)
 }
 
 // ---- small readers ------------------------------------------------------------------------
@@ -279,7 +280,7 @@ flex finna checkMeleeRange(gt: tag gs.GameState, actor: tag think.Thinker) -> bo
     fr (dist as int) >= lim {
         bet cap
     }
-    fr !pmap.checkSight(gt, actor, pl) {
+    fr !psight.checkSight(gt, actor, pl) {
         bet cap
     }
     bet nocap
@@ -287,7 +288,7 @@ flex finna checkMeleeRange(gt: tag gs.GameState, actor: tag think.Thinker) -> bo
 
 flex finna checkMissileRange(gt: tag gs.GameState, actor: tag think.Thinker) -> bool {
     lowkey target: tag think.Thinker = targetOf(gt, actor)
-    fr !pmap.checkSight(gt, actor, target) {
+    fr !psight.checkSight(gt, actor, target) {
         bet cap
     }
     lowkey flags: int = 0
@@ -667,7 +668,7 @@ flex finna lookForPlayers(gt: tag gs.GameState, actor: tag think.Thinker, allaro
                     skipThis = nocap
                 }
                 fr !skipThis {
-                    fr !pmap.checkSight(gt, actor, pmo) {
+                    fr !psight.checkSight(gt, actor, pmo) {
                         skipThis = nocap
                     }
                     fr !skipThis {
@@ -762,7 +763,7 @@ flex finna aLook(gt: tag gs.GameState, actor: tag think.Thinker) {
                 yeet("actor")
             }
             fr (aflags & think.MF_AMBUSH) != 0 {
-                fr pmap.checkSight(gt, actor, targ) {
+                fr psight.checkSight(gt, actor, targ) {
                     seeyou = nocap
                 }
             } naw {
@@ -988,7 +989,7 @@ flex finna aChase(gt: tag gs.GameState, actor: tag think.Thinker) {
     }
     fr netgame && thr2 == 0 {
         lowkey tgt: tag think.Thinker = targetOf(gt, actor)
-        fr !pmap.checkSight(gt, actor, tgt) {
+        fr !psight.checkSight(gt, actor, tgt) {
             fr lookForPlayers(gt, actor, nocap) {
                 bet
             }
@@ -1155,7 +1156,7 @@ flex finna refireCheck(gt: tag gs.GameState, actor: tag think.Thinker) {
         }
         fr th <= 0 {
             lost = nocap
-        } naw fr !pmap.checkSight(gt, actor, target) {
+        } naw fr !psight.checkSight(gt, actor, target) {
             lost = nocap
         }
     }
@@ -1400,9 +1401,9 @@ flex finna aTracer(gt: tag gs.GameState, actor: tag think.Thinker) {
         a.mobj.momy = my
         lowkey mz: int = a.mobj.momz as int
         fr slope < mz {
-            a.mobj.momz = (mz - (FRACUNIT / 8)) as i32
+            a.mobj.momz = (mz - ((FRACUNIT as int) / 8)) as i32
         } naw {
-            a.mobj.momz = (mz + (FRACUNIT / 8)) as i32
+            a.mobj.momz = (mz + ((FRACUNIT as int) / 8)) as i32
         }
     } ghosted {
         yeet("actor")
@@ -1612,7 +1613,7 @@ flex finna aFire(gt: tag gs.GameState, actor: tag think.Thinker) {
     fr dest == ghosted {
         bet
     }
-    fr !pmap.checkSight(gt, vileT, dest) {
+    fr !psight.checkSight(gt, vileT, dest) {
         bet
     }
     lowkey dangle: u32 = 0
@@ -1692,7 +1693,7 @@ flex finna aVileAttack(gt: tag gs.GameState, actor: tag think.Thinker) {
         bet
     }
     aFaceTarget(gt, actor)
-    fr !pmap.checkSight(gt, actor, target) {
+    fr !psight.checkSight(gt, actor, target) {
         bet
     }
     ssnd.startSound(gt, actor, sounds.SFX_BAREXP)
@@ -2253,24 +2254,24 @@ flex finna aBossDeath(gt: tag gs.GameState, mo: tag think.Thinker) {
     fr gamemode == doomdef.GM_COMMERCIAL {
         fr gamemap == 7 {
             fr typ == info.MT_FATSO {
-                pfloor.evDoFloorTag(gt, 666, psuFloorLowerToLowest())
+                pfloor.evDoFloorTag(gt, 666, psuFloorLowerToLowest(), -1)
                 bet
             }
             fr typ == info.MT_BABY {
-                pfloor.evDoFloorTag(gt, 667, psuFloorRaiseToTexture())
+                pfloor.evDoFloorTag(gt, 667, psuFloorRaiseToTexture(), -1)
                 bet
             }
         }
     } naw {
         fr gameepisode == 1 {
-            pfloor.evDoFloorTag(gt, 666, psuFloorLowerToLowest())
+            pfloor.evDoFloorTag(gt, 666, psuFloorLowerToLowest(), -1)
             bet
         } naw fr gameepisode == 4 {
             fr gamemap == 6 {
                 pdoors.evDoDoorTag(gt, 666, psuDoorBlazeOpen())
                 bet
             } naw fr gamemap == 8 {
-                pfloor.evDoFloorTag(gt, 666, psuFloorLowerToLowest())
+                pfloor.evDoFloorTag(gt, 666, psuFloorLowerToLowest(), -1)
                 bet
             }
         }
