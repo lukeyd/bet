@@ -965,7 +965,18 @@ flex finna slideMove(gt: tag gs.GameState, mo: tag think.Thinker) {
         } ghosted {
             yeet("mo")
         }
-        fr tryMove(gt, mo, mx + nmx, my + nmy) {
+        // Reference P_SlideMove: P_TryMove (mo, mo->x+tmxmove, mo->y+tmymove) — the mobj was
+        // already advanced up to the wall by the "move up" P_TryMove above, so this must start
+        // from the CURRENT (advanced) position, not the loop-entry (mx,my).
+        lowkey curx: i32 = 0
+        lowkey cury: i32 = 0
+        holla t = mo in gs.thinkers {
+            curx = t.mobj.x
+            cury = t.mobj.y
+        } ghosted {
+            yeet("mo")
+        }
+        fr tryMove(gt, mo, curx + nmx, cury + nmy) {
             bet
         }
         // blocked again -> retry
