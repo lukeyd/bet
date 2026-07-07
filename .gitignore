@@ -14,6 +14,27 @@
 # outside any worktree; shared scratch, never committed)
 /doom-oracle/
 
+# Upstream id Software DOOM C source — reference we translate the `bet` port FROM.
+# Cloned locally (see ports/doom/README.md) but NEVER checked in: it is GPL, and it
+# is kept OUTSIDE ports/doom so the reference stays separate from the bet port.
+/doom-reference/
+
+# WAD game data (shareware or commercial) is copyrighted id/ZeniMax data — never committed.
+*.wad
+
+# DOOM port: id-derived verification artifacts. Kept LOCALLY for the in-progress port's parity
+# checks but never committed — the gen_*.c generators #include linuxdoom-1.10 source, *.oracle.sync
+# is doomgeneric (id engine) output, and these goldens are produced by id's own code paths / WAD
+# data. Regenerate with `cargo xtask-doom doom-golden-gen` and `cargo xtask-doom doom-oracle`.
+/ports/doom/goldens/gen/
+/ports/doom/goldens/oracle.patch
+/ports/doom/goldens/*.oracle.sync
+/ports/doom/goldens/fixed.golden
+/ports/doom/goldens/random.golden
+/ports/doom/goldens/angle.golden
+/ports/doom/goldens/tables.golden
+/ports/doom/goldens/mus_e1m1.golden
+
 # Release artifacts (`cargo xtask dist`)
 /dist
 
