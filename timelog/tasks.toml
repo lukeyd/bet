@@ -490,9 +490,9 @@ status = "done"
 
 [[task]]
 slug = "doom"
-name = "Milestone 7.2: Doom port targeting gg — pixel-perfect vs demo-lump oracle (plan: it-s-time-to-port-deep-umbrella.md)"
+name = "Milestone 7.2: Doom port targeting gg — DONE: boots+plays; sim 100% vs oracle on demo2/demo3 (demo1 5024/5026), 3D view pixel-perfect (full-frame 99.6-99.8%, residual = DOOM's own OOB sprite-edge reads). Plan: it-s-time-to-port-deep-umbrella.md"
 size = 34
-status = "doing"
+status = "done"
 
 [[task]]
 slug = "doom-p29a"
