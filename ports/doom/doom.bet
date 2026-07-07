@@ -1,0 +1,16 @@
+// doom.bet — the DOOM port entry point (linuxdoom-1.10 i_main.c): cop the single GameState into
+// its crib, initialize every handle field, then hand off to D_DoomMain. All engine state lives in
+// the one gs.GameState (crib gs.gsc); the whole port threads it as `gt`.
+//
+// Build native:  cargo build -p driver --features llvm; cargo build -p runtime --features gg-desktop
+//                target/debug/bet build ports/doom/doom.bet --runtime real -o /tmp/doom
+// Boot headless: BET_GG_HEADLESS=1 /tmp/doom -iwad <doom1.wad> -maxframes 40
+// Demo + sync:   BET_GG_HEADLESS=1 /tmp/doom -iwad <doom1.wad> -timedemo demo1 -sync /tmp/ours.sync
+pull "defs/gs" as gs
+pull "d/d_main" as dmain
+
+finna main() {
+    lowkey gt = cop gs.GameState{} in gs.gsc
+    gs.gsInit(gt)
+    dmain.doomMain(gt)
+}

@@ -1,0 +1,582 @@
+// d/d_main.bet — DOOM's top-level assembly (linuxdoom-1.10 d_main.c + i_main.c's entry): the exact
+// D_DoomMain init order, the D_DoomLoop frame loop, D_Display frame composition (by gamestate, with
+// the melt wipe on gamestate changes), the event pump, and the attract "demo loop". Plus the
+// harness plumbing: -iwad/-timedemo/-playdemo/-sync/-warp arg handling, the per-frame crc32 that
+// feeds the sync C field, and a headless -maxframes self-terminate cap.
+//
+// The event pump (I_StartTic + D_ProcessEvents) and demo-advance are driven from D_DoomLoop (rather
+// than inside d_net's NetUpdate/TryRunTics) so the module DAG stays acyclic: d_main -> d_net, never
+// the reverse.
+//
+// PORTED:  D_DoomMain (init order), D_DoomLoop, D_Display, D_ProcessEvents, D_PageDrawer,
+//          D_AdvanceDemo/DoAdvanceDemo, D_StartTitle, IdentifyVersion (shareware).
+// SKIPPED: FindResponseFile, D_AddFile/multi-wad, -turbo/-cdrom/-statcopy, X11 UpdateNoBlit.
+pull "spill"
+pull "mem"
+pull "vec"
+pull "str"
+pull "fs"
+pull "sys"
+pull "../defs/gs" as gs
+pull "../defs/doomdef" as doomdef
+pull "../defs/event" as event
+pull "../defs/player" as pdef
+pull "../defs/think" as think
+pull "../defs/info" as info
+pull "../defs/tables" as tables
+pull "../defs/sounds" as sounds
+pull "../util/m_argv" as margv
+pull "../util/m_random" as rnd
+pull "../w/w_wad" as wad
+pull "../v/v_video" as vv
+pull "../r/r_main" as rmain
+pull "../p/p_action" as paction
+pull "../p/p_switch" as pswitch
+pull "../p/p_spec" as pspec
+pull "../p/p_inter" as pinter
+pull "../i/i_system" as isys
+pull "../i/i_sound" as isnd
+pull "../i/i_music" as imus
+pull "../i/i_video" as iv
+pull "../s/s_sound" as ssnd
+pull "../st/st_stuff" as st
+pull "../hu/hu_stuff" as hu
+pull "../m/m_menu" as mmenu
+pull "../m/m_misc" as mmisc
+pull "../am/am_map" as am
+pull "../wi/wi_stuff" as wi
+pull "../f/f_finale" as ffin
+pull "../f/f_wipe" as fwipe
+pull "../d/d_net" as dnet
+pull "../g/g_game" as ggame
+
+// argAfter — the parameter value following `name`, or "" when absent / at the end.
+flex finna argAfter(name: str) -> str {
+    lowkey p = margv.checkParm(name)
+    fr p != 0 && p < sys.argc() - 1 {
+        bet sys.arg(p + 1)
+    }
+    bet ""
+}
+
+// fillTables — install the generated data tables (compiler-intrinsic stand-in): trig LUTs, states,
+// mobjinfo, sfx, RNG table. The port's equivalent of DOOM's compiled-in info.c/tables.c.
+flex finna fillTables(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.info.finesine = tables.initFinesineAll(g.info.finesine)
+        g.info.finetangent = tables.initFinetangentAll(g.info.finetangent)
+        g.info.tantoangle = tables.initTantoangleAll(g.info.tantoangle)
+        info.initStatesAll(g.info.states)
+        info.initMobjinfoAll(g.info.mobjinfo)
+        sounds.initSfxAll(g.info.sfx)
+        g.tick.rndtable = rnd.initRndtable(g.tick.rndtable)
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// D_ProcessEvents — send each queued event down the responder chain (menu first, then game).
+flex finna dProcessEvents(gt: tag gs.GameState) {
+    lowkey draining = nocap
+    vibin draining {
+        lowkey have = cap
+        lowkey etyp = 0
+        lowkey ed1 = 0
+        lowkey ed2 = 0
+        lowkey ed3 = 0
+        holla g = gt in gs.gsc {
+            fr g.events.tail as int != g.events.head as int {
+                lowkey t = g.events.tail as int
+                etyp = g.events.ring[t].typ as int
+                ed1 = g.events.ring[t].data1 as int
+                ed2 = g.events.ring[t].data2 as int
+                ed3 = g.events.ring[t].data3 as int
+                g.events.tail = ((t + 1) & 63) as i32
+                have = nocap
+            }
+        } ghosted {
+            yeet("gs")
+        }
+        fr !have {
+            draining = cap
+        } naw {
+            fr !mmenu.mResponder(gt, etyp, ed1) {
+                ggame.gResponder(gt, event.Event{ typ: etyp as i32, data1: ed1 as i32, data2: ed2 as i32, data3: ed3 as i32 })
+            }
+        }
+    }
+}
+
+// crc32Scr0 — crc32 (IEEE reflected, poly 0xEDB88320) of the 64000-byte 8-bit screen. Matches the
+// oracle's crc32_buf. Table built locally each call (256 iters — negligible vs the 64000-byte fold).
+flex finna crc32Scr0(gt: tag gs.GameState) -> int {
+    lowkey tbl = mem.slab[i32](256)
+    lowkey i = 0
+    vibin i < 256 {
+        lowkey c = i
+        lowkey k = 0
+        vibin k < 8 {
+            lowkey lsb = c & 1
+            c = c >> 1
+            fr lsb != 0 {
+                c = c ^ 3988292384
+            }
+            k = k + 1
+        }
+        tbl[i] = c as i32
+        i = i + 1
+    }
+    lowkey crc = 4294967295
+    holla g = gt in gs.gsc {
+        lowkey j = 0
+        vibin j < 64000 {
+            lowkey byte = g.vid.scr0[j] as int
+            crc = (crc >> 8) ^ ((tbl[((crc ^ byte) & 255)] as int) & 4294967295)
+            j = j + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    bet (crc ^ 4294967295) & 4294967295
+}
+
+// D_PageDrawer — draw the current attract page (TITLEPIC / CREDIT / HELP2) full-screen into scr0.
+flex finna dPageDrawer(gt: tag gs.GameState) {
+    lowkey name = ""
+    holla g = gt in gs.gsc {
+        name = g.shell.pagename
+    } ghosted {
+        yeet("gs")
+    }
+    fr str.len(name) == 0 {
+        bet
+    }
+    lowkey ofs = wad.lumpNameOfs(gt, name)
+    vv.drawPatch(gt, 0, 0, 0, ofs)
+}
+
+// D_Display — compose the frame by gamestate, optionally melt-wipe on a gamestate change, compute
+// the sync crc from the composed screen, then present.
+flex finna dDisplay(gt: tag gs.GameState) {
+    lowkey nodrawers = cap
+    lowkey gamestate = 0
+    lowkey wipegamestate = 0
+    lowkey automapactive = cap
+    lowkey gametic = 0
+    lowkey viewheight = 0
+    lowkey displayplayer = 0
+    lowkey timingdemo = cap
+    lowkey syncOn = cap
+    holla g = gt in gs.gsc {
+        nodrawers = g.shell.nodrawers
+        gamestate = g.shell.gamestate as int
+        wipegamestate = g.shell.wipegamestate as int
+        automapactive = g.shell.automapactive
+        gametic = g.shell.gametic as int
+        viewheight = g.render.viewheight as int
+        displayplayer = g.shell.displayplayer as int
+        timingdemo = g.shell.timingdemo
+        syncOn = g.shell.syncOn
+    } ghosted {
+        yeet("gs")
+    }
+    fr nodrawers {
+        bet
+    }
+    lowkey wipe = gamestate != wipegamestate
+    fr wipe && !timingdemo {
+        fwipe.wipeStartScreen(gt)      // capture the OLD frame before we compose the new one
+    }
+    // compose by gamestate
+    fr gamestate == doomdef.GS_LEVEL {
+        fr gametic != 0 {
+            fr automapactive {
+                am.amDrawer(gt)
+            } naw {
+                rmain.renderPlayerView(gt, displayplayer)
+            }
+            st.stDrawer(gt, viewheight == 200, nocap)
+            hu.huDrawer(gt)
+        }
+    } naw fr gamestate == doomdef.GS_INTERMISSION {
+        wi.wiDrawer(gt)
+    } naw fr gamestate == doomdef.GS_FINALE {
+        ffin.fDrawer(gt)
+    } naw fr gamestate == doomdef.GS_DEMOSCREEN {
+        dPageDrawer(gt)
+    }
+    mmenu.mDrawer(gt)                   // menu drawn on top of everything
+    // sync crc of the composed frame (used as the NEXT tic's C — the one-frame lag)
+    fr syncOn {
+        lowkey c = crc32Scr0(gt)
+        holla g = gt in gs.gsc {
+            g.shell.lastFrameCrc = c as i32
+        } ghosted {
+            yeet("gs")
+        }
+    }
+    // present (in timedemo, skip the blocking melt — keep the sim uncapped & deterministic)
+    fr wipe && !timingdemo {
+        fwipe.wipeEndScreen(gt)
+        lowkey done = cap
+        vibin !done {
+            done = fwipe.wipeScreenWipe(gt, 1)
+            mmenu.mDrawer(gt)
+            iv.finishUpdate(gt)
+        }
+    } naw {
+        iv.finishUpdate(gt)
+    }
+    holla g = gt in gs.gsc {
+        g.shell.wipegamestate = g.shell.gamestate
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// D_AdvanceDemo — flag that the current demo/page finished; D_DoAdvanceDemo runs next frame.
+flex finna dAdvanceDemo(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.shell.advancedemo = nocap
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// D_DoAdvanceDemo — cycle the attract sequence (shareware: TITLEPIC / demo1 / CREDIT / demo2 /
+// HELP2 / demo3).
+flex finna dDoAdvanceDemo(gt: tag gs.GameState) {
+    lowkey seq = 0
+    holla g = gt in gs.gsc {
+        g.shell.players[g.shell.consoleplayer as int].playerstate = pdef.PST_LIVE as i32
+        g.shell.advancedemo = cap
+        g.shell.usergame = cap
+        g.shell.paused = cap
+        g.shell.gameaction = doomdef.GA_NOTHING as i32
+        g.shell.demosequence = ((g.shell.demosequence + 1) % 6) as i32
+        seq = g.shell.demosequence as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr seq == 0 {
+        holla g = gt in gs.gsc {
+            g.shell.pagetic = 170
+            g.shell.gamestate = doomdef.GS_DEMOSCREEN as i32
+            g.shell.pagename = "TITLEPIC"
+        } ghosted {
+            yeet("gs")
+        }
+        ssnd.startMusic(gt, sounds.MUS_INTRO)
+    } naw fr seq == 1 {
+        ggame.gDeferedPlayDemo(gt, "demo1")
+    } naw fr seq == 2 {
+        holla g = gt in gs.gsc {
+            g.shell.pagetic = 200
+            g.shell.gamestate = doomdef.GS_DEMOSCREEN as i32
+            g.shell.pagename = "CREDIT"
+        } ghosted {
+            yeet("gs")
+        }
+    } naw fr seq == 3 {
+        ggame.gDeferedPlayDemo(gt, "demo2")
+    } naw fr seq == 4 {
+        holla g = gt in gs.gsc {
+            g.shell.pagetic = 200
+            g.shell.gamestate = doomdef.GS_DEMOSCREEN as i32
+            g.shell.pagename = "HELP2"
+        } ghosted {
+            yeet("gs")
+        }
+    } naw fr seq == 5 {
+        ggame.gDeferedPlayDemo(gt, "demo3")
+    }
+}
+
+// D_StartTitle — kick off the attract loop from the title page.
+flex finna dStartTitle(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.shell.gameaction = doomdef.GA_NOTHING as i32
+        g.shell.demosequence = -1
+    } ghosted {
+        yeet("gs")
+    }
+    dAdvanceDemo(gt)
+}
+
+// flushSync — write the accumulated -sync fingerprint buffer to the -sync path.
+flex finna flushSync(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        lowkey n = g.shell.syncBuf.gang() as int
+        lowkey out = mem.slab[u8](n)
+        lowkey i = 0
+        vibin i < n {
+            out[i] = g.shell.syncBuf[i] as u8
+            i = i + 1
+        }
+        fs.drop(g.shell.syncPath, out)
+        spill.f("[doom] wrote {} sync bytes to {}\n", n, g.shell.syncPath)
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// D_DoomLoop — the main frame loop. Pumps input, runs tics (singletics for timedemo, else
+// TryRunTics), updates sound/music, composes+presents the frame, honors the headless frame cap.
+flex finna dDoomLoop(gt: tag gs.GameState) {
+    lowkey demorecording = cap
+    holla g = gt in gs.gsc {
+        demorecording = g.shell.demorecording
+    } ghosted {
+        yeet("gs")
+    }
+    fr demorecording {
+        ggame.gBeginRecording(gt)
+    }
+    lowkey running = nocap
+    vibin running {
+        iv.startTic(gt)                // pump gg input -> event ring
+        dProcessEvents(gt)
+        lowkey advancedemo = cap
+        lowkey singletics = cap
+        lowkey cp = 0
+        holla g = gt in gs.gsc {
+            advancedemo = g.shell.advancedemo
+            singletics = g.shell.singletics
+            cp = g.shell.consoleplayer as int
+        } ghosted {
+            yeet("gs")
+        }
+        fr advancedemo {
+            dDoAdvanceDemo(gt)
+        }
+        fr singletics {
+            ggame.buildTiccmd(gt)      // -> netcmds[cp][maketic%BACKUPTICS]
+            mmenu.mTicker(gt)
+            ggame.gTicker(gt)
+            holla g = gt in gs.gsc {
+                g.shell.gametic = (g.shell.gametic + 1) as i32
+                g.net.maketic = (g.net.maketic + 1) as i32
+            } ghosted {
+                yeet("gs")
+            }
+        } naw {
+            dnet.tryRunTics(gt)
+        }
+        // move positional sounds + top up the music ring
+        lowkey listener: tag think.Thinker = ghosted
+        holla g = gt in gs.gsc {
+            listener = g.shell.players[cp].mo
+        } ghosted {
+            yeet("gs")
+        }
+        ssnd.updateSounds(gt, listener)
+        imus.musicUpdate(gt)
+        dDisplay(gt)
+        // frame accounting + self-terminate conditions
+        lowkey stop = cap
+        holla g = gt in gs.gsc {
+            g.shell.frameCount = (g.shell.frameCount + 1) as i32
+            fr g.shell.quitRequested || g.shell.demoDone {
+                stop = nocap
+            }
+            fr g.shell.maxframes as int > 0 && g.shell.frameCount as int >= g.shell.maxframes as int {
+                stop = nocap
+            }
+        } ghosted {
+            yeet("gs")
+        }
+        fr stop {
+            running = cap
+        }
+    }
+    lowkey syncOn = cap
+    holla g = gt in gs.gsc {
+        syncOn = g.shell.syncOn
+    } ghosted {
+        yeet("gs")
+    }
+    fr syncOn {
+        flushSync(gt)
+    }
+}
+
+// IdentifyVersion — v1 is shareware doom1.wad only. (No PWAD/-file support; the WAD path comes
+// from -iwad, defaulting to a cwd doom1.wad.)
+flex finna identifyVersion(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.shell.gamemode = doomdef.GM_SHAREWARE as i32
+        g.shell.gamemission = doomdef.GMIS_DOOM as i32
+        g.shell.language = doomdef.LANG_ENGLISH as i32
+        g.shell.modifiedgame = cap
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// D_DoomMain — the exact init order (mirrors d_main.c, reduced for the port).
+flex finna doomMain(gt: tag gs.GameState) {
+    identifyVersion(gt)
+    holla g = gt in gs.gsc {
+        g.shell.nomonsters = margv.checkParm("-nomonsters") != 0
+        g.shell.respawnparm = margv.checkParm("-respawn") != 0
+        g.shell.fastparm = margv.checkParm("-fast") != 0
+        g.shell.devparm = margv.checkParm("-devparm") != 0
+        fr margv.checkParm("-altdeath") != 0 {
+            g.shell.deathmatch = 2
+        } naw fr margv.checkParm("-deathmatch") != 0 {
+            g.shell.deathmatch = 1
+        }
+        // default start
+        g.shell.startskill = doomdef.SK_MEDIUM as i32
+        g.shell.startepisode = 1
+        g.shell.startmap = 1
+        g.shell.autostart = cap
+    } ghosted {
+        yeet("gs")
+    }
+    // skill / episode / warp parms
+    lowkey sSkill = argAfter("-skill")
+    fr str.len(sSkill) > 0 {
+        holla g = gt in gs.gsc {
+            g.shell.startskill = (str.at(sSkill, 0) - 49) as i32   // '1' -> 0
+            g.shell.autostart = nocap
+        } ghosted {
+            yeet("gs")
+        }
+    }
+    lowkey sEp = argAfter("-episode")
+    fr str.len(sEp) > 0 {
+        holla g = gt in gs.gsc {
+            g.shell.startepisode = (str.at(sEp, 0) - 48) as i32
+            g.shell.startmap = 1
+            g.shell.autostart = nocap
+        } ghosted {
+            yeet("gs")
+        }
+    }
+    lowkey warpP = margv.checkParm("-warp")
+    fr warpP != 0 && warpP < sys.argc() - 1 {
+        lowkey we = sys.arg(warpP + 1)
+        holla g = gt in gs.gsc {
+            g.shell.startepisode = (str.at(we, 0) - 48) as i32
+            g.shell.autostart = nocap
+        } ghosted {
+            yeet("gs")
+        }
+        fr warpP < sys.argc() - 2 {
+            lowkey wm = sys.arg(warpP + 2)
+            holla g = gt in gs.gsc {
+                g.shell.startmap = (str.at(wm, 0) - 48) as i32
+            } ghosted {
+                yeet("gs")
+            }
+        }
+    }
+    // -maxframes (headless self-terminate cap)
+    lowkey sMax = argAfter("-maxframes")
+    fr str.len(sMax) > 0 {
+        lowkey mv = 0
+        lowkey i = 0
+        vibin i < str.len(sMax) {
+            lowkey c = str.at(sMax, i)
+            fr c >= 48 && c <= 57 {
+                mv = mv * 10 + (c - 48)
+            }
+            i = i + 1
+        }
+        holla g = gt in gs.gsc {
+            g.shell.maxframes = mv as i32
+        } ghosted {
+            yeet("gs")
+        }
+    }
+    // -- init subsystems (d_main.c order) --------------------------------------------------------
+    vv.vInit(gt)                       // V_Init
+    fillTables(gt)                     // (compiled-in data tables)
+    mmisc.loadDefaults(gt)             // M_LoadDefaults
+    lowkey iwad = argAfter("-iwad")
+    fr str.len(iwad) == 0 {
+        iwad = "doom1.wad"
+    }
+    wad.initWad(gt, iwad)              // W_Init
+    rmain.rInit(gt)                    // R_Init
+    paction.wireActions(gt)            // *** CRITICAL: wire every action/hook before any thinker ***
+    // P_Init
+    pswitch.initSwitchList(gt)
+    pspec.initPicAnims(gt)
+    pinter.initAmmoTables(gt)
+    // I_Init
+    isys.initTime(gt)
+    isnd.initSound(gt)
+    imus.musicInit(gt)
+    dnet.dCheckNetGame(gt)             // D_CheckNetGame (loopback)
+    lowkey sfxVol = 0
+    lowkey musVol = 0
+    holla g = gt in gs.gsc {
+        sfxVol = g.sound.sfxVolume as int
+        musVol = g.sound.musicVolume as int
+    } ghosted {
+        yeet("gs")
+    }
+    ssnd.sInit(gt, sfxVol, musVol)     // S_Init
+    hu.huInit(gt)                      // HU_Init
+    st.stInit(gt)                      // ST_Init
+    mmenu.mInit(gt)                    // M_Init
+    iv.initGraphics(gt)               // I_InitGraphics
+    iv.setPalette(gt, 0)
+    // -- -sync fingerprint writer setup ----------------------------------------------------------
+    lowkey syncOut = argAfter("-sync")
+    fr str.len(syncOut) > 0 {
+        holla g = gt in gs.gsc {
+            g.shell.syncOn = nocap
+            g.shell.syncPath = syncOut
+            g.shell.syncBuf = vec.new[int]()
+        } ghosted {
+            yeet("gs")
+        }
+    }
+    // -- start the appropriate game --------------------------------------------------------------
+    lowkey timedemo = argAfter("-timedemo")
+    lowkey playdemo = argAfter("-playdemo")
+    lowkey record = argAfter("-record")
+    lowkey autostart = cap
+    holla g = gt in gs.gsc {
+        autostart = g.shell.autostart
+    } ghosted {
+        yeet("gs")
+    }
+    fr str.len(record) > 0 {
+        ggame.gRecordDemo(gt, record)
+        holla g = gt in gs.gsc {
+            g.shell.autostart = nocap
+            autostart = nocap
+        } ghosted {
+            yeet("gs")
+        }
+    }
+    fr str.len(timedemo) > 0 {
+        ggame.gTimeDemo(gt, timedemo)
+    } naw fr str.len(playdemo) > 0 {
+        holla g = gt in gs.gsc {
+            g.shell.singledemo = nocap
+        } ghosted {
+            yeet("gs")
+        }
+        ggame.gDeferedPlayDemo(gt, playdemo)
+    } naw fr autostart {
+        lowkey sk = 0
+        lowkey ep = 0
+        lowkey mp = 0
+        holla g = gt in gs.gsc {
+            sk = g.shell.startskill as int
+            ep = g.shell.startepisode as int
+            mp = g.shell.startmap as int
+        } ghosted {
+            yeet("gs")
+        }
+        ggame.gInitNew(gt, sk, ep, mp)
+    } naw {
+        dStartTitle(gt)
+    }
+    dDoomLoop(gt)
+}

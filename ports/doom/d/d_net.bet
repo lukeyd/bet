@@ -1,0 +1,218 @@
+// d/d_net.bet — the DOOM tic-sync machinery (linuxdoom-1.10 d_net.c), reduced to single-player
+// loopback. The full NetState (doomcom/netbuffer/netcmds/nettics/maketic) is modelled in gs.bet so
+// a future UDP transport swaps in behind D_CheckNetGame with no game-loop restructuring; v1 runs
+// one node / one player and the packet path (HSendPacket/HGetPacket/GetPackets) is a rebound no-op.
+//
+// The demo (timedemo) path uses D_DoomLoop's singletics branch (1 tic/frame, uncapped); TryRunTics
+// here drives the real-time attract loop. To keep the module DAG acyclic (d_main pulls d_net), the
+// event pump (I_StartTic/D_ProcessEvents) and demo-advance are hoisted into D_DoomLoop, so d_net
+// never calls back into d_main.
+//
+// PORTED:  D_CheckNetGame (loopback), NetUpdate, TryRunTics, GetPackets (no-op).
+// SKIPPED: HSendPacket/HGetPacket/GetPackets packet marshalling, NetbufferChecksum, ExpandTics,
+//          D_ArbitrateNetStart, D_QuitNetGame, consistancy failure (single-player never diverges).
+pull "../defs/gs" as gs
+pull "../defs/doomdef" as doomdef
+pull "../i/i_net" as inet
+pull "../i/i_system" as isys
+pull "../m/m_menu" as mmenu
+pull "../g/g_game" as ggame
+
+flex facts MAXNETNODES: int = 8
+
+// D_CheckNetGame — work out player numbers among the (loopback) participants.
+flex finna dCheckNetGame(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        lowkey i = 0
+        vibin i < MAXNETNODES {
+            g.net.nodeingame[i] = cap
+            g.net.nettics[i] = 0
+            g.net.remoteresend[i] = cap
+            g.net.resendto[i] = 0
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    inet.initNetwork(gt)               // sets doomcom (numnodes=1/numplayers=1) + netgame=false
+    lowkey badId = cap
+    holla g = gt in gs.gsc {
+        badId = g.net.dcId as int != inet.DOOMCOM_ID
+    } ghosted {
+        yeet("gs")
+    }
+    fr badId {
+        isys.iError("Doomcom buffer invalid!")
+    }
+    holla g = gt in gs.gsc {
+        g.shell.consoleplayer = g.net.dcConsoleplayer
+        g.shell.displayplayer = g.net.dcConsoleplayer
+        g.net.ticdup = g.net.dcTicdup
+        lowkey i = 0
+        vibin i < g.net.dcNumplayers as int {
+            g.shell.playeringame[i] = nocap
+            i = i + 1
+        }
+        i = 0
+        vibin i < g.net.dcNumnodes as int {
+            g.net.nodeingame[i] = nocap
+            i = i + 1
+        }
+        g.net.maketic = 0
+        g.net.gametime = 0
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// NetUpdate — build ticcmds for the console player for each real tic that has elapsed, storing them
+// in netcmds[consoleplayer][maketic%BACKUPTICS] (loopback: no packets). Event processing (I_StartTic
+// / D_ProcessEvents) is done by D_DoomLoop before this call.
+flex finna netUpdate(gt: tag gs.GameState) {
+    lowkey ticdup = 1
+    lowkey nowtime = 0
+    lowkey newtics = 0
+    lowkey gametime = 0
+    lowkey skiptics = 0
+    holla g = gt in gs.gsc {
+        ticdup = g.net.ticdup as int
+        fr ticdup < 1 {
+            ticdup = 1
+        }
+        gametime = g.net.gametime as int
+        skiptics = g.net.skiptics as int
+    } ghosted {
+        yeet("gs")
+    }
+    nowtime = isys.getTime(gt) / ticdup
+    newtics = nowtime - gametime
+    holla g = gt in gs.gsc {
+        g.net.gametime = nowtime as i32
+    } ghosted {
+        yeet("gs")
+    }
+    fr newtics <= 0 {
+        getPackets(gt)
+        bet
+    }
+    fr skiptics <= newtics {
+        newtics = newtics - skiptics
+        skiptics = 0
+    } naw {
+        skiptics = skiptics - newtics
+        newtics = 0
+    }
+    holla g = gt in gs.gsc {
+        g.net.skiptics = skiptics as i32
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey gameticdiv = 0
+    holla g = gt in gs.gsc {
+        gameticdiv = g.shell.gametic as int / ticdup
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey i = 0
+    vibin i < newtics {
+        lowkey stop = cap
+        holla g = gt in gs.gsc {
+            fr g.net.maketic as int - gameticdiv >= gs.BACKUPTICS / 2 - 1 {
+                stop = nocap            // can't hold any more
+            }
+        } ghosted {
+            yeet("gs")
+        }
+        fr stop {
+            dip
+        }
+        ggame.buildTiccmd(gt)          // writes netcmds[consoleplayer][maketic%BACKUPTICS]
+        holla g = gt in gs.gsc {
+            g.net.maketic = (g.net.maketic + 1) as i32
+        } ghosted {
+            yeet("gs")
+        }
+        i = i + 1
+    }
+    getPackets(gt)
+}
+
+// GetPackets — loopback: no packets to receive. In real DOOM this copied remote ticcmds into
+// netcmds; here netcmds is filled directly by NetUpdate, so this is a no-op.
+flex finna getPackets(gt: tag gs.GameState) {
+}
+
+// TryRunTics — run the game tics that are available, pacing to real time. Single node: the highest
+// available tic (lowtic) is simply maketic. Runs M_Ticker + G_Ticker + gametic++ per tic.
+flex finna tryRunTics(gt: tag gs.GameState) {
+    lowkey ticdup = 1
+    lowkey entertic = 0
+    lowkey realtics = 0
+    lowkey oldentertic = 0
+    holla g = gt in gs.gsc {
+        ticdup = g.net.ticdup as int
+        fr ticdup < 1 {
+            ticdup = 1
+        }
+        oldentertic = g.net.lasttime as int
+    } ghosted {
+        yeet("gs")
+    }
+    entertic = isys.getTime(gt) / ticdup
+    realtics = entertic - oldentertic
+    holla g = gt in gs.gsc {
+        g.net.lasttime = entertic as i32
+    } ghosted {
+        yeet("gs")
+    }
+    netUpdate(gt)
+    lowkey lowtic = 0
+    lowkey gtdiv = 0
+    holla g = gt in gs.gsc {
+        lowtic = g.net.maketic as int
+        gtdiv = g.shell.gametic as int / ticdup
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey availabletics = lowtic - gtdiv
+    lowkey counts = availabletics
+    fr realtics < availabletics - 1 {
+        counts = realtics + 1
+    } naw fr realtics < availabletics {
+        counts = realtics
+    }
+    fr counts < 1 {
+        counts = 1
+    }
+    // wait for enough tics (or give the menu a chance after 20 real tics)
+    lowkey waiting = nocap
+    vibin waiting {
+        holla g = gt in gs.gsc {
+            lowtic = g.net.maketic as int
+            gtdiv = g.shell.gametic as int / ticdup
+        } ghosted {
+            yeet("gs")
+        }
+        fr lowtic >= gtdiv + counts {
+            waiting = cap
+        } naw {
+            netUpdate(gt)
+            fr isys.getTime(gt) / ticdup - entertic >= 20 {
+                mmenu.mTicker(gt)
+                bet
+            }
+        }
+    }
+    // run the tics
+    vibin counts > 0 {
+        mmenu.mTicker(gt)
+        ggame.gTicker(gt)
+        holla g = gt in gs.gsc {
+            g.shell.gametic = (g.shell.gametic + 1) as i32
+        } ghosted {
+            yeet("gs")
+        }
+        netUpdate(gt)
+        counts = counts - 1
+    }
+}

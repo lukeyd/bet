@@ -1,0 +1,77 @@
+// tools/demo_decode.bet — decode the first N ticcmds of a demo lump and print them, exactly as
+// G_ReadDemoTiccmd does (forwardmove/sidemove = signed bytes, angleturn = byte<<8, buttons = byte).
+// The deterministic proof that the port's demo reader matches the shareware DEMO lumps.
+//
+// Build+run NATIVE headless:
+//   target/debug/bet build ports/doom/tools/demo_decode.bet --runtime real -o /tmp/demo_decode
+//   BET_GG_HEADLESS=1 /tmp/demo_decode <doom1.wad> demo1 200
+pull "spill"
+pull "mem"
+pull "str"
+pull "sys"
+pull "../defs/gs" as gs
+pull "../util/bstream" as bstream
+pull "../w/w_wad" as wad
+
+facts DEMOMARKER: int = 0x80
+
+flex finna hex4(v: int) -> str {
+    lowkey val = v & 0xffff
+    lowkey buf = mem.slab[u8](4)
+    lowkey i = 0
+    vibin i < 4 {
+        lowkey nib = (val >> (12 - i * 4)) & 15
+        fr nib < 10 {
+            buf[i] = (48 + nib) as u8
+        } naw {
+            buf[i] = (87 + nib) as u8
+        }
+        i = i + 1
+    }
+    bet str.fromBytesTrust(buf)
+}
+
+finna main() {
+    lowkey g0 = cop gs.GameState{} in gs.gsc
+    gs.gsInit(g0)
+    lowkey iwad = sys.arg(1)
+    lowkey name = sys.arg(2)
+    lowkey n = 200
+    fr sys.argc() > 3 {
+        lowkey s = sys.arg(3)
+        n = 0
+        lowkey i = 0
+        vibin i < str.len(s) {
+            n = n * 10 + (str.at(s, i) - 48)
+            i = i + 1
+        }
+    }
+    wad.initWad(g0, iwad)
+    lowkey ofs = wad.lumpNameOfs(g0, name)
+    holla g = g0 in gs.gsc {
+        lowkey p = ofs
+        lowkey ver = bstream.rdU8(g.wad.buf, p)
+        lowkey skill = bstream.rdU8(g.wad.buf, p + 1)
+        lowkey ep = bstream.rdU8(g.wad.buf, p + 2)
+        lowkey map = bstream.rdU8(g.wad.buf, p + 3)
+        spill.f("DEMO {} ver={} skill={} ep={} map={}\n", name, ver, skill, ep, map)
+        p = p + 13                      // skip the 13-byte header
+        lowkey k = 0
+        vibin k < n {
+            lowkey b0 = bstream.rdU8(g.wad.buf, p)
+            fr b0 == DEMOMARKER {
+                spill.it("END")
+                dip
+            }
+            lowkey fm = bstream.rdI8(g.wad.buf, p)
+            lowkey sm = bstream.rdI8(g.wad.buf, p + 1)
+            lowkey at = bstream.rdU8(g.wad.buf, p + 2) << 8
+            lowkey bt = bstream.rdU8(g.wad.buf, p + 3)
+            spill.f("{} fm={} sm={} at={} bt={}\n", k, fm, sm, hex4(at), hex4(bt))
+            p = p + 4
+            k = k + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}

@@ -1,0 +1,1545 @@
+// g/g_game.bet — the game controller (linuxdoom-1.10 g_game.c): per-tic orchestration, input->
+// ticcmd, demo record/playback, level/new-game/completed/worlddone/save/load gameaction handling,
+// plus the -sync fingerprint writer (SETUP block + per-tic line) that the W3 oracle grind diffs.
+//
+// Reduced to single-player + loopback (no consistancy failures, no netgame respawn machinery), but
+// the demo stream is read/written byte-for-byte (G_ReadDemoTiccmd / G_WriteDemoTiccmd).
+//
+// PORTED:  G_BuildTiccmd, G_Responder, G_Ticker, G_DoLoadLevel, G_PlayerReborn/FinishLevel,
+//          G_InitNew/DeferedInitNew/DoNewGame, G_DoCompleted/WorldDone/DoWorldDone, G_ExitLevel,
+//          G_DoLoadGame/DoSaveGame (via p_saveg), the demo suite, G_CheckDemoStatus.
+// PORTED-PARTIAL: demo version check relaxed (doom1.wad ships v109 demos; the oracle plays them);
+//          G_InitNew's nightmare/-fast state-tic tweak SKIPPED (mutates the immutable states vec —
+//          only affects nightmare/-fast, never a skill-2 demo).
+// SKIPPED: netgame respawn (G_CheckSpot / G_DeathMatchSpawnPlayer), joystick, mouse double-click.
+pull "spill"
+pull "mem"
+pull "vec"
+pull "str"
+pull "fs"
+pull "../defs/gs" as gs
+pull "../defs/doomdef" as doomdef
+pull "../defs/event" as event
+pull "../defs/player" as pdef
+pull "../defs/think" as think
+pull "../defs/sounds" as sounds
+pull "../util/bstream" as bstream
+pull "../util/m_random" as rnd
+pull "../w/w_wad" as wad
+pull "../p/p_setup" as psetup
+pull "../p/p_tick" as ptick
+pull "../p/p_spec" as pspec
+pull "../p/p_pspr" as ppspr
+pull "../p/p_saveg" as psaveg
+pull "../r/r_data" as rdata
+pull "../s/s_sound" as ssnd
+pull "../wi/wi_stuff" as wi
+pull "../hu/hu_stuff" as hu
+pull "../st/st_stuff" as st
+pull "../am/am_map" as am
+pull "../f/f_finale" as ffin
+pull "../m/m_menu" as mmenu
+pull "../m/m_misc" as mmisc
+
+flex facts MAXPLAYERS: int = 4
+flex facts VERSION: int = 110
+flex facts DEMOMARKER: int = 0x80
+flex facts SLOWTURNTICS: int = 6
+flex facts TURBOTHRESHOLD: int = 0x32
+flex facts NUMKEYS: int = 256
+flex facts MAXHEALTH: int = 100
+
+// controls — id's default key codes (m_misc defaults). Kept as constants (v1 config does not
+// rebind them; see m_misc PORTED-PARTIAL). DOOM keycodes from doomdef.
+flex facts KEY_STRAFELEFT: int = 44   // ','
+flex facts KEY_STRAFERIGHT: int = 46  // '.'
+flex facts KEY_USE: int = 32          // ' '
+flex facts MOUSEB_FIRE: int = 0
+flex facts MOUSEB_STRAFE: int = 1
+flex facts MOUSEB_FORWARD: int = 2
+
+// movement magnitude tables (fixed_t units *2048). forwardmove/sidemove indexed by [speed 0/1].
+flex finna forwardmove(speed: int) -> int {
+    fr speed == 0 {
+        bet 0x19
+    }
+    bet 0x32
+}
+flex finna sidemove(speed: int) -> int {
+    fr speed == 0 {
+        bet 0x18
+    }
+    bet 0x28
+}
+flex finna angleturnT(t: int) -> int {
+    fr t == 0 {
+        bet 640
+    }
+    fr t == 1 {
+        bet 1280
+    }
+    bet 320                             // + slow turn
+}
+
+// ncIdx — flatten netcmds[player][tic] into the Ticcmd[48] slab index (player*BACKUPTICS + buf).
+flex finna ncIdx(player: int, buf: int) -> int {
+    bet player * gs.BACKUPTICS + buf
+}
+
+// -------------------------------------------------------------------------------------------------
+// G_BuildTiccmd — build the console player's command for maketic from held keys + mouse, writing
+// into netcmds[consoleplayer][maketic%BACKUPTICS]. In the headless demo harness no keys are held,
+// so the command is empty (the demo stream overwrites it in G_Ticker); interactive play drives it.
+// -------------------------------------------------------------------------------------------------
+flex finna buildTiccmd(gt: tag gs.GameState) {
+    lowkey cp = 0
+    lowkey mk = 0
+    holla g = gt in gs.gsc {
+        cp = g.shell.consoleplayer as int
+        mk = g.net.maketic as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey idx = ncIdx(cp, mk % gs.BACKUPTICS)
+    lowkey forward = 0
+    lowkey side = 0
+    lowkey angleturn = 0
+    lowkey buttons = 0
+    holla g = gt in gs.gsc {
+        lowkey strafe = g.shell.gamekeydown[doomdef.KEY_RALT] || g.shell.mousebuttons[MOUSEB_STRAFE]
+        lowkey speed = cap
+        fr g.shell.gamekeydown[doomdef.KEY_RSHIFT] {
+            speed = nocap
+        }
+        lowkey sp = 0
+        fr speed {
+            sp = 1
+        }
+        // two-stage accelerative turning
+        fr g.shell.gamekeydown[doomdef.KEY_RIGHTARROW] || g.shell.gamekeydown[doomdef.KEY_LEFTARROW] {
+            g.shell.turnheld = (g.shell.turnheld + 1) as i32
+        } naw {
+            g.shell.turnheld = 0
+        }
+        lowkey tspeed = sp
+        fr g.shell.turnheld as int < SLOWTURNTICS {
+            tspeed = 2
+        }
+        fr strafe {
+            fr g.shell.gamekeydown[doomdef.KEY_RIGHTARROW] {
+                side = side + sidemove(sp)
+            }
+            fr g.shell.gamekeydown[doomdef.KEY_LEFTARROW] {
+                side = side - sidemove(sp)
+            }
+        } naw {
+            fr g.shell.gamekeydown[doomdef.KEY_RIGHTARROW] {
+                angleturn = angleturn - angleturnT(tspeed)
+            }
+            fr g.shell.gamekeydown[doomdef.KEY_LEFTARROW] {
+                angleturn = angleturn + angleturnT(tspeed)
+            }
+        }
+        fr g.shell.gamekeydown[doomdef.KEY_UPARROW] {
+            forward = forward + forwardmove(sp)
+        }
+        fr g.shell.gamekeydown[doomdef.KEY_DOWNARROW] {
+            forward = forward - forwardmove(sp)
+        }
+        fr g.shell.gamekeydown[KEY_STRAFERIGHT] {
+            side = side + sidemove(sp)
+        }
+        fr g.shell.gamekeydown[KEY_STRAFELEFT] {
+            side = side - sidemove(sp)
+        }
+        fr g.shell.gamekeydown[doomdef.KEY_RCTRL] || g.shell.mousebuttons[MOUSEB_FIRE] {
+            buttons = buttons | event.BT_ATTACK
+        }
+        fr g.shell.gamekeydown[KEY_USE] {
+            buttons = buttons | event.BT_USE
+        }
+        // weapon select keys '1'..'8'
+        lowkey wk = 0
+        vibin wk < doomdef.NUMWEAPONS - 1 {
+            fr g.shell.gamekeydown[49 + wk] {
+                buttons = buttons | event.BT_CHANGE
+                buttons = buttons | (wk << event.BT_WEAPONSHIFT)
+                wk = doomdef.NUMWEAPONS      // break the scan
+            }
+            wk = wk + 1
+        }
+        // mouse forward + turn
+        fr g.shell.mousebuttons[MOUSEB_FORWARD] {
+            forward = forward + forwardmove(sp)
+        }
+        forward = forward + g.shell.mousey as int
+        fr strafe {
+            side = side + g.shell.mousex as int * 2
+        } naw {
+            angleturn = angleturn - g.shell.mousex as int * 8
+        }
+        g.shell.mousex = 0
+        g.shell.mousey = 0
+    } ghosted {
+        yeet("gs")
+    }
+    // clamp forward/side to MAXPLMOVE (== forwardmove[1] == 0x32)
+    lowkey maxpl = 0x32
+    fr forward > maxpl {
+        forward = maxpl
+    }
+    fr forward < 0 - maxpl {
+        forward = 0 - maxpl
+    }
+    fr side > maxpl {
+        side = maxpl
+    }
+    fr side < 0 - maxpl {
+        side = 0 - maxpl
+    }
+    holla g = gt in gs.gsc {
+        g.net.netcmds[idx].forwardmove = forward as i32
+        g.net.netcmds[idx].sidemove = side as i32
+        g.net.netcmds[idx].angleturn = (angleturn & 0xffff) as i32
+        g.net.netcmds[idx].chatchar = 0
+        g.net.netcmds[idx].buttons = buttons as i32
+        // special buttons (pause / save) — single-player uses sendpause/sendsave
+        fr g.shell.sendpause {
+            g.shell.sendpause = cap
+            g.net.netcmds[idx].buttons = (event.BT_SPECIAL | event.BTS_PAUSE) as i32
+        }
+        fr g.shell.sendsave {
+            g.shell.sendsave = cap
+            g.net.netcmds[idx].buttons = (event.BT_SPECIAL | event.BTS_SAVEGAME | (g.shell.savegameslot as int << event.BTS_SAVESHIFT)) as i32
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// G_Responder — route one input event: menu (handled by D_ProcessEvents before us), then the
+// demo-attract "any key -> menu" case, then the level responders (HU/ST/AM), then key/mouse state.
+// -------------------------------------------------------------------------------------------------
+flex finna gResponder(gt: tag gs.GameState, ev: event.Event) -> bool {
+    lowkey gamestate = 0
+    lowkey gameaction = 0
+    lowkey singledemo = cap
+    lowkey demoplayback = cap
+    holla g = gt in gs.gsc {
+        gamestate = g.shell.gamestate as int
+        gameaction = g.shell.gameaction as int
+        singledemo = g.shell.singledemo
+        demoplayback = g.shell.demoplayback
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey etype = ev.typ as int
+    lowkey d1 = ev.data1 as int
+    // any key pops up the menu during the attract loop / demo
+    fr gameaction == doomdef.GA_NOTHING && !singledemo && (demoplayback || gamestate == doomdef.GS_DEMOSCREEN) {
+        fr etype == event.EV_KEYDOWN {
+            mmenu.startControlPanel(gt)
+            bet nocap
+        }
+        bet cap
+    }
+    fr gamestate == doomdef.GS_LEVEL {
+        fr hu.huResponder(gt, etype, d1) {
+            bet nocap
+        }
+        fr st.stResponder(gt, etype, d1) {
+            bet nocap
+        }
+        fr am.amResponder(gt, etype, d1) {
+            bet nocap
+        }
+    }
+    fr gamestate == doomdef.GS_FINALE {
+        fr ffin.fResponder(gt, etype, d1) {
+            bet nocap
+        }
+    }
+    fr etype == event.EV_KEYDOWN {
+        fr d1 == doomdef.KEY_PAUSE {
+            holla g = gt in gs.gsc {
+                g.shell.sendpause = nocap
+            } ghosted {
+                yeet("gs")
+            }
+            bet nocap
+        }
+        fr d1 < NUMKEYS {
+            holla g = gt in gs.gsc {
+                g.shell.gamekeydown[d1] = nocap
+            } ghosted {
+                yeet("gs")
+            }
+        }
+        bet nocap                       // eat key down
+    }
+    fr etype == event.EV_KEYUP {
+        fr d1 < NUMKEYS {
+            holla g = gt in gs.gsc {
+                g.shell.gamekeydown[d1] = cap
+            } ghosted {
+                yeet("gs")
+            }
+        }
+        bet cap                         // let key up filter down
+    }
+    fr etype == event.EV_MOUSE {
+        holla g = gt in gs.gsc {
+            g.shell.mousebuttons[0] = (d1 & 1) != 0
+            g.shell.mousebuttons[1] = (d1 & 2) != 0
+            g.shell.mousebuttons[2] = (d1 & 4) != 0
+            lowkey sens = g.shell.mouseSensitivity as int
+            g.shell.mousex = (ev.data2 as int * (sens + 5) / 10) as i32
+            g.shell.mousey = (ev.data3 as int * (sens + 5) / 10) as i32
+        } ghosted {
+            yeet("gs")
+        }
+        bet nocap
+    }
+    bet cap
+}
+
+// -------------------------------------------------------------------------------------------------
+// G_DoLoadLevel — set sky, mark gamestate, reborn dead/new players (the P_SpawnPlayer seam), set up
+// the level, spawn specials, wire the psprites, start level sounds/music, emit the SETUP block.
+// -------------------------------------------------------------------------------------------------
+flex finna gDoLoadLevel(gt: tag gs.GameState) {
+    lowkey ep = 0
+    lowkey mp = 0
+    lowkey sk = 0
+    holla g = gt in gs.gsc {
+        // sky texture for the episode (shareware: E1 -> SKY1)
+        g.render.skytexture = rdata.textureNumForName(gt, "SKY1") as i32
+        g.shell.levelstarttic = g.shell.gametic
+        fr g.shell.wipegamestate as int == doomdef.GS_LEVEL {
+            g.shell.wipegamestate = -1  // force a wipe
+        }
+        g.shell.gamestate = doomdef.GS_LEVEL as i32
+        ep = g.shell.gameepisode as int
+        mp = g.shell.gamemap as int
+        sk = g.shell.gameskill as int
+        lowkey i = 0
+        vibin i < MAXPLAYERS {
+            fr g.shell.playeringame[i] && g.shell.players[i].playerstate as int == pdef.PST_DEAD {
+                g.shell.players[i].playerstate = pdef.PST_REBORN as i32
+            }
+            lowkey j = 0
+            vibin j < MAXPLAYERS {
+                g.shell.players[i].frags[j] = 0
+                j = j + 1
+            }
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    // Wire the P_SpawnPlayer reborn seam: reborn every in-game player marked PST_REBORN BEFORE
+    // P_SetupLevel spawns their mobj (so it copies health=100 etc.). id does this inside
+    // P_SpawnPlayer; the port left it a seam (p_setup spawnPlayer).
+    lowkey i2 = 0
+    vibin i2 < MAXPLAYERS {
+        lowkey pig = cap
+        lowkey rb = cap
+        holla g = gt in gs.gsc {
+            pig = g.shell.playeringame[i2]
+            rb = g.shell.players[i2].playerstate as int == pdef.PST_REBORN
+        } ghosted {
+            yeet("gs")
+        }
+        fr pig && rb {
+            gPlayerReborn(gt, i2)
+        }
+        i2 = i2 + 1
+    }
+    psetup.setupLevel(gt, ep, mp, sk)
+    pspec.spawnSpecials(gt)
+    // psprites: bring up the ready weapon for each in-game player (P_SetupPsprites, id does it in
+    // P_SpawnPlayer). Safe after spawn — the player mobj exists.
+    lowkey i3 = 0
+    vibin i3 < MAXPLAYERS {
+        lowkey pig = cap
+        holla g = gt in gs.gsc {
+            pig = g.shell.playeringame[i3]
+        } ghosted {
+            yeet("gs")
+        }
+        fr pig {
+            ppspr.setupPsprites(gt, i3)
+        }
+        i3 = i3 + 1
+    }
+    // ST_Start / HU_Start for the console player (the P_SpawnPlayer seam).
+    st.stStart(gt)
+    hu.huStart(gt)
+    ssnd.sStart(gt)                     // S_Start: stop old sounds, start the level music
+    holla g = gt in gs.gsc {
+        g.shell.displayplayer = g.shell.consoleplayer
+        g.shell.gameaction = doomdef.GA_NOTHING as i32
+        // clear cmd-building input state
+        lowkey k = 0
+        vibin k < NUMKEYS {
+            g.shell.gamekeydown[k] = cap
+            k = k + 1
+        }
+        g.shell.mousex = 0
+        g.shell.mousey = 0
+        g.shell.sendpause = cap
+        g.shell.sendsave = cap
+        g.shell.paused = cap
+        g.shell.mousebuttons[0] = cap
+        g.shell.mousebuttons[1] = cap
+        g.shell.mousebuttons[2] = cap
+    } ghosted {
+        yeet("gs")
+    }
+    emitSyncSetup(gt)                   // DG_SyncSetup hook (after P_SetupLevel)
+}
+
+// G_PlayerReborn — reset a player to first-spawn state, preserving frags/kill/item/secret counts.
+flex finna gPlayerReborn(gt: tag gs.GameState, player: int) {
+    holla g = gt in gs.gsc {
+        lowkey killcount = g.shell.players[player].killcount
+        lowkey itemcount = g.shell.players[player].itemcount
+        lowkey secretcount = g.shell.players[player].secretcount
+        // clear powers/cards/inventory
+        lowkey i = 0
+        vibin i < doomdef.NUMPOWERS {
+            g.shell.players[player].powers[i] = 0
+            i = i + 1
+        }
+        i = 0
+        vibin i < doomdef.NUMCARDS {
+            g.shell.players[player].cards[i] = cap
+            i = i + 1
+        }
+        i = 0
+        vibin i < doomdef.NUMWEAPONS {
+            g.shell.players[player].weaponowned[i] = cap
+            i = i + 1
+        }
+        i = 0
+        vibin i < doomdef.NUMAMMO {
+            g.shell.players[player].ammo[i] = 0
+            g.shell.players[player].maxammo[i] = g.shell.maxammo[i]
+            i = i + 1
+        }
+        g.shell.players[player].backpack = cap
+        g.shell.players[player].damagecount = 0
+        g.shell.players[player].bonuscount = 0
+        g.shell.players[player].extralight = 0
+        g.shell.players[player].fixedcolormap = 0
+        g.shell.players[player].colormap = 0
+        g.shell.players[player].armorpoints = 0
+        g.shell.players[player].armortype = 0
+        g.shell.players[player].refire = 0
+        g.shell.players[player].message = ""
+        g.shell.players[player].attacker = ghosted
+        g.shell.players[player].killcount = killcount
+        g.shell.players[player].itemcount = itemcount
+        g.shell.players[player].secretcount = secretcount
+        g.shell.players[player].usedown = nocap
+        g.shell.players[player].attackdown = nocap
+        g.shell.players[player].playerstate = pdef.PST_LIVE as i32
+        g.shell.players[player].health = MAXHEALTH as i32
+        g.shell.players[player].readyweapon = doomdef.WP_PISTOL as i32
+        g.shell.players[player].pendingweapon = doomdef.WP_PISTOL as i32
+        g.shell.players[player].weaponowned[doomdef.WP_FIST] = nocap
+        g.shell.players[player].weaponowned[doomdef.WP_PISTOL] = nocap
+        g.shell.players[player].ammo[doomdef.AM_CLIP] = 50
+        g.shell.players[player].cheats = 0
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// G_PlayerFinishLevel — strip per-level state on level exit.
+flex finna gPlayerFinishLevel(gt: tag gs.GameState, player: int) {
+    holla g = gt in gs.gsc {
+        lowkey i = 0
+        vibin i < doomdef.NUMPOWERS {
+            g.shell.players[player].powers[i] = 0
+            i = i + 1
+        }
+        i = 0
+        vibin i < doomdef.NUMCARDS {
+            g.shell.players[player].cards[i] = cap
+            i = i + 1
+        }
+        g.shell.players[player].extralight = 0
+        g.shell.players[player].fixedcolormap = 0
+        g.shell.players[player].damagecount = 0
+        g.shell.players[player].bonuscount = 0
+    } ghosted {
+        yeet("gs")
+    }
+    // cancel invisibility on the mobj (MF_SHADOW)
+    lowkey mo: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        mo = g.shell.players[player].mo
+    } ghosted {
+        yeet("gs")
+    }
+    holla m = mo in gs.thinkers {
+        m.mobj.flags = (m.mobj.flags as int & ~think.MF_SHADOW) as i32
+    } ghosted {
+    }
+}
+
+// G_DoReborn — single-player: reload the level. (Netgame respawn is SKIPPED.)
+flex finna gDoReborn(gt: tag gs.GameState, player: int) {
+    holla g = gt in gs.gsc {
+        g.shell.gameaction = doomdef.GA_LOADLEVEL as i32
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// G_Ticker — the per-tic driver: reborns, gameaction dispatch, feed netcmds -> player cmds (+demo
+// read/write), special buttons, then the per-gamestate ticker. Emits the sync fingerprint at the
+// end (after the tic, before the caller's gametic++) exactly where the oracle's DG_SyncTick fires.
+// -------------------------------------------------------------------------------------------------
+flex finna gTicker(gt: tag gs.GameState) {
+    // player reborns
+    lowkey i = 0
+    vibin i < MAXPLAYERS {
+        lowkey pig = cap
+        lowkey rb = cap
+        holla g = gt in gs.gsc {
+            pig = g.shell.playeringame[i]
+            rb = g.shell.players[i].playerstate as int == pdef.PST_REBORN
+        } ghosted {
+            yeet("gs")
+        }
+        fr pig && rb {
+            gDoReborn(gt, i)
+        }
+        i = i + 1
+    }
+    // gameaction state changes (loop until GA_NOTHING)
+    lowkey ga = 0
+    holla g = gt in gs.gsc {
+        ga = g.shell.gameaction as int
+    } ghosted {
+        yeet("gs")
+    }
+    vibin ga != doomdef.GA_NOTHING {
+        fr ga == doomdef.GA_LOADLEVEL {
+            gDoLoadLevel(gt)
+        } naw fr ga == doomdef.GA_NEWGAME {
+            gDoNewGame(gt)
+        } naw fr ga == doomdef.GA_LOADGAME {
+            gDoLoadGame(gt)
+        } naw fr ga == doomdef.GA_SAVEGAME {
+            gDoSaveGame(gt)
+        } naw fr ga == doomdef.GA_PLAYDEMO {
+            gDoPlayDemo(gt)
+        } naw fr ga == doomdef.GA_COMPLETED {
+            gDoCompleted(gt)
+        } naw fr ga == doomdef.GA_VICTORY {
+            ffin.startFinale(gt)
+        } naw fr ga == doomdef.GA_WORLDDONE {
+            gDoWorldDone(gt)
+        } naw fr ga == doomdef.GA_SCREENSHOT {
+            mmisc.screenShot(gt)
+            holla g = gt in gs.gsc {
+                g.shell.gameaction = doomdef.GA_NOTHING as i32
+            } ghosted {
+                yeet("gs")
+            }
+        }
+        holla g = gt in gs.gsc {
+            ga = g.shell.gameaction as int
+        } ghosted {
+            yeet("gs")
+        }
+    }
+    // feed commands: netcmds[i][buf] -> players[i].cmd, then demo read/write
+    lowkey gametic = 0
+    lowkey demoplayback = cap
+    lowkey demorecording = cap
+    holla g = gt in gs.gsc {
+        gametic = g.shell.gametic as int
+        demoplayback = g.shell.demoplayback
+        demorecording = g.shell.demorecording
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey buf = gametic % gs.BACKUPTICS
+    i = 0
+    vibin i < MAXPLAYERS {
+        lowkey pig = cap
+        holla g = gt in gs.gsc {
+            pig = g.shell.playeringame[i]
+        } ghosted {
+            yeet("gs")
+        }
+        fr pig {
+            lowkey src = ncIdx(i, buf)
+            holla g = gt in gs.gsc {
+                g.shell.players[i].cmd.forwardmove = g.net.netcmds[src].forwardmove
+                g.shell.players[i].cmd.sidemove = g.net.netcmds[src].sidemove
+                g.shell.players[i].cmd.angleturn = g.net.netcmds[src].angleturn
+                g.shell.players[i].cmd.consistancy = g.net.netcmds[src].consistancy
+                g.shell.players[i].cmd.chatchar = g.net.netcmds[src].chatchar
+                g.shell.players[i].cmd.buttons = g.net.netcmds[src].buttons
+            } ghosted {
+                yeet("gs")
+            }
+            fr demoplayback {
+                gReadDemoTiccmd(gt, i)
+            }
+            fr demorecording {
+                gWriteDemoTiccmd(gt, i)
+            }
+        }
+        i = i + 1
+    }
+    // if the demo ended (G_CheckDemoStatus set demoDone), abort this tic before it advances the sim
+    lowkey demoDone = cap
+    holla g = gt in gs.gsc {
+        demoDone = g.shell.demoDone
+    } ghosted {
+        yeet("gs")
+    }
+    fr demoDone {
+        bet
+    }
+    // special buttons (pause / savegame)
+    i = 0
+    vibin i < MAXPLAYERS {
+        lowkey pig = cap
+        lowkey btns = 0
+        holla g = gt in gs.gsc {
+            pig = g.shell.playeringame[i]
+            btns = g.shell.players[i].cmd.buttons as int
+        } ghosted {
+            yeet("gs")
+        }
+        fr pig && (btns & event.BT_SPECIAL) != 0 {
+            lowkey mask = btns & event.BT_SPECIALMASK
+            fr mask == event.BTS_PAUSE {
+                lowkey nowpaused = cap
+                holla g = gt in gs.gsc {
+                    g.shell.paused = !g.shell.paused
+                    nowpaused = g.shell.paused
+                } ghosted {
+                    yeet("gs")
+                }
+                fr nowpaused {
+                    ssnd.pauseSound(gt)
+                } naw {
+                    ssnd.resumeSound(gt)
+                }
+            } naw fr mask == event.BTS_SAVEGAME {
+                holla g = gt in gs.gsc {
+                    g.shell.savegameslot = ((btns & event.BTS_SAVEMASK) >> event.BTS_SAVESHIFT) as i32
+                    g.shell.gameaction = doomdef.GA_SAVEGAME as i32
+                } ghosted {
+                    yeet("gs")
+                }
+            }
+        }
+        i = i + 1
+    }
+    // per-gamestate ticker
+    lowkey gamestate = 0
+    holla g = gt in gs.gsc {
+        gamestate = g.shell.gamestate as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr gamestate == doomdef.GS_LEVEL {
+        ptick.pTicker(gt)
+        st.stTicker(gt)
+        am.amTicker(gt)
+        hu.huTicker(gt)
+    } naw fr gamestate == doomdef.GS_INTERMISSION {
+        wi.wiTicker(gt)
+    } naw fr gamestate == doomdef.GS_FINALE {
+        ffin.fTicker(gt)
+    } naw fr gamestate == doomdef.GS_DEMOSCREEN {
+        // D_PageTicker (inlined to keep g_game below d_main in the DAG): count down, then advance.
+        holla g = gt in gs.gsc {
+            g.shell.pagetic = (g.shell.pagetic - 1) as i32
+            fr g.shell.pagetic < 0 {
+                g.shell.advancedemo = nocap
+            }
+        } ghosted {
+            yeet("gs")
+        }
+    }
+    // sync fingerprint (DG_SyncTick): only in a level, only when -sync is on
+    fr gamestate == doomdef.GS_LEVEL {
+        emitSyncTic(gt)
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// G_InitNew / deferred new game
+// -------------------------------------------------------------------------------------------------
+flex finna gDeferedInitNew(gt: tag gs.GameState, skill: int, episode: int, map: int) {
+    holla g = gt in gs.gsc {
+        g.shell.startskill = skill as i32
+        g.shell.startepisode = episode as i32
+        g.shell.startmap = map as i32
+        g.shell.gameaction = doomdef.GA_NEWGAME as i32
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna gDoNewGame(gt: tag gs.GameState) {
+    lowkey sk = 0
+    lowkey ep = 0
+    lowkey mp = 0
+    holla g = gt in gs.gsc {
+        g.shell.demoplayback = cap
+        g.shell.netdemo = cap
+        g.shell.netgame = cap
+        g.shell.deathmatch = 0
+        g.shell.playeringame[1] = cap
+        g.shell.playeringame[2] = cap
+        g.shell.playeringame[3] = cap
+        g.shell.respawnparm = cap
+        g.shell.fastparm = cap
+        g.shell.nomonsters = cap
+        g.shell.consoleplayer = 0
+        sk = g.shell.startskill as int
+        ep = g.shell.startepisode as int
+        mp = g.shell.startmap as int
+    } ghosted {
+        yeet("gs")
+    }
+    gInitNew(gt, sk, ep, mp)
+    holla g = gt in gs.gsc {
+        g.shell.gameaction = doomdef.GA_NOTHING as i32
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna gInitNew(gt: tag gs.GameState, skill0: int, episode0: int, map0: int) {
+    lowkey skill = skill0
+    lowkey episode = episode0
+    lowkey map = map0
+    lowkey gm = 0
+    holla g = gt in gs.gsc {
+        gm = g.shell.gamemode as int
+        fr g.shell.paused {
+            g.shell.paused = cap
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    fr skill > doomdef.SK_NIGHTMARE {
+        skill = doomdef.SK_NIGHTMARE
+    }
+    fr episode < 1 {
+        episode = 1
+    }
+    fr gm == doomdef.GM_RETAIL {
+        fr episode > 4 {
+            episode = 4
+        }
+    } naw fr gm == doomdef.GM_SHAREWARE {
+        fr episode > 1 {
+            episode = 1
+        }
+    } naw {
+        fr episode > 3 {
+            episode = 3
+        }
+    }
+    fr map < 1 {
+        map = 1
+    }
+    fr map > 9 && gm != doomdef.GM_COMMERCIAL {
+        map = 9
+    }
+    rnd.clearRandom(gt)
+    holla g = gt in gs.gsc {
+        fr skill == doomdef.SK_NIGHTMARE || g.shell.respawnparm {
+            g.shell.respawnmonsters = nocap
+        } naw {
+            g.shell.respawnmonsters = cap
+        }
+        // (SKIPPED: nightmare/-fast state-tic + mobjinfo.speed tweak — mutates immutable vecs)
+        lowkey i = 0
+        vibin i < MAXPLAYERS {
+            g.shell.players[i].playerstate = pdef.PST_REBORN as i32
+            i = i + 1
+        }
+        g.shell.usergame = nocap
+        g.shell.paused = cap
+        g.shell.demoplayback = cap
+        g.shell.automapactive = cap
+        g.shell.viewactive = nocap
+        g.shell.gameepisode = episode as i32
+        g.shell.gamemap = map as i32
+        g.shell.gameskill = skill as i32
+    } ghosted {
+        yeet("gs")
+    }
+    gDoLoadLevel(gt)
+}
+
+// -------------------------------------------------------------------------------------------------
+// Level completion / intermission / world done
+// -------------------------------------------------------------------------------------------------
+flex finna gExitLevel(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.shell.secretexit = cap
+        g.shell.gameaction = doomdef.GA_COMPLETED as i32
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna gSecretExitLevel(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.shell.secretexit = nocap
+        g.shell.gameaction = doomdef.GA_COMPLETED as i32
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// partime — id's DOOM par-time table pars[episode][map] (shareware ep 1 only exercised).
+flex finna partime(episode: int, map: int) -> int {
+    lowkey t = mem.slab[i32](10)
+    fr episode == 1 {
+        t[1] = 30
+        t[2] = 75
+        t[3] = 120
+        t[4] = 90
+        t[5] = 165
+        t[6] = 180
+        t[7] = 180
+        t[8] = 30
+        t[9] = 165
+    } naw fr episode == 2 {
+        t[1] = 90
+        t[2] = 90
+        t[3] = 90
+        t[4] = 120
+        t[5] = 90
+        t[6] = 360
+        t[7] = 240
+        t[8] = 30
+        t[9] = 170
+    } naw {
+        t[1] = 90
+        t[2] = 45
+        t[3] = 90
+        t[4] = 150
+        t[5] = 90
+        t[6] = 90
+        t[7] = 165
+        t[8] = 30
+        t[9] = 135
+    }
+    fr map < 1 || map > 9 {
+        bet 0
+    }
+    bet t[map] as int
+}
+
+flex finna gDoCompleted(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.shell.gameaction = doomdef.GA_NOTHING as i32
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey i2 = 0
+    vibin i2 < MAXPLAYERS {
+        lowkey pig = cap
+        holla g = gt in gs.gsc {
+            pig = g.shell.playeringame[i2]
+        } ghosted {
+            yeet("gs")
+        }
+        fr pig {
+            gPlayerFinishLevel(gt, i2)
+        }
+        i2 = i2 + 1
+    }
+    lowkey amactive = cap
+    holla g = gt in gs.gsc {
+        amactive = g.shell.automapactive
+    } ghosted {
+        yeet("gs")
+    }
+    fr amactive {
+        am.amStop(gt)
+    }
+    lowkey gm = 0
+    lowkey ep = 0
+    lowkey mp = 0
+    lowkey secretexit = cap
+    holla g = gt in gs.gsc {
+        gm = g.shell.gamemode as int
+        ep = g.shell.gameepisode as int
+        mp = g.shell.gamemap as int
+        secretexit = g.shell.secretexit
+    } ghosted {
+        yeet("gs")
+    }
+    // episode-8 boss -> victory (finale); non-commercial only
+    fr gm != doomdef.GM_COMMERCIAL && mp == 8 {
+        holla g = gt in gs.gsc {
+            g.shell.gameaction = doomdef.GA_VICTORY as i32
+        } ghosted {
+            yeet("gs")
+        }
+        bet
+    }
+    fr gm != doomdef.GM_COMMERCIAL && mp == 9 {
+        lowkey i = 0
+        holla g = gt in gs.gsc {
+            vibin i < MAXPLAYERS {
+                g.shell.players[i].didsecret = nocap
+                i = i + 1
+            }
+        } ghosted {
+            yeet("gs")
+        }
+    }
+    // fill wminfo (non-commercial next-map logic)
+    lowkey nextm = mp
+    fr secretexit {
+        nextm = 8
+    } naw fr mp == 9 {
+        nextm = 3                       // E1M9 -> E1M4 (0-based 3); episodes 2/3 differ but shareware is ep1
+    } naw {
+        nextm = mp
+    }
+    holla g = gt in gs.gsc {
+        g.shell.wminfo.didsecret = g.shell.players[g.shell.consoleplayer as int].didsecret
+        g.shell.wminfo.epsd = (ep - 1) as i32
+        g.shell.wminfo.last = (mp - 1) as i32
+        g.shell.wminfo.next = nextm as i32
+        g.shell.wminfo.maxkills = g.shell.totalkills
+        g.shell.wminfo.maxitems = g.shell.totalitems
+        g.shell.wminfo.maxsecret = g.shell.totalsecret
+        g.shell.wminfo.maxfrags = 0
+        g.shell.wminfo.partime = (35 * partime(ep, mp)) as i32
+        g.shell.wminfo.pnum = g.shell.consoleplayer
+        lowkey i = 0
+        vibin i < MAXPLAYERS {
+            g.shell.wminfo.plyr[i].inGame = g.shell.playeringame[i]
+            g.shell.wminfo.plyr[i].skills = g.shell.players[i].killcount
+            g.shell.wminfo.plyr[i].sitems = g.shell.players[i].itemcount
+            g.shell.wminfo.plyr[i].ssecret = g.shell.players[i].secretcount
+            g.shell.wminfo.plyr[i].stime = g.tick.leveltime
+            lowkey j = 0
+            vibin j < MAXPLAYERS {
+                g.shell.wminfo.plyr[i].frags[j] = g.shell.players[i].frags[j]
+                j = j + 1
+            }
+            i = i + 1
+        }
+        g.shell.gamestate = doomdef.GS_INTERMISSION as i32
+        g.shell.viewactive = cap
+        g.shell.automapactive = cap
+    } ghosted {
+        yeet("gs")
+    }
+    wi.wiStart(gt)
+}
+
+flex finna gWorldDone(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.shell.gameaction = doomdef.GA_WORLDDONE as i32
+        fr g.shell.secretexit {
+            g.shell.players[g.shell.consoleplayer as int].didsecret = nocap
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna gDoWorldDone(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.shell.gamestate = doomdef.GS_LEVEL as i32
+        g.shell.gamemap = (g.shell.wminfo.next + 1) as i32
+    } ghosted {
+        yeet("gs")
+    }
+    gDoLoadLevel(gt)
+    holla g = gt in gs.gsc {
+        g.shell.gameaction = doomdef.GA_NOTHING as i32
+        g.shell.viewactive = nocap
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Save / load (through p_saveg). Paths are the port's own <name>N.dsg convention.
+// -------------------------------------------------------------------------------------------------
+// strCat — concatenate two strings (native has no `str + str`).
+flex finna strCat(a: str, b: str) -> str {
+    lowkey na = str.len(a)
+    lowkey nb = str.len(b)
+    lowkey buf = mem.slab[u8](na + nb)
+    lowkey i = 0
+    vibin i < na {
+        buf[i] = str.at(a, i) as u8
+        i = i + 1
+    }
+    lowkey j = 0
+    vibin j < nb {
+        buf[na + j] = str.at(b, j) as u8
+        j = j + 1
+    }
+    bet str.fromBytesTrust(buf)
+}
+
+// saveName — "doomsav<slot>.dsg" (the port's own savegame path convention).
+flex finna saveName(slot: int) -> str {
+    lowkey buf = mem.slab[u8](8)
+    buf[0] = 100                        // 'd'
+    buf[1] = 111                        // 'o'
+    buf[2] = 111                        // 'o'
+    buf[3] = 109                        // 'm'
+    buf[4] = 115                        // 's'
+    buf[5] = 118                        // 'v'
+    buf[6] = 118                        // 'v'
+    buf[7] = (48 + slot % 10) as u8
+    bet strCat(str.fromBytesTrust(buf), ".dsg")
+}
+
+flex finna gSaveGame(gt: tag gs.GameState, slot: int, description: str) {
+    holla g = gt in gs.gsc {
+        g.shell.savegameslot = slot as i32
+        g.shell.savedescription = description
+        g.shell.sendsave = nocap
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna gDoSaveGame(gt: tag gs.GameState) {
+    lowkey slot = 0
+    lowkey desc = ""
+    holla g = gt in gs.gsc {
+        slot = g.shell.savegameslot as int
+        desc = g.shell.savedescription
+        g.shell.gameaction = doomdef.GA_NOTHING as i32
+    } ghosted {
+        yeet("gs")
+    }
+    psaveg.saveGame(gt, saveName(slot), desc)
+    holla g = gt in gs.gsc {
+        g.shell.players[g.shell.consoleplayer as int].message = "game saved."
+        g.shell.savedescription = ""
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna gLoadGame(gt: tag gs.GameState, slot: int) {
+    holla g = gt in gs.gsc {
+        g.shell.savegameslot = slot as i32
+        g.shell.gameaction = doomdef.GA_LOADGAME as i32
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna gDoLoadGame(gt: tag gs.GameState) {
+    lowkey slot = 0
+    holla g = gt in gs.gsc {
+        slot = g.shell.savegameslot as int
+        g.shell.gameaction = doomdef.GA_NOTHING as i32
+    } ghosted {
+        yeet("gs")
+    }
+    psaveg.loadGame(gt, saveName(slot))
+}
+
+flex finna gScreenShot(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.shell.gameaction = doomdef.GA_SCREENSHOT as i32
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// DEMO playback / recording
+// -------------------------------------------------------------------------------------------------
+flex finna gDeferedPlayDemo(gt: tag gs.GameState, name: str) {
+    holla g = gt in gs.gsc {
+        g.shell.defdemoname = name
+        g.shell.gameaction = doomdef.GA_PLAYDEMO as i32
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna gDoPlayDemo(gt: tag gs.GameState) {
+    lowkey name = ""
+    holla g = gt in gs.gsc {
+        g.shell.gameaction = doomdef.GA_NOTHING as i32
+        name = g.shell.defdemoname
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey ofs = wad.lumpNameOfs(gt, name)
+    lowkey len = wad.lumpLength(gt, wad.getNumForName(gt, name))
+    lowkey skill = 0
+    lowkey episode = 0
+    lowkey map = 0
+    holla g = gt in gs.gsc {
+        // header: version, skill, episode, map, deathmatch, respawn, fast, nomonsters, cp, pig[4]
+        lowkey p = ofs
+        lowkey ver = bstream.rdU8(g.wad.buf, p)
+        p = p + 1
+        // PORTED-PARTIAL: the shareware doom1.wad demos are v109 while VERSION is 110; the oracle
+        // plays them, so the version check is relaxed (accepted, not rejected).
+        skill = bstream.rdU8(g.wad.buf, p)
+        p = p + 1
+        episode = bstream.rdU8(g.wad.buf, p)
+        p = p + 1
+        map = bstream.rdU8(g.wad.buf, p)
+        p = p + 1
+        g.shell.deathmatch = bstream.rdU8(g.wad.buf, p) as i32
+        p = p + 1
+        g.shell.respawnparm = bstream.rdU8(g.wad.buf, p) != 0
+        p = p + 1
+        g.shell.fastparm = bstream.rdU8(g.wad.buf, p) != 0
+        p = p + 1
+        g.shell.nomonsters = bstream.rdU8(g.wad.buf, p) != 0
+        p = p + 1
+        g.shell.consoleplayer = bstream.rdU8(g.wad.buf, p) as i32
+        p = p + 1
+        lowkey k = 0
+        vibin k < MAXPLAYERS {
+            g.shell.playeringame[k] = bstream.rdU8(g.wad.buf, p) != 0
+            p = p + 1
+            k = k + 1
+        }
+        g.shell.demoOfs = p             // first ticcmd byte
+        g.shell.demoend = ofs + len
+        fr g.shell.playeringame[1] {
+            g.shell.netgame = nocap
+            g.shell.netdemo = nocap
+        }
+        g.shell.precache = cap
+    } ghosted {
+        yeet("gs")
+    }
+    gInitNew(gt, skill, episode, map)
+    holla g = gt in gs.gsc {
+        g.shell.precache = nocap
+        g.shell.usergame = cap
+        g.shell.demoplayback = nocap
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// G_ReadDemoTiccmd — decode the next 4-byte demo ticcmd into players[pi].cmd; at the DEMOMARKER
+// (0x80) end the demo. forwardmove/sidemove are signed bytes; angleturn is a byte<<8; buttons a byte.
+flex finna gReadDemoTiccmd(gt: tag gs.GameState, pi: int) {
+    lowkey marker = cap
+    holla g = gt in gs.gsc {
+        marker = bstream.rdU8(g.wad.buf, g.shell.demoOfs) == DEMOMARKER
+    } ghosted {
+        yeet("gs")
+    }
+    fr marker {
+        gCheckDemoStatus(gt)
+        bet
+    }
+    holla g = gt in gs.gsc {
+        lowkey p = g.shell.demoOfs
+        g.shell.players[pi].cmd.forwardmove = bstream.rdI8(g.wad.buf, p) as i32
+        g.shell.players[pi].cmd.sidemove = bstream.rdI8(g.wad.buf, p + 1) as i32
+        g.shell.players[pi].cmd.angleturn = (bstream.rdU8(g.wad.buf, p + 2) << 8) as i32
+        g.shell.players[pi].cmd.buttons = bstream.rdU8(g.wad.buf, p + 3) as i32
+        g.shell.demoOfs = p + 4
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// G_WriteDemoTiccmd — append a 4-byte ticcmd to the record buffer (angleturn folded to a byte).
+flex finna gWriteDemoTiccmd(gt: tag gs.GameState, pi: int) {
+    holla g = gt in gs.gsc {
+        lowkey fm = g.shell.players[pi].cmd.forwardmove as int & 0xff
+        lowkey sm = g.shell.players[pi].cmd.sidemove as int & 0xff
+        lowkey at = ((g.shell.players[pi].cmd.angleturn as int + 128) >> 8) & 0xff
+        lowkey bt = g.shell.players[pi].cmd.buttons as int & 0xff
+        g.shell.syncBuf.stack(fm)       // demorecording reuses syncBuf as the growing demo buffer
+        g.shell.syncBuf.stack(sm)
+        g.shell.syncBuf.stack(at)
+        g.shell.syncBuf.stack(bt)
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna gRecordDemo(gt: tag gs.GameState, name: str) {
+    holla g = gt in gs.gsc {
+        g.shell.usergame = cap
+        g.shell.demoName = strCat(name, ".lmp")
+        g.shell.syncBuf = vec.new[int]()
+        g.shell.demorecording = nocap
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// G_BeginRecording — write the 13-byte demo header into the record buffer.
+flex finna gBeginRecording(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.shell.syncBuf.stack(VERSION)
+        g.shell.syncBuf.stack(g.shell.gameskill as int)
+        g.shell.syncBuf.stack(g.shell.gameepisode as int)
+        g.shell.syncBuf.stack(g.shell.gamemap as int)
+        g.shell.syncBuf.stack(g.shell.deathmatch as int)
+        lowkey rp = 0
+        fr g.shell.respawnparm {
+            rp = 1
+        }
+        g.shell.syncBuf.stack(rp)
+        lowkey fp = 0
+        fr g.shell.fastparm {
+            fp = 1
+        }
+        g.shell.syncBuf.stack(fp)
+        lowkey nm = 0
+        fr g.shell.nomonsters {
+            nm = 1
+        }
+        g.shell.syncBuf.stack(nm)
+        g.shell.syncBuf.stack(g.shell.consoleplayer as int)
+        lowkey k = 0
+        vibin k < MAXPLAYERS {
+            lowkey pv = 0
+            fr g.shell.playeringame[k] {
+                pv = 1
+            }
+            g.shell.syncBuf.stack(pv)
+            k = k + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna gTimeDemo(gt: tag gs.GameState, name: str) {
+    holla g = gt in gs.gsc {
+        g.shell.timingdemo = nocap
+        g.shell.singletics = nocap
+        g.shell.defdemoname = name
+        g.shell.gameaction = doomdef.GA_PLAYDEMO as i32
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// G_CheckDemoStatus — called at demo end. Timedemo: flag done (D_DoomLoop writes the sync + stops).
+// Single-play demo: quit. Otherwise: reset demo flags and advance the attract loop. Recording:
+// terminate the write buffer and flush.
+flex finna gCheckDemoStatus(gt: tag gs.GameState) {
+    lowkey timingdemo = cap
+    lowkey demoplayback = cap
+    lowkey singledemo = cap
+    lowkey demorecording = cap
+    holla g = gt in gs.gsc {
+        timingdemo = g.shell.timingdemo
+        demoplayback = g.shell.demoplayback
+        singledemo = g.shell.singledemo
+        demorecording = g.shell.demorecording
+    } ghosted {
+        yeet("gs")
+    }
+    fr demorecording {
+        holla g = gt in gs.gsc {
+            g.shell.syncBuf.stack(DEMOMARKER)
+        } ghosted {
+            yeet("gs")
+        }
+        flushDemo(gt)
+        holla g = gt in gs.gsc {
+            g.shell.demorecording = cap
+            g.shell.demoDone = nocap
+        } ghosted {
+            yeet("gs")
+        }
+        bet
+    }
+    fr timingdemo {
+        holla g = gt in gs.gsc {
+            g.shell.demoDone = nocap
+        } ghosted {
+            yeet("gs")
+        }
+        bet
+    }
+    fr demoplayback {
+        holla g = gt in gs.gsc {
+            g.shell.demoplayback = cap
+            g.shell.netdemo = cap
+            g.shell.netgame = cap
+            g.shell.deathmatch = 0
+            g.shell.playeringame[1] = cap
+            g.shell.playeringame[2] = cap
+            g.shell.playeringame[3] = cap
+            g.shell.respawnparm = cap
+            g.shell.fastparm = cap
+            g.shell.nomonsters = cap
+            g.shell.consoleplayer = 0
+        } ghosted {
+            yeet("gs")
+        }
+        fr singledemo {
+            holla g = gt in gs.gsc {
+                g.shell.quitRequested = nocap
+                g.shell.demoDone = nocap
+            } ghosted {
+                yeet("gs")
+            }
+            bet
+        }
+        holla g = gt in gs.gsc {
+            g.shell.advancedemo = nocap
+        } ghosted {
+            yeet("gs")
+        }
+    }
+}
+
+// flushDemo — write the record buffer (syncBuf, holding raw demo bytes) to the .lmp path.
+flex finna flushDemo(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        lowkey n = g.shell.syncBuf.gang() as int
+        lowkey out = mem.slab[u8](n)
+        lowkey i = 0
+        vibin i < n {
+            out[i] = g.shell.syncBuf[i] as u8
+            i = i + 1
+        }
+        fs.drop(g.shell.demoName, out)
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// =================================================================================================
+// -sync fingerprint writer. Matches ports/doom/goldens/demo3.oracle.sync EXACTLY (fixed-width hex).
+// =================================================================================================
+
+// appendStr — push a str's bytes to the sync buffer.
+flex finna appendStr(b: vec[int], s: str) {
+    lowkey i = 0
+    lowkey n = str.len(s)
+    vibin i < n {
+        b.stack(str.at(s, i))
+        i = i + 1
+    }
+}
+
+// appendHex8 — push the low 32 bits of v as 8 lowercase hex digits.
+flex finna appendHex8(b: vec[int], v: int) {
+    lowkey val = v & 0xffffffff
+    lowkey i = 0
+    vibin i < 8 {
+        lowkey nib = (val >> (28 - i * 4)) & 15
+        fr nib < 10 {
+            b.stack(48 + nib)
+        } naw {
+            b.stack(87 + nib)
+        }
+        i = i + 1
+    }
+}
+
+// appendField — " LABEL=HHHHHHHH".
+flex finna appendField(b: vec[int], label: str, v: int) {
+    appendStr(b, label)
+    appendHex8(b, v)
+}
+
+// emitSyncSetup — DG_SyncSetup: "SETUP sectors=.. lines=.. things=.." + one "SETUP T .." per mobj
+// thinker in spawn order. Walked twice: once to count FUNC_MOBJ nodes, once to emit them.
+flex finna emitSyncSetup(gt: tag gs.GameState) {
+    lowkey on = cap
+    holla g = gt in gs.gsc {
+        on = g.shell.syncOn
+    } ghosted {
+        yeet("gs")
+    }
+    fr !on {
+        bet
+    }
+    // count mobj thinkers
+    lowkey capT: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        capT = g.tick.thinkercap
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey count = 0
+    lowkey cur: tag think.Thinker = ghosted
+    holla c = capT in gs.thinkers {
+        cur = c.next
+    } ghosted {
+        yeet("cap")
+    }
+    vibin !(cur == capT) {
+        lowkey fid = 0
+        lowkey nxt: tag think.Thinker = ghosted
+        holla n = cur in gs.thinkers {
+            fid = n.funcId as int
+            nxt = n.next
+        } ghosted {
+            yeet("cur")
+        }
+        fr fid == think.FUNC_MOBJ {
+            count = count + 1
+        }
+        cur = nxt
+    }
+    lowkey ns = 0
+    lowkey nl = 0
+    holla g = gt in gs.gsc {
+        ns = g.level.numsectors as int
+        nl = g.level.numlines as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey b = vecOf(gt)
+    appendStr(b, "SETUP sectors=")
+    appendHex8(b, ns)
+    appendField(b, " lines=", nl)
+    appendField(b, " things=", count)
+    b.stack(10)
+    // emit each mobj
+    lowkey cur2: tag think.Thinker = ghosted
+    holla c = capT in gs.thinkers {
+        cur2 = c.next
+    } ghosted {
+        yeet("cap")
+    }
+    lowkey idx = 0
+    vibin !(cur2 == capT) {
+        lowkey fid = 0
+        lowkey nxt: tag think.Thinker = ghosted
+        lowkey typ = 0
+        lowkey mx = 0
+        lowkey my = 0
+        lowkey ma = 0
+        holla n = cur2 in gs.thinkers {
+            fid = n.funcId as int
+            nxt = n.next
+            typ = n.mobj.typeIdx as int
+            mx = n.mobj.x as int
+            my = n.mobj.y as int
+            ma = n.mobj.angle as int
+        } ghosted {
+            yeet("cur")
+        }
+        fr fid == think.FUNC_MOBJ {
+            appendStr(b, "SETUP T i=")
+            appendHex8(b, idx)
+            appendField(b, " type=", typ)
+            appendField(b, " x=", mx)
+            appendField(b, " y=", my)
+            appendField(b, " a=", ma)
+            b.stack(10)
+            idx = idx + 1
+        }
+        cur2 = nxt
+    }
+}
+
+// vecOf — the sync buffer (allocated by D_DoomMain when -sync is set).
+flex finna vecOf(gt: tag gs.GameState) -> vec[int] {
+    lowkey b = vec.new[int]()
+    holla g = gt in gs.gsc {
+        b = g.shell.syncBuf
+    } ghosted {
+        yeet("gs")
+    }
+    bet b
+}
+
+// emitSyncTic — DG_SyncTick: one fingerprint line for the current tic. Fields from players[0].mo,
+// prndindex, leveltime, gametic, and the LAST presented frame's crc (C lags by one; 0 on tic 0).
+flex finna emitSyncTic(gt: tag gs.GameState) {
+    lowkey on = cap
+    holla g = gt in gs.gsc {
+        on = g.shell.syncOn
+    } ghosted {
+        yeet("gs")
+    }
+    fr !on {
+        bet
+    }
+    lowkey gametic = 0
+    lowkey prnd = 0
+    lowkey health = 0
+    lowkey leveltime = 0
+    lowkey lastc = 0
+    lowkey mo: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        gametic = g.shell.gametic as int
+        prnd = g.tick.prndindex as int
+        health = g.shell.players[0].health as int
+        leveltime = g.tick.leveltime as int
+        lastc = g.shell.lastFrameCrc as int
+        mo = g.shell.players[0].mo
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey x = 0
+    lowkey y = 0
+    lowkey z = 0
+    lowkey a = 0
+    lowkey mx = 0
+    lowkey my = 0
+    lowkey sub = -1
+    holla m = mo in gs.thinkers {
+        x = m.mobj.x as int
+        y = m.mobj.y as int
+        z = m.mobj.z as int
+        a = m.mobj.angle as int
+        mx = m.mobj.momx as int
+        my = m.mobj.momy as int
+        sub = m.mobj.subsector as int
+    } ghosted {
+    }
+    lowkey sector = 0
+    fr sub >= 0 {
+        holla g = gt in gs.gsc {
+            sector = g.level.ssSector[sub] as int
+        } ghosted {
+            yeet("gs")
+        }
+    }
+    lowkey b = vecOf(gt)
+    appendStr(b, "T=")
+    appendHex8(b, gametic)
+    appendField(b, " R=", prnd)
+    appendField(b, " X=", x)
+    appendField(b, " Y=", y)
+    appendField(b, " Z=", z)
+    appendField(b, " A=", a)
+    appendField(b, " MX=", mx)
+    appendField(b, " MY=", my)
+    appendField(b, " H=", health)
+    appendField(b, " S=", sector)
+    appendField(b, " LT=", leveltime)
+    appendField(b, " C=", lastc)
+    b.stack(10)
+}
