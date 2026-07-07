@@ -1,49 +1,105 @@
-# `ports/doom` — the DOOM port (W0 harness landed)
+# `ports/doom` — DOOM, ported to `bet`
 
-The gate (plan-amendment-01.md §7.2) is met and the port has begun. **W0** (this layer)
-is the data-table codegen + verification-oracle harness; the engine port itself is the
-W1+ workstreams. The reference source (id's GPL linuxdoom-1.10) and the shareware
-`doom1.wad` live OUTSIDE the repo at `doom-reference/` (never edited; new files only in
-`doom-reference/headless/`).
+A faithful, playable port of id Software's DOOM (from the GPL `linuxdoom-1.10` source) to
+`bet`, targeting the `gg` platform layer. ~30,000 lines of C translated into ~90 `bet`
+modules that compile to a single native binary — the BSP software renderer, the full play
+simulation (physics, collision, monster AI, weapons, sector specials), WAD/asset loading,
+an OPL2 FM synthesizer for music, save/load, and the complete UI.
 
-**Design:** engine code translated from the GPL Doom source, targeting the `gg` platform
-layer (framebuffer, audio ring, input, hi-res timing). The second permanent design oracle
-(amendment §1): a brutally honest systems/gamedev test (bit manipulation, FFI, byte-level
-I/O, function tables, allocation pressure).
+**Status: DONE.** It boots, plays, saves, and renders real DOOM — verified tic-by-tic and
+pixel-by-pixel against id's behavior via deterministic demo-lump playback.
 
-## Layout
+## Parity (vs a pristine doomgeneric oracle, shareware `doom1.wad`)
 
-| path | what |
-|---|---|
-| `defs/*.bet` | GENERATED leaf modules (`cargo xtask doom-gen`): `info.bet` (states[]/mobjinfo[]/sprnames + S_/MT_/SPR_/AID_ ordinal facts), `tables.bet` (finesine/finetangent/tantoangle VERBATIM + `slopeDiv`), `sounds.bet` (S_sfx[] + SFX_/MUS_ ordinals). Do not edit; regenerate and commit. `doom-gen --check` byte-diffs them in CI style. |
-| `tools/gen_smoke.bet` | interp smoke: pulls all three defs, fills the vecs/slabs, checks ~40 hand-extracted values (`cargo run -p driver -- run ports/doom/tools/gen_smoke.bet`). |
-| `tools/goldens.bet` | (W1, not yet written) the bet twin that reprints the goldens, section per `#GOLDEN <name>` marker, for `doom-verify --goldens`. |
-| `goldens/gen/*.c` | committed C golden generators — they `#include` the reference m_fixed.c / m_random.c / tables.c so id's own code computes every value (`cargo xtask doom-golden-gen`). |
-| `goldens/*.golden` | committed outputs: FixedMul/FixedDiv grid, rndtable + 2000 P_Random, SlopeDiv + 8-octant point-to-angle sweep, table CRCs + spot values. |
-| `goldens/inventory.txt` | FROZEN census of all 720 function definitions in the reference tree (`doom-gen --inventory`); consumed by `cargo xtask doom-coverage` with `// PORTED:` / `// PORTED-PARTIAL:` / `// SKIPPED:` markers placed above definitions in the reference checkout. |
-| `goldens/oracle.patch` | headless dump platform for doomgeneric (the primary oracle), applied by `cargo xtask doom-oracle --setup` to the pinned clone at `doom-oracle/`. |
-| `goldens/demo3.oracle.sync` | committed reference sync stream: `doom1.wad -timedemo demo3` through the patched doomgeneric (2402 lines, deterministic). |
+| demo | simulation | full-frame pixels |
+|---|---|---|
+| demo1 | 5024/5026 (99.96%) | 99.56% |
+| **demo2** | **3836/3836 (100%)** | 99.69% |
+| **demo3** | **2134/2134 (100%)** | 99.81% |
 
-## The verification pipeline
+- **Simulation is byte-exact**: for two full recorded demos every per-tic fingerprint field
+  (player X/Y/Z, angle, momentum, health, RNG index, sector, leveltime) matches the
+  reference for *every* tic.
+- **The 3D renderer is pixel-perfect**: 0-diff vs id's rasterizer wherever the sim agrees.
+- **Known residuals** (not port bugs):
+  - demo1: one 2-tic self-healing RNG blip @ tic 2748 (a monster's `A_Chase` RNG crossing a
+    tic boundary; player state unaffected). See `DESYNC-LOG.md`.
+  - full-frame: ~16 tics/demo of DOOM's *own* out-of-bounds sprite-top-edge read
+    (`(frac>>16)&127` past a short post). The port and oracle compute identical math and the
+    same texel index; the byte differs only because it's undefined memory — the port reads
+    the contiguous WAD's next-lump byte, doomgeneric reads `Z_Malloc` heap garbage. See
+    `RENDER-LOG.md`.
 
-- **CRC-32 everywhere:** IEEE 802.3 reflected, poly `0xEDB88320`, init `0xFFFFFFFF`,
-  final XOR `0xFFFFFFFF`; 32-bit table entries are fed little-endian. Implementations:
-  `crates/xtask/src/doom.rs::crc32`, `goldens/gen/gen_tables.c`, the oracle patch — the
-  bet twin must copy it bit-for-bit.
-- **Sync-stream format** (oracle now, bet port from W2/W3): per-tic fingerprint lines
-  `T= R= X= Y= Z= A= MX= MY= H= S= LT= C=` (all `%08x`; player-0 mobj state, prndindex,
-  leveltime, framebuffer crc — the crc of the frame as last PRESENTED, one behind the
-  sim) plus per-level `SETUP sectors= lines= things=` and `SETUP T i= type= x= y= a=`
-  spawn-order blocks. Diff: `cargo xtask doom-verify --ours <mine> --theirs <oracle>` —
-  first divergence, 3 lines of context, per-field diff, and triage (SETUP → loader;
-  C-only → renderer; anything else → sim).
-- **Tie-breaker:** `doom-reference/headless/` builds linuxdoom-1.10 itself with modern
-  clang (see its README for hook-point caveats) when doomgeneric's testimony is in doubt.
+## Build & run
+
+```sh
+# one-time env (this Mac; see the llvm-local-build-env memory)
+export LLVM_SYS_180_PREFIX=/opt/homebrew/opt/llvm@18
+export LIBRARY_PATH="/opt/homebrew/lib:$LIBRARY_PATH"
+
+# build the compiler + the windowed runtime, then the port
+cargo build -p driver  --features llvm
+cargo build -p runtime --features gg-desktop
+target/debug/bet build ports/doom/doom.bet --runtime real -o /tmp/doom
+
+# play it (opens a gg window)
+/tmp/doom -iwad doom-reference/doom1.wad                 # attract loop → menu → New Game
+/tmp/doom -iwad doom-reference/doom1.wad -warp 1 1 -skill 3   # straight into E1M1
+```
+
+Controls follow DOOM: arrows move/turn, Ctrl fire, Alt strafe, Shift run, Space use, Esc
+menu, Tab automap, number keys select weapons; the classic cheats work (`iddqd`, `idkfa`,
+`idclev##`, …).
+
+Headless mode (`BET_GG_HEADLESS=1`, with `-timedemo <name> -sync <out>`) plays a demo
+start-to-finish and writes the fingerprint stream — the correctness harness, no window.
+`-dumpframe <tic> -dumpout <raw>` writes the 8-bit `scr0` at a gametic.
+
+## Verify (demo-lump differential oracle)
+
+```sh
+# regenerate an oracle reference (pinned doomgeneric + committed patch), git-clean = pristine
+cargo xtask doom-oracle --setup                 # clone + apply goldens/oracle.patch
+cargo xtask doom-oracle --run --demo demo3      # writes goldens/demo3.oracle.sync
+
+# run the port headless and diff tic-by-tic
+BET_GG_HEADLESS=1 /tmp/doom -iwad doom-reference/doom1.wad -timedemo demo3 -sync /tmp/ours.sync
+cargo xtask doom-verify --ours /tmp/ours.sync --theirs ports/doom/goldens/demo3.oracle.sync
+#   --sim-only ignores the frame-CRC (C) field; triage: SETUP→loader, C-only→renderer, else→sim
+
+cargo xtask doom-verify --goldens   # bit-exact unit vectors (FixedMul/Div, P_Random, tables, angles)
+cargo xtask doom-gen --check        # generated data tables byte-match the reference
+```
+
+## Layout (~90 `.bet` modules, C names kept recognizable)
+
+| dir | modules | what |
+|---|---|---|
+| `defs/` | fixed, tables\*, doomdef, event, info\*, sounds\*, strings, think, player, **gs** | primitives + the **frozen `GameState` contract** (`gs.bet`): all engine state in one crib-resident struct; every stateful fn takes `gt: tag gs.GameState`. `*` = GENERATED by `cargo xtask doom-gen`. |
+| `util/` | bstream, m_bbox, m_argv, m_random, m_cheat | byte I/O, bboxes, args, the deterministic RNGs, cheat matcher |
+| `w/` `v/` `i/` | w_wad, v_video, i_video, i_system, i_sound, i_music, i_net | WAD access, patch drawing, and the platform layer on `gg` (palette/present/input, timing, SFX, OPL2 music glue, net loopback) |
+| `r/` | r_geom, r_data, r_sky, r_draw, r_plane, r_segs, r_bsp, r_things, r_main | the BSP software renderer (geometry, textures/flats/sprites, columns/spans, walls, floors, sprites, view) |
+| `p/` | p_think, p_maputl, p_sight, p_mobj, p_map, p_inter, p_spec + doors/floor/ceilng/plats/lights/switch/telept/specutil, p_enemy, p_pspr, p_user, p_tick, p_action, p_setup, p_saveg | the play simulation: thinkers, geometry, LoS, mobjs, movement/collision, damage/pickups, sector specials, monster AI, weapons, the ticker, level load, save/load |
+| `s/` | s_sound, opl, mus, genmidi, wad | the sound engine + the OPL2/MUS/GENMIDI music core |
+| `st/ hu/ m/ am/ wi/ f/` | st_stuff/st_lib, hu_stuff/hu_lib, m_menu/m_misc, am_map, wi_stuff, f_finale/f_wipe | status bar, HUD, menus/config, automap, intermission, finale/wipe |
+| `d/` `doom.bet` | d_main, d_net, doom.bet | init order, tic-sync, the main loop, `D_Display`, demo playback, and the entry point |
+| `goldens/` | `*.oracle.sync`, `gen/*.c`, `*.golden`, `oracle.patch`, `inventory.txt`, `framediff.py` | the verification corpus (demo streams, C golden generators, the oracle patch, the pixel differ) |
+| `tools/` | `*_smoke.bet`, `firstframe.bet`, `goldens.bet`, `mus_render.bet`, … | per-package native smoke tests + the first-frame / frame-dump tools |
+
+Grind writeups: `RENDER-LOG.md` (pixel parity) and `DESYNC-LOG.md` (sim parity).
+
+## Notable `bet` findings from the port
+Stress-testing the language surfaced and hardened real features/gotchas: per-slot `evict`,
+the `fs.drop` write intrinsic, `cop T{}` zero-defaults, a dozen `gg` additions
+(keys/mouse/`tune`/`show`/`audioSpec`/headless), and the load-bearing native rule that
+`vec` is append-only and **writes through a nested `holla` don't reliably commit** (both
+`gs.bet` design and two demo-sync bugs turned on this). See `CONTRACTS.md`.
 
 ## Licensing & assets
-
-- **The port is GPL** (it derives from id Software's GPL source). The bet language and
-  toolchain are unaffected — keep this GPL code isolated in this directory.
-- **No copyrighted WADs.** Test against the shareware WAD or **Freedoom**.
+- **The port is GPL** (derived from id's GPL source); the `bet` language/toolchain are
+  unaffected — this GPL code stays isolated in this directory.
+- **No copyrighted WADs are committed.** Test with the shareware `doom1.wad` (its DEMO1/2/3
+  lumps are the correctness oracle) or Freedoom. The reference source and WAD live outside
+  the repo at `doom-reference/` (never edited except `// PORTED:` markers).
 - **Correctness oracle:** deterministic demo-lump playback diffed against a reference port
   (differential testing against id's 1993 behavior; amendment §6.3).
