@@ -48,8 +48,12 @@ RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path \
  && chmod -R a+rwX "$RUSTUP_HOME" "$CARGO_HOME"
 
 # 4) cargo-nextest (the project's test runner) — the official prebuilt static binary, no compile.
-RUN curl -fsSL https://get.nexte.st/latest/linux | tar -xzf - -C /usr/local/cargo/bin \
- && chmod a+rx /usr/local/cargo/bin/cargo-nextest
+#    Pinned to a specific version so the image is reproducible (a bare `latest` URL would drift
+#    between rebuilds). Bump NEXTEST_VERSION deliberately.
+ARG NEXTEST_VERSION=0.9.140
+RUN curl -fsSL "https://get.nexte.st/${NEXTEST_VERSION}/linux" | tar -xzf - -C /usr/local/cargo/bin \
+ && chmod a+rx /usr/local/cargo/bin/cargo-nextest \
+ && cargo-nextest --version
 
 # 5) Work around the DOOM smoke tools' hardcoded absolute macOS WAD path
 #    (/Users/lukebaggett/.../doom-reference/doom1.wad) so they can run unmodified: point that

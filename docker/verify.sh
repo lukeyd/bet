@@ -73,16 +73,18 @@ step "runtime"     cargo build -p runtime      # headless real runtime (byte-ide
 
 # ---------------------------------------------------------------------------
 sec "3. compile the DOOM port -> native x86_64 binary"
-# NOTE: this stage currently drives the `bet` backend into runaway memory (>45 GB). The
-# container's cgroup cap (above) turns that into a clean in-container OOM (exit 137) instead of a
-# host-endangering event. Exit 137 is reported distinctly so it reads as "hit the memory cap".
+# The container's cgroup cap (above) is a standing guardrail: any OOM here is a clean in-container
+# kill (exit 137), never a host-endangering event. (The aggregate-codegen blowup that once made
+# this compile balloon past 24 GB was fixed in #29; the cap stays as protection against
+# regressions.) Exit 137 is reported distinctly so it reads as "hit the memory cap", not a
+# compile error.
 target/debug/bet build ports/doom/doom.bet --runtime real -o /tmp/doom
 rc=$?
 if [[ $rc -eq 0 ]]; then
   ok "compile ports/doom/doom.bet"
   file /tmp/doom; ls -la /tmp/doom
 elif [[ $rc -eq 137 || $rc -eq 139 ]]; then
-  bad "compile ports/doom/doom.bet (exit $rc — OOM-killed at the cgroup cap; runaway memory in the bet backend)"
+  bad "compile ports/doom/doom.bet (exit $rc — OOM-killed at the cgroup cap; raise BET_MEM_LIMIT to investigate)"
 else
   bad "compile ports/doom/doom.bet (exit $rc)"
 fi

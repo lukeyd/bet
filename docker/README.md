@@ -99,5 +99,7 @@ some Mac-only assumptions still worth noting.
 - `ubuntu:22.04`, LLVM 18 from `apt.llvm.org` (jammy), Rust via rustup under `/usr/local`.
 - Contains **no project source** — the repo is bind-mounted at `/work`, so editing code never
   requires an image rebuild.
-- A named volume (`bet-cargo-registry`) persists the cargo download cache across runs.
+- The cargo download cache persists across runs via a gitignored bind mount at
+  `/work/.docker-cache/cargo` (compose sets `CARGO_HOME` there) — owned by the runtime user, so
+  no root-owned artifacts. Delete `.docker-cache/` to clear it.
 - `LLVM_SYS_180_PREFIX=/usr/lib/llvm-18` is baked in (matches `llvm-sys 180` + the port README).
