@@ -1,5 +1,5 @@
 visspriteP=2
   vissprite[1] scale=52429 patch=327 x1=143 x2=171
   vissprite[0] scale=69899 patch=467 x1=109 x2=123
-scr0NonzeroPixels=60294
-scr0Crc=0x98df0334
+scr0NonzeroPixels=50907
+scr0Crc=0xdb3028aa

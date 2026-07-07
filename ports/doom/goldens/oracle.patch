@@ -21,10 +21,10 @@ index b8962cc..4b37083 100644
  static loop_interface_t doom_loop_interface = {
 diff --git a/doomgeneric/doomgeneric_dump.c b/doomgeneric/doomgeneric_dump.c
 new file mode 100644
-index 0000000..88b403a
+index 0000000..010b4d2
 --- /dev/null
 +++ b/doomgeneric/doomgeneric_dump.c
-@@ -0,0 +1,185 @@
+@@ -0,0 +1,265 @@
 +//
 +// doomgeneric_dump.c — headless "dump" platform for the bet DOOM port's oracle
 +// (added by ports/doom/goldens/oracle.patch; built by `cargo xtask doom-oracle`).
@@ -68,6 +68,8 @@ index 0000000..88b403a
 +
 +extern int prndindex; /* m_random.c keeps it private to the header's users */
 +
++static uint32_t crc32_buf(const unsigned char* p, size_t n); /* fwd (defined below) */
++
 +//
 +// DG platform callbacks: headless.
 +//
@@ -76,8 +78,67 @@ index 0000000..88b403a
 +{
 +}
 +
++//
++// DG_DrawFrame — present hook (called from I_FinishUpdate). Headless: no-op, EXCEPT when
++// DOOM_FRAME_OUT + DOOM_FRAME_TIC are set — then, on the tic where gametic == DOOM_FRAME_TIC,
++// write the raw 8-bit paletted I_VideoBuffer (SCREENWIDTH*SCREENHEIGHT bytes) to DOOM_FRAME_OUT.
++// This is exactly the frame whose crc is reported as the sync stream's C field at line T=gametic
++// (both are the last-PRESENTED frame at this gametic), so it lines up tic-for-tic with the bet
++// port's -dumpframe. A stderr note prints gametic + crc so the dumped frame can be cross-checked
++// against demo3.oracle.sync's C column.
++//
 +void DG_DrawFrame()
 +{
++    static int done = 0;
++    const char* path;
++    const char* stic;
++    int target;
++    FILE* f;
++
++    if (done)
++        return;
++    path = getenv("DOOM_FRAME_OUT");
++    stic = getenv("DOOM_FRAME_TIC");
++    if (!path || !path[0] || !stic || !stic[0])
++        return;
++    target = atoi(stic);
++    if (!I_VideoBuffer)
++        return;
++    {
++        /* Select which presented frame to dump. Default: gametic == DOOM_FRAME_TIC (aligns with
++         * the sync C field at line T=gametic for steady-state tics). DOOM_FRAME_CRC=<hex> instead
++         * matches by framebuffer crc (for startup frames whose gametic is aliased). DOOM_FRAME_SKIP
++         * skips that many matching frames first (to step past fade-in / attract frames). */
++        const char* scrc = getenv("DOOM_FRAME_CRC");
++        if (scrc && scrc[0]) {
++            unsigned want = (unsigned)strtoul(scrc, NULL, 16);
++            unsigned got = crc32_buf((const unsigned char*)I_VideoBuffer,
++                                     (size_t)SCREENWIDTH * (size_t)SCREENHEIGHT);
++            if (got != want)
++                return;
++        } else if ((int)gametic != target) {
++            return;
++        }
++        {
++            const char* ssk = getenv("DOOM_FRAME_SKIP");
++            if (ssk && ssk[0]) {
++                static int seen = 0;
++                if (seen++ < atoi(ssk))
++                    return;
++            }
++        }
++    }
++
++    f = fopen(path, "wb");
++    if (f) {
++        fwrite(I_VideoBuffer, 1, (size_t)SCREENWIDTH * (size_t)SCREENHEIGHT, f);
++        fclose(f);
++    }
++    fprintf(stderr, "[oracle] DOOM_FRAME_OUT: gametic=%d crc=%08x -> %s\n", (int)gametic,
++            (unsigned)crc32_buf((const unsigned char*)I_VideoBuffer,
++                                (size_t)SCREENWIDTH * (size_t)SCREENHEIGHT),
++            path);
++    done = 1;
 +}
 +
 +void DG_SleepMs(uint32_t ms)
@@ -143,6 +204,25 @@ index 0000000..88b403a
 +    FILE* f = sync_out();
 +    mobj_t* mo;
 +    unsigned x = 0, y = 0, z = 0, a = 0, mx = 0, my = 0, s = 0, c = 0;
++
++    /* Capture the exact frame whose crc becomes the sync C field at this T=gametic (the
++     * last-PRESENTED frame, read here just as the C field is). Lets the startup frames (whose
++     * gametic is aliased at DG_DrawFrame time) still be diffed by their sync-tic label. */
++    {
++        const char* sp = getenv("DOOM_SYNCFRAME_OUT");
++        const char* st = getenv("DOOM_SYNCFRAME_TIC");
++        if (sp && sp[0] && st && st[0] && (int)gametic == atoi(st) && I_VideoBuffer) {
++            FILE* ff = fopen(sp, "wb");
++            if (ff) {
++                fwrite(I_VideoBuffer, 1, (size_t)SCREENWIDTH * (size_t)SCREENHEIGHT, ff);
++                fclose(ff);
++            }
++            fprintf(stderr, "[oracle] DOOM_SYNCFRAME: T=%d crc=%08x -> %s\n", (int)gametic,
++                    (unsigned)crc32_buf((const unsigned char*)I_VideoBuffer,
++                                        (size_t)SCREENWIDTH * (size_t)SCREENHEIGHT),
++                    sp);
++        }
++    }
 +
 +    if (!f || gamestate != GS_LEVEL)
 +        return;

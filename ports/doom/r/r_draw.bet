@@ -143,26 +143,32 @@ flex finna initTranslationTables(gt: tag gs.GameState) {
     }
 }
 
+// R_DrawSpan — draws one horizontal flat span. Mirrors doomgeneric's (the parity oracle's) ACTIVE
+// R_DrawSpan, NOT linuxdoom's `#if 0` separate-xfrac/yfrac reference: it PACKS x (top 16 bits) and
+// y (bottom 16 bits) of the texture coordinate into a single u32 `position` — 6 integer + 10
+// fractional bits per axis — and advances it with one 32-bit `position += step`. That reduced
+// (10-bit) fractional precision plus the x<-y carry coupling produce the exact sub-texel walk id's
+// oracle takes; stepping xfrac/yfrac separately at full 16.16 precision drifts and mismatches the
+// oracle by a scatter of ±1-texel floor pixels. See ports/doom/RENDER-LOG.md (span-precision fix).
 flex finna drawSpan(gt: tag gs.GameState) {
     holla g = gt in gs.gsc {
         lowkey x1: int = g.render.ds_x1 as int
         lowkey x2: int = g.render.ds_x2 as int
         lowkey y: int = g.render.ds_y as int
-        lowkey xfrac: i32 = g.render.ds_xfrac
-        lowkey yfrac: i32 = g.render.ds_yfrac
-        lowkey xstep: i32 = g.render.ds_xstep
-        lowkey ystep: i32 = g.render.ds_ystep
         lowkey dest: int = g.render.ylookup[y] as int + g.render.columnofs[x1] as int
         lowkey count: int = x2 - x1
         lowkey srcOfs: int = g.render.ds_sourceOfs as int
         lowkey cmapOfs: int = g.render.ds_colormapOfs as int
+        lowkey position: u32 = (((g.render.ds_xfrac as u32) << 10) & 4294901760) | ((g.render.ds_yfrac as u32) >> 6 & 65535)
+        lowkey step: u32 = (((g.render.ds_xstep as u32) << 10) & 4294901760) | ((g.render.ds_ystep as u32) >> 6 & 65535)
         vibin count >= 0 {
-            lowkey spot: int = ((yfrac >> 10 & 4032) + (xfrac >> 16 & 63)) as int
+            lowkey ytemp: int = (position >> 4 & 4032) as int
+            lowkey xtemp: int = (position >> 26) as int
+            lowkey spot: int = xtemp | ytemp
             lowkey px: int = g.wad.buf[srcOfs + spot] as int
             g.vid.scr0[dest] = g.render.colormaps[cmapOfs + px]
             dest = dest + 1
-            xfrac = xfrac + xstep
-            yfrac = yfrac + ystep
+            position = position + step
             count = count - 1
         }
     } ghosted {

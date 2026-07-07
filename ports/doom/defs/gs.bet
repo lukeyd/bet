@@ -647,6 +647,9 @@ flex drip GameShell {
     flex syncPath: str
     flex syncBuf: vec[int]         // accumulated ASCII bytes; fs.drop'd at demo end (null until D_DoomMain)
     flex lastFrameCrc: i32         // crc32 of the LAST presented scr0 (C lags the sim one frame)
+    // -dumpframe <tic> -dumpout <path>: write the 8-bit scr0 at gametic==dumpTic (render parity) --
+    flex dumpTic: i32              // gametic at which to fs.drop scr0 (0 with empty dumpPath = off)
+    flex dumpPath: str             // output path for the raw 64000-byte 8-bit frame ("" = disabled)
     flex demoDone: bool            // set by G_CheckDemoStatus in timedemo; breaks D_DoomLoop
     flex maxframes: i32            // headless self-terminate cap (0 = unlimited)
     flex frameCount: i32           // frames elapsed since D_DoomLoop start

@@ -215,6 +215,26 @@ flex finna dDisplay(gt: tag gs.GameState) {
             yeet("gs")
         }
     }
+    // -dumpframe render-parity dump: write the finished 8-bit scr0 at the target gametic. This is
+    // exactly the frame whose crc becomes the sync C at line T=gametic — so it lines up tic-for-tic
+    // with the oracle's DG_DrawFrame dump (DOOM_FRAME_TIC==gametic). See ports/doom/RENDER-LOG.md.
+    lowkey dumpPath = ""
+    lowkey dumpTic = 0
+    holla g = gt in gs.gsc {
+        dumpPath = g.shell.dumpPath
+        dumpTic = g.shell.dumpTic as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr str.len(dumpPath) > 0 && gametic == dumpTic {
+        lowkey dc = crc32Scr0(gt)
+        holla g = gt in gs.gsc {
+            fs.drop(dumpPath, g.vid.scr0)
+        } ghosted {
+            yeet("gs")
+        }
+        spill.f("[doom] -dumpframe: gametic={} crc={} -> {}\n", gametic, dc, dumpPath)
+    }
     // present (in timedemo, skip the blocking melt — keep the sim uncapped & deterministic)
     fr wipe && !timingdemo {
         fwipe.wipeEndScreen(gt)
@@ -531,6 +551,26 @@ flex finna doomMain(gt: tag gs.GameState) {
             g.shell.syncOn = nocap
             g.shell.syncPath = syncOut
             g.shell.syncBuf = vec.new[int]()
+        } ghosted {
+            yeet("gs")
+        }
+    }
+    // -- -dumpframe <tic> -dumpout <path>: raw 8-bit frame dump for render parity (W3) -----------
+    lowkey dumpOut = argAfter("-dumpout")
+    fr str.len(dumpOut) > 0 {
+        lowkey sTic = argAfter("-dumpframe")
+        lowkey dt = 0
+        lowkey di = 0
+        vibin di < str.len(sTic) {
+            lowkey dc = str.at(sTic, di)
+            fr dc >= 48 && dc <= 57 {
+                dt = dt * 10 + (dc - 48)
+            }
+            di = di + 1
+        }
+        holla g = gt in gs.gsc {
+            g.shell.dumpTic = dt as i32
+            g.shell.dumpPath = dumpOut
         } ghosted {
             yeet("gs")
         }

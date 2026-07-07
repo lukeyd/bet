@@ -199,7 +199,11 @@ flex finna executeSetViewSize(gt: tag gs.GameState) {
 
 flex finna rInit(gt: tag gs.GameState) {
     rdata.initData(gt)
-    setViewSize(gt, 11, 0)
+    // screenblocks 10 == full-width (320) 3D view 168 rows tall WITH the status bar (centery 84),
+    // matching the reference default (m_menu.c `screenblocks = 10`). Using 11 (fullscreen, 200 tall,
+    // centery 100) shifts the whole 3D projection down 16 rows -> every textured pixel mismatches
+    // the oracle. See ports/doom/RENDER-LOG.md (2026-07-06 centery/viewheight fix).
+    setViewSize(gt, 10, 0)
     executeSetViewSize(gt)
     initLightTables(gt)
     rsky.initSkyMap(gt)
