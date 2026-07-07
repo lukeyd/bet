@@ -922,6 +922,14 @@ flex finna slideMove(gt: tag gs.GameState, mo: tag think.Thinker) {
         }
         // fudge a bit so it doesn't quite hit
         bestfrac = bestfrac - 0x800
+        // Track the mobj position after the "move up to the wall" step. The reference's
+        // "continue along the wall" P_TryMove reads the ALREADY-advanced mo->x/mo->y, so the
+        // along-move must start there — not from the loop-entry (mx,my). P_TryMove sets
+        // mo->x/mo->y to its target exactly on success, so we know the advanced position is
+        // (mx+newx, my+newy) without re-reading the mobj (a re-read through a fresh `holla`
+        // after a nested-`holla` write is not reliable in native lowering).
+        lowkey ux: i32 = mx
+        lowkey uy: i32 = my
         fr bestfrac > 0 {
             lowkey newx: i32 = fixed.fixedMul(momx, bestfrac)
             lowkey newy: i32 = fixed.fixedMul(momy, bestfrac)
@@ -929,6 +937,8 @@ flex finna slideMove(gt: tag gs.GameState, mo: tag think.Thinker) {
                 stairStep(gt, mo)
                 bet
             }
+            ux = mx + newx
+            uy = my + newy
         }
         // continue along the wall — the remaining fraction
         lowkey rem: i32 = (fixed.FRACUNIT - (bestfrac + 0x800)) as i32
@@ -965,18 +975,8 @@ flex finna slideMove(gt: tag gs.GameState, mo: tag think.Thinker) {
         } ghosted {
             yeet("mo")
         }
-        // Reference P_SlideMove: P_TryMove (mo, mo->x+tmxmove, mo->y+tmymove) — the mobj was
-        // already advanced up to the wall by the "move up" P_TryMove above, so this must start
-        // from the CURRENT (advanced) position, not the loop-entry (mx,my).
-        lowkey curx: i32 = 0
-        lowkey cury: i32 = 0
-        holla t = mo in gs.thinkers {
-            curx = t.mobj.x
-            cury = t.mobj.y
-        } ghosted {
-            yeet("mo")
-        }
-        fr tryMove(gt, mo, curx + nmx, cury + nmy) {
+        // P_TryMove (mo, mo->x+tmxmove, mo->y+tmymove): mo->x/mo->y are the advanced (ux,uy).
+        fr tryMove(gt, mo, ux + nmx, uy + nmy) {
             bet
         }
         // blocked again -> retry

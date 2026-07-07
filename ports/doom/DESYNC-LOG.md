@@ -53,4 +53,21 @@ ordering bug.
 - **result**: demo3 sim now matches **all 2134 tics** (2402/2402 stream lines under
   `--sim-only`). The remaining full-diff divergence is the `C` framebuffer crc (renderer).
 
+### follow-up: the fix must NOT re-read the mobj through a fresh `holla`
+
+The first cut of this fix re-read the advanced position with
+`holla t = mo in gs.thinkers { curx = t.mobj.x; cury = t.mobj.y }` right after the
+"move up to the wall" `tryMove`. That is the *nested-`holla` diverges in native* gotcha:
+a fresh `holla` read of a field that a prior nested `holla` (inside `tryMove` →
+`P_SetThingPosition`) just wrote is **not reliably ordered** in native lowering — the
+read can observe the stale (pre-move-up) value. It happened to pass with debug
+instrumentation present (the extra `holla` blocks perturbed codegen) and regress once the
+instrumentation was removed; demo2/demo3 flapped between line-357/300 and full match
+depending on the build. Root fix: don't re-read at all. `P_TryMove` sets `mo->x/mo->y` to
+its target exactly on success, so the advanced position is *known* to be `(mx+newx,
+my+newy)`; track it in locals `ux`/`uy` and pass `ux+nmx, uy+nmy` to the along-move
+`tryMove`. Deterministic, and exact per the reference.
+- **result**: demo1 advances 278 → 2966, **demo2 and demo3 match ALL tics** (4147/4147
+  and 2402/2402), stable across repeated runs.
+
 ---
