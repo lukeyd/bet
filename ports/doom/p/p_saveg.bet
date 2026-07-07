@@ -1,0 +1,1080 @@
+// p/p_saveg.bet — SAVEGAMES: serialize + restore the full simulation state (linuxdoom-1.10
+// p_saveg.c). save->load->continue reconstructs a byte-identical sim.
+//
+// PORTED: P_SaveGame, P_LoadGame, P_ArchivePlayers, P_UnArchivePlayers, P_ArchiveWorld,
+//   P_UnArchiveWorld, P_ArchiveThinkers, P_UnArchiveThinkers, P_ArchiveSpecials,
+//   P_UnArchiveSpecials.
+//
+// DEVIATION FROM VANILLA (documented, per plan): NOT byte-compatible with vanilla's 32-bit
+// struct dumps. This is a versioned bet-native format ("BSAV" magic + a version word), because
+// bet has no raw pointers — mobj cross-refs are `tag think.Thinker`, not `mobj_t*`. Vanilla
+// memcpy's whole structs and swizzles pointers to array indices; here every field is written
+// explicitly little-endian and every mobj cross-ref (target/tracer, player->mo/attacker) is
+// converted to a SERIAL INDEX (the mobj's ordinal position in the thinker list) on save and
+// resolved back to a tag on load. Behaviorally equivalent, not bit-for-bit.
+//
+// TAG <-> SERIAL-INDEX SCHEME (no pointer arithmetic, no scratch fields, no tag arrays):
+//   * SAVE:  `serialOf(gt, target)` walks the thinker list (thinkercap.next ..) counting only
+//            FUNC_MOBJ nodes; returns the ordinal of the node whose tag == target, or -1 for a
+//            null/ghosted tag. Because both the mobj-write pass and serialOf walk the list in the
+//            same order, the k-th mobj written gets serial k and serialOf(that tag) == k.
+//   * LOAD:  mobjs are read in serial order and appended (P_AddThinker) so the freshly-built list
+//            is [mobj0, mobj1, ...]. `tagOfSerial(gt, idx)` walks to the idx-th FUNC_MOBJ node's
+//            tag (ghosted for idx < 0). A second pass fixes up target/tracer (and players' mo/
+//            attacker) from the stored serial indices. snext/sprev/bnext/bprev/subsector are NOT
+//            saved — P_SetThingPosition rebuilds them from x/y.
+//
+// STASIS specials need no special-casing: this port keeps a ceiling in stasis at funcId
+//   FUNC_CEILING (direction==0, olddirection preserved) and a plat at FUNC_PLAT
+//   (status==PLAT_INSTASIS). Both are ordinary live thinker-list nodes, so the funcId walk
+//   captures them and their SectorAction fields carry the stasis state.
+//
+// NOT PERSISTED (matches vanilla): the switch/button timer list (buttonlist — transient texture
+//   animations), the item-respawn queue, the ChangeSector crush regs, and player.message (nulled
+//   on load). The RNG index (prndindex/rndindex) IS persisted (header) and restored last, so a
+//   resumed sim's RNG stream is exact (setup consumes RNG; we overwrite it back) — this is the
+//   seam the W3 save-mid-demo determinism test builds on.
+//
+// NATIVE is the correctness target (WAD-scale setup/unarchive). Proven by tools/saveg_smoke.bet
+//   (goldens/saveg.golden).
+//
+// SEAMS for P2.8 (g/g_game): G_SaveGame -> saveGame(gt, path, description); G_DoLoadGame ->
+//   loadGame(gt, path). The save-slot menu + per-char description editing is P2.9b's (m_menu);
+//   this module provides the file I/O + the (un)archive.
+pull "fs"
+pull "mem"
+pull "vec"
+pull "str"
+pull "../defs/gs" as gs
+pull "../defs/think" as think
+pull "../util/bstream" as bstream
+pull "../p/p_setup" as psetup
+pull "../p/p_think" as pthink
+pull "../p/p_maputl" as pmaputl
+pull "../p/p_specutil" as psu
+pull "../p/p_ceilng" as pceilng
+pull "../p/p_plats" as pplats
+
+// ---- format facts -------------------------------------------------------------------------
+flex facts SAVE_VERSION: int = 1
+flex facts TC_END: int = 0          // thinker-list / specials-list terminator (no FUNC_* is 0)
+flex facts MOBJ_FIELDS: int = 32    // i32 words per mobj record (see writeMobj / readMobj)
+
+// ===========================================================================================
+// little-endian byte writers over an append-only byte vec (mus_render.bet's WAV pattern)
+// ===========================================================================================
+flex finna wU8(b: vec[int], v: int) {
+    b.stack(v & 255)
+}
+
+flex finna wI16(b: vec[int], v: int) {
+    b.stack(v & 255)
+    b.stack((v >> 8) & 255)
+}
+
+flex finna wI32(b: vec[int], v: int) {
+    b.stack(v & 255)
+    b.stack((v >> 8) & 255)
+    b.stack((v >> 16) & 255)
+    b.stack((v >> 24) & 255)
+}
+
+flex finna wStr(b: vec[int], s: str) {
+    lowkey n: int = str.len(s)
+    wI16(b, n)
+    lowkey i: int = 0
+    vibin i < n {
+        b.stack(str.at(s, i) & 255)
+        i = i + 1
+    }
+}
+
+// ===========================================================================================
+// tag <-> serial-index helpers (walk the thinker list; count FUNC_MOBJ nodes)
+// ===========================================================================================
+
+// serialOf — mobj ordinal of `target` in the thinker list, or -1 if null/ghosted.
+flex finna serialOf(gt: tag gs.GameState, target: tag think.Thinker) -> int {
+    fr target == ghosted {
+        bet -1
+    }
+    lowkey capT: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        capT = g.tick.thinkercap
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey cur: tag think.Thinker = ghosted
+    holla c = capT in gs.thinkers {
+        cur = c.next
+    } ghosted {
+        yeet("cap")
+    }
+    lowkey idx: int = 0
+    lowkey res: int = -1
+    vibin !(cur == capT) {
+        lowkey fid: int = 0
+        lowkey nxt: tag think.Thinker = ghosted
+        holla n = cur in gs.thinkers {
+            fid = n.funcId as int
+            nxt = n.next
+        } ghosted {
+            yeet("cur")
+        }
+        fr fid == think.FUNC_MOBJ {
+            fr cur == target {
+                res = idx
+            }
+            idx = idx + 1
+        }
+        cur = nxt
+    }
+    bet res
+}
+
+// tagOfSerial — the tag of the idx-th FUNC_MOBJ node (ghosted for idx < 0 / out of range).
+flex finna tagOfSerial(gt: tag gs.GameState, idx: int) -> tag think.Thinker {
+    lowkey res: tag think.Thinker = ghosted
+    fr idx < 0 {
+        bet res
+    }
+    lowkey capT: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        capT = g.tick.thinkercap
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey cur: tag think.Thinker = ghosted
+    holla c = capT in gs.thinkers {
+        cur = c.next
+    } ghosted {
+        yeet("cap")
+    }
+    lowkey k: int = 0
+    vibin !(cur == capT) {
+        lowkey fid: int = 0
+        lowkey nxt: tag think.Thinker = ghosted
+        holla n = cur in gs.thinkers {
+            fid = n.funcId as int
+            nxt = n.next
+        } ghosted {
+            yeet("cur")
+        }
+        fr fid == think.FUNC_MOBJ {
+            fr k == idx {
+                res = cur
+            }
+            k = k + 1
+        }
+        cur = nxt
+    }
+    bet res
+}
+
+// ===========================================================================================
+// P_ArchivePlayers / P_UnArchivePlayers
+// ===========================================================================================
+
+// one player's fields (mo + attacker as serial indices). Called for in-game players only.
+flex finna writePlayer(gt: tag gs.GameState, b: vec[int], pi: int) {
+    lowkey mo: tag think.Thinker = ghosted
+    lowkey attacker: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        mo = g.shell.players[pi].mo
+        attacker = g.shell.players[pi].attacker
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey moSerial: int = serialOf(gt, mo)
+    lowkey atkSerial: int = serialOf(gt, attacker)
+    holla g = gt in gs.gsc {
+        wI32(b, g.shell.players[pi].playerstate as int)
+        wI32(b, g.shell.players[pi].viewz as int)
+        wI32(b, g.shell.players[pi].viewheight as int)
+        wI32(b, g.shell.players[pi].deltaviewheight as int)
+        wI32(b, g.shell.players[pi].bob as int)
+        wI32(b, g.shell.players[pi].health as int)
+        wI32(b, g.shell.players[pi].armorpoints as int)
+        wI32(b, g.shell.players[pi].armortype as int)
+        lowkey i: int = 0
+        vibin i < 6 {
+            wI32(b, g.shell.players[pi].powers[i] as int)
+            i = i + 1
+        }
+        i = 0
+        vibin i < 6 {
+            fr g.shell.players[pi].cards[i] {
+                wU8(b, 1)
+            } naw {
+                wU8(b, 0)
+            }
+            i = i + 1
+        }
+        fr g.shell.players[pi].backpack {
+            wU8(b, 1)
+        } naw {
+            wU8(b, 0)
+        }
+        i = 0
+        vibin i < 4 {
+            wI32(b, g.shell.players[pi].frags[i] as int)
+            i = i + 1
+        }
+        wI32(b, g.shell.players[pi].readyweapon as int)
+        wI32(b, g.shell.players[pi].pendingweapon as int)
+        i = 0
+        vibin i < 9 {
+            fr g.shell.players[pi].weaponowned[i] {
+                wU8(b, 1)
+            } naw {
+                wU8(b, 0)
+            }
+            i = i + 1
+        }
+        i = 0
+        vibin i < 4 {
+            wI32(b, g.shell.players[pi].ammo[i] as int)
+            i = i + 1
+        }
+        i = 0
+        vibin i < 4 {
+            wI32(b, g.shell.players[pi].maxammo[i] as int)
+            i = i + 1
+        }
+        fr g.shell.players[pi].attackdown {
+            wU8(b, 1)
+        } naw {
+            wU8(b, 0)
+        }
+        fr g.shell.players[pi].usedown {
+            wU8(b, 1)
+        } naw {
+            wU8(b, 0)
+        }
+        wI32(b, g.shell.players[pi].cheats as int)
+        wI32(b, g.shell.players[pi].refire as int)
+        wI32(b, g.shell.players[pi].killcount as int)
+        wI32(b, g.shell.players[pi].itemcount as int)
+        wI32(b, g.shell.players[pi].secretcount as int)
+        wI32(b, g.shell.players[pi].damagecount as int)
+        wI32(b, g.shell.players[pi].bonuscount as int)
+        wI32(b, g.shell.players[pi].extralight as int)
+        wI32(b, g.shell.players[pi].fixedcolormap as int)
+        wI32(b, g.shell.players[pi].colormap as int)
+        fr g.shell.players[pi].didsecret {
+            wU8(b, 1)
+        } naw {
+            wU8(b, 0)
+        }
+        i = 0
+        vibin i < 2 {
+            wI32(b, g.shell.players[pi].psprites[i].stateIdx as int)
+            wI32(b, g.shell.players[pi].psprites[i].tics as int)
+            wI32(b, g.shell.players[pi].psprites[i].sx as int)
+            wI32(b, g.shell.players[pi].psprites[i].sy as int)
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    wI32(b, moSerial)
+    wI32(b, atkSerial)
+}
+
+flex finna archivePlayers(gt: tag gs.GameState, b: vec[int]) {
+    lowkey i: int = 0
+    vibin i < 4 {
+        lowkey ingame: bool = cap
+        holla g = gt in gs.gsc {
+            ingame = g.shell.playeringame[i]
+        } ghosted {
+            yeet("gs")
+        }
+        fr ingame {
+            writePlayer(gt, b, i)
+        }
+        i = i + 1
+    }
+}
+
+// reads one player's fields; stashes mo/attacker serials into moIdx[pi]/atkIdx[pi] for the
+// post-thinkers fixup. Returns the advanced cursor.
+flex finna readPlayer(gt: tag gs.GameState, buf: []u8, cur0: int, pi: int, moIdx: []i32, atkIdx: []i32) -> int {
+    lowkey cur: int = cur0
+    holla g = gt in gs.gsc {
+        g.shell.players[pi].playerstate = bstream.rdI32(buf, cur) as i32
+        cur = cur + 4
+        g.shell.players[pi].viewz = bstream.rdI32(buf, cur) as i32
+        cur = cur + 4
+        g.shell.players[pi].viewheight = bstream.rdI32(buf, cur) as i32
+        cur = cur + 4
+        g.shell.players[pi].deltaviewheight = bstream.rdI32(buf, cur) as i32
+        cur = cur + 4
+        g.shell.players[pi].bob = bstream.rdI32(buf, cur) as i32
+        cur = cur + 4
+        g.shell.players[pi].health = bstream.rdI32(buf, cur) as i32
+        cur = cur + 4
+        g.shell.players[pi].armorpoints = bstream.rdI32(buf, cur) as i32
+        cur = cur + 4
+        g.shell.players[pi].armortype = bstream.rdI32(buf, cur) as i32
+        cur = cur + 4
+        lowkey i: int = 0
+        vibin i < 6 {
+            g.shell.players[pi].powers[i] = bstream.rdI32(buf, cur) as i32
+            cur = cur + 4
+            i = i + 1
+        }
+        i = 0
+        vibin i < 6 {
+            g.shell.players[pi].cards[i] = bstream.rdU8(buf, cur) != 0
+            cur = cur + 1
+            i = i + 1
+        }
+        g.shell.players[pi].backpack = bstream.rdU8(buf, cur) != 0
+        cur = cur + 1
+        i = 0
+        vibin i < 4 {
+            g.shell.players[pi].frags[i] = bstream.rdI32(buf, cur) as i32
+            cur = cur + 4
+            i = i + 1
+        }
+        g.shell.players[pi].readyweapon = bstream.rdI32(buf, cur) as i32
+        cur = cur + 4
+        g.shell.players[pi].pendingweapon = bstream.rdI32(buf, cur) as i32
+        cur = cur + 4
+        i = 0
+        vibin i < 9 {
+            g.shell.players[pi].weaponowned[i] = bstream.rdU8(buf, cur) != 0
+            cur = cur + 1
+            i = i + 1
+        }
+        i = 0
+        vibin i < 4 {
+            g.shell.players[pi].ammo[i] = bstream.rdI32(buf, cur) as i32
+            cur = cur + 4
+            i = i + 1
+        }
+        i = 0
+        vibin i < 4 {
+            g.shell.players[pi].maxammo[i] = bstream.rdI32(buf, cur) as i32
+            cur = cur + 4
+            i = i + 1
+        }
+        g.shell.players[pi].attackdown = bstream.rdU8(buf, cur) != 0
+        cur = cur + 1
+        g.shell.players[pi].usedown = bstream.rdU8(buf, cur) != 0
+        cur = cur + 1
+        g.shell.players[pi].cheats = bstream.rdI32(buf, cur) as i32
+        cur = cur + 4
+        g.shell.players[pi].refire = bstream.rdI32(buf, cur) as i32
+        cur = cur + 4
+        g.shell.players[pi].killcount = bstream.rdI32(buf, cur) as i32
+        cur = cur + 4
+        g.shell.players[pi].itemcount = bstream.rdI32(buf, cur) as i32
+        cur = cur + 4
+        g.shell.players[pi].secretcount = bstream.rdI32(buf, cur) as i32
+        cur = cur + 4
+        g.shell.players[pi].damagecount = bstream.rdI32(buf, cur) as i32
+        cur = cur + 4
+        g.shell.players[pi].bonuscount = bstream.rdI32(buf, cur) as i32
+        cur = cur + 4
+        g.shell.players[pi].extralight = bstream.rdI32(buf, cur) as i32
+        cur = cur + 4
+        g.shell.players[pi].fixedcolormap = bstream.rdI32(buf, cur) as i32
+        cur = cur + 4
+        g.shell.players[pi].colormap = bstream.rdI32(buf, cur) as i32
+        cur = cur + 4
+        g.shell.players[pi].didsecret = bstream.rdU8(buf, cur) != 0
+        cur = cur + 1
+        i = 0
+        vibin i < 2 {
+            g.shell.players[pi].psprites[i].stateIdx = bstream.rdI32(buf, cur) as i32
+            cur = cur + 4
+            g.shell.players[pi].psprites[i].tics = bstream.rdI32(buf, cur) as i32
+            cur = cur + 4
+            g.shell.players[pi].psprites[i].sx = bstream.rdI32(buf, cur) as i32
+            cur = cur + 4
+            g.shell.players[pi].psprites[i].sy = bstream.rdI32(buf, cur) as i32
+            cur = cur + 4
+            i = i + 1
+        }
+        // will be resolved after thinkers exist (fixupPlayers). Null for now (id nulls mo/attacker).
+        g.shell.players[pi].mo = ghosted
+        g.shell.players[pi].attacker = ghosted
+        g.shell.players[pi].message = ""
+    } ghosted {
+        yeet("gs")
+    }
+    moIdx[pi] = bstream.rdI32(buf, cur) as i32
+    cur = cur + 4
+    atkIdx[pi] = bstream.rdI32(buf, cur) as i32
+    cur = cur + 4
+    bet cur
+}
+
+flex finna unArchivePlayers(gt: tag gs.GameState, buf: []u8, cur0: int, moIdx: []i32, atkIdx: []i32) -> int {
+    lowkey cur: int = cur0
+    lowkey i: int = 0
+    vibin i < 4 {
+        moIdx[i] = -1
+        atkIdx[i] = -1
+        lowkey ingame: bool = cap
+        holla g = gt in gs.gsc {
+            ingame = g.shell.playeringame[i]
+        } ghosted {
+            yeet("gs")
+        }
+        fr ingame {
+            cur = readPlayer(gt, buf, cur, i, moIdx, atkIdx)
+        }
+        i = i + 1
+    }
+    bet cur
+}
+
+flex finna fixupPlayers(gt: tag gs.GameState, moIdx: []i32, atkIdx: []i32) {
+    lowkey i: int = 0
+    vibin i < 4 {
+        lowkey ingame: bool = cap
+        holla g = gt in gs.gsc {
+            ingame = g.shell.playeringame[i]
+        } ghosted {
+            yeet("gs")
+        }
+        fr ingame {
+            lowkey mo: tag think.Thinker = tagOfSerial(gt, moIdx[i] as int)
+            lowkey atk: tag think.Thinker = tagOfSerial(gt, atkIdx[i] as int)
+            holla g = gt in gs.gsc {
+                g.shell.players[i].mo = mo
+                g.shell.players[i].attacker = atk
+            } ghosted {
+                yeet("gs")
+            }
+        }
+        i = i + 1
+    }
+}
+
+// ===========================================================================================
+// P_ArchiveWorld / P_UnArchiveWorld — the mutable per-level world state (id: shorts)
+// ===========================================================================================
+flex finna archiveWorld(gt: tag gs.GameState, b: vec[int]) {
+    holla g = gt in gs.gsc {
+        lowkey nsec: int = g.level.numsectors as int
+        wI32(b, nsec)
+        lowkey i: int = 0
+        vibin i < nsec {
+            wI16(b, (g.level.secFloorH[i] >> 16) as int)
+            wI16(b, (g.level.secCeilH[i] >> 16) as int)
+            wI16(b, g.level.secFloorPic[i] as int)
+            wI16(b, g.level.secCeilPic[i] as int)
+            wI16(b, g.level.secLight[i] as int)
+            wI16(b, g.level.secSpecial[i] as int)
+            wI16(b, g.level.secTag[i] as int)
+            i = i + 1
+        }
+        lowkey nlines: int = g.level.numlines as int
+        wI32(b, nlines)
+        i = 0
+        vibin i < nlines {
+            wI16(b, g.level.lineFlags[i] as int)
+            wI16(b, g.level.lineSpecial[i] as int)
+            wI16(b, g.level.lineTag[i] as int)
+            lowkey s0: int = g.level.lineSide0[i] as int
+            fr s0 != -1 {
+                wI16(b, (g.level.sdTexOfs[s0] >> 16) as int)
+                wI16(b, (g.level.sdRowOfs[s0] >> 16) as int)
+                wI16(b, g.level.sdTopTex[s0] as int)
+                wI16(b, g.level.sdBotTex[s0] as int)
+                wI16(b, g.level.sdMidTex[s0] as int)
+            }
+            lowkey s1: int = g.level.lineSide1[i] as int
+            fr s1 != -1 {
+                wI16(b, (g.level.sdTexOfs[s1] >> 16) as int)
+                wI16(b, (g.level.sdRowOfs[s1] >> 16) as int)
+                wI16(b, g.level.sdTopTex[s1] as int)
+                wI16(b, g.level.sdBotTex[s1] as int)
+                wI16(b, g.level.sdMidTex[s1] as int)
+            }
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+flex finna unArchiveWorld(gt: tag gs.GameState, buf: []u8, cur0: int) -> int {
+    lowkey cur: int = cur0
+    holla g = gt in gs.gsc {
+        lowkey nsec: int = bstream.rdI32(buf, cur) as int
+        cur = cur + 4
+        lowkey i: int = 0
+        vibin i < nsec {
+            g.level.secFloorH[i] = (bstream.rdI16(buf, cur) << 16) as i32
+            cur = cur + 2
+            g.level.secCeilH[i] = (bstream.rdI16(buf, cur) << 16) as i32
+            cur = cur + 2
+            g.level.secFloorPic[i] = bstream.rdI16(buf, cur) as i32
+            cur = cur + 2
+            g.level.secCeilPic[i] = bstream.rdI16(buf, cur) as i32
+            cur = cur + 2
+            g.level.secLight[i] = bstream.rdI16(buf, cur) as i32
+            cur = cur + 2
+            g.level.secSpecial[i] = bstream.rdI16(buf, cur) as i32
+            cur = cur + 2
+            g.level.secTag[i] = bstream.rdI16(buf, cur) as i32
+            cur = cur + 2
+            // id: sec->specialdata = 0; sec->soundtarget = 0 (thinglist is rebuilt by setThingPos).
+            g.level.secLinks[i].specialT = ghosted
+            g.level.secLinks[i].soundtarget = ghosted
+            i = i + 1
+        }
+        lowkey nlines: int = bstream.rdI32(buf, cur) as int
+        cur = cur + 4
+        i = 0
+        vibin i < nlines {
+            g.level.lineFlags[i] = bstream.rdI16(buf, cur) as i32
+            cur = cur + 2
+            g.level.lineSpecial[i] = bstream.rdI16(buf, cur) as i32
+            cur = cur + 2
+            g.level.lineTag[i] = bstream.rdI16(buf, cur) as i32
+            cur = cur + 2
+            lowkey s0: int = g.level.lineSide0[i] as int
+            fr s0 != -1 {
+                g.level.sdTexOfs[s0] = (bstream.rdI16(buf, cur) << 16) as i32
+                cur = cur + 2
+                g.level.sdRowOfs[s0] = (bstream.rdI16(buf, cur) << 16) as i32
+                cur = cur + 2
+                g.level.sdTopTex[s0] = bstream.rdI16(buf, cur) as i32
+                cur = cur + 2
+                g.level.sdBotTex[s0] = bstream.rdI16(buf, cur) as i32
+                cur = cur + 2
+                g.level.sdMidTex[s0] = bstream.rdI16(buf, cur) as i32
+                cur = cur + 2
+            }
+            lowkey s1: int = g.level.lineSide1[i] as int
+            fr s1 != -1 {
+                g.level.sdTexOfs[s1] = (bstream.rdI16(buf, cur) << 16) as i32
+                cur = cur + 2
+                g.level.sdRowOfs[s1] = (bstream.rdI16(buf, cur) << 16) as i32
+                cur = cur + 2
+                g.level.sdTopTex[s1] = bstream.rdI16(buf, cur) as i32
+                cur = cur + 2
+                g.level.sdBotTex[s1] = bstream.rdI16(buf, cur) as i32
+                cur = cur + 2
+                g.level.sdMidTex[s1] = bstream.rdI16(buf, cur) as i32
+                cur = cur + 2
+            }
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    bet cur
+}
+
+// ===========================================================================================
+// P_ArchiveThinkers / P_UnArchiveThinkers — the mobjs (FUNC_MOBJ nodes)
+// ===========================================================================================
+
+// one mobj record: MOBJ_FIELDS i32 words. angle (word 11) is unsigned; target/tracer (30,31)
+// are serial indices.
+flex finna writeMobj(gt: tag gs.GameState, b: vec[int], mo: tag think.Thinker) {
+    lowkey target: tag think.Thinker = ghosted
+    lowkey tracer: tag think.Thinker = ghosted
+    holla t = mo in gs.thinkers {
+        target = t.mobj.target
+        tracer = t.mobj.tracer
+    } ghosted {
+        yeet("mo")
+    }
+    lowkey targetSerial: int = serialOf(gt, target)
+    lowkey tracerSerial: int = serialOf(gt, tracer)
+    holla t = mo in gs.thinkers {
+        wI32(b, t.mobj.typeIdx as int)
+        wI32(b, t.mobj.x as int)
+        wI32(b, t.mobj.y as int)
+        wI32(b, t.mobj.z as int)
+        wI32(b, t.mobj.momx as int)
+        wI32(b, t.mobj.momy as int)
+        wI32(b, t.mobj.momz as int)
+        wI32(b, t.mobj.floorz as int)
+        wI32(b, t.mobj.ceilingz as int)
+        wI32(b, t.mobj.radius as int)
+        wI32(b, t.mobj.height as int)
+        wI32(b, t.mobj.angle as int)
+        wI32(b, t.mobj.spriteIdx as int)
+        wI32(b, t.mobj.frame as int)
+        wI32(b, t.mobj.stateIdx as int)
+        wI32(b, t.mobj.tics as int)
+        wI32(b, t.mobj.flags as int)
+        wI32(b, t.mobj.health as int)
+        wI32(b, t.mobj.movedir as int)
+        wI32(b, t.mobj.movecount as int)
+        wI32(b, t.mobj.reactiontime as int)
+        wI32(b, t.mobj.threshold as int)
+        wI32(b, t.mobj.lastlook as int)
+        wI32(b, t.mobj.validcount as int)
+        wI32(b, t.mobj.player as int)
+        wI32(b, t.mobj.spawnpoint.x as int)
+        wI32(b, t.mobj.spawnpoint.y as int)
+        wI32(b, t.mobj.spawnpoint.angle as int)
+        wI32(b, t.mobj.spawnpoint.typ as int)
+        wI32(b, t.mobj.spawnpoint.options as int)
+    } ghosted {
+        yeet("mo")
+    }
+    wI32(b, targetSerial)
+    wI32(b, tracerSerial)
+}
+
+flex finna archiveThinkers(gt: tag gs.GameState, b: vec[int]) {
+    lowkey capT: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        capT = g.tick.thinkercap
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey cur: tag think.Thinker = ghosted
+    holla c = capT in gs.thinkers {
+        cur = c.next
+    } ghosted {
+        yeet("cap")
+    }
+    vibin !(cur == capT) {
+        lowkey fid: int = 0
+        lowkey nxt: tag think.Thinker = ghosted
+        holla n = cur in gs.thinkers {
+            fid = n.funcId as int
+            nxt = n.next
+        } ghosted {
+            yeet("cur")
+        }
+        fr fid == think.FUNC_MOBJ {
+            wU8(b, think.FUNC_MOBJ)
+            writeMobj(gt, b, cur)
+        }
+        cur = nxt
+    }
+    wU8(b, TC_END)
+}
+
+// read one mobj record; cop + fill + setThingPosition + addThinker; append target/tracer serial
+// indices to the fixup vecs. Returns the advanced cursor.
+flex finna readMobj(gt: tag gs.GameState, buf: []u8, cur0: int, tIdx: vec[int], trIdx: vec[int]) -> int {
+    lowkey base: int = cur0
+    lowkey mo: tag think.Thinker = cop think.Thinker{ funcId: think.FUNC_MOBJ as i32 } in gs.thinkers
+    holla t = mo in gs.thinkers {
+        t.mobj.typeIdx = bstream.rdI32(buf, base + 0 * 4) as i32
+        t.mobj.x = bstream.rdI32(buf, base + 1 * 4) as i32
+        t.mobj.y = bstream.rdI32(buf, base + 2 * 4) as i32
+        t.mobj.z = bstream.rdI32(buf, base + 3 * 4) as i32
+        t.mobj.momx = bstream.rdI32(buf, base + 4 * 4) as i32
+        t.mobj.momy = bstream.rdI32(buf, base + 5 * 4) as i32
+        t.mobj.momz = bstream.rdI32(buf, base + 6 * 4) as i32
+        t.mobj.floorz = bstream.rdI32(buf, base + 7 * 4) as i32
+        t.mobj.ceilingz = bstream.rdI32(buf, base + 8 * 4) as i32
+        t.mobj.radius = bstream.rdI32(buf, base + 9 * 4) as i32
+        t.mobj.height = bstream.rdI32(buf, base + 10 * 4) as i32
+        t.mobj.angle = bstream.rdU32(buf, base + 11 * 4) as u32
+        t.mobj.spriteIdx = bstream.rdI32(buf, base + 12 * 4) as i32
+        t.mobj.frame = bstream.rdI32(buf, base + 13 * 4) as i32
+        t.mobj.stateIdx = bstream.rdI32(buf, base + 14 * 4) as i32
+        t.mobj.tics = bstream.rdI32(buf, base + 15 * 4) as i32
+        t.mobj.flags = bstream.rdI32(buf, base + 16 * 4) as i32
+        t.mobj.health = bstream.rdI32(buf, base + 17 * 4) as i32
+        t.mobj.movedir = bstream.rdI32(buf, base + 18 * 4) as i32
+        t.mobj.movecount = bstream.rdI32(buf, base + 19 * 4) as i32
+        t.mobj.reactiontime = bstream.rdI32(buf, base + 20 * 4) as i32
+        t.mobj.threshold = bstream.rdI32(buf, base + 21 * 4) as i32
+        t.mobj.lastlook = bstream.rdI32(buf, base + 22 * 4) as i32
+        t.mobj.validcount = bstream.rdI32(buf, base + 23 * 4) as i32
+        t.mobj.player = bstream.rdI32(buf, base + 24 * 4) as i32
+        t.mobj.spawnpoint.x = bstream.rdI32(buf, base + 25 * 4) as i32
+        t.mobj.spawnpoint.y = bstream.rdI32(buf, base + 26 * 4) as i32
+        t.mobj.spawnpoint.angle = bstream.rdI32(buf, base + 27 * 4) as i32
+        t.mobj.spawnpoint.typ = bstream.rdI32(buf, base + 28 * 4) as i32
+        t.mobj.spawnpoint.options = bstream.rdI32(buf, base + 29 * 4) as i32
+        // target/tracer resolved in fixupThinkerRefs; snext/sprev/bnext/bprev/subsector by setThingPos.
+        t.mobj.target = ghosted
+        t.mobj.tracer = ghosted
+    } ghosted {
+        yeet("mo")
+    }
+    tIdx.stack(bstream.rdI32(buf, base + 30 * 4) as int)
+    trIdx.stack(bstream.rdI32(buf, base + 31 * 4) as int)
+    pmaputl.setThingPosition(gt, mo)
+    pthink.addThinker(gt, mo)
+    bet base + MOBJ_FIELDS * 4
+}
+
+flex finna unArchiveThinkers(gt: tag gs.GameState, buf: []u8, cur0: int, tIdx: vec[int], trIdx: vec[int]) -> int {
+    lowkey cur: int = cur0
+    lowkey going: bool = nocap
+    vibin going {
+        lowkey tc: int = bstream.rdU8(buf, cur) as int
+        cur = cur + 1
+        fr tc == TC_END {
+            going = cap
+        } naw fr tc == think.FUNC_MOBJ {
+            cur = readMobj(gt, buf, cur, tIdx, trIdx)
+        } naw {
+            yeet("p_saveg: bad thinker class")
+        }
+    }
+    bet cur
+}
+
+// pass 2: for the k-th mobj set target/tracer from tIdx[k]/trIdx[k]. At this point the thinker
+// list holds ONLY the restored mobjs in serial order (specials not added yet).
+flex finna fixupThinkerRefs(gt: tag gs.GameState, tIdx: vec[int], trIdx: vec[int]) {
+    lowkey capT: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        capT = g.tick.thinkercap
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey cur: tag think.Thinker = ghosted
+    holla c = capT in gs.thinkers {
+        cur = c.next
+    } ghosted {
+        yeet("cap")
+    }
+    lowkey k: int = 0
+    vibin !(cur == capT) {
+        lowkey fid: int = 0
+        lowkey nxt: tag think.Thinker = ghosted
+        holla n = cur in gs.thinkers {
+            fid = n.funcId as int
+            nxt = n.next
+        } ghosted {
+            yeet("cur")
+        }
+        fr fid == think.FUNC_MOBJ {
+            lowkey targetT: tag think.Thinker = tagOfSerial(gt, tIdx[k])
+            lowkey tracerT: tag think.Thinker = tagOfSerial(gt, trIdx[k])
+            holla t = cur in gs.thinkers {
+                t.mobj.target = targetT
+                t.mobj.tracer = tracerT
+            } ghosted {
+                yeet("cur")
+            }
+            k = k + 1
+        }
+        cur = nxt
+    }
+}
+
+// ===========================================================================================
+// P_ArchiveSpecials / P_UnArchiveSpecials — sector-effect thinkers (SectorAction by funcId)
+// ===========================================================================================
+
+// one SectorAction record: 25 i32 fields + crush (u8). funcId is written by the caller.
+flex finna writeSpecial(gt: tag gs.GameState, b: vec[int], sp: tag think.Thinker) {
+    holla t = sp in gs.thinkers {
+        wI32(b, t.sa.kind as int)
+        wI32(b, t.sa.secnum as int)
+        wI32(b, t.sa.speed as int)
+        wI32(b, t.sa.topheight as int)
+        wI32(b, t.sa.bottomheight as int)
+        wI32(b, t.sa.floordestheight as int)
+        wI32(b, t.sa.low as int)
+        wI32(b, t.sa.high as int)
+        wI32(b, t.sa.direction as int)
+        wI32(b, t.sa.olddirection as int)
+        wI32(b, t.sa.topwait as int)
+        wI32(b, t.sa.topcountdown as int)
+        wI32(b, t.sa.wait as int)
+        wI32(b, t.sa.count as int)
+        wI32(b, t.sa.secTag as int)
+        wI32(b, t.sa.newspecial as int)
+        wI32(b, t.sa.texture as int)
+        wI32(b, t.sa.status as int)
+        wI32(b, t.sa.oldstatus as int)
+        wI32(b, t.sa.maxlight as int)
+        wI32(b, t.sa.minlight as int)
+        wI32(b, t.sa.maxtime as int)
+        wI32(b, t.sa.mintime as int)
+        wI32(b, t.sa.darktime as int)
+        wI32(b, t.sa.brighttime as int)
+        fr t.sa.crush {
+            wU8(b, 1)
+        } naw {
+            wU8(b, 0)
+        }
+    } ghosted {
+        yeet("sp")
+    }
+}
+
+flex finna archiveSpecials(gt: tag gs.GameState, b: vec[int]) {
+    lowkey capT: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        capT = g.tick.thinkercap
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey cur: tag think.Thinker = ghosted
+    holla c = capT in gs.thinkers {
+        cur = c.next
+    } ghosted {
+        yeet("cap")
+    }
+    vibin !(cur == capT) {
+        lowkey fid: int = 0
+        lowkey nxt: tag think.Thinker = ghosted
+        holla n = cur in gs.thinkers {
+            fid = n.funcId as int
+            nxt = n.next
+        } ghosted {
+            yeet("cur")
+        }
+        fr fid >= think.FUNC_DOOR && fid <= think.FUNC_GLOW {
+            wU8(b, fid)
+            writeSpecial(gt, b, cur)
+        }
+        cur = nxt
+    }
+    wU8(b, TC_END)
+}
+
+// read one SectorAction record into a fresh thinker with the given funcId; wire it in.
+flex finna readSpecial(gt: tag gs.GameState, buf: []u8, cur0: int, funcId: int) -> int {
+    lowkey base: int = cur0
+    lowkey sp: tag think.Thinker = cop think.Thinker{ funcId: funcId as i32 } in gs.thinkers
+    lowkey secnum: int = 0
+    holla t = sp in gs.thinkers {
+        t.sa.kind = bstream.rdI32(buf, base + 0 * 4) as i32
+        t.sa.secnum = bstream.rdI32(buf, base + 1 * 4) as i32
+        t.sa.speed = bstream.rdI32(buf, base + 2 * 4) as i32
+        t.sa.topheight = bstream.rdI32(buf, base + 3 * 4) as i32
+        t.sa.bottomheight = bstream.rdI32(buf, base + 4 * 4) as i32
+        t.sa.floordestheight = bstream.rdI32(buf, base + 5 * 4) as i32
+        t.sa.low = bstream.rdI32(buf, base + 6 * 4) as i32
+        t.sa.high = bstream.rdI32(buf, base + 7 * 4) as i32
+        t.sa.direction = bstream.rdI32(buf, base + 8 * 4) as i32
+        t.sa.olddirection = bstream.rdI32(buf, base + 9 * 4) as i32
+        t.sa.topwait = bstream.rdI32(buf, base + 10 * 4) as i32
+        t.sa.topcountdown = bstream.rdI32(buf, base + 11 * 4) as i32
+        t.sa.wait = bstream.rdI32(buf, base + 12 * 4) as i32
+        t.sa.count = bstream.rdI32(buf, base + 13 * 4) as i32
+        t.sa.secTag = bstream.rdI32(buf, base + 14 * 4) as i32
+        t.sa.newspecial = bstream.rdI32(buf, base + 15 * 4) as i32
+        t.sa.texture = bstream.rdI32(buf, base + 16 * 4) as i32
+        t.sa.status = bstream.rdI32(buf, base + 17 * 4) as i32
+        t.sa.oldstatus = bstream.rdI32(buf, base + 18 * 4) as i32
+        t.sa.maxlight = bstream.rdI32(buf, base + 19 * 4) as i32
+        t.sa.minlight = bstream.rdI32(buf, base + 20 * 4) as i32
+        t.sa.maxtime = bstream.rdI32(buf, base + 21 * 4) as i32
+        t.sa.mintime = bstream.rdI32(buf, base + 22 * 4) as i32
+        t.sa.darktime = bstream.rdI32(buf, base + 23 * 4) as i32
+        t.sa.brighttime = bstream.rdI32(buf, base + 24 * 4) as i32
+        t.sa.crush = bstream.rdU8(buf, base + 25 * 4) != 0
+        secnum = t.sa.secnum as int
+    } ghosted {
+        yeet("sp")
+    }
+    pthink.addThinker(gt, sp)
+    // id: door/ceiling/floor/plat re-point sector->specialdata; lights do not.
+    fr funcId == think.FUNC_DOOR || funcId == think.FUNC_CEILING || funcId == think.FUNC_FLOOR || funcId == think.FUNC_PLAT {
+        psu.setSectorSpecialData(gt, secnum, sp)
+    }
+    fr funcId == think.FUNC_CEILING {
+        pceilng.addActiveCeiling(gt, sp)
+    }
+    fr funcId == think.FUNC_PLAT {
+        pplats.addActivePlat(gt, sp)
+    }
+    // record length = 25 i32 words + 1 crush byte.
+    bet base + 25 * 4 + 1
+}
+
+flex finna unArchiveSpecials(gt: tag gs.GameState, buf: []u8, cur0: int) -> int {
+    lowkey cur: int = cur0
+    lowkey going: bool = nocap
+    vibin going {
+        lowkey tc: int = bstream.rdU8(buf, cur) as int
+        cur = cur + 1
+        fr tc == TC_END {
+            going = cap
+        } naw fr tc >= think.FUNC_DOOR && tc <= think.FUNC_GLOW {
+            cur = readSpecial(gt, buf, cur, tc)
+        } naw {
+            yeet("p_saveg: bad special class")
+        }
+    }
+    bet cur
+}
+
+// ===========================================================================================
+// clearThinkers — remove the freshly-spawned things (setupLevel) before unarchiving.
+// Mirrors P_UnArchiveThinkers' removal loop + P_InitThinkers: unset each mobj's world position
+// (empties every sector thinglist + blockmap chain), evict every node, then a fresh cap.
+// ===========================================================================================
+flex finna clearThinkers(gt: tag gs.GameState) {
+    lowkey capT: tag think.Thinker = ghosted
+    holla g = gt in gs.gsc {
+        capT = g.tick.thinkercap
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey cur: tag think.Thinker = ghosted
+    holla c = capT in gs.thinkers {
+        cur = c.next
+    } ghosted {
+        yeet("cap")
+    }
+    vibin !(cur == capT) {
+        lowkey fid: int = 0
+        lowkey nxt: tag think.Thinker = ghosted
+        holla n = cur in gs.thinkers {
+            fid = n.funcId as int
+            nxt = n.next
+        } ghosted {
+            yeet("cur")
+        }
+        fr fid == think.FUNC_MOBJ {
+            pmaputl.unsetThingPosition(gt, cur)
+        }
+        evict cur in gs.thinkers
+        cur = nxt
+    }
+    evict capT in gs.thinkers
+    // also clear the active-special lists (their entries pointed at the evicted specials, if any).
+    holla g = gt in gs.gsc {
+        lowkey i: int = 0
+        vibin i < 30 {
+            g.tick.activeceilings[i].t = ghosted
+            g.tick.activeplats[i].t = ghosted
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    pthink.initThinkers(gt)
+}
+
+// ===========================================================================================
+// P_SaveGame / P_LoadGame — the drivers
+// ===========================================================================================
+flex finna saveGame(gt: tag gs.GameState, path: str, description: str) -> bool {
+    lowkey b: vec[int] = vec.new[int]()
+    // header: magic "BSAV"
+    wU8(b, 66)
+    wU8(b, 83)
+    wU8(b, 65)
+    wU8(b, 86)
+    wI32(b, SAVE_VERSION)
+    wStr(b, description)
+    holla g = gt in gs.gsc {
+        wI32(b, g.shell.gameepisode as int)
+        wI32(b, g.shell.gamemap as int)
+        wI32(b, g.shell.gameskill as int)
+        wI32(b, g.shell.gametic as int)
+        wI32(b, g.tick.leveltime as int)
+        wI32(b, g.shell.consoleplayer as int)
+        wI32(b, g.tick.prndindex as int)
+        wI32(b, g.tick.rndindex as int)
+        lowkey i: int = 0
+        vibin i < 4 {
+            fr g.shell.playeringame[i] {
+                wU8(b, 1)
+            } naw {
+                wU8(b, 0)
+            }
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    archivePlayers(gt, b)
+    archiveWorld(gt, b)
+    archiveThinkers(gt, b)
+    archiveSpecials(gt, b)
+    // copy the byte vec into an exact-length []u8 and drop it.
+    lowkey n: int = b.gang() as int
+    lowkey out: []u8 = mem.slab[u8](n)
+    lowkey k: int = 0
+    vibin k < n {
+        out[k] = b[k] as u8
+        k = k + 1
+    }
+    bet fs.drop(path, out)
+}
+
+flex finna loadGame(gt: tag gs.GameState, path: str) -> bool {
+    lowkey buf: []u8 = fs.peep(path)
+    lowkey cur: int = 0
+    // header magic + version
+    lowkey m0: int = bstream.rdU8(buf, 0) as int
+    lowkey m1: int = bstream.rdU8(buf, 1) as int
+    lowkey m2: int = bstream.rdU8(buf, 2) as int
+    lowkey m3: int = bstream.rdU8(buf, 3) as int
+    fr m0 != 66 || m1 != 83 || m2 != 65 || m3 != 86 {
+        bet cap
+    }
+    lowkey ver: int = bstream.rdI32(buf, 4) as int
+    fr ver != SAVE_VERSION {
+        bet cap
+    }
+    cur = 8
+    lowkey descLen: int = bstream.rdI16(buf, cur) as int
+    cur = cur + 2 + descLen
+    lowkey episode: int = bstream.rdI32(buf, cur) as int
+    cur = cur + 4
+    lowkey map: int = bstream.rdI32(buf, cur) as int
+    cur = cur + 4
+    lowkey skill: int = bstream.rdI32(buf, cur) as int
+    cur = cur + 4
+    lowkey savedGametic: int = bstream.rdI32(buf, cur) as int
+    cur = cur + 4
+    lowkey savedLeveltime: int = bstream.rdI32(buf, cur) as int
+    cur = cur + 4
+    lowkey savedConsole: int = bstream.rdI32(buf, cur) as int
+    cur = cur + 4
+    lowkey savedPrnd: int = bstream.rdI32(buf, cur) as int
+    cur = cur + 4
+    lowkey savedRnd: int = bstream.rdI32(buf, cur) as int
+    cur = cur + 4
+    // playeringame + the header-derived shell fields must be set BEFORE setupLevel (spawnPlayer
+    // reads playeringame; spawnMapThing/spawnMobj read gameskill).
+    holla g = gt in gs.gsc {
+        g.shell.gameepisode = episode as i32
+        g.shell.gamemap = map as i32
+        g.shell.gameskill = skill as i32
+        g.shell.gametic = savedGametic as i32
+        g.shell.consoleplayer = savedConsole as i32
+        lowkey i: int = 0
+        vibin i < 4 {
+            g.shell.playeringame[i] = bstream.rdU8(buf, cur) != 0
+            cur = cur + 1
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    // rebuild static geometry + spawn things, then discard the spawned things (id: G_InitNew
+    // then P_UnArchiveThinkers' removal loop).
+    psetup.setupLevel(gt, episode, map, skill)
+    clearThinkers(gt)
+    // restore state
+    lowkey moIdx: []i32 = mem.slab[i32](4)
+    lowkey atkIdx: []i32 = mem.slab[i32](4)
+    cur = unArchivePlayers(gt, buf, cur, moIdx, atkIdx)
+    cur = unArchiveWorld(gt, buf, cur)
+    lowkey tIdx: vec[int] = vec.new[int]()
+    lowkey trIdx: vec[int] = vec.new[int]()
+    cur = unArchiveThinkers(gt, buf, cur, tIdx, trIdx)
+    fixupThinkerRefs(gt, tIdx, trIdx)
+    fixupPlayers(gt, moIdx, atkIdx)
+    cur = unArchiveSpecials(gt, buf, cur)
+    // restore the fields setupLevel clobbered (leveltime->0) + the RNG stream for exact resume.
+    holla g = gt in gs.gsc {
+        g.tick.leveltime = savedLeveltime as i32
+        g.tick.prndindex = savedPrnd as i32
+        g.tick.rndindex = savedRnd as i32
+    } ghosted {
+        yeet("gs")
+    }
+    bet nocap
+}

@@ -1,0 +1,14 @@
+perturb: doorSec=1 door_rtn=1
+save ok=nocap mobjs=90 fp=149d7c99
+load ok=nocap mobjs=90 fp=149d7c99
+  ok   fingerprint = 345865369
+  ok   mobj-count = 90
+  ok   door-topheight = 14417920
+  ok   door-secnum = 1
+  ok   door-direction = 1
+  ok   sector-floor = 48
+  ok   sector-light = 123
+  ok   player-health = 71
+  ok   player-ammo1 = 17
+  ok   target-link-serial = 88
+RESULT PASS fp=149d7c99
