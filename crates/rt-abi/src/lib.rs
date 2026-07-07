@@ -497,6 +497,11 @@ unsafe extern "C" {
     /// ring (submitted but not yet consumed by the device callback) — the backpressure signal
     /// for streaming music synths. Headless: always `0` (instant drain). Backs `gg.pending`.
     pub fn bet_gg_pending() -> u64;
+    /// Set the window title to the `len` UTF-8 bytes at `title` (applied to the live window, or
+    /// remembered for when the window is next created). The bytes are copied, so the caller's
+    /// buffer need not outlive the call; an empty/absent or non-UTF-8 title is ignored. Headless:
+    /// a no-op. Backs `gg.title`.
+    pub fn bet_gg_title(title: *const u8, len: usize);
 }
 
 #[cfg(test)]

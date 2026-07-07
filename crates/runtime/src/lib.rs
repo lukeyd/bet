@@ -1285,3 +1285,17 @@ pub unsafe extern "C" fn bet_gg_audio_spec() -> u64 {
 pub unsafe extern "C" fn bet_gg_pending() -> u64 {
     gg_backend::pending()
 }
+
+/// `bet_gg_title` — set the window title to the `len` UTF-8 bytes at `title`. Empty/absent or
+/// non-UTF-8 is ignored. Headless: a no-op.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_title(title: *const u8, len: usize) {
+    if title.is_null() || len == 0 {
+        return;
+    }
+    // SAFETY: the contract says `title` addresses `len` readable bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(title, len) };
+    if let Ok(name) = std::str::from_utf8(bytes) {
+        gg_backend::title(name);
+    }
+}

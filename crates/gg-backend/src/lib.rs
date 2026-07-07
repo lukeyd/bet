@@ -321,6 +321,12 @@ pub fn pending() -> u64 {
     imp::pending()
 }
 
+/// Set the window title, applied to the live window immediately and remembered for a later window
+/// (re)creation. An empty title is ignored. Headless: a no-op.
+pub fn title(name: &str) {
+    imp::title(name);
+}
+
 // ===========================================================================
 // Headless implementation (default: `desktop` OFF). Zero heavy dependencies.
 // ===========================================================================
@@ -394,6 +400,8 @@ mod imp {
     pub(super) fn pending() -> u64 {
         0
     }
+
+    pub(super) fn title(_name: &str) {}
 }
 
 // ===========================================================================
@@ -406,8 +414,9 @@ mod imp {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex, OnceLock};
 
-    /// The window title (brief §1: "bet · pong").
-    const WINDOW_TITLE: &str = "bet · pong";
+    /// The default window title, used until a game sets its own via [`title`]. Kept generic (not
+    /// per-game) so a gg program that never calls `gg.title` doesn't inherit another game's name.
+    const WINDOW_TITLE: &str = "bet";
     /// Cap the audio ring so a program that outruns the audio callback can't grow it forever.
     const RING_CAP: usize = 1 << 20;
 
@@ -491,6 +500,27 @@ mod imp {
         (minifb::Key::F12, key::F12),
     ];
 
+    /// CoreGraphics relative-mouse support (macOS only). Warping the cursor back to window-center
+    /// near an edge is how a position-difference mouse delta avoids clamping to zero at the screen
+    /// boundary; the associate call after the warp cancels the ~250ms movement-suppression interval
+    /// CGWarp otherwise imposes, keeping the turn smooth. The framework link directive here does not
+    /// survive into a static archive, so the compiled-program link names it explicitly too (see
+    /// `driver`'s `MACOS_GG_FRAMEWORKS`).
+    #[cfg(target_os = "macos")]
+    mod cg {
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        pub struct CGPoint {
+            pub x: f64,
+            pub y: f64,
+        }
+        #[link(name = "CoreGraphics", kind = "framework")]
+        unsafe extern "C" {
+            pub fn CGWarpMouseCursorPosition(new_cursor_position: CGPoint) -> i32;
+            pub fn CGAssociateMouseAndMouseCursorPosition(connected: i32) -> i32;
+        }
+    }
+
     /// An uploaded texture: premultiplied `0xAARR_GGBB` pixels, row-major `w * h`.
     struct Texture {
         w: u32,
@@ -573,6 +603,16 @@ mod imp {
         /// Debounced mouse-button state, for MOUSE_DOWN / MOUSE_UP edge detection.
         mouse_left: bool,
         mouse_right: bool,
+        /// Relative-mouse mode: armed on the first `mouse_delta()` drain (so absolute-`gg.mouse()`
+        /// games like Pong/FrozenBubble, which never drain a delta, stay unaffected). While armed
+        /// the cursor is hidden and, on macOS, warped back to window-center near an edge so the raw
+        /// delta never clamps to zero at the screen boundary — the mouse-look edge-clip turn bug.
+        relative_mouse: bool,
+        /// Whether the cursor has already been hidden for `relative_mouse` (hide once, not per pump).
+        cursor_hidden: bool,
+        /// The window title: `WINDOW_TITLE` until a game sets its own via `set_title`, then applied
+        /// live and used as the title when the window is (re)created.
+        title: String,
         /// The voice mixer, behind its OWN mutex (NOT the outer GG one) so the cpal callback can
         /// lock it without ever touching GG — preserving the no-deadlock invariant.
         mixer: Arc<Mutex<Mixer>>,
@@ -608,6 +648,9 @@ mod imp {
                 acc_dy: 0.0,
                 mouse_left: false,
                 mouse_right: false,
+                relative_mouse: false,
+                cursor_hidden: false,
+                title: WINDOW_TITLE.to_string(),
                 mixer: Arc::new(Mutex::new(Mixer {
                     sounds: Vec::new(),
                     voices: Vec::new(),
@@ -620,6 +663,7 @@ mod imp {
         /// Copy `buf` (a tightly packed `w * h` frame) into the window, creating the window on
         /// the first call, then synthesize input events from the new key state.
         fn present(&mut self, buf: &[u32], w: usize, h: usize) {
+            let title = self.title.clone();
             let window = self.window.get_or_insert_with(|| {
                 // `X1` maps the framebuffer 1:1 to the window (no upscaling), so the program can
                 // drive true dynamic resolution by sizing the framebuffer to `size()`. `resize`
@@ -631,7 +675,7 @@ mod imp {
                     scale_mode: minifb::ScaleMode::Stretch,
                     ..minifb::WindowOptions::default()
                 };
-                minifb::Window::new(WINDOW_TITLE, w, h, opts)
+                minifb::Window::new(&title, w, h, opts)
                     .expect("gg: failed to open the minifb window")
             });
             // `update_with_buffer` wants exactly `w * h` pixels; `present()` guarantees `buf`
@@ -645,6 +689,17 @@ mod imp {
         /// a quit: it arrives as a normal key event (code 27, via `KEY_TABLE`) so games can
         /// drive pause/settings menus with it — only window close means "the player left".
         fn pump_input(&mut self) {
+            // Arm relative-mouse presentation once `mouse_delta()` has been drained: hide the
+            // cursor (meaningless in a mouse-look game) exactly once. The warp-to-center itself
+            // lives in the delta section below, next to the position read it corrects.
+            if self.relative_mouse
+                && !self.cursor_hidden
+                && let Some(w) = self.window.as_mut()
+            {
+                w.set_cursor_visibility(false);
+                self.cursor_hidden = true;
+            }
+
             let Some(window) = self.window.as_ref() else {
                 return;
             };
@@ -686,8 +741,11 @@ mod imp {
             self.down = now_down;
 
             // Relative mouse: accumulate raw window-pixel deltas between pumps, drained by
-            // `mouse_delta()`. minifb exposes only absolute positions (no pointer lock), so the
-            // deltas are position differences and clamp once the cursor pins a window edge.
+            // `mouse_delta()`. minifb exposes only absolute positions (no pointer lock). On macOS,
+            // once relative mode is armed we warp the cursor back to window-center whenever it
+            // nears an edge (CoreGraphics), so the delta never clamps to zero at the screen
+            // boundary — the mouse-look edge-clip turn bug. Off macOS the delta is a plain position
+            // difference and still clips at the edge (the target platform is this Mac).
             // NB: the MOUSE_MOVE event kind stays reserved and unemitted — movement is polled
             // via `gg.mouse()` (absolute) / `gg.mouseDelta()` (relative), never event-queued.
             if let Some((wx, wy)) = window.get_mouse_pos(minifb::MouseMode::Pass) {
@@ -696,6 +754,37 @@ mod imp {
                     self.acc_dy += wy - ly;
                 }
                 self.last_win_mouse = Some((wx, wy));
+
+                #[cfg(target_os = "macos")]
+                if self.relative_mouse {
+                    let (sw, sh) = window.get_size();
+                    let (sw, sh) = (sw as f32, sh as f32);
+                    // Re-center when inside this edge margin (a quarter of the smaller dimension,
+                    // min 16px) — a wide comfort band so a fast flick can't overshoot the true
+                    // edge between warps.
+                    let margin = (sw.min(sh) * 0.25).max(16.0);
+                    if sw > 2.0 * margin
+                        && sh > 2.0 * margin
+                        && (wx < margin || wy < margin || wx > sw - margin || wy > sh - margin)
+                    {
+                        let (cx, cy) = (sw / 2.0, sh / 2.0);
+                        let (px, py) = window.get_position();
+                        // CGWarpMouseCursorPosition takes a global, top-left-origin display point;
+                        // minifb's get_position is the window's top-left in that same space.
+                        let target = cg::CGPoint {
+                            x: px as f64 + cx as f64,
+                            y: py as f64 + cy as f64,
+                        };
+                        // SAFETY: POD-point CoreGraphics calls, always linked on macOS. The second
+                        // call cancels the ~250ms post-warp suppression so turning stays smooth.
+                        unsafe {
+                            cg::CGWarpMouseCursorPosition(target);
+                            cg::CGAssociateMouseAndMouseCursorPosition(1);
+                        }
+                        // The warp must not read as movement: next pump measures from center.
+                        self.last_win_mouse = Some((cx, cy));
+                    }
+                }
             }
 
             // Mouse: track the cursor in logical-canvas coords, and synthesize MOUSE_DOWN/UP
@@ -953,6 +1042,7 @@ mod imp {
         /// window→logical mapping for the mouse; pump input.
         fn present_scaled(&mut self, src: &[u32], cw: usize, ch: usize) {
             // 1. Ensure the window (default ~2x the frame), read its live size, end that borrow.
+            let title = self.title.clone();
             let window = self.window.get_or_insert_with(|| {
                 let opts = minifb::WindowOptions {
                     resize: true,
@@ -960,7 +1050,7 @@ mod imp {
                     scale_mode: minifb::ScaleMode::Stretch,
                     ..minifb::WindowOptions::default()
                 };
-                minifb::Window::new(WINDOW_TITLE, cw * 2, ch * 2, opts)
+                minifb::Window::new(&title, cw * 2, ch * 2, opts)
                     .expect("gg: failed to open the minifb window")
             });
             let (win_w, win_h) = window.get_size();
@@ -1079,10 +1169,25 @@ mod imp {
             ((self.mouse_x as u32 as u64) << 32) | (self.mouse_y as u32 as u64)
         }
 
+        /// Set the window title, applied to the live window immediately and remembered so a later
+        /// window (re)creation uses it. An empty title is ignored (keeps the current/default).
+        fn set_title(&mut self, name: &str) {
+            if name.is_empty() {
+                return;
+            }
+            self.title = name.to_string();
+            if let Some(w) = self.window.as_mut() {
+                w.set_title(name);
+            }
+        }
+
         /// Drain the accumulated raw mouse delta as a sign-preserving `(dx, dy)` `i32` pair
         /// packed `(dx as u32) << 32 | (dy as u32)`. Truncates toward zero; the fractional
         /// sub-pixel remainder stays accumulated for the next drain.
         fn mouse_delta(&mut self) -> u64 {
+            // The first drain arms relative-mouse presentation (cursor hide + macOS edge-warp,
+            // applied at the next pump). Lazy arming keeps absolute-`gg.mouse()` games unaffected.
+            self.relative_mouse = true;
             let dx = self.acc_dx as i32;
             let dy = self.acc_dy as i32;
             self.acc_dx -= dx as f32;
@@ -1462,5 +1567,12 @@ mod imp {
             return 0;
         }
         with_state(|st| st.pending())
+    }
+
+    pub(super) fn title(name: &str) {
+        if headless() {
+            return;
+        }
+        with_state(|st| st.set_title(name));
     }
 }

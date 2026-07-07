@@ -86,13 +86,15 @@ fn link_unix(obj: &Path, libdir: &Path, out: &Path, runtime: Runtime) -> Result<
 }
 
 /// macOS frameworks the `gg-desktop` runtime (minifb + cpal) references but a static archive does
-/// not carry: window/graphics/input (Cocoa/Carbon/Metal/MetalKit) + audio
-/// (AudioUnit/CoreAudio/CoreFoundation). `AudioUnit`'s dylib re-exports the AudioToolbox symbols.
+/// not carry: window/graphics/input (Cocoa/Carbon/Metal/MetalKit), the relative-mouse cursor warp
+/// (CoreGraphics), and audio (AudioUnit/CoreAudio/CoreFoundation). `AudioUnit`'s dylib re-exports
+/// the AudioToolbox symbols.
 const MACOS_GG_FRAMEWORKS: &[&str] = &[
     "Cocoa",
     "Carbon",
     "Metal",
     "MetalKit",
+    "CoreGraphics",
     "AudioUnit",
     "CoreAudio",
     "CoreFoundation",

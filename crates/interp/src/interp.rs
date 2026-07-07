@@ -2176,6 +2176,12 @@ impl<'p> Interp<'p> {
             // `gg.audio` ring — the streaming-synth backpressure signal.
             ("pending", []) => Ok(vec![Value::Int(gg_backend::pending() as i64)]),
             ("pending", _) => Err(RunError::Type("`gg.pending` takes no arguments".into())),
+            // `gg.title(name)` sets the window title (applied live / used at window creation).
+            ("title", [Value::Str(s)]) => {
+                gg_backend::title(s);
+                Ok(Vec::new())
+            }
+            ("title", _) => Err(RunError::Type("`gg.title` takes a single string".into())),
             (other, _) => Err(RunError::Unsupported(format!("gg.{other}"))),
         }
     }

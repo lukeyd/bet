@@ -3912,6 +3912,30 @@ impl LowerCtx {
                 let ext = self.get_extern("bet_gg_audio", vec![rawptr, usize_t], vec![]);
                 self.emit_extern_call(ext, &[], vec![frames, cnt])
             }
+            // `gg.title(name)` — set the window title from a string (its `{ptr, len}`). Void.
+            ("gg", "title") => {
+                if args.len() != 1 {
+                    return Err("`gg.title` takes a single string".into());
+                }
+                let rawptr = self.m.intern_ty(TyKind::RawPtr);
+                let usize_t = self.m.t_int(IntWidth::W64, false);
+                let strt = self.m.t_str();
+                let (s, _) = self.lower_expr(&args[0].value, Some(strt))?;
+                let ptr = self.new_local(rawptr);
+                let len = self.new_local(usize_t);
+                self.fb()
+                    .assign(Place::local(ptr), Rvalue::StrPtr(s.clone()));
+                self.fb().assign(Place::local(len), Rvalue::StrLen(s));
+                let ext = self.get_extern("bet_gg_title", vec![rawptr, usize_t], vec![]);
+                self.emit_extern_call(
+                    ext,
+                    &[],
+                    vec![
+                        Operand::Copy(Place::local(ptr)),
+                        Operand::Copy(Place::local(len)),
+                    ],
+                )
+            }
             // `gg.poll()` -> (int, int) — poll the next input event into a stack slot, then return
             // `(kind, code)` zero-extended to `int`. The `bool` result and `x`/`y` are ignored; a
             // NONE event (`kind == 0`) means the queue was empty.

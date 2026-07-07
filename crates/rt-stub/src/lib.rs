@@ -970,6 +970,9 @@ pub unsafe extern "C" fn bet_gg_pending() -> u64 {
     0
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_gg_title(_title: *const u8, _len: usize) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -30,6 +30,7 @@ flex facts GG_MOUSEUP: int = 6
 // initGraphics — I_InitGraphics on gg: screens (via v_video), plus the u32 present buffer and
 // the 256-entry XRGB palette. No window/visual/colormap setup (gg owns the window).
 flex finna initGraphics(gt: tag gs.GameState) {
+    gg.title("DOOM")                  // name the window (else it inherits gg's default title)
     v.vInit(gt)
     holla g = gt in gs.gsc {
         g.vid.fb = mem.slab[u32](64000)
@@ -115,11 +116,19 @@ flex finna postEvent(gt: tag gs.GameState, e: event.Event) {
 // from gg.mouseDelta() (X11 I_GetEvent's MotionNotify model: data1=buttons, data2=dx<<2,
 // data3=-dy<<2). QUIT (window close) latches g.shell.quitRequested (no D_PostEvent analog).
 //
-// NOTE (deferred): held mouse-button state ACROSS tics needs a persisted mask; gg gives edge
-// MOUSE_DOWN/UP, so this build only reflects presses seen within the current tic. Mouse is not
-// exercised by the P1.2 smoke test (headless poll returns NONE); refine when g_game uses it.
+// Held mouse-button state persists ACROSS tics in g.shell.mousebtnmask: gg delivers edge
+// MOUSE_DOWN/UP, so we set the bit on down and clear it on up, and the mask carries into the next
+// tic. The EV_MOUSE event fires whenever a button is (or was just) held or the mouse moved — the
+// release edge (mask 0 this tic, nonzero last tic) still emits one event so G_Responder clears
+// g.shell.mousebuttons.
 flex finna startTic(gt: tag gs.GameState) {
     lowkey mbtn = 0
+    holla g = gt in gs.gsc {
+        mbtn = g.shell.mousebtnmask as int
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey prev = mbtn
     lowkey draining = nocap
     vibin draining {
         lowkey kind, code = gg.poll()
@@ -132,7 +141,7 @@ flex finna startTic(gt: tag gs.GameState) {
         } naw fr kind == GG_MOUSEDOWN {
             mbtn = mbtn | (1 << code)
         } naw fr kind == GG_MOUSEUP {
-            mbtn = mbtn | (1 << code)
+            mbtn = mbtn & ~(1 << code)
         } naw fr kind == GG_QUIT {
             holla g = gt in gs.gsc {
                 g.shell.quitRequested = nocap
@@ -141,8 +150,13 @@ flex finna startTic(gt: tag gs.GameState) {
             }
         }
     }
+    holla g = gt in gs.gsc {
+        g.shell.mousebtnmask = mbtn as i32
+    } ghosted {
+        yeet("gs")
+    }
     lowkey dx, dy = gg.mouseDelta()
-    fr mbtn != 0 || dx != 0 || dy != 0 {
+    fr mbtn != 0 || prev != 0 || dx != 0 || dy != 0 {
         postEvent(gt, event.Event{ typ: event.EV_MOUSE as i32, data1: mbtn as i32, data2: (dx << 2) as i32, data3: ((0 - dy) << 2) as i32 })
     }
 }

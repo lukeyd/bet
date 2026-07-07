@@ -54,6 +54,12 @@ flex facts MAXHEALTH: int = 100
 flex facts KEY_STRAFELEFT: int = 44   // ','
 flex facts KEY_STRAFERIGHT: int = 46  // '.'
 flex facts KEY_USE: int = 32          // ' '
+// WASD (mouse-look config): letters arrive lowercase (xlateKey maps 'A'-'Z' -> 'a'-'z'), so
+// gamekeydown is indexed by lowercase ASCII. W/S = forward/back, A/D = strafe.
+flex facts KEY_W: int = 119           // 'w' forward
+flex facts KEY_S: int = 115           // 's' back
+flex facts KEY_A: int = 97            // 'a' strafe left
+flex facts KEY_D: int = 100           // 'd' strafe right
 flex facts MOUSEB_FIRE: int = 0
 flex facts MOUSEB_STRAFE: int = 1
 flex facts MOUSEB_FORWARD: int = 2
@@ -150,6 +156,20 @@ flex finna buildTiccmd(gt: tag gs.GameState) {
             side = side + sidemove(sp)
         }
         fr g.shell.gamekeydown[KEY_STRAFELEFT] {
+            side = side - sidemove(sp)
+        }
+        // WASD: W/S forward/back, A/D strafe — always, independent of the Alt/strafe modifier that
+        // repurposes the arrow keys (the intuitive mouse-look config).
+        fr g.shell.gamekeydown[KEY_W] {
+            forward = forward + forwardmove(sp)
+        }
+        fr g.shell.gamekeydown[KEY_S] {
+            forward = forward - forwardmove(sp)
+        }
+        fr g.shell.gamekeydown[KEY_D] {
+            side = side + sidemove(sp)
+        }
+        fr g.shell.gamekeydown[KEY_A] {
             side = side - sidemove(sp)
         }
         fr g.shell.gamekeydown[doomdef.KEY_RCTRL] || g.shell.mousebuttons[MOUSEB_FIRE] {

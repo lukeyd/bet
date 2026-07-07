@@ -642,6 +642,7 @@ flex drip GameShell {
     flex mousex: i32
     flex mousey: i32
     flex mousebuttons: bool[4]
+    flex mousebtnmask: i32         // held mouse-button bitmask, persisted across tics (gg sends edges)
     // -sync fingerprint writer (-timedemo -sync <out>) ---------------------------------------
     flex syncOn: bool
     flex syncPath: str
