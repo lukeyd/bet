@@ -623,3 +623,15 @@ slug = "port-frozen-bubble"
 name = "Frozen Bubble port umbrella: gg graphics (alpha blit + asset loading) + gg audio (PCM mixing) extensions, then a pixel-perfect + audio-accurate port under ports/frozen-bubble"
 size = 21
 status = "doing"
+
+# ─────────────────────────── Tooling: reproducible containerized build ───────────────────────────
+# Cross-platform validation: the whole project was built on macOS/ARM64. A pinned Ubuntu 22.04
+# x86_64 container (Rust 1.96.1 + LLVM 18) gives a reproducible, sudo-free build+verify environment
+# and confirms the toolchain and the Doom port build & pass the headless differential oracle on a
+# second platform+arch.
+
+[[task]]
+slug = "docker-build"
+name = "Dockerized build/verify environment (Ubuntu 22.04 x86_64, Rust 1.96.1 + LLVM 18); confirm Doom port builds + passes headless oracle off-Mac"
+size = 3
+status = "doing"

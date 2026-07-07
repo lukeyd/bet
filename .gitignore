@@ -48,3 +48,6 @@
 
 # NOTE: Cargo.lock is intentionally COMMITTED (the workspace ships the `bet` binary;
 #       CI builds with --locked). timelog/ is intentionally COMMITTED (durable effort log).
+
+# Docker build env cargo cache (docker/compose.yaml CARGO_HOME)
+/.docker-cache/

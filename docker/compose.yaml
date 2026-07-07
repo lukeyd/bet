@@ -1,0 +1,39 @@
+# Dockerized build/verify environment for `bet`. Run from the repo root:
+#
+#   docker compose -f docker/compose.yaml build
+#   docker compose -f docker/compose.yaml up -d           # start the idle builder
+#   docker compose -f docker/compose.yaml exec bet docker/verify.sh
+#
+# or one-shot:
+#   docker compose -f docker/compose.yaml run --rm bet docker/verify.sh
+#
+# The container runs as the host UID/GID so build artifacts under target/ (bind-mounted) are
+# owned by you, not root. Export UID/GID first if your shell doesn't already:  export UID GID
+name: bet-build
+
+services:
+  bet:
+    build:
+      context: .
+    image: bet-build:llvm18-ubuntu2204
+    # No root-owned files on the bind mount: run as the invoking user.
+    user: "${UID:-1000}:${GID:-1000}"
+    working_dir: /work
+    # Hard RAM cap for the container's cgroup — a standing guardrail so any pathological compile is
+    # OOM-killed inside its own cgroup (exit 137) and fails as a normal stage, instead of exhausting
+    # the host and tripping the host OOM killer. (The aggregate-codegen blowup that motivated this
+    # was fixed in #29; the cap stays as protection against future regressions.) With
+    # mem_limit == memswap_limit the container gets NO swap. Raise for investigation: BET_MEM_LIMIT=48g.
+    mem_limit: ${BET_MEM_LIMIT:-24g}
+    memswap_limit: ${BET_MEM_LIMIT:-24g}
+    environment:
+      HOME: /tmp
+      CARGO_TERM_COLOR: "always"
+      # Keep the cargo cache on the bind mount (owned by the runtime UID, gitignored) rather than
+      # a root-owned named volume — persists across runs and is writable by the non-root user.
+      CARGO_HOME: /work/.docker-cache/cargo
+    volumes:
+      # The repo root (this file lives in docker/, so .. is the repo root).
+      - ..:/work
+    # Keep an idle builder alive for `exec`; overridden by `run --rm bet <cmd>`.
+    command: ["sleep", "infinity"]
