@@ -119,23 +119,23 @@ flex finna setDoorDir(gt: tag gs.GameState, doorT: tag think.Thinker, d: int) {
 }
 
 flex finna evDoDoor(gt: tag gs.GameState, line: int, doortype: int) -> int {
-    lowkey tag: int = 0
+    lowkey tagn: int = 0
     holla g = gt in gs.gsc {
-        tag = g.level.lineTag[line] as int
+        tagn = g.level.lineTag[line] as int
     } ghosted {
         yeet("gs")
     }
-    bet evDoDoorTag(gt, tag, doortype)
+    bet evDoDoorTag(gt, tagn, doortype)
 }
 
 // evDoDoorTag — EV_DoDoor keyed on a sector tag directly (p_specutil.findSectorFromTag). The
 // junk-line boss-death triggers (p_enemy A_BossDeath/A_KeenDie) call this with tag 666, which has
 // no real linedef, so they cannot go through the lineTag path.
-flex finna evDoDoorTag(gt: tag gs.GameState, tag: int, doortype: int) -> int {
+flex finna evDoDoorTag(gt: tag gs.GameState, tagn: int, doortype: int) -> int {
     lowkey secnum: int = -1
     lowkey rtn: int = 0
     vibin nocap {
-        secnum = psu.findSectorFromTag(gt, tag, secnum)
+        secnum = psu.findSectorFromTag(gt, tagn, secnum)
         fr secnum < 0 {
             dip
         }
