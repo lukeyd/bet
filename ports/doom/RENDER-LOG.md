@@ -160,3 +160,81 @@ a ~1-column shift of part of a sprite silhouette); demo2 has 12 such tics. They 
 y<168) that were masked before because the face diff made every frame's CRC differ from tic 18 on.
 The render workstream's earlier "3D view pixel-perfect" was verified only over tics 2–30; these
 appear later, when close sprites are drawn. Left for the renderer (r_things/r_draw) workstream.
+
+
+## W3-sprite — the last sprite-edge residuals ROOT-CAUSED (doom-spr): irreducible OOB read
+
+Picking up the "tiny masked-column sprite-edge" residuals above (demo3 196/341/685/1936;
+demo2 351/356/631/810/1731/2208/2325/2426/2717/2925/3604/3787). Result: **these are NOT an
+`r_things`/`r_draw` precision bug. The port's masked-column rendering math is byte-for-byte
+identical to the doomgeneric oracle. Every residual pixel is the SAME vanilla-DOOM
+out-of-bounds sprite-top-edge texel read, and the two implementations differ only in what
+memory that OOB read lands in.** No principled render fix can close them; documented + stopped.
+
+### How it was proven (instrumented BOTH sides, reverted after)
+Added temporary matched debug to the port (`r_things.drawMaskedColumn` + `r_draw.drawColumn`)
+and to the oracle (pristine `r_things.c` + `r_draw.c`, rebuilt `doomgeneric_dump_dbg`, then
+`git checkout`ed both — the committed patch `d_net.c`/`g_game.c` and `demo{1,2,3}.oracle.sync`
+were never touched). For every divergent pixel, dumped `dc_yl`, `dc_texturemid`, `dc_iscale`,
+`centery`, the per-row `frac`, the texel index `(frac>>16)&127`, and the raw source byte.
+
+At **every** divergent pixel the port and the oracle compute the **identical** top-of-post row
+and the identical texel index **127**, e.g. demo3 tic 685 col 30/31 (sprite **BON2A0**, the
+armor bonus):
+
+```
+row y=154  topscreen=10092423 (=153.996*FRACUNIT)  ->  dc_yl = ceil = 154
+frac(154) = dc_texturemid(-2031693) + (154-84)*iscale(29024) = -13      (just below 0)
+texel = (-13 >> 16) & 127 = (-1) & 127 = 127        <-- BOTH port and oracle
+port  reads raw byte 111  -> colormap -> 5
+oracle reads raw byte 0   -> colormap -> 0
+```
+
+The `-13` is the classic DOOM artifact: the ceil rounding of `dc_yl` at a post whose true top
+is a hair above the pixel grid makes `frac` land a few units below zero on the first row, so
+`(frac>>FRACBITS)` is `-1`, and R_DrawColumn's `&127` wraps it to **texel 127** — far past
+these short sprite posts (BON2A0's post is 11 px; the whole lump is 356 B). This is an
+out-of-bounds read that vanilla DOOM (and therefore doomgeneric) performs unchanged; the port
+reproduces it faithfully (verified `R_DrawColumn`/`R_DrawMaskedColumn` are byte-identical to
+doomgeneric's active functions, including the `&127`).
+
+### Why the byte differs (memory model, not rendering)
+`dc_source[127]` reads **past the sprite lump**. The two ports store WAD lumps differently:
+
+- **Port**: the whole WAD is one contiguous in-RAM image, so `dc_source[127]` reads the byte
+  that physically follows in the file — the **next lump's** data.
+- **doomgeneric oracle**: `W_CacheLumpNum` (with `w_file_stdc`, no mmap) `Z_Malloc`s each lump
+  into its own buffer, so `dc_source[127]` reads **zone-heap** memory past that buffer.
+
+Confirmed lump-by-lump (all `within_lump = False`, i.e. the OOB index clears the post's lump):
+
+| tic (demo) | sprite lump | port raw @127 | oracle raw @127 |
+|---|---|---|---|
+| 685 (d3) col30/31 | BON2A0 (356 B) | 111 (→next lump BON2B0) | 0 (zone heap) |
+| 341/196 (d3) | BLUDA0 (76 B, blood) | 1 / 255 / 188 / 177 / 4 | 181 / 185 / 188 / 15 |
+| 1936 (d3) col207/8 | SARGN0 (1728 B, demon) | 78 | 15 |
+| 351 (d2) col218 | (2nd overlapping post) | 207 | 0 |
+| 810 (d2) col243/5/6 | (blood) | 2 / 141 | 0 / 109 |
+
+The oracle's OOB bytes (181, 185, 188, 15, 0, 109 …) are **not** constant and **not** derivable
+from the WAD — they are doomgeneric's zone-allocator contents past each cached lump, an artifact
+of its allocation order/history. Neither side reads a "correct" pixel; both read undefined memory.
+
+### Why it is irreducible (no principled fix, and a real regression risk)
+- Matching the oracle byte-for-byte would require the port to reproduce doomgeneric's exact
+  `Z_Malloc` zone layout + cache-on-demand order + initial contents across the whole demo —
+  i.e. re-implement the allocator to reproduce garbage, not a render fix, and extremely fragile.
+- Zero-padding isolated per-lump buffers would match only the cases where the oracle heap is 0
+  (tic 685, 351) and still diverge where it's non-zero (341/196/1936/2717/3787/…). Worse, it
+  changes the source memory for **every** sprite/masked column, so any of the ~5960 currently-
+  matching frames that also perform a coincidentally-matching tix=127 read would flip to a NEW
+  mismatch — a likely net regression against the "count must go UP, never down" rule.
+- Clamping the texel index to the post (drawing the sprite's real top texel) renders "more
+  correctly" but diverges from the oracle's garbage at every one of these pixels — no parity win.
+
+### Verdict + counts (UNCHANGED — no render code touched)
+- demo3 **2130 / 2134**, demo2 **3824 / 3836** (the 16 residual tics are exactly the 16 OOB
+  cases above). This is the maximum full-frame-C parity attainable without reproducing
+  doomgeneric's zone allocator. Per the "genuine oracle divergence rather than a port bug →
+  document + STOP" provision, no `r/*` change is made. All instrumentation reverted; the port
+  worktree and the `doom-oracle` tree (committed patch + `demo{1,2,3}.oracle.sync`) are git-clean.
