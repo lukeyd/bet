@@ -532,6 +532,12 @@ size = 4
 # scr0 crc 0x98df0334 deterministic). Renderer now draws walls+floors+sprites+psprites.
 status = "done"
 
+[[task]]
+slug = "doom-p24"
+name = "Doom P2.4: sim-AI — p_enemy (52 mobj A_* actions) + p_pspr (22 psprite A_* + weapon logic) + p_user (PlayerThink/CalcHeight) + p_tick (P_Ticker) + p_action (wire all 74 actions + hooks)"
+size = 8
+status = "doing"
+
 # ─────────────────────── Oregon Trail port + the language features it needs ───────────────────────
 # A faithful port of the 1978 MECC Oregon Trail BASIC listing (ports/oregon-trail/). It needs two
 # stdlib intrinsics the language lacked: a seedable RNG and interactive stdin. betfe is intentionally

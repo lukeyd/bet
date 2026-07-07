@@ -1,0 +1,113 @@
+// p/p_action.bet — THE WIRING LINCHPIN. `wireActions` binds every fn-value dispatch surface in
+// GameState to its real implementation, making the whole simulation come alive. It sets:
+//   * all 74 g.actions.a* fields (52 mobj + 22 psprite actions) -> p_enemy / p_pspr,
+//   * g.hooks.mobjThink -> p_mobj.mobjThinker (thinker forward-dispatch),
+//   * the 4 movement/aim hooks (tryMove/slideMove/checkPosition/aimLineAttack) -> p_map,
+//   * g.hooks.dropWeapon -> p_pspr.dropWeapon (the p_inter.killMobj seam), and
+//   * calls p_spec.wireHooks (the 3 line-special hooks + the 8 sector-thinker hooks).
+//
+// CONTRACT: D_DoomMain / G_InitNew (P2.8) MUST call wireActions(gt) exactly ONCE at startup,
+// BEFORE any thinker runs (P_RunThinkers dispatches these fn-values unconditionally — native cannot
+// null-compare an fn-value, so an unwired slot would crash on the first monster/psprite/door tic).
+// Nothing pulls p_action except the shell/smoke; p_action sits at the TOP of the DAG (it pulls
+// p_enemy/p_pspr/p_mobj/p_map/p_spec — all below it).
+pull "../defs/gs" as gs
+pull "../p/p_enemy" as penemy
+pull "../p/p_pspr" as ppspr
+pull "../p/p_mobj" as pmobj
+pull "../p/p_map" as pmap
+pull "../p/p_spec" as pspec
+
+// wireActions — install every action + hook. Call ONCE at startup, before the first thinker runs.
+flex finna wireActions(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        // ---- the 4 movement/aim hooks (p_map) + the mobj-thinker forward slot (p_mobj) --------
+        g.hooks.tryMove = pmap.tryMove
+        g.hooks.slideMove = pmap.slideMove
+        g.hooks.checkPosition = pmap.checkPosition
+        g.hooks.aimLineAttack = pmap.aimLineAttack
+        g.hooks.mobjThink = pmobj.mobjThinker
+        // ---- the P_DropWeapon seam (p_inter.killMobj dispatches through this) ------------------
+        g.hooks.dropWeapon = ppspr.dropWeapon
+        // ---- the 52 mobj actions (p_enemy; A_BFGSpray lives in p_pspr) -------------------------
+        g.actions.aBFGSpray = ppspr.aBFGSpray
+        g.actions.aBabyMetal = penemy.aBabyMetal
+        g.actions.aBossDeath = penemy.aBossDeath
+        g.actions.aBrainAwake = penemy.aBrainAwake
+        g.actions.aBrainDie = penemy.aBrainDie
+        g.actions.aBrainExplode = penemy.aBrainExplode
+        g.actions.aBrainPain = penemy.aBrainPain
+        g.actions.aBrainScream = penemy.aBrainScream
+        g.actions.aBrainSpit = penemy.aBrainSpit
+        g.actions.aBruisAttack = penemy.aBruisAttack
+        g.actions.aBspiAttack = penemy.aBspiAttack
+        g.actions.aCPosAttack = penemy.aCPosAttack
+        g.actions.aCPosRefire = penemy.aCPosRefire
+        g.actions.aChase = penemy.aChase
+        g.actions.aCyberAttack = penemy.aCyberAttack
+        g.actions.aExplode = penemy.aExplode
+        g.actions.aFaceTarget = penemy.aFaceTarget
+        g.actions.aFall = penemy.aFall
+        g.actions.aFatAttack1 = penemy.aFatAttack1
+        g.actions.aFatAttack2 = penemy.aFatAttack2
+        g.actions.aFatAttack3 = penemy.aFatAttack3
+        g.actions.aFatRaise = penemy.aFatRaise
+        g.actions.aFire = penemy.aFire
+        g.actions.aFireCrackle = penemy.aFireCrackle
+        g.actions.aHeadAttack = penemy.aHeadAttack
+        g.actions.aHoof = penemy.aHoof
+        g.actions.aKeenDie = penemy.aKeenDie
+        g.actions.aLook = penemy.aLook
+        g.actions.aMetal = penemy.aMetal
+        g.actions.aPain = penemy.aPain
+        g.actions.aPainAttack = penemy.aPainAttack
+        g.actions.aPainDie = penemy.aPainDie
+        g.actions.aPlayerScream = penemy.aPlayerScream
+        g.actions.aPosAttack = penemy.aPosAttack
+        g.actions.aSPosAttack = penemy.aSPosAttack
+        g.actions.aSargAttack = penemy.aSargAttack
+        g.actions.aScream = penemy.aScream
+        g.actions.aSkelFist = penemy.aSkelFist
+        g.actions.aSkelMissile = penemy.aSkelMissile
+        g.actions.aSkelWhoosh = penemy.aSkelWhoosh
+        g.actions.aSkullAttack = penemy.aSkullAttack
+        g.actions.aSpawnFly = penemy.aSpawnFly
+        g.actions.aSpawnSound = penemy.aSpawnSound
+        g.actions.aSpidRefire = penemy.aSpidRefire
+        g.actions.aStartFire = penemy.aStartFire
+        g.actions.aTracer = penemy.aTracer
+        g.actions.aTroopAttack = penemy.aTroopAttack
+        g.actions.aVileAttack = penemy.aVileAttack
+        g.actions.aVileChase = penemy.aVileChase
+        g.actions.aVileStart = penemy.aVileStart
+        g.actions.aVileTarget = penemy.aVileTarget
+        g.actions.aXScream = penemy.aXScream
+        // ---- the 22 weapon/psprite actions (p_pspr) -------------------------------------------
+        g.actions.aBFGsound = ppspr.aBFGsound
+        g.actions.aCheckReload = ppspr.aCheckReload
+        g.actions.aCloseShotgun2 = ppspr.aCloseShotgun2
+        g.actions.aFireBFG = ppspr.aFireBFG
+        g.actions.aFireCGun = ppspr.aFireCGun
+        g.actions.aFireMissile = ppspr.aFireMissile
+        g.actions.aFirePistol = ppspr.aFirePistol
+        g.actions.aFirePlasma = ppspr.aFirePlasma
+        g.actions.aFireShotgun = ppspr.aFireShotgun
+        g.actions.aFireShotgun2 = ppspr.aFireShotgun2
+        g.actions.aGunFlash = ppspr.aGunFlash
+        g.actions.aLight0 = ppspr.aLight0
+        g.actions.aLight1 = ppspr.aLight1
+        g.actions.aLight2 = ppspr.aLight2
+        g.actions.aLoadShotgun2 = ppspr.aLoadShotgun2
+        g.actions.aLower = ppspr.aLower
+        g.actions.aOpenShotgun2 = ppspr.aOpenShotgun2
+        g.actions.aPunch = ppspr.aPunch
+        g.actions.aRaise = ppspr.aRaise
+        g.actions.aReFire = ppspr.aReFire
+        g.actions.aSaw = ppspr.aSaw
+        g.actions.aWeaponReady = ppspr.aWeaponReady
+    } ghosted {
+        yeet("gs")
+    }
+    // ---- the p_spec hooks: 3 line-special hooks + the 8 sector-thinker forward slots ----------
+    pspec.wireHooks(gt)
+}

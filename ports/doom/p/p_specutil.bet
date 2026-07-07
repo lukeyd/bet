@@ -251,13 +251,25 @@ flex finna findHighestCeilingSurrounding(gt: tag gs.GameState, sec: int) -> i32 
 }
 
 flex finna findSectorFromLineTag(gt: tag gs.GameState, line: int, start: int) -> int {
+    lowkey ltag: int = 0
+    holla g = gt in gs.gsc {
+        ltag = g.level.lineTag[line] as int
+    } ghosted {
+        yeet("gs")
+    }
+    bet findSectorFromTag(gt, ltag, start)
+}
+
+// findSectorFromTag — the tag-based core of P_FindSectorFromLineTag. Split out so the boss/keen
+// death actions (p_enemy A_BossDeath/A_KeenDie), which trigger EV_Do* on a synthetic tag-666 junk
+// line with no real linedef, can drive the sector search without a lineTag lookup.
+flex finna findSectorFromTag(gt: tag gs.GameState, tagn: int, start: int) -> int {
     lowkey res: int = -1
     holla g = gt in gs.gsc {
-        lowkey ltag: int = g.level.lineTag[line] as int
         lowkey nsec: int = g.level.numsectors as int
         lowkey i: int = start + 1
         vibin i < nsec {
-            fr g.level.secTag[i] as int == ltag {
+            fr g.level.secTag[i] as int == tagn {
                 res = i
                 dip
             }

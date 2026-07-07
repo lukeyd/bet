@@ -404,6 +404,11 @@ flex drip Hooks {
     flex flashThink: finna(tag GameState, tag think.Thinker) -> void
     flex strobeThink: finna(tag GameState, tag think.Thinker) -> void
     flex glowThink: finna(tag GameState, tag think.Thinker) -> void
+    // P2.4 amendment: P_DropWeapon forward-dispatch. p_inter.killMobj lowers the dead player's
+    // weapon, but p_inter cannot pull p/p_pspr (p_pspr -> p_inter for P_DamageMobj, so the reverse
+    // edge would cycle). Modelled as a pre-wired fn-value exactly like mobjThink; p_action wires it
+    // to p_pspr.dropWeapon at startup. Arg is the player index. cop zero-inits it.
+    flex dropWeapon: finna(tag GameState, int) -> void
 }
 
 flex drip Actions {
@@ -539,6 +544,12 @@ flex drip TickState {
     flex numbraintargets: i32
     flex brainTargetOn: i32
     flex brainEasy: i32
+    // P2.4 amendment: Archvile corpse-raise scratch (p_enemy A_VileChase / PIT_VileCheck). The
+    // block-things iterator callback only receives (gt, thing), so the try-position + the found
+    // corpse are threaded through here (mirrors the tm* regs the p_map PIT_ callbacks use).
+    flex viletryx: i32
+    flex viletryy: i32
+    flex corpsehit: tag think.Thinker
     flex anims: vec[AnimDef]
     flex switchlist: i32[100]
     flex numswitches: i32

@@ -1,0 +1,75 @@
+// p/p_tick.bet — the per-tic orchestrator (linuxdoom-1.10 p_tick.c, ticker half). P_Ticker runs
+// one game tic: every player-in-game thinks, then all thinkers run, then the sector specials
+// update, queued items respawn, and leveltime advances. (P_InitThinkers/P_AddThinker/
+// P_RemoveThinker/P_RunThinkers live in p/p_think — not duplicated here.)
+//
+// SEAM: g/g_game (P2.8) drives P_Ticker once per game tic after feeding ticcmds into
+// g.shell.players[i].cmd. NATIVE is the correctness target.
+pull "../defs/gs" as gs
+pull "../defs/doomdef" as doomdef
+pull "../p/p_user" as puser
+pull "../p/p_think" as pthink
+pull "../p/p_spec" as pspec
+pull "../p/p_mobj" as pmobj
+
+flex facts MAXPLAYERS: int = 4
+
+// P_Ticker — advance the world by one tic.
+flex finna pTicker(gt: tag gs.GameState) {
+    lowkey paused: bool = cap
+    holla g = gt in gs.gsc {
+        paused = g.shell.paused
+    } ghosted {
+        yeet("gs")
+    }
+    fr paused {
+        bet
+    }
+    // pause if in a menu and at least one tic has run (single-player, non-demo)
+    lowkey netgame: bool = cap
+    lowkey menuactive: bool = cap
+    lowkey demoplayback: bool = cap
+    lowkey cp: int = 0
+    holla g = gt in gs.gsc {
+        netgame = g.shell.netgame
+        menuactive = g.shell.menuactive
+        demoplayback = g.shell.demoplayback
+        cp = g.shell.consoleplayer as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr !netgame && menuactive && !demoplayback {
+        lowkey viewz: int = 0
+        holla g = gt in gs.gsc {
+            viewz = g.shell.players[cp].viewz as int
+        } ghosted {
+            yeet("gs")
+        }
+        fr viewz != 1 {
+            bet
+        }
+    }
+    // player thinking
+    lowkey i: int = 0
+    vibin i < MAXPLAYERS {
+        lowkey pig: bool = cap
+        holla g = gt in gs.gsc {
+            pig = g.shell.playeringame[i]
+        } ghosted {
+            yeet("gs")
+        }
+        fr pig {
+            puser.playerThink(gt, i)
+        }
+        i = i + 1
+    }
+    pthink.runThinkers(gt)
+    pspec.updateSpecials(gt)
+    pmobj.respawnSpecials(gt)
+    // for par times
+    holla g = gt in gs.gsc {
+        g.tick.leveltime = g.tick.leveltime + 1
+    } ghosted {
+        yeet("gs")
+    }
+}
