@@ -566,21 +566,28 @@ flex finna tryMove(gt: tag gs.GameState, thing: tag think.Thinker, x: i32, y: i3
     pmaputl.unsetThingPosition(gt, thing)
     lowkey oldx: i32 = 0
     lowkey oldy: i32 = 0
+    // Read the tm interval into locals FIRST, then write the mobj through a top-level holla.
+    // Writing t.mobj.x/y inside a nested `holla ... in gs.thinkers` (itself inside `holla ...
+    // in gs.gsc`) does not reliably commit the store in native lowering — the position write
+    // was intermittently lost, which showed up as a stale demo-sync fingerprint one tic after
+    // a P_SlideMove (the mobj was actually moved, but a later read saw the pre-move value).
+    lowkey tmfloorz2: i32 = 0
+    lowkey tmceilingz2: i32 = 0
     holla g = gt in gs.gsc {
-        lowkey tmfloorz = g.tick.tmfloorz
-        lowkey tmceilingz = g.tick.tmceilingz
-        holla t = thing in gs.thinkers {
-            oldx = t.mobj.x
-            oldy = t.mobj.y
-            t.mobj.floorz = tmfloorz
-            t.mobj.ceilingz = tmceilingz
-            t.mobj.x = x
-            t.mobj.y = y
-        } ghosted {
-            yeet("thing")
-        }
+        tmfloorz2 = g.tick.tmfloorz
+        tmceilingz2 = g.tick.tmceilingz
     } ghosted {
         yeet("gs")
+    }
+    holla t = thing in gs.thinkers {
+        oldx = t.mobj.x
+        oldy = t.mobj.y
+        t.mobj.floorz = tmfloorz2
+        t.mobj.ceilingz = tmceilingz2
+        t.mobj.x = x
+        t.mobj.y = y
+    } ghosted {
+        yeet("thing")
     }
     pmaputl.setThingPosition(gt, thing)
     // special-line crossings (skip if teleport / noclip)
@@ -922,6 +929,14 @@ flex finna slideMove(gt: tag gs.GameState, mo: tag think.Thinker) {
         }
         // fudge a bit so it doesn't quite hit
         bestfrac = bestfrac - 0x800
+        // Track the mobj position after the "move up to the wall" step. The reference's
+        // "continue along the wall" P_TryMove reads the ALREADY-advanced mo->x/mo->y, so the
+        // along-move must start there — not from the loop-entry (mx,my). P_TryMove sets
+        // mo->x/mo->y to its target exactly on success, so we know the advanced position is
+        // (mx+newx, my+newy) without re-reading the mobj (a re-read through a fresh `holla`
+        // after a nested-`holla` write is not reliable in native lowering).
+        lowkey ux: i32 = mx
+        lowkey uy: i32 = my
         fr bestfrac > 0 {
             lowkey newx: i32 = fixed.fixedMul(momx, bestfrac)
             lowkey newy: i32 = fixed.fixedMul(momy, bestfrac)
@@ -929,6 +944,8 @@ flex finna slideMove(gt: tag gs.GameState, mo: tag think.Thinker) {
                 stairStep(gt, mo)
                 bet
             }
+            ux = mx + newx
+            uy = my + newy
         }
         // continue along the wall — the remaining fraction
         lowkey rem: i32 = (fixed.FRACUNIT - (bestfrac + 0x800)) as i32
@@ -965,7 +982,8 @@ flex finna slideMove(gt: tag gs.GameState, mo: tag think.Thinker) {
         } ghosted {
             yeet("mo")
         }
-        fr tryMove(gt, mo, mx + nmx, my + nmy) {
+        // P_TryMove (mo, mo->x+tmxmove, mo->y+tmymove): mo->x/mo->y are the advanced (ux,uy).
+        fr tryMove(gt, mo, ux + nmx, uy + nmy) {
             bet
         }
         // blocked again -> retry

@@ -37,15 +37,19 @@ pub fn run(args: &[String], root: &Path) -> Result<()> {
     }
     let (Some(ours), Some(theirs)) = (flag_value(args, "--ours"), flag_value(args, "--theirs"))
     else {
-        bail!("usage: doom-verify --goldens | --ours <file> --theirs <file> | --demo <name>");
+        bail!(
+            "usage: doom-verify --goldens | --ours <file> --theirs <file> [--sim-only] | --demo <name>"
+        );
     };
+    let sim_only = args.iter().any(|a| a == "--sim-only");
     let ours_text = fs::read_to_string(ours).with_context(|| format!("reading --ours {ours}"))?;
     let theirs_text =
         fs::read_to_string(theirs).with_context(|| format!("reading --theirs {theirs}"))?;
-    match sync_diff(&ours_text, &theirs_text) {
+    match sync_diff_opt(&ours_text, &theirs_text, sim_only) {
         None => {
+            let scope = if sim_only { " (sim fields only)" } else { "" };
             println!(
-                "doom-verify: streams match ({} lines)",
+                "doom-verify: streams match ({} lines){scope}",
                 ours_text.lines().count()
             );
             Ok(())
@@ -263,19 +267,32 @@ impl Divergence {
 /// Compare two sync streams line-by-line; `None` when byte-identical (modulo a trailing
 /// newline). Reports the FIRST divergent line — everything after the first divergence is
 /// noise, since the sim is a chaotic system.
-pub fn sync_diff(ours: &str, theirs: &str) -> Option<Divergence> {
+/// When `sim_only` is set the framebuffer crc field (`C=`) is ignored for both the
+/// line-equality test and the field diff — so the first reported divergence is always
+/// among the sim fields R/X/Y/Z/A/MX/MY/H/S/LT (the renderer's `C` is the sibling's
+/// problem). With `sim_only = false` this is a strict, crc-sensitive line diff.
+pub fn sync_diff_opt(ours: &str, theirs: &str, sim_only: bool) -> Option<Divergence> {
     let a: Vec<&str> = ours.lines().collect();
     let b: Vec<&str> = theirs.lines().collect();
     let n = a.len().max(b.len());
     for i in 0..n {
         let (x, y) = (a.get(i).copied(), b.get(i).copied());
-        if x == y {
+        let equal = if sim_only {
+            match (x, y) {
+                (Some(x), Some(y)) => strip_c(x) == strip_c(y),
+                (None, None) => true,
+                _ => false,
+            }
+        } else {
+            x == y
+        };
+        if equal {
             continue;
         }
         let start = i.saturating_sub(3);
         let context = a[start..i].iter().map(|s| s.to_string()).collect();
         let fields = match (x, y) {
-            (Some(x), Some(y)) => field_diff(x, y),
+            (Some(x), Some(y)) => field_diff(x, y, sim_only),
             _ => Vec::new(),
         };
         let is_setup = x.map(|l| l.starts_with("SETUP")).unwrap_or(false)
@@ -299,9 +316,19 @@ pub fn sync_diff(ours: &str, theirs: &str) -> Option<Divergence> {
     None
 }
 
+/// Drop the framebuffer-crc token (`C=...`) from a fingerprint line, so the remaining
+/// text is the sim-only fingerprint. Used by `--sim-only`.
+fn strip_c(line: &str) -> String {
+    line.split_whitespace()
+        .filter(|tok| !tok.starts_with("C="))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Parse `K=V` tokens out of both lines and list the fields whose values differ (fields
-/// missing on one side diff against `<absent>`).
-fn field_diff(ours: &str, theirs: &str) -> Vec<(String, String, String)> {
+/// missing on one side diff against `<absent>`). When `sim_only`, the `C` field is
+/// omitted from the report.
+fn field_diff(ours: &str, theirs: &str, sim_only: bool) -> Vec<(String, String, String)> {
     let pa = parse_fields(ours);
     let pb = parse_fields(theirs);
     let mut keys: Vec<&String> = pa.keys().collect();
@@ -313,6 +340,9 @@ fn field_diff(ours: &str, theirs: &str) -> Vec<(String, String, String)> {
     let absent = "<absent>".to_string();
     let mut out = Vec::new();
     for k in keys {
+        if sim_only && k == "C" {
+            continue;
+        }
         let va = pa.get(k).unwrap_or(&absent);
         let vb = pb.get(k).unwrap_or(&absent);
         if va != vb {
@@ -370,7 +400,7 @@ mod tests {
     #[test]
     fn identical_streams_match() {
         let s = format!("{L1}\n{L2}\n");
-        assert!(sync_diff(&s, &s).is_none());
+        assert!(sync_diff_opt(&s, &s, false).is_none());
     }
 
     #[test]
@@ -378,7 +408,7 @@ mod tests {
         let ours = format!("{L1}\n{L2}\nT=00000003 R=00000007 X=00120000 Y=00200000 C=11111111\n");
         let theirs =
             format!("{L1}\n{L2}\nT=00000003 R=00000009 X=00121000 Y=00200000 C=22222222\n");
-        let d = sync_diff(&ours, &theirs).expect("diverges");
+        let d = sync_diff_opt(&ours, &theirs, false).expect("diverges");
         assert_eq!(d.line_no, 3);
         assert_eq!(d.context.len(), 2); // only two preceding lines exist
         assert_eq!(d.triage, Triage::Sim);
@@ -391,10 +421,36 @@ mod tests {
     }
 
     #[test]
+    fn sim_only_ignores_crc_and_finds_first_sim_field() {
+        // Two tics that agree on every sim field but differ in C: sim-only sees no
+        // divergence there, and reports the later tic where X actually diverges.
+        let l2b = L2.replace("C=cafef00d", "C=deadbeef");
+        let ours = format!("{L1}\n{L2}\nT=00000003 R=00000007 X=00120000 Y=00200000 C=11111111\n");
+        let theirs =
+            format!("{L1}\n{l2b}\nT=00000003 R=00000007 X=00121000 Y=00200000 C=22222222\n");
+        let d = sync_diff_opt(&ours, &theirs, true).expect("diverges on X");
+        assert_eq!(d.line_no, 3);
+        assert_eq!(d.triage, Triage::Sim);
+        // C must not appear in the reported fields under --sim-only.
+        let keys: Vec<&str> = d.fields.iter().map(|(k, _, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["X"]);
+    }
+
+    #[test]
+    fn sim_only_crc_only_divergence_matches() {
+        // If ONLY C differs across the whole stream, sim-only reports a full match.
+        let ours = format!("{L1}\n{L2}\n");
+        let theirs = format!("{L1}\n{}\n", L2.replace("C=cafef00d", "C=00000000"));
+        assert!(sync_diff_opt(&ours, &theirs, true).is_none());
+        // ...but the default (crc-sensitive) diff still catches it.
+        assert!(sync_diff_opt(&ours, &theirs, false).is_some());
+    }
+
+    #[test]
     fn crc_only_divergence_is_renderer() {
         let ours = format!("{L1}\n{L2}\n");
         let theirs = format!("{L1}\n{}\n", L2.replace("C=cafef00d", "C=00000000"));
-        let d = sync_diff(&ours, &theirs).expect("diverges");
+        let d = sync_diff_opt(&ours, &theirs, false).expect("diverges");
         assert_eq!(d.triage, Triage::Renderer);
         assert_eq!(d.fields.len(), 1);
         assert_eq!(d.fields[0].0, "C");
@@ -404,7 +460,7 @@ mod tests {
     fn setup_divergence_is_loader() {
         let ours = "SETUP sectors=00000010 lines=00000040 things=00000005\nSETUP T i=00000000 type=00000001 x=00100000 y=00100000 a=00000000\n";
         let theirs = "SETUP sectors=00000010 lines=00000040 things=00000005\nSETUP T i=00000000 type=00000002 x=00100000 y=00100000 a=00000000\n";
-        let d = sync_diff(ours, theirs).expect("diverges");
+        let d = sync_diff_opt(ours, theirs, false).expect("diverges");
         assert_eq!(d.line_no, 2);
         assert_eq!(d.triage, Triage::Loader);
         assert_eq!(d.fields[0].0, "type");
@@ -414,7 +470,7 @@ mod tests {
     fn truncated_stream_reports_end() {
         let ours = format!("{L1}\n{L2}\n");
         let theirs = format!("{L1}\n");
-        let d = sync_diff(&ours, &theirs).expect("diverges");
+        let d = sync_diff_opt(&ours, &theirs, false).expect("diverges");
         assert_eq!(d.line_no, 2);
         assert!(d.theirs.is_none());
         assert!(d.render().contains("<stream ended>"));
