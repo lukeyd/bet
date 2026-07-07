@@ -1,0 +1,233 @@
+// m/m_misc.bet — the default.cfg config I/O + file helpers (linuxdoom-1.10 m_misc.c). The config
+// is the machine-independent settings block: volumes, screen size, detail, gamma, mouse
+// sensitivity, sound channels. id keyed each `default_t` to a global int*; here each maps to a
+// GameState field. String defaults (key bindings, chat macros) are NOT persisted in v1 (the port
+// keeps id's default key codes as g_game constants) — a documented minimal-config deviation.
+//
+// PORTED:  M_LoadDefaults (base values + override from file), M_SaveDefaults, M_WriteFile,
+//          M_ReadFile, M_ScreenShot (raw 8-bit dump — the PCX packer is SKIPPED per the plan's
+//          "PCX or raw — optional").
+// PORTED-PARTIAL: config only round-trips the int settings above (no key-binding/chat-macro rows).
+pull "spill"
+pull "mem"
+pull "vec"
+pull "str"
+pull "fs"
+pull "sys"
+pull "../defs/gs" as gs
+pull "../defs/doomdef" as doomdef
+pull "../util/m_argv" as margv
+
+// configPath — id's basedefault ($HOME/.doomrc) or the -config override. The port defaults to a
+// cwd-local "default.cfg" (no $HOME dependency in the headless harness).
+flex finna configPath() -> str {
+    lowkey p = margv.checkParm("-config")
+    fr p != 0 && p < sys.argc() - 1 {
+        bet sys.arg(p + 1)
+    }
+    bet "default.cfg"
+}
+
+// setBase — id's "set everything to base values" loop (the default_t defaultvalue column).
+flex finna setBase(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.shell.mouseSensitivity = 5
+        g.sound.sfxVolume = 8
+        g.sound.musicVolume = 8
+        g.menu.showMessages = 1
+        g.menu.screenblocks = 9
+        g.menu.screenSize = 6           // screenSize == screenblocks-3
+        g.menu.detailLevel = 0
+        g.sound.numChannels = 8
+        g.vid.gammaIndex = 0
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// setKey — apply one parsed "name value" pair (the default_t name->location table).
+flex finna setKey(gt: tag gs.GameState, name: str, v: int) {
+    holla g = gt in gs.gsc {
+        fr str.slaps(name, "mouse_sensitivity") {
+            g.shell.mouseSensitivity = v as i32
+        } naw fr str.slaps(name, "sfx_volume") {
+            g.sound.sfxVolume = v as i32
+        } naw fr str.slaps(name, "music_volume") {
+            g.sound.musicVolume = v as i32
+        } naw fr str.slaps(name, "show_messages") {
+            g.menu.showMessages = v as i32
+        } naw fr str.slaps(name, "screenblocks") {
+            g.menu.screenblocks = v as i32
+            g.menu.screenSize = (v - 3) as i32
+        } naw fr str.slaps(name, "detaillevel") {
+            g.menu.detailLevel = v as i32
+        } naw fr str.slaps(name, "snd_channels") {
+            g.sound.numChannels = v as i32
+        } naw fr str.slaps(name, "usegamma") {
+            g.vid.gammaIndex = v as i32
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// isSpace — whitespace test for the token scanner (space/tab/newline/CR).
+flex finna isSpace(c: int) -> bool {
+    bet c == 32 || c == 9 || c == 10 || c == 13
+}
+
+// parseInt — read a signed decimal at s[i..]; returns (value, nextIndex, ok). ok=false if s[i]
+// isn't a digit or '-' (e.g. a quoted string default we skip).
+flex finna parseInt(s: str, i0: int, n: int) -> (int, int, bool) {
+    lowkey i = i0
+    lowkey neg = cap
+    fr i < n && str.at(s, i) == 45 {
+        neg = nocap
+        i = i + 1
+    }
+    lowkey start = i
+    lowkey v = 0
+    vibin i < n {
+        lowkey c = str.at(s, i)
+        fr c < 48 || c > 57 {
+            dip
+        }
+        v = v * 10 + (c - 48)
+        i = i + 1
+    }
+    fr i == start {
+        bet 0, i0, cap
+    }
+    fr neg {
+        v = 0 - v
+    }
+    bet v, i, nocap
+}
+
+// M_LoadDefaults — set base values, then override from the config file (tolerant: a missing/empty
+// file leaves the base values in place). Parses "name value" token pairs; non-integer values
+// (quoted strings) are skipped.
+flex finna loadDefaults(gt: tag gs.GameState) {
+    setBase(gt)
+    lowkey txt = fs.peepText(configPath())
+    lowkey n = str.len(txt)
+    lowkey i = 0
+    vibin i < n {
+        // skip whitespace
+        vibin i < n && isSpace(str.at(txt, i)) {
+            i = i + 1
+        }
+        fr i >= n {
+            dip
+        }
+        // read a name token (up to whitespace)
+        lowkey ns = i
+        vibin i < n && !isSpace(str.at(txt, i)) {
+            i = i + 1
+        }
+        lowkey name = str.sub(txt, ns, i)
+        // skip whitespace to the value
+        vibin i < n && isSpace(str.at(txt, i)) {
+            i = i + 1
+        }
+        lowkey v, ni, ok = parseInt(txt, i, n)
+        fr ok {
+            setKey(gt, name, v)
+            i = ni
+        } naw {
+            // skip the rest of this value token (a quoted string default we don't persist)
+            vibin i < n && !isSpace(str.at(txt, i)) {
+                i = i + 1
+            }
+        }
+    }
+}
+
+// pushStr / pushInt — append helpers for the config writer (bytes into a growing vec).
+flex finna pushStr(b: vec[int], s: str) {
+    lowkey i = 0
+    lowkey n = str.len(s)
+    vibin i < n {
+        b.stack(str.at(s, i))
+        i = i + 1
+    }
+}
+flex finna pushInt(b: vec[int], v0: int) {
+    lowkey v = v0
+    fr v < 0 {
+        b.stack(45)
+        v = 0 - v
+    }
+    fr v == 0 {
+        b.stack(48)
+        bet
+    }
+    lowkey digs = mem.slab[u8](12)
+    lowkey k = 0
+    vibin v > 0 {
+        digs[k] = (48 + v % 10) as u8
+        v = v / 10
+        k = k + 1
+    }
+    vibin k > 0 {
+        k = k - 1
+        b.stack(digs[k] as int)
+    }
+}
+
+// writeLine — one "name\t\tvalue\n" default row.
+flex finna writeLine(b: vec[int], name: str, v: int) {
+    pushStr(b, name)
+    b.stack(9)
+    b.stack(9)
+    pushInt(b, v)
+    b.stack(10)
+}
+
+// M_SaveDefaults — write the int settings back out (the persisted subset).
+flex finna saveDefaults(gt: tag gs.GameState) {
+    lowkey b = vec.new[int]()
+    holla g = gt in gs.gsc {
+        writeLine(b, "mouse_sensitivity", g.shell.mouseSensitivity as int)
+        writeLine(b, "sfx_volume", g.sound.sfxVolume as int)
+        writeLine(b, "music_volume", g.sound.musicVolume as int)
+        writeLine(b, "show_messages", g.menu.showMessages as int)
+        writeLine(b, "screenblocks", g.menu.screenblocks as int)
+        writeLine(b, "detaillevel", g.menu.detailLevel as int)
+        writeLine(b, "snd_channels", g.sound.numChannels as int)
+        writeLine(b, "usegamma", g.vid.gammaIndex as int)
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey n = b.gang() as int
+    lowkey out = mem.slab[u8](n)
+    lowkey i = 0
+    vibin i < n {
+        out[i] = b[i] as u8
+        i = i + 1
+    }
+    fs.drop(configPath(), out)
+}
+
+// M_WriteFile — write `data` to `path` (create/truncate). fs.drop already has these semantics.
+flex finna writeFile(path: str, data: []u8) -> bool {
+    bet fs.drop(path, data)
+}
+
+// M_ReadFile — slurp `path` into a []u8. (No length is returned — bet []u8 slices carry it
+// internally; callers that need the size read a header, like w_wad. PORTED-PARTIAL vs id's
+// length-returning signature.)
+flex finna readFile(path: str) -> []u8 {
+    bet fs.peep(path)
+}
+
+// M_ScreenShot — dump the current 8-bit screen (scr0) raw to DOOMxx.raw. (The PCX packer +
+// PLAYPAL palette block are SKIPPED; a raw 320x200 indexed dump is enough for the port.)
+flex finna screenShot(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        fs.drop("DOOM00.raw", g.vid.scr0)
+        g.shell.players[g.shell.consoleplayer as int].message = "screen shot"
+    } ghosted {
+        yeet("gs")
+    }
+}

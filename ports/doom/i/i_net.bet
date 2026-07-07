@@ -1,0 +1,40 @@
+// i/i_net.bet — the network transport seam (linuxdoom-1.10 i_net.c), v1 LOOPBACK.
+//
+// id's i_net.c owns the UDP socket, the doomcom shared buffer, and I_NetCmd (send/recv). The
+// v1 port runs single-player only, so the transport is a loopback stub: I_InitNetwork sets up a
+// one-node / one-player doomcom (numnodes=1, numplayers=1, consoleplayer=0, ticdup=1) with
+// netgame=false, and I_NetCmd is a no-op (no packets ever leave the machine). The shape mirrors
+// id's doomcom_t so a future real-UDP `net` intrinsic set swaps in behind D_CheckNetGame with
+// zero game-loop restructuring (see the plan's "full machinery behind a loopback seam").
+//
+// PORTED:  I_InitNetwork (loopback doomcom), I_NetCmd (no-op).
+// SKIPPED: UDP socket setup, PacketSend/PacketGet, sendaddress[] (deferred: real net, v2).
+pull "../defs/gs" as gs
+
+// doomcom_t.id magic (d_net.h DOOMCOM_ID). D_CheckNetGame I_Errors if g.net.dcId != this.
+flex facts DOOMCOM_ID: int = 0x12345678
+
+// I_InitNetwork — set up the single-player loopback doomcom + clear netgame. Mirrors i_net.c's
+// no-args branch (when no `-net` parm): one node, one player, this machine is player 0.
+flex finna initNetwork(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        g.shell.netgame = cap
+        g.net.dcId = DOOMCOM_ID as i32
+        g.net.dcNumnodes = 1
+        g.net.dcNumplayers = 1
+        g.net.dcConsoleplayer = 0
+        g.net.dcTicdup = 1
+        g.net.dcExtratics = 0
+        g.net.dcCommand = 0
+        g.net.dcRemotenode = -1
+        g.net.dcDatalength = 0
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// I_NetCmd — the packet send/recv entry. Loopback: nothing to transmit or receive. (The rebound
+// loopback that HSendPacket/HGetPacket used in d_net is short-circuited in d_net.bet directly, so
+// this stub is only here to preserve the i_net.c call surface for the future UDP swap.)
+flex finna netCmd(gt: tag gs.GameState) {
+}

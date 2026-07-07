@@ -1,0 +1,157 @@
+// f/f_wipe.bet — the mission-begin melt/wipe (linuxdoom-1.10 f_wipe.c). Only the Melt effect is
+// used by DOOM (wipe_ScreenWipe is always called with wipe_Melt); the ColorXForm variant is
+// SKIPPED. Operates on the 8-bit screens in g.vid: the "start" (old) frame is captured in
+// g.wipe.scrStart, the "end" (new) frame in g.wipe.scrEnd, and the melt is composited back into
+// g.vid.scr0 each tic.
+//
+// The melt slides each screen COLUMN of the OLD frame downward at a per-column rate, revealing the
+// NEW frame from the top. id's version reorganizes to column-major shorts for speed
+// (wipe_shittyColMajorXform); the port composites directly in row-major bytes using the melt's
+// invariant — for a column whose offset is Y (0..200): rows [0,Y) show the END screen and rows
+// [Y,200) show the START screen shifted down by Y. The per-column initial offsets come from
+// m_random.mRandom exactly as id (the wipe RNG, NOT p_random).
+//
+// PORTED:  wipe_StartScreen, wipe_EndScreen, wipe_initMelt, wipe_doMelt, wipe_ScreenWipe.
+// SKIPPED: wipe_shittyColMajorXform (column-major speed hack — direct composite instead),
+//          wipe_*ColorXForm (unused by DOOM), wipe_exitMelt (no zone free; g.wipe.y is persistent).
+pull "../defs/gs" as gs
+pull "../util/m_random" as rnd
+
+flex facts SCREENWIDTH: int = 320
+flex facts SCREENHEIGHT: int = 200
+
+// wipeStartScreen — wipe_StartScreen: snapshot the current screen (scr0) as the "start" (old) frame.
+flex finna wipeStartScreen(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        lowkey i = 0
+        vibin i < 64000 {
+            g.wipe.scrStart[i] = g.vid.scr0[i]
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// wipeEndScreen — wipe_EndScreen: snapshot the current screen (scr0) as the "end" (new) frame,
+// then restore the start frame into scr0 so the melt animates from old -> new.
+flex finna wipeEndScreen(gt: tag gs.GameState) {
+    holla g = gt in gs.gsc {
+        lowkey i = 0
+        vibin i < 64000 {
+            g.wipe.scrEnd[i] = g.vid.scr0[i]
+            g.vid.scr0[i] = g.wipe.scrStart[i]
+            i = i + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+}
+
+// initMelt — wipe_initMelt: seed the per-column vertical offsets (y<0 => not ready to scroll).
+flex finna initMelt(gt: tag gs.GameState) {
+    lowkey r0 = rnd.mRandom(gt)
+    holla g = gt in gs.gsc {
+        g.wipe.y[0] = (0 - (r0 % 16)) as i32
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey i = 1
+    vibin i < SCREENWIDTH {
+        lowkey r = rnd.mRandom(gt) % 3 - 1
+        holla g = gt in gs.gsc {
+            lowkey yv = g.wipe.y[i - 1] as int + r
+            fr yv > 0 {
+                yv = 0
+            } naw fr yv == -16 {
+                yv = -15
+            }
+            g.wipe.y[i] = yv as i32
+        } ghosted {
+            yeet("gs")
+        }
+        i = i + 1
+    }
+}
+
+// doMelt — wipe_doMelt: advance every column `ticks` times, then recomposite scr0 from the
+// per-column offset. Returns true when every column has finished (offset == SCREENHEIGHT).
+flex finna doMelt(gt: tag gs.GameState, ticks: int) -> bool {
+    lowkey done = nocap
+    holla g = gt in gs.gsc {
+        lowkey t = ticks
+        vibin t > 0 {
+            lowkey x = 0
+            vibin x < SCREENWIDTH {
+                lowkey yv = g.wipe.y[x] as int
+                fr yv < 0 {
+                    g.wipe.y[x] = (yv + 1) as i32
+                    done = cap
+                } naw fr yv < SCREENHEIGHT {
+                    lowkey dy = 8
+                    fr yv < 16 {
+                        dy = yv + 1
+                    }
+                    fr yv + dy >= SCREENHEIGHT {
+                        dy = SCREENHEIGHT - yv
+                    }
+                    g.wipe.y[x] = (yv + dy) as i32
+                    done = cap
+                }
+                x = x + 1
+            }
+            t = t - 1
+        }
+        // recomposite scr0: top Y rows = end frame, rest = start frame shifted down by Y
+        lowkey x2 = 0
+        vibin x2 < SCREENWIDTH {
+            lowkey yy = g.wipe.y[x2] as int
+            fr yy < 0 {
+                yy = 0
+            }
+            lowkey r = 0
+            vibin r < SCREENHEIGHT {
+                lowkey dst = r * SCREENWIDTH + x2
+                fr r < yy {
+                    g.vid.scr0[dst] = g.wipe.scrEnd[dst]
+                } naw {
+                    g.vid.scr0[dst] = g.wipe.scrStart[(r - yy) * SCREENWIDTH + x2]
+                }
+                r = r + 1
+            }
+            x2 = x2 + 1
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    bet done
+}
+
+// wipeScreenWipe — wipe_ScreenWipe(wipe_Melt): kick off the melt on the first call (initMelt) and
+// advance it by `ticks` on each call. g.wipe.active is id's `go`; returns true when the wipe is
+// complete (id returns !go).
+flex finna wipeScreenWipe(gt: tag gs.GameState, ticks: int) -> bool {
+    lowkey active = cap
+    holla g = gt in gs.gsc {
+        active = g.wipe.active
+    } ghosted {
+        yeet("gs")
+    }
+    fr !active {
+        holla g = gt in gs.gsc {
+            g.wipe.active = nocap
+        } ghosted {
+            yeet("gs")
+        }
+        initMelt(gt)
+    }
+    lowkey done = doMelt(gt, ticks)
+    fr done {
+        holla g = gt in gs.gsc {
+            g.wipe.active = cap
+        } ghosted {
+            yeet("gs")
+        }
+    }
+    bet done
+}
