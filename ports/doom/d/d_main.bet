@@ -411,16 +411,27 @@ flex finna dDoomLoop(gt: tag gs.GameState) {
         fr primed {
             dDisplay(gt)
         } naw {
-            // Oracle parity: the first tic gets no D_Display. The framebuffer is allocated but not
-            // yet drawn, so the crc reported at the next tic (C@T=1) is crc(the black scr0).
+            // First tic. Under -sync (oracle parity) we skip D_Display: the framebuffer is allocated
+            // but not yet drawn, so the crc reported at the next tic (C@T=1) is crc(the black scr0),
+            // matching the reference's TryRunTics-before-first-D_Display ordering. Interactively there
+            // is no oracle to match, so present frame 1 immediately — otherwise the window stays blank
+            // for the first tic (~28ms) on launch (e.g. before the title screen wipes in).
             primed = nocap
-            lowkey blackCrc = crc32Scr0(gt)
+            lowkey syncOn = cap
             holla g = gt in gs.gsc {
-                fr g.shell.syncOn {
-                    g.shell.lastFrameCrc = blackCrc as i32
-                }
+                syncOn = g.shell.syncOn
             } ghosted {
                 yeet("gs")
+            }
+            fr syncOn {
+                lowkey blackCrc = crc32Scr0(gt)
+                holla g = gt in gs.gsc {
+                    g.shell.lastFrameCrc = blackCrc as i32
+                } ghosted {
+                    yeet("gs")
+                }
+            } naw {
+                dDisplay(gt)
             }
         }
         // frame accounting + self-terminate conditions
