@@ -762,6 +762,13 @@ flex drip StBarState {
     flex firsttime: bool
     flex keyboxes: i32[3]
     flex oldweaponsowned: bool[9]
+    // arms multicon diff-draw tracking (st_lib.c STlib_updateMultIcon). id draws the STARMS overlay
+    // once at the level-start refresh; when an arms digit later changes (weapon pickup) it erases the
+    // old digit to the STBAR *backing screen* (not STARMS), so that cell's transparent digit pixels
+    // then show STBAR instead of STARMS. armsOldInum = last drawn inum (init -1); armsUnderStbar =
+    // whether this cell's under-digit background is now STBAR (true) rather than STARMS (false).
+    flex armsOldInum: i32[6]
+    flex armsUnderStbar: bool[6]
     flex lastAttackDown: i32
     flex statusBarOn: bool
     flex stPalette: i32

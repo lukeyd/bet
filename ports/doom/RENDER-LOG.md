@@ -90,3 +90,73 @@ correctly shrinks the 3D view from 200 to 168 rows (screenblocks 10):
 These goldens are the port's own render regression baselines (not oracle truth); the new values
 reflect the now-oracle-correct render. Both smokes pass against the regenerated goldens.
 
+
+## W3-residuals — closing the full-frame-CRC gaps (doom-resid)
+
+Picking up from "full-frame CRC matches tics 2–17; residual = the status-bar face". The 3D view
+was 0-diff at sim-correct tics, so the whole-frame CRC was chased down to three status-bar / main-
+loop parity gaps. Diagnosed by temporarily adding `rndindex` (the M_Random stream index, `RI=`) to
+both the port sync line and the oracle `DG_SyncTick` (reverted after — the committed fingerprint
+format and `demo{1,2,3}.oracle.sync` are unchanged).
+
+### 1. Doomguy face — the level-start melt wipe advances `rndindex` (the main win)
+`M_Random` (face RNG, `st_randomnumber = M_Random()` in `ST_Ticker`) uses `g.tick.rndindex`, a
+separate stream from the sim's `prndindex`. It was *ordered and counted* right per-tic, but the
+absolute `rndindex` drifted: the reference's `D_Display` runs the level-start **melt wipe**
+(`wipe_ScreenWipe`→`wipe_initMelt`) even under `-timedemo`, and `wipe_initMelt` draws
+**SCREENWIDTH (320) `M_Random()`** values (`y[0]` + 319 column deltas). The port skipped the whole
+wipe under `-timedemo` (`wipe && !timingdemo`), so its `rndindex` was 320 behind. The straight-ahead
+face is re-rolled every `ST_STRAIGHTFACECOUNT` (17) tics as `ST_calcPainOffset() + st_randomnumber%3`,
+so the first re-roll (tic 18) picked a different face → the 34-px face diff at x143–176. **Fix**
+(`d/d_main.bet` `D_Display`): under `-timedemo`, still call `fwipe.initMelt` on the wipe frame for
+its RNG side-effect (it only advances `rndindex` and fills `g.wipe.y`; it never touches `scr0`), just
+skip the blocking melt animation. `RI` then matched tic-for-tic.
+
+### 1b. Sound pitch — an *extra* `M_Random` the doomgeneric oracle never makes
+After 1, `rndindex` still diverged by +1 at demo3 tic 46 (the first in-level sound). linuxdoom-1.10
+`S_StartSoundAtVolume` randomizes sfx pitch with `pitch += N - (M_Random()&M)` — two draws — and the
+port had ported that. The **oracle** (doomgeneric / Chocolate-Doom `s_sound.c`) removed pitch
+randomization entirely (fixed `NORM_PITCH`, no `M_Random` in the sound path). Since `M_Random` shares
+`rndindex` with the face, each stray sound draw desynced the face for the rest of the demo. **Fix**
+(`s/s_sound.bet` `startSoundAtVolume`): drop the two pitch-jitter `M_Random` draws (keep `NORM_PITCH`).
+`RI` now matches **all** tics on demo1/demo2/demo3.
+
+### 2. Tic-1 present timing — mirror the reference pre-loop `TryRunTics`
+The reference `D_DoomLoop` runs one `TryRunTics()` *before* the first `D_Display` (and before
+`I_InitGraphics`), so (a) its first *composed* gameplay frame is the SECOND gametic's, (b) the frame
+whose CRC lands at `C@T=1` is the freshly-allocated all-black framebuffer, and (c) the level-start
+melt wipe fires between the `T=1` and `T=2` fingerprints — not `T=0`/`T=1`. The port did
+`gTicker + dDisplay` from the first iteration, composing an extra tic-0 frame (so `C@T=1` was tic-0
+gameplay, not black, and the melt landed one fingerprint early). **Fix** (`d/d_main.bet` `D_DoomLoop`):
+a `primed` flag runs the first tic with **no** `dDisplay`, recording `crc(black scr0)` as the last-
+presented frame. This fixed `C@T=1` (now `0x7dc291ab` = crc of zeros, matching the oracle) **and**
+landed the melt at the correct tic in one shot (the two residuals shared this root cause).
+
+### 3. Arms weapon widgets — diff-draw erases to STBAR, not STARMS
+Exposed once the face matched: a static ~5-px diff per arms cell, appearing the tic a weapon is
+picked up (demo3 tic 47 = shotgun). The digit glyph (`STYSNUM*`) matched; the differing pixels were
+its *transparent* posts, showing the panel background. The reference's `st_backing_screen` is **STBAR
+only**; `STARMS` is a separate overlay widget. `STlib_updateMultIcon` erases a changed digit to the
+STBAR backing screen (`V_CopyRect(..., st_backing_screen, ...)`), so once a cell changes, its
+transparent posts show **STBAR** — whereas the port's full-refresh always draws the **STARMS** overlay
+under every digit. STBAR and STARMS have a few gray shades' difference in the arms panel. Verified by
+extracting both lumps: STBAR = oracle's pixels, STARMS = the port's. **Fix** (`st/st_stuff.bet`
+`drawArm` + `st/st_lib.bet` `eraseMultIcon` + `defs/gs.bet` `armsOldInum[6]`/`armsUnderStbar[6]`):
+track each arms multicon's `oldinum`; once a cell's inum changes it becomes "under-STBAR" — erase that
+digit box from the STBAR backing screen (BG/scr4) before drawing the digit, exactly as id's diff-draw.
+`statusbar.golden` is unchanged (the smoke draws the bar once, before any pickup, so no cell is dirty).
+
+### Result (C = full-frame CRC over the whole 320×200 frame, vs the committed oracle refs)
+- **demo3** (E1M7, all 2134 tics sim-correct): C-match **17 → 2130 / 2134**.
+- **demo2** (all 3836 tics sim-correct): C-match **→ 3824 / 3836**.
+- `rndindex`/face is now byte-exact on all three demos; `C@T=1` matches; `statusbar.golden`,
+  `renderworld.golden`, `renderthings.golden`, `sound_channels.golden` all still pass.
+
+### Still residual (NOT fixed here — 3D-view renderer, out of the st/d/p/defs lane)
+The remaining C gaps are tiny masked-column **sprite-edge** differences in the 3D view (y<168),
+2–8 px each, at isolated tics: demo3 tics 196/341/685/1936 (e.g. tic 196: 8 px at x233–238 y146–147,
+a ~1-column shift of part of a sprite silhouette); demo2 has 12 such tics. They are pre-existing
+`r_things` masked-column / sprite-clip nuances (my status-bar + present-timing changes cannot touch
+y<168) that were masked before because the face diff made every frame's CRC differ from tic 18 on.
+The render workstream's earlier "3D view pixel-perfect" was verified only over tics 2–30; these
+appear later, when close sprites are drawn. Left for the renderer (r_things/r_draw) workstream.

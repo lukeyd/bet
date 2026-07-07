@@ -128,3 +128,16 @@ my+newy)`; track it in locals `ux`/`uy` and pass `ux+nmx, uy+nmy` to the along-m
   against the oracle beyond reasonable effort. Handing off per protocol.
 
 ---
+
+## W3-residuals note — demo1 tic-2748 blip revisited (still documented, not fixed)
+
+The final full-frame-CRC pass (see `RENDER-LOG.md` "W3-residuals") did not touch the sim, so the
+demo1 tic-2748 `prndindex` off-by-one above is **unchanged**: demo1 is still sim-exact except tics
+2748–2749 (R +1, self-healing at 2750; player X/Y/Z/A/MX/MY/H/S all match throughout). It was
+re-examined and left as documented per the time-box — it is a thinker-order / leveltime-boundary
+`P_Random` crossing that self-heals in 2 tics and never perturbs the tracked player state.
+
+Separately, the face-RNG work found that the `rndindex` (M_Random) stream — NOT captured by this
+sim fingerprint — had two port-vs-oracle mismatches, both now fixed (level-start melt draws under
+`-timedemo`; and the removal of linuxdoom's `S_StartSound` pitch `M_Random` jitter, which the
+doomgeneric oracle's Chocolate-Doom `s_sound.c` does not do). Details in `RENDER-LOG.md`.

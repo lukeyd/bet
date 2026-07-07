@@ -261,6 +261,14 @@ flex finna stStart(gt: tag gs.GameState) {
             g.stbar.keyboxes[i] = -1
             i = i + 1
         }
+        // arms multicons start "clean": STlib_initMultIcon sets oldinum = -1, so the first refresh
+        // draws each digit over the freshly-drawn STARMS overlay (STARMS shows under it).
+        i = 0
+        vibin i < 6 {
+            g.stbar.armsOldInum[i] = -1
+            g.stbar.armsUnderStbar[i] = cap
+            i = i + 1
+        }
     } ghosted {
         yeet("gs")
     }
@@ -671,9 +679,30 @@ flex finna drawWidgets(gt: tag gs.GameState) {
 }
 
 // drawArm — one weapon-ownership cell: arms[i][owned] via a MultIcon whose patch list is the
-// flat arms table indexed by i*2 + owned (0 gray / 1 yellow).
+// flat arms table indexed by i*2 + owned (0 gray / 1 yellow). Replicates STlib_updateMultIcon's
+// diff-draw erase: the STARMS overlay is composited under every arms digit at the level-start
+// refresh, but once a digit's inum changes (weapon picked up) id erases the old digit to the STBAR
+// backing screen — so this cell's transparent digit posts then show STBAR instead of STARMS (the
+// two panel graphics differ by a few gray shades). We track that per-cell so the full-refresh
+// framebuffer matches id's diff-drawn one pixel-for-pixel.
 flex finna drawArm(gt: tag gs.GameState, i: int, x: int, y: int, arms: []i32, owned: int) {
-    stlib.drawMultIcon(gt, stlib.initMultIcon(x, y), arms, i * 2 + owned, FG)
+    lowkey inum = i * 2 + owned
+    lowkey underStbar = cap
+    holla g = gt in gs.gsc {
+        lowkey oldinum = g.stbar.armsOldInum[i] as int
+        fr oldinum != -1 && inum != oldinum {
+            g.stbar.armsUnderStbar[i] = nocap
+        }
+        g.stbar.armsOldInum[i] = inum as i32
+        underStbar = g.stbar.armsUnderStbar[i]
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey mi = stlib.initMultIcon(x, y)
+    fr underStbar {
+        stlib.eraseMultIcon(gt, mi, arms[inum] as int)
+    }
+    stlib.drawMultIcon(gt, mi, arms, inum, FG)
 }
 
 // =========================================================================================

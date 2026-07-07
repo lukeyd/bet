@@ -144,6 +144,28 @@ flex finna drawMultIcon(gt: tag gs.GameState, mi: StMultIcon, patchOfs: []i32, i
     }
 }
 
+// eraseMultIcon — STlib_updateMultIcon's erase branch: restore the STBAR backing screen (BG) under
+// an icon's cell (x-leftoffset, y-topoffset, w, h). id does this from st_backing_screen when a
+// multicon's inum changes; needed because the STARMS overlay differs from the STBAR backdrop, so a
+// digit that has been diff-erased shows STBAR (not STARMS) under its transparent posts.
+flex finna eraseMultIcon(gt: tag gs.GameState, mi: StMultIcon, patchOfs: int) {
+    lowkey lofs = 0
+    lowkey tofs = 0
+    lowkey w = 0
+    lowkey h = 0
+    holla g = gt in gs.gsc {
+        lofs = bstream.rdI16(g.wad.buf, patchOfs + 4)
+        tofs = bstream.rdI16(g.wad.buf, patchOfs + 6)
+        w = bstream.rdU16(g.wad.buf, patchOfs)
+        h = bstream.rdU16(g.wad.buf, patchOfs + 2)
+    } ghosted {
+        yeet("gs")
+    }
+    lowkey x = mi.x - lofs
+    lowkey y = mi.y - tofs
+    vv.copyRect(gt, x, y - ST_Y, BG, w, h, x, y, FG)
+}
+
 // drawBinIcon — STlib_drawBinIcon: if `val`, draw the icon at (b.x, b.y); else clear its cell
 // from BG (V_CopyRect), using the patch's leftoffset/topoffset for the true top-left.
 flex finna drawBinIcon(gt: tag gs.GameState, b: StBinIcon, patchOfs: int, val: bool, screen: int) {
