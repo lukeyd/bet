@@ -95,3 +95,36 @@ my+newy)`; track it in locals `ux`/`uy` and pass `ux+nmx, uy+nmy` to the along-m
   divergence is an **RNG-order** issue (R off by one) — a different class, logged next.
 
 ---
+
+## demo1 tic 2748 — UNRESOLVED: transient 1-call RNG-order blip in A_Chase (STOP+report)
+
+- **status**: NOT fixed. This is the ONLY remaining demo1 divergence; demo2/demo3 are clean.
+- **symptom**: at gametic 2748 (line 2966, H=6 combat), the fingerprint's **R** (prndindex)
+  is ours=0x1a vs theirs=0x1b — off by exactly **one**. Every other sim field
+  (X/Y/Z/A/MX/MY/H/S) matches. R stays +1 for tics 2748–2749 and then **re-syncs** at 2750
+  — demo1 has only **2 divergent sim tics out of 2134**, and every tic before and after
+  (incl. all ~2400 later tics) matches. So the player trajectory is correct; ours makes one
+  P_Random call one tic later than the oracle and catches up.
+- **analysis** (instrumented both ours and the pinned doomgeneric oracle, matching the
+  play RNG call-by-call in a ±3-tic window):
+  * The two P_Random streams are **identical in order and value** (same rndtable indices,
+    same 36 calls in the window) — only the *tic boundary* of ONE call differs: the call
+    landing on prndindex 27 (value 36) is the LAST call of the oracle's tic 2747 but the
+    FIRST call of ours' tic 2748.
+  * A backtrace on the oracle's prndindex-27 call is `P_Random ← A_Chase ← P_SetMobjState
+    ← P_Ticker`: a monster's walk-state action.
+  * The A_Chase **active-sound** `P_Random()<3` was ruled OUT — instrumenting that exact
+    site (monster type/state/tics/movecount/pos right before it) gave byte-identical traces
+    in both. Tagging the other A_Chase-path sites in the oracle (P_CheckMissileRange,
+    P_TryWalk, P_NewChaseDir) produced NO hits in the window either.
+- **hypotheses** (unconfirmed): (a) the P_Ticker leveltime-increment point differs by one
+  step relative to when a monster's P_SetMobjState/A_Chase runs, so a single monster's
+  walk-frame action (and its P_Random) crosses the tic boundary one step early/late; (b) a
+  monster thinker is processed in a slightly different position in the thinker-list order on
+  this tic (thinker append/remove ordering), shifting one A_Chase call across the boundary.
+  Both are consistent with "same calls, same values, one call one tic off, self-healing."
+- **why STOP**: it does not affect the tracked player state, self-heals in 2 tics, and
+  pinning the exact boundary requires matching P_Ticker's leveltime/thinker-order bookkeeping
+  against the oracle beyond reasonable effort. Handing off per protocol.
+
+---
