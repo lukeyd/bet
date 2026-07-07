@@ -29,7 +29,6 @@ pull "../defs/sounds" as sounds
 pull "../defs/think" as think
 pull "../w/w_wad" as w
 pull "../i/i_sound" as isnd
-pull "../util/m_random" as rnd
 
 // ---- constants (s_sound.c #defines) -------------------------------------------------------
 flex facts S_MAX_VOLUME: int = 127
@@ -504,21 +503,12 @@ flex finna startSoundAtVolume(gt: tag gs.GameState, origin: tag think.Thinker, s
     } naw {
         sep = NORM_SEP
     }
-    fr soundId >= sounds.SFX_SAWUP && soundId <= sounds.SFX_SAWHIT {
-        pitch = pitch + 8 - (rnd.mRandom(gt) & 15)
-        fr pitch < 0 {
-            pitch = 0
-        } naw fr pitch > 255 {
-            pitch = 255
-        }
-    } naw fr soundId != sounds.SFX_ITEMUP && soundId != sounds.SFX_TINK {
-        pitch = pitch + 16 - (rnd.mRandom(gt) & 31)
-        fr pitch < 0 {
-            pitch = 0
-        } naw fr pitch > 255 {
-            pitch = 255
-        }
-    }
+    // NO pitch jitter. linuxdoom-1.10 randomizes pitch here with two M_Random() draws, but the
+    // W3 oracle (doomgeneric / Chocolate-Doom s_sound.c) removed that: it plays every sfx at a
+    // fixed pitch and never calls M_Random in the sound path. M_Random shares its rndindex with
+    // the status-bar face RNG, so a single stray draw here desyncs the doomguy face for the rest
+    // of the demo (first seen at demo3 tic 46, the first in-level sound). Keep pitch = NORM_PITCH
+    // (or the linked sfx's pitch) and draw no randomness, matching the oracle's rndindex stream.
     stopSound(gt, origin)
     lowkey cnum = sGetChannel(gt, origin, soundId)
     fr cnum < 0 {

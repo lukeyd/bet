@@ -235,7 +235,13 @@ flex finna dDisplay(gt: tag gs.GameState) {
         }
         spill.f("[doom] -dumpframe: gametic={} crc={} -> {}\n", gametic, dc, dumpPath)
     }
-    // present (in timedemo, skip the blocking melt — keep the sim uncapped & deterministic)
+    // present (in timedemo, skip the blocking melt — keep the sim uncapped & deterministic).
+    // The melt's wipe_initMelt draws SCREENWIDTH M_Random() values (m_random rndindex, the same
+    // stream as the status-bar face RNG). The oracle runs it even under -timedemo, so we must too —
+    // otherwise rndindex drifts by 320 at the level-start wipe and the straight-ahead face pick
+    // (st_randomnumber % 3, re-rolled every ST_STRAIGHTFACECOUNT tics) desyncs from tic 18 on.
+    // initMelt only advances rndindex + fills g.wipe.y; it never touches scr0, so the composed
+    // frame (and its crc) is unchanged. We do the RNG side-effect but skip the blocking animation.
     fr wipe && !timingdemo {
         fwipe.wipeEndScreen(gt)
         lowkey done = cap
@@ -245,6 +251,9 @@ flex finna dDisplay(gt: tag gs.GameState) {
             iv.finishUpdate(gt)
         }
     } naw {
+        fr wipe {
+            fwipe.initMelt(gt)     // match the oracle's melt RNG draws (rndindex parity)
+        }
         iv.finishUpdate(gt)
     }
     holla g = gt in gs.gsc {
@@ -353,6 +362,14 @@ flex finna dDoomLoop(gt: tag gs.GameState) {
         ggame.gBeginRecording(gt)
     }
     lowkey running = nocap
+    // The reference D_DoomLoop runs one TryRunTics BEFORE the first D_Display (see doomgeneric
+    // d_main.c: TryRunTics() then I_InitGraphics() then the doomgeneric_Tick loop). So the oracle's
+    // first gameplay frame is composed for the SECOND gametic, and the frame the C field reports at
+    // T=1 is the freshly-allocated (all-black) framebuffer — not tic-0's gameplay. `primed` mirrors
+    // that: the first tic runs with no dDisplay; we record crc(black scr0) as the last-presented
+    // frame so C@T=1 == the oracle's crc(zeros), and the first real compose + level-start melt wipe
+    // (and its M_Random draws) land one tic later, exactly where the oracle does them.
+    lowkey primed = cap
     vibin running {
         iv.startTic(gt)                // pump gg input -> event ring
         dProcessEvents(gt)
@@ -391,7 +408,21 @@ flex finna dDoomLoop(gt: tag gs.GameState) {
         }
         ssnd.updateSounds(gt, listener)
         imus.musicUpdate(gt)
-        dDisplay(gt)
+        fr primed {
+            dDisplay(gt)
+        } naw {
+            // Oracle parity: the first tic gets no D_Display. The framebuffer is allocated but not
+            // yet drawn, so the crc reported at the next tic (C@T=1) is crc(the black scr0).
+            primed = nocap
+            lowkey blackCrc = crc32Scr0(gt)
+            holla g = gt in gs.gsc {
+                fr g.shell.syncOn {
+                    g.shell.lastFrameCrc = blackCrc as i32
+                }
+            } ghosted {
+                yeet("gs")
+            }
+        }
         // frame accounting + self-terminate conditions
         lowkey stop = cap
         holla g = gt in gs.gsc {
