@@ -29,6 +29,8 @@ facts ATT_MAX: f64 = 512.0     // envelope attenuation ceiling (~48 dB), 1/64-oc
 facts OPL_NATIVE: f64 = 49716.0
 facts FM_INDEX: f64 = 0.5      // carrier phase deviation (turns) per unit modulator output
 facts ENV_K: f64 = 16.0        // envelope speed: units/second base (doubles every 4 rate steps)
+facts ATTACK_PROP: f64 = 0.0625 // attack curve: fraction of remaining attenuation added to the
+                                // per-sample step (exponential/front-loaded attack; see advanceEnv)
 facts OUT_SCALE: f64 = 7000.0  // f64 mix (~+/-1 per active channel) -> i16
 
 // The chip. Tables are shared vec handles; state is threaded fixed arrays.
@@ -456,7 +458,15 @@ finna advanceEnv(env: f64, stage: int, arDr: int, slRr: int, avekm: int, block: 
     lowkey ksr = (avekm >> 4) & 1
     fr stage == 1 {
         lowkey ar = (arDr >> 4) & 0xF
-        lowkey e = env - incTab[effRate(ar, ksr, block, fnum)]
+        // Real OPL attack is EXPONENTIAL, not linear: the attenuation falls at a rate
+        // proportional to how far it still has to drop, so a note reaches audible
+        // levels in a small fraction of the nominal attack time. A purely linear
+        // attack (env -= inc) crawls through the loud region and leaves slow-attack
+        // instruments (strings/pads, low AR) inaudible on short notes — they never
+        // clear the gain floor before note-off. The `+ inc` floor guarantees the
+        // attack still completes for any rate.
+        lowkey inc = incTab[effRate(ar, ksr, block, fnum)]
+        lowkey e = env - (1.0 + env * ATTACK_PROP) * inc
         fr e <= 0.0 {
             bet 0.0, 2
         }

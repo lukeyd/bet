@@ -141,6 +141,26 @@ flex drip SeqState {
     flex chVol: int[16]      // channel volume (controller 3)
     flex chPitch: int[16]    // pitch-wheel value (128 = centre)
     flex age: int            // monotonic allocation counter
+    flex volMap: vec[int]    // DMX log volume-mapping table (Rc-shared, read-only)
+}
+
+// volMapTable — DMX's 128-entry logarithmic MIDI-volume curve (Chocolate Doom
+// i_oplmusic.c `volume_mapping_table`). Maps a 0..127 linear volume to a concave
+// curve so mid-range velocities stay audible; used by carVolume to derive the
+// carrier total-level. A `vec` (built once per song in newSeq, cheap to thread).
+finna volMapTable() -> vec[int] {
+    lowkey t = vec.new[int]()
+    squad x in [0, 1, 3, 5, 6, 8, 10, 11, 13, 14, 16, 17, 19, 20, 22, 23,
+                25, 26, 27, 29, 30, 32, 33, 34, 36, 37, 39, 41, 43, 45, 47, 49,
+                50, 52, 54, 55, 57, 59, 60, 61, 63, 64, 66, 67, 68, 69, 71, 72,
+                73, 74, 75, 76, 77, 79, 80, 81, 82, 83, 84, 84, 85, 86, 87, 88,
+                89, 90, 91, 92, 92, 93, 94, 95, 96, 96, 97, 98, 99, 99, 100, 101,
+                101, 102, 103, 103, 104, 105, 105, 106, 107, 107, 108, 109, 109, 110, 110, 111,
+                112, 112, 113, 113, 114, 114, 115, 115, 116, 117, 117, 118, 118, 119, 119, 120,
+                120, 121, 121, 122, 122, 123, 123, 123, 124, 124, 125, 125, 126, 126, 127, 127] {
+        t.stack(x)
+    }
+    bet t
 }
 
 // The persistent music handle: the OPL chip + the sequencer state. Threaded
@@ -166,7 +186,8 @@ flex finna newSeq() -> SeqState {
         chInstr: zi16(),
         chVol: zi16(),
         chPitch: zi16(),
-        age: 0
+        age: 0,
+        volMap: volMapTable()
     }
     lowkey i = 0
     vibin i < 9 {
@@ -199,26 +220,38 @@ finna instrIndex(s: SeqState, ch: int, note: int, numInstr: int) -> int {
     bet idx
 }
 
-// Combine the instrument's carrier level with the effective note volume into a
-// 0x40 register value (KSL bits preserved, TL raised as volume drops).
-finna carrierLevel(scale: int, level: int, volume: int) -> int {
-    lowkey vol = volume
-    fr vol < 0 {
-        vol = 0
+// carVolume — DMX's carrier total-level from channel + note volume (Chocolate Doom
+// i_oplmusic.c `SetVoiceVolume`). The instrument's own carrier level is NOT part of
+// the loudness: the carrier TL is driven ENTIRELY by MIDI volume through the log
+// mapping table (the instrument defines timbre via its modulator/feedback/waveforms).
+//   midi_volume = 2*(volMap[chVol]+1);  full = (volMap[noteVol]*midi_volume)>>9;
+//   car_volume  = 0x3f - full   (0 = loudest .. 0x3f = silent)
+finna carVolume(volMap: vec[int], chVol: int, noteVol: int) -> int {
+    lowkey cv = chVol
+    fr cv < 0 {
+        cv = 0
     }
-    fr vol > 127 {
-        vol = 127
+    fr cv > 127 {
+        cv = 127
     }
-    lowkey tl = (level & 0x3F) + ((127 - vol) * 63) / 127
-    fr tl > 63 {
-        tl = 63
+    lowkey nv = noteVol
+    fr nv < 0 {
+        nv = 0
     }
-    bet (scale & 0xC0) | tl
+    fr nv > 127 {
+        nv = 127
+    }
+    lowkey midiVol = 2 * (volMap[cv] + 1)
+    lowkey full = (volMap[nv] * midiVol) >> 9
+    bet 63 - full
 }
 
-// Load GENMIDI voice1 onto OPL channel `oplCh`; carrier scaled by `volume`.
-// Threads (returns) the chip.
-finna loadInstrument(chip: opl.OplChip, oplCh: int, instr: genmidi.GenMidiInstr, volume: int) -> opl.OplChip {
+// Load GENMIDI voice1 onto OPL channel `oplCh` at carrier total-level `carVol`
+// (0..0x3f, from carVolume). The carrier's loudness is `carVol` (its instrument
+// level field is unused — see carVolume). The modulator keeps its instrument level
+// in FM mode; in additive/feedback mode (feedback bit 0) it too is raised to at
+// least `carVol` (DMX's mod_volume = max(instr level, car_volume)). Threads the chip.
+finna loadInstrument(chip: opl.OplChip, oplCh: int, instr: genmidi.GenMidiInstr, carVol: int) -> opl.OplChip {
     lowkey v = instr.v1
     lowkey mo = chip.modOff[oplCh]
     lowkey co = chip.carOff[oplCh]
@@ -226,12 +259,16 @@ finna loadInstrument(chip: opl.OplChip, oplCh: int, instr: genmidi.GenMidiInstr,
     c = opl.oplWriteReg(c, 0x60 + mo, v.modOp.attack)
     c = opl.oplWriteReg(c, 0x80 + mo, v.modOp.sustain)
     c = opl.oplWriteReg(c, 0xE0 + mo, v.modOp.waveform)
-    c = opl.oplWriteReg(c, 0x40 + mo, (v.modOp.scale & 0xC0) | (v.modOp.level & 0x3F))
+    lowkey modTl = v.modOp.level & 0x3F
+    fr (v.feedback & 0x01) != 0 && modTl < carVol {
+        modTl = carVol
+    }
+    c = opl.oplWriteReg(c, 0x40 + mo, (v.modOp.scale & 0xC0) | modTl)
     c = opl.oplWriteReg(c, 0x20 + co, v.carOp.tremolo)
     c = opl.oplWriteReg(c, 0x60 + co, v.carOp.attack)
     c = opl.oplWriteReg(c, 0x80 + co, v.carOp.sustain)
     c = opl.oplWriteReg(c, 0xE0 + co, v.carOp.waveform)
-    c = opl.oplWriteReg(c, 0x40 + co, carrierLevel(v.carOp.scale, v.carOp.level, volume))
+    c = opl.oplWriteReg(c, 0x40 + co, (v.carOp.scale & 0xC0) | (carVol & 0x3F))
     c = opl.oplWriteReg(c, 0xC0 + oplCh, v.feedback)
     bet c
 }
@@ -311,8 +348,8 @@ finna noteOn(ms: MusicState, instrs: vec[genmidi.GenMidiInstr], ch: int, note: i
     lowkey idx = instrIndex(s, ch, note, instrs.gang() as int)
     lowkey instr = instrs[idx]
     lowkey oplCh = allocVoice(s)
-    lowkey eff = (vol * s.chVol[ch]) / 127
-    lowkey c = loadInstrument(ms.chip, oplCh, instr, eff)
+    lowkey carVol = carVolume(s.volMap, s.chVol[ch], vol)
+    lowkey c = loadInstrument(ms.chip, oplCh, instr, carVol)
     c = setPitch(c, oplCh, note, instr, s.chPitch[ch], 1)
     s.voiceCh[oplCh] = ch
     s.voiceNote[oplCh] = note
