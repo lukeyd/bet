@@ -1,0 +1,144 @@
+// cheat_smoke.bet — regression for the three cheats that were stubbed by the st_stuff<->g_game
+// import cycle: idclev## (warp), idmus## (music), idmypos (position readout). Drives the real
+// ST_Responder with typed keystrokes and checks the effect. Native-only (WAD-scale). Run headless:
+//   target/debug/bet build ports/doom/tools/cheat_smoke.bet --runtime real -o /tmp/cheat_smoke
+//   BET_GG_HEADLESS=1 /tmp/cheat_smoke
+pull "spill"
+pull "str"
+pull "mem"
+pull "../defs/gs" as gs
+pull "../defs/tables" as tables
+pull "../defs/info" as info
+pull "../defs/sounds" as sounds
+pull "../defs/doomdef" as doomdef
+pull "../defs/event" as event
+pull "../w/w_wad" as wad
+pull "../r/r_main" as rmain
+pull "../i/i_video" as ivideo
+pull "../i/i_system" as isys
+pull "../i/i_sound" as isnd
+pull "../i/i_music" as imus
+pull "../p/p_setup" as psetup
+pull "../p/p_think" as pthink
+pull "../st/st_stuff" as st
+
+facts WADP: str = "/Users/lukebaggett/Documents/bet/doom-reference/doom1.wad"
+
+// feed a typed string through ST_Responder as EV_KEYDOWN events, char by char (as the game does).
+finna feed(gt: tag gs.GameState, s: str) {
+    lowkey i = 0
+    vibin i < str.len(s) {
+        st.stResponder(gt, event.EV_KEYDOWN, str.at(s, i))
+        i = i + 1
+    }
+}
+
+finna main() {
+    lowkey g0 = cop gs.GameState{} in gs.gsc
+    gs.gsInit(g0)
+    holla g = g0 in gs.gsc {
+        g.info.finesine = tables.initFinesineAll(g.info.finesine)
+        g.info.finetangent = tables.initFinetangentAll(g.info.finetangent)
+        g.info.tantoangle = tables.initTantoangleAll(g.info.tantoangle)
+        info.initStatesAll(g.info.states)
+        info.initMobjinfoAll(g.info.mobjinfo)
+        sounds.initSfxAll(g.info.sfx)
+    } ghosted {
+        yeet("gs")
+    }
+    wad.initWad(g0, WADP)
+    holla g = g0 in gs.gsc {
+        g.shell.gamemode = doomdef.GM_SHAREWARE as i32
+        g.shell.gameskill = 2
+        g.shell.gameepisode = 1
+        g.shell.gamemap = 1
+        g.shell.gameaction = doomdef.GA_NOTHING as i32
+    } ghosted {
+        yeet("gs")
+    }
+    isys.initTime(g0)
+    isnd.initSound(g0)
+    imus.musicInit(g0)
+    rmain.rInit(g0)
+    ivideo.initGraphics(g0)
+    ivideo.setPalette(g0, 0)
+    pthink.initThinkers(g0)
+    st.stInit(g0)
+
+    lowkey pass = nocap
+
+    // ---- idclev13: valid warp arms the deferred new-game (GA_NEWGAME, E1M3) --------------------
+    feed(g0, "idclev13")
+    lowkey ga = 0
+    lowkey ep = 0
+    lowkey mp = 0
+    holla g = g0 in gs.gsc {
+        ga = g.shell.gameaction as int
+        ep = g.shell.startepisode as int
+        mp = g.shell.startmap as int
+    } ghosted {
+        yeet("gs")
+    }
+    spill.f("idclev13 -> gameaction={} startepisode={} startmap={}  (want 2 / 1 / 3)\n", ga, ep, mp)
+    fr ga != doomdef.GA_NEWGAME {
+        pass = cap
+    }
+    fr ep != 1 || mp != 3 {
+        pass = cap
+    }
+
+    // ---- idclev31: out-of-range on shareware is rejected --------------------------------------
+    holla g = g0 in gs.gsc {
+        g.shell.gameaction = doomdef.GA_NOTHING as i32
+    } ghosted {
+        yeet("gs")
+    }
+    feed(g0, "idclev31")
+    lowkey ga2 = 0
+    holla g = g0 in gs.gsc {
+        ga2 = g.shell.gameaction as int
+    } ghosted {
+        yeet("gs")
+    }
+    spill.f("idclev31 -> gameaction={}  (want 0 = rejected)\n", ga2)
+    fr ga2 != doomdef.GA_NOTHING {
+        pass = cap
+    }
+
+    // ---- idmus11: changeMusic sets the current song to mus_e1m1 -------------------------------
+    feed(g0, "idmus11")
+    lowkey musId = 0
+    holla g = g0 in gs.gsc {
+        musId = g.music.musId as int
+    } ghosted {
+        yeet("gs")
+    }
+    spill.f("idmus11  -> musId={}  (want {} = MUS_E1M1)\n", musId, sounds.MUS_E1M1)
+    fr musId != sounds.MUS_E1M1 {
+        pass = cap
+    }
+
+    // ---- idmypos: needs a live player body; load + spawn, then read the formatted readout -----
+    holla g = g0 in gs.gsc {
+        g.shell.playeringame[0] = nocap
+        g.shell.consoleplayer = 0
+        g.shell.displayplayer = 0
+    } ghosted {
+        yeet("gs")
+    }
+    psetup.setupLevel(g0, 1, 1, 3)
+    lowkey mypos = st.myposMessage(g0)
+    spill.f("idmypos  -> '{}'  (want 42 chars, prefix 'ang=0x')\n", mypos)
+    fr str.len(mypos) != 42 {
+        pass = cap
+    }
+    fr !str.slaps(str.sub(mypos, 0, 6), "ang=0x") {
+        pass = cap
+    }
+
+    fr pass {
+        spill.it("CHEAT SMOKE: PASS")
+    } naw {
+        spill.it("CHEAT SMOKE: FAIL")
+    }
+}

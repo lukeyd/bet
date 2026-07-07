@@ -32,6 +32,8 @@ pull "../util/m_random" as rnd
 pull "../util/m_cheat" as cheat
 pull "../r/r_geom" as rgeom
 pull "../i/i_video" as iv
+pull "../defs/sounds" as sounds
+pull "../s/s_sound" as ssnd
 
 // ---- status-bar geometry / screen numbers -------------------------------------------------
 flex facts ST_X: int = 0
@@ -909,7 +911,7 @@ flex finna stResponder(gt: tag gs.GameState, evType: int, key: int) -> bool {
     matchClev(gt, key)
     // 'idmypos' — position readout (message set plain; angle/coord formatting deferred)
     fr matchCheat(gt, seqMypos(), CH_MYPOS, key) {
-        setMessage(gt, "mypos")
+        setMessage(gt, myposMessage(gt))
     }
     bet cap
 }
@@ -1055,6 +1057,68 @@ flex finna powerDuration(i: int) -> int {
     bet 1
 }
 
+// ---- idmypos: build id's "ang=0x..;x,y=(0x..,0x..)" position readout ----------------------------
+// bet has no format-to-string, so assemble the bytes by hand and reinterpret the buffer as a str.
+// id sprintf's %x (leading zeros stripped); this uses fixed-width %08x — same information. The
+// mem.slab buffer is heap-allocated and persistent, so the message str stays valid while shown.
+finna putStr(buf: []u8, off: int, s: str) -> int {
+    lowkey i = 0
+    lowkey n = str.len(s)
+    vibin i < n {
+        buf[off + i] = str.at(s, i) as u8
+        i = i + 1
+    }
+    bet off + n
+}
+
+finna hexU32(buf: []u8, off: int, v0: int) -> int {
+    lowkey i = 0
+    vibin i < 8 {
+        lowkey nib = (v0 >> ((7 - i) * 4)) & 15
+        fr nib < 10 {
+            buf[off + i] = (48 + nib) as u8     // '0'..'9'
+        } naw {
+            buf[off + i] = (87 + nib) as u8     // 'a'..'f'  (87 = 'a' - 10)
+        }
+        i = i + 1
+    }
+    bet off + 8
+}
+
+// myposMessage — IDMYPOS readout for the console player's mobj (angle is u32; x,y are fixed_t i32,
+// shown as their raw 32-bit hex). Falls back to a plain "mypos" if the player has no body yet.
+flex finna myposMessage(gt: tag gs.GameState) -> str {
+    lowkey ang = 0
+    lowkey px = 0
+    lowkey py = 0
+    lowkey have = cap
+    holla g = gt in gs.gsc {
+        lowkey cp = g.shell.consoleplayer as int
+        holla m = g.shell.players[cp].mo in gs.thinkers {
+            ang = m.mobj.angle as int
+            px = (m.mobj.x as u32) as int
+            py = (m.mobj.y as u32) as int
+            have = nocap
+        } ghosted {
+        }
+    } ghosted {
+        yeet("gs")
+    }
+    fr !have {
+        bet "mypos"
+    }
+    lowkey buf = mem.slab[u8](42)     // "ang=0x"6 + 8 + ";x,y=(0x"8 + 8 + ",0x"3 + 8 + ")"1 = 42
+    lowkey k = 0
+    k = putStr(buf, k, "ang=0x")
+    k = hexU32(buf, k, ang)
+    k = putStr(buf, k, ";x,y=(0x")
+    k = hexU32(buf, k, px)
+    k = putStr(buf, k, ",0x")
+    k = hexU32(buf, k, py)
+    k = putStr(buf, k, ")")
+    bet str.fromBytesTrust(buf)
+}
+
 // matchMus — idmus##: capture the two map digits, validate, set MUS/NOMUS. Persistent seq cMus.
 flex finna matchMus(gt: tag gs.GameState, key: int) {
     lowkey rc = 0
@@ -1094,7 +1158,17 @@ flex finna matchMus(gt: tag gs.GameState, key: int) {
             }
         }
         fr ok {
-            setMessage(gt, strings.STSTR_MUS)   // S_ChangeMusic deferred
+            setMessage(gt, strings.STSTR_MUS)
+            // S_ChangeMusic(musnum, 1): non-commercial base is mus_e1m1 + n; commercial is
+            // mus_runnin + n - 1 (id ST_Responder). changeMusic silently no-ops a missing lump
+            // (e.g. an E2+ song on the shareware WAD), so an out-of-episode idmus just goes quiet.
+            lowkey musId = 0
+            fr commercial {
+                musId = sounds.MUS_RUNNIN + n - 1
+            } naw {
+                musId = sounds.MUS_E1M1 + n
+            }
+            ssnd.changeMusic(gt, musId, 1)
         } naw {
             setMessage(gt, strings.STSTR_NOMUS)
         }
@@ -1133,15 +1207,39 @@ flex finna matchClev(gt: tag gs.GameState, key: int) {
             epsd = d0 - 48
             map = d1 - 48
         }
+        // Catch invalid maps — id ST_Responder rejects out-of-range epsd/map per gamemode.
         lowkey valid = nocap
-        fr epsd < 1 && gamemode != doomdef.GM_COMMERCIAL {
-            valid = cap
-        }
-        fr map < 1 {
-            valid = cap
+        fr gamemode == doomdef.GM_COMMERCIAL {
+            fr map < 1 || map > 34 {
+                valid = cap
+            }
+        } naw {
+            fr epsd < 1 || map < 1 {
+                valid = cap
+            }
+            fr gamemode == doomdef.GM_RETAIL && (epsd > 4 || map > 9) {
+                valid = cap
+            }
+            fr gamemode == doomdef.GM_REGISTERED && (epsd > 3 || map > 9) {
+                valid = cap
+            }
+            fr gamemode == doomdef.GM_SHAREWARE && (epsd > 1 || map > 9) {
+                valid = cap
+            }
         }
         fr valid {
-            setMessage(gt, strings.STSTR_CLEV)   // G_DeferedInitNew deferred
+            setMessage(gt, strings.STSTR_CLEV)
+            // G_DeferedInitNew(gameskill, epsd, map): set the deferred new-game directly. st_stuff
+            // can't `pull g_game` (g_game already pulls st_stuff -> that would cycle), so we write the
+            // same GameState fields gDeferedInitNew does; G_Ticker's GA_NEWGAME dispatch loads it.
+            holla g = gt in gs.gsc {
+                g.shell.startskill = g.shell.gameskill
+                g.shell.startepisode = epsd as i32
+                g.shell.startmap = map as i32
+                g.shell.gameaction = doomdef.GA_NEWGAME as i32
+            } ghosted {
+                yeet("gs")
+            }
         }
     }
 }
