@@ -50,7 +50,8 @@ use inkwell::types::{
     BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FunctionType, PointerType, StructType,
 };
 use inkwell::values::{
-    BasicMetadataValueEnum, BasicValueEnum, FunctionValue, GlobalValue, IntValue, PointerValue,
+    ArrayValue, BasicMetadataValueEnum, BasicValueEnum, FunctionValue, GlobalValue, IntValue,
+    PointerValue,
 };
 use inkwell::{AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel};
 
@@ -59,6 +60,51 @@ use midir::*;
 
 fn lower_err(e: BuilderError) -> BackendError {
     BackendError::Lower(e.to_string())
+}
+
+/// Whether an LLVM value is a compile-time constant. Used to pick the O(n) constant-aggregate
+/// path when building `[]T` / struct values whose elements are all constants.
+fn is_const_value(v: &BasicValueEnum) -> bool {
+    match v {
+        BasicValueEnum::IntValue(x) => x.is_const(),
+        BasicValueEnum::FloatValue(x) => x.is_const(),
+        BasicValueEnum::PointerValue(x) => x.is_const(),
+        BasicValueEnum::ArrayValue(x) => x.is_const(),
+        BasicValueEnum::StructValue(x) => x.is_const(),
+        BasicValueEnum::VectorValue(x) => x.is_const(),
+    }
+}
+
+/// Build a single constant array of `elem_ty` from constant element `vals` (all assumed constant,
+/// per [`is_const_value`]). One `ConstantArray`, allocated once — the O(n) counterpart to chaining
+/// `insertvalue` on a growing constant aggregate.
+fn const_array<'c>(elem_ty: BasicTypeEnum<'c>, vals: &[BasicValueEnum<'c>]) -> ArrayValue<'c> {
+    match elem_ty {
+        BasicTypeEnum::IntType(t) => {
+            let e: Vec<_> = vals.iter().map(|v| v.into_int_value()).collect();
+            t.const_array(&e)
+        }
+        BasicTypeEnum::FloatType(t) => {
+            let e: Vec<_> = vals.iter().map(|v| v.into_float_value()).collect();
+            t.const_array(&e)
+        }
+        BasicTypeEnum::PointerType(t) => {
+            let e: Vec<_> = vals.iter().map(|v| v.into_pointer_value()).collect();
+            t.const_array(&e)
+        }
+        BasicTypeEnum::ArrayType(t) => {
+            let e: Vec<_> = vals.iter().map(|v| v.into_array_value()).collect();
+            t.const_array(&e)
+        }
+        BasicTypeEnum::StructType(t) => {
+            let e: Vec<_> = vals.iter().map(|v| v.into_struct_value()).collect();
+            t.const_array(&e)
+        }
+        BasicTypeEnum::VectorType(t) => {
+            let e: Vec<_> = vals.iter().map(|v| v.into_vector_value()).collect();
+            t.const_array(&e)
+        }
+    }
 }
 
 pub fn compile(module: &Module, opts: &EmitOptions) -> Result<Vec<u8>, BackendError> {
@@ -547,17 +593,47 @@ impl<'c> Cg<'c> {
             }
             AggKind::Array(elem) => {
                 let elem_ty = self.basic_ty(*elem)?;
-                let arr_ty = elem_ty.array_type(ops.len() as u32);
-                let mut agg = arr_ty.get_undef();
-                for (i, op) in ops.iter().enumerate() {
-                    let v = self.lower_operand(func, locals, op)?;
-                    agg = self
-                        .builder
-                        .build_insert_value(agg, v, i as u32, "arr")
-                        .map_err(lower_err)?
-                        .into_array_value();
+                let n = ops.len();
+                let arr_ty = elem_ty.array_type(n as u32);
+                // Lower the elements. A zero-defaulted `cop T{}` field emits `vec![z; n]` — n
+                // identical operands — so lower a splat once and reuse it (values are Copy), which
+                // keeps even the load count O(1) for a big `[N]` field.
+                let vals: Vec<BasicValueEnum<'c>> = if n > 1 && ops.iter().all(|o| *o == ops[0]) {
+                    let v = self.lower_operand(func, locals, &ops[0])?;
+                    vec![v; n]
+                } else {
+                    let mut vs = Vec::with_capacity(n);
+                    for op in ops {
+                        vs.push(self.lower_operand(func, locals, op)?);
+                    }
+                    vs
+                };
+                // All-constant elements (zero-defaulted scalar arrays, literal arrays): assemble
+                // ONE constant array, O(n).
+                if vals.iter().all(is_const_value) {
+                    return Ok(const_array(elem_ty, &vals).into());
                 }
-                Ok(agg.into())
+                // Otherwise (e.g. an array of zeroed structs, whose element is a runtime `load`):
+                // materialize through a stack slot with one store per element — O(n). Chaining
+                // `insertvalue` on the whole array value instead is O(n^2) in the aggregate size,
+                // which makes a large `[N]` field of structs explode (GameState's `TagBox[32768]`
+                // drove a single `cop GameState{}` past 24 GB).
+                let slot = self
+                    .builder
+                    .build_alloca(arr_ty, "arr.tmp")
+                    .map_err(lower_err)?;
+                let i32t = self.cx.i32_type();
+                for (i, v) in vals.into_iter().enumerate() {
+                    // `slot` points at the array, i.e. at element 0, so a single-index GEP by
+                    // element type lands on `slot[i]` (opaque pointers make the array/elem-0
+                    // pointers identical).
+                    let idx = i32t.const_int(i as u64, false);
+                    let gep = self.gep_index_elem(elem_ty, slot, idx)?;
+                    self.builder.build_store(gep, v).map_err(lower_err)?;
+                }
+                self.builder
+                    .build_load(arr_ty, slot, "arr.val")
+                    .map_err(lower_err)
             }
             AggKind::Sum { sum, variant } => {
                 self.build_sum_value(func, locals, *sum, *variant, ops)
@@ -573,9 +649,18 @@ impl<'c> Cg<'c> {
         sty: StructType<'c>,
         ops: &[Operand],
     ) -> Result<BasicValueEnum<'c>, BackendError> {
+        let mut vals = Vec::with_capacity(ops.len());
+        for op in ops {
+            vals.push(self.lower_operand(func, locals, op)?);
+        }
+        // Fast path: an all-constant struct/tuple (e.g. a zero-defaulted `cop T{}`, or one whose
+        // fields are themselves constant aggregates) becomes a single constant — O(fields) — so a
+        // large struct never pays the O(n^2) of chaining `insertvalue` on a constant aggregate.
+        if vals.iter().all(is_const_value) {
+            return Ok(sty.const_named_struct(&vals).into());
+        }
         let mut agg = sty.get_undef();
-        for (i, op) in ops.iter().enumerate() {
-            let v = self.lower_operand(func, locals, op)?;
+        for (i, v) in vals.into_iter().enumerate() {
             agg = self
                 .builder
                 .build_insert_value(agg, v, i as u32, "agg")
