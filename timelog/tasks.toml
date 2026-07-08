@@ -169,6 +169,19 @@ name = "§2.3 stash hash maps: new/put/peep/yeet/gang, generic + allocator-aware
 size = 13
 status = "done"
 
+[[task]]
+slug = "soa"
+name = "soa struct-of-arrays layout keyword: TyKind::Soa wrapper (array/slice/vec), per-field access only (whole-element banned), transposed LLVM layout + vec-handle bundle; interp-parity"
+size = 13
+# Plan: ~/.claude/plans/nested-weaving-origami.md. Surface `soa` keyword flips container
+# layout to parallel per-field arrays while arr[i].field stays identical. DONE (branch
+# soa-layout): 0 type plumbing, 1 fixed arrays (soa T[N], transposed {[N x f]}), 2 slices
+# (soa []T via mem.slab[Drip], k fat sub-slices), 3 vec (soa vec[Drip] = k VecHandles,
+# stack/gang/per-field get+set, pop banned). Whole-element ops banned with slang errors.
+# Corpus: soa-array/soa-slice/soa-vec (interp==compiled parity); 9 ban unit tests. No
+# rt-abi change, no graph-allowlist change. Extends midir TyKind contract (review).
+status = "done"
+
 # ─────────────────────── Track 3 — memory milestones ───────────────────────
 
 [[task]]

@@ -207,6 +207,10 @@ pub enum TypeKind {
     Tag(Box<Type>),
     /// `crib T`.
     Crib(Box<Type>),
+    /// `soa C` — a struct-of-arrays layout on a container of a `drip` element. The inner
+    /// type is `[]Enemy`, `Enemy[N]`, or `vec[Enemy]`; the layout is transposed to parallel
+    /// per-field arrays while `arr[i].field` access stays identical.
+    Soa(Box<Type>),
     /// `finna(params) -> ret` — a function-pointer type.
     Fn(Vec<Type>, Box<Type>),
     /// `rawptr`.

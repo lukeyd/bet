@@ -455,6 +455,15 @@ impl<'a> Parser<'a> {
                 span: self.span_from(lo),
             });
         }
+        // `soa C` — struct-of-arrays layout. The inner `parse_type` picks up the container
+        // form: `soa []Enemy` (slice), `soa Enemy[N]` (fixed array), `soa vec[Enemy]` (vec).
+        if self.eat(&Token::Soa) {
+            let inner = self.parse_type()?;
+            return Ok(Type {
+                kind: TypeKind::Soa(Box::new(inner)),
+                span: self.span_from(lo),
+            });
+        }
         if self.eat(&Token::Finna) {
             // `finna ( typeList? ) -> type`.
             self.expect(&Token::LParen)?;

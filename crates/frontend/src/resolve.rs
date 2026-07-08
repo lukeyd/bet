@@ -320,6 +320,7 @@ impl Resolver<'_> {
             TypeKind::Array(b, n) => TypeKind::Array(Box::new(self.ty(*b)?), n),
             TypeKind::Tag(b) => TypeKind::Tag(Box::new(self.ty(*b)?)),
             TypeKind::Crib(b) => TypeKind::Crib(Box::new(self.ty(*b)?)),
+            TypeKind::Soa(b) => TypeKind::Soa(Box::new(self.ty(*b)?)),
             TypeKind::Fn(ps, r) => TypeKind::Fn(
                 ps.into_iter()
                     .map(|p| self.ty(p))

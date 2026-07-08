@@ -176,9 +176,11 @@ fn norm_ret(r: &mut RetType) {
 fn norm_type(t: &mut Type) {
     t.span = Span::DUMMY;
     match &mut t.kind {
-        TypeKind::Slice(i) | TypeKind::Tag(i) | TypeKind::Crib(i) | TypeKind::Array(i, _) => {
-            norm_type(i)
-        }
+        TypeKind::Slice(i)
+        | TypeKind::Tag(i)
+        | TypeKind::Crib(i)
+        | TypeKind::Soa(i)
+        | TypeKind::Array(i, _) => norm_type(i),
         TypeKind::Fn(ps, r) => {
             for p in ps {
                 norm_type(p);

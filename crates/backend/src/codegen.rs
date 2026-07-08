@@ -217,6 +217,8 @@ impl<'c> Cg<'c> {
             TyKind::Str | TyKind::Slice(_) => self.fat_ptr_ty().into(),
             // A fixed-size array is an inline value.
             TyKind::Array(elem, n) => self.basic_ty(*elem)?.array_type(*n as u32).into(),
+            // A `soa` container is stored transposed — one parallel array per struct field.
+            TyKind::Soa(inner) => self.soa_llvm_ty(*inner)?,
             TyKind::Tuple(elems) => {
                 let fields: Vec<BasicTypeEnum> = elems
                     .iter()
@@ -243,6 +245,51 @@ impl<'c> Cg<'c> {
         Ok(self.cx.struct_type(&fields, false))
     }
 
+    /// The transposed LLVM type for a `soa` container: one parallel array per struct field.
+    /// `soa T[N]` lowers to `{ [N x f0], [N x f1], ... }` — the struct-of-arrays layout. So
+    /// `soa[i].field(j)` addresses `field-array j`, then index `i` (see `place_ptr`). Only
+    /// fixed-size arrays are wired so far; soa slices/vecs land in later phases.
+    fn soa_llvm_ty(&self, inner: TyId) -> Result<BasicTypeEnum<'c>, BackendError> {
+        enum SoaFieldKind {
+            Array(u64),
+            Slice,
+            Vec,
+        }
+        // Per struct field: `soa T[N]` → `[N x Tj]` (inline); `soa []T` → a fat sub-slice
+        // `{ptr,len}`; `soa vec[T]` → a runtime vec handle (a pointer).
+        let (elem, kind) = match self.m.ty(inner) {
+            TyKind::Array(e, n) => (*e, SoaFieldKind::Array(*n)),
+            TyKind::Slice(e) => (*e, SoaFieldKind::Slice),
+            TyKind::Vec(e) => (*e, SoaFieldKind::Vec),
+            other => {
+                return Err(BackendError::Lower(format!(
+                    "soa layout for {other:?} isn't implemented yet"
+                )));
+            }
+        };
+        let sid = match self.m.ty(elem) {
+            TyKind::Struct(sid) => *sid,
+            other => {
+                return Err(BackendError::Lower(format!(
+                    "soa element must be a drip, got {other:?}"
+                )));
+            }
+        };
+        let def = self.m.struct_def(sid);
+        let fields: Vec<BasicTypeEnum> = def
+            .fields
+            .iter()
+            .map(|f| {
+                Ok(match kind {
+                    SoaFieldKind::Array(n) => self.basic_ty(f.ty)?.array_type(n as u32).into(),
+                    SoaFieldKind::Slice => self.fat_ptr_ty().into(),
+                    SoaFieldKind::Vec => self.ptr_ty().into(),
+                })
+            })
+            .collect::<Result<_, BackendError>>()?;
+        Ok(self.cx.struct_type(&fields, false).into())
+    }
+
     /// An over-estimating count of 8-byte words needed to store a value of `ty`, used only to
     /// size a `moods` payload union. Over-estimation is always safe: the union is a byte blob
     /// that must merely be *big enough* for any variant. Max scalar/pointer alignment on our
@@ -265,6 +312,9 @@ impl<'c> Cg<'c> {
             // `str` and slices are fat `(ptr, len)` values (two words).
             TyKind::Str | TyKind::Slice(_) => 2,
             TyKind::Array(elem, n) => self.ty_words(*elem).saturating_mul(*n as u32),
+            // A `soa` container occupies the same total storage as its AoS inner (only the
+            // field order within is transposed), so its word count is the inner's.
+            TyKind::Soa(inner) => self.ty_words(*inner),
             TyKind::Tuple(elems) => elems.iter().map(|&t| self.ty_words(t)).sum(),
             TyKind::Struct(sid) => self
                 .m
@@ -1249,7 +1299,14 @@ impl<'c> Cg<'c> {
         // A `Downcast(v)` positions us at the sum's payload array; the following `Field(j)`
         // then indexes that array. This carries the pending `(sum, variant)` between them.
         let mut pending: Option<(SumId, u32)> = None;
-        for proj in &place.proj {
+        // `soa[i].field(j)` fuses an `Index` with the following `Field`; when the pair is
+        // consumed we set `skip_field` so the next iteration skips that trailing `Field`.
+        let mut skip_field = false;
+        for (k, proj) in place.proj.iter().enumerate() {
+            if skip_field {
+                skip_field = false;
+                continue;
+            }
             match proj {
                 Proj::Deref => {
                     let elem = match self.m.ty(ty) {
@@ -1303,6 +1360,12 @@ impl<'c> Cg<'c> {
                             })?;
                             (self.tuple_llvm_ty(elems)?, field_ty)
                         }
+                        // Field(j) on a `soa` slice/vec bundle addresses the j-th per-field slot
+                        // (a fat sub-slice for `soa []T`, a vec handle for `soa vec[T]`). The
+                        // slot's storage matches `basic_ty(inner)` — a fat ptr or a plain ptr —
+                        // so the inner container type is exactly the right type at that address.
+                        // (A `soa T[N]` field is only ever reached fused with an Index.)
+                        TyKind::Soa(inner) => (self.basic_ty(ty)?.into_struct_type(), *inner),
                         other => {
                             return Err(BackendError::Lower(format!(
                                 "field projection on non-aggregate {other:?}"
@@ -1359,6 +1422,72 @@ impl<'c> Cg<'c> {
                                 .into_pointer_value();
                             ptr = self.gep_index_elem(elem_llvm, data, idx_v)?;
                             ty = *e;
+                        }
+                        // A `soa` container is transposed: `soa[i].field(j)` addresses
+                        // field-array `j` first, then index `i`. The `Index` MUST be followed
+                        // by a `Field` — a bare whole-element index has no single address, so
+                        // the frontend rejects it; this is the soundness backstop.
+                        TyKind::Soa(inner) => {
+                            let field_j = match place.proj.get(k + 1) {
+                                Some(Proj::Field(j)) => *j,
+                                _ => {
+                                    return Err(BackendError::Lower(
+                                        "whole-element access of a soa container reached codegen \
+                                         (a frontend ban was missed)"
+                                            .into(),
+                                    ));
+                                }
+                            };
+                            // `soa T[N]` field `j` is the inline `[N x Tj]` array; `soa []T`
+                            // field `j` is a fat sub-slice whose data pointer must be loaded.
+                            let (elem, is_slice) = match self.m.ty(*inner) {
+                                TyKind::Array(e, _) => (*e, false),
+                                TyKind::Slice(e) => (*e, true),
+                                other => {
+                                    return Err(BackendError::Lower(format!(
+                                        "soa index for {other:?} isn't implemented yet"
+                                    )));
+                                }
+                            };
+                            let sid = match self.m.ty(elem) {
+                                TyKind::Struct(s) => *s,
+                                other => {
+                                    return Err(BackendError::Lower(format!(
+                                        "soa element must be a drip, got {other:?}"
+                                    )));
+                                }
+                            };
+                            let field_ty = self.m.struct_def(sid).fields[field_j as usize].ty;
+                            let soa_llvm = self.basic_ty(ty)?.into_struct_type();
+                            // GEP to the bundle's per-field slot `j`.
+                            let field_slot = self
+                                .builder
+                                .build_struct_gep(soa_llvm, ptr, field_j, "soa.field")
+                                .map_err(|_| {
+                                    BackendError::Lower(format!("soa field gep {field_j}"))
+                                })?;
+                            let elem_llvm = self.basic_ty(field_ty)?;
+                            ptr = if is_slice {
+                                // Sub-slice: load its data pointer (fat field 0), then index.
+                                let fat = self.fat_ptr_ty();
+                                let data_addr = self
+                                    .builder
+                                    .build_struct_gep(fat, field_slot, 0, "soa.sub.ptr")
+                                    .map_err(|_| {
+                                        BackendError::Lower("soa sub-slice ptr gep".into())
+                                    })?;
+                                let data = self
+                                    .builder
+                                    .build_load(self.ptr_ty(), data_addr, "soa.sub.data")
+                                    .map_err(lower_err)?
+                                    .into_pointer_value();
+                                self.gep_index_elem(elem_llvm, data, idx_v)?
+                            } else {
+                                // Inline field-array: index straight off it.
+                                self.gep_index_elem(elem_llvm, field_slot, idx_v)?
+                            };
+                            ty = field_ty;
+                            skip_field = true;
                         }
                         other => {
                             return Err(BackendError::Lower(format!(

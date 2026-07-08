@@ -709,6 +709,44 @@ impl<'p> Interp<'p> {
                 }
             }
             ExprKind::Field { base, name, .. } => {
+                // `vec[i].field = x`: a vec element lives behind a shared runtime handle (not an
+                // addressable place), so mutate it through a borrow. This is the per-field write
+                // that `soa vec` enables; a plain vec's element-field write is rejected by the
+                // frontend, so only `soa vec` programs reach here.
+                if let ExprKind::Index { base: vbase, index } = &base.kind
+                    && let Value::Vec(rc) = self.eval_expr(env, vbase)?
+                {
+                    let i = match self.eval_expr(env, index)? {
+                        Value::Int(i) if i >= 0 => i as usize,
+                        other => {
+                            return Err(RunError::Type(format!(
+                                "index must be a non-negative int, got {}",
+                                other.type_name()
+                            )));
+                        }
+                    };
+                    let mut xs = rc.borrow_mut();
+                    let len = xs.len();
+                    let elem = xs.get_mut(i).ok_or_else(|| {
+                        RunError::Type(format!("index {i} out of bounds (len {len})"))
+                    })?;
+                    return match elem {
+                        Value::Struct { ty, fields } => match fields.get_mut(name) {
+                            Some(slot) => {
+                                *slot = val;
+                                Ok(())
+                            }
+                            None => Err(RunError::UnknownField {
+                                ty: ty.clone(),
+                                field: name.clone(),
+                            }),
+                        },
+                        other => Err(RunError::Type(format!(
+                            "cannot assign field `{name}` of {}",
+                            other.type_name()
+                        ))),
+                    };
+                }
                 let place = self.place_mut(env, base)?;
                 match place {
                     Value::Struct { ty, fields } => {
@@ -1156,6 +1194,9 @@ impl<'p> Interp<'p> {
             TypeKind::Tag(_) => Ok(Value::Ghosted),
             // Null handles: assignable later, a crash only on use.
             TypeKind::Crib(_) | TypeKind::Fn(..) => Ok(Value::Ghosted),
+            // `soa C` is a layout the interp doesn't model; its default is the inner
+            // container's default (SoA and AoS are observationally identical here).
+            TypeKind::Soa(inner) => self.zero_default(inner, subst),
             TypeKind::RawPtr => Ok(Value::Int(0)),
         }
     }
@@ -1178,9 +1219,9 @@ impl<'p> Interp<'p> {
             ExprKind::Method {
                 receiver,
                 method,
+                generics,
                 args,
-                ..
-            } => self.eval_method_call(env, receiver, method, args),
+            } => self.eval_method_call(env, receiver, method, generics, args),
             ExprKind::Call { callee, args } => self.eval_plain_call(env, callee, args),
             // Any other expression yields exactly one value.
             _ => Ok(vec![self.eval_expr(env, e)?]),
@@ -1194,6 +1235,7 @@ impl<'p> Interp<'p> {
         env: &mut Env,
         receiver: &Expr,
         method: &str,
+        generics: &[Type],
         args: &[Arg],
     ) -> Result<Vec<Value>, RunError> {
         if let ExprKind::Name { name: modname, .. } = &receiver.kind {
@@ -1224,9 +1266,10 @@ impl<'p> Interp<'p> {
                         let id = self.new_arena(false);
                         return Ok(vec![Value::Crib(id)]);
                     }
-                    // `mem.slab[T](n)` — a zero-initialized `[]T` buffer of `n` elements. The
-                    // element type is erased in the interpreter (every scalar is a `Value::Int`),
-                    // so it's an `Array` of `n` zeros, matching the compiled `bet_alloc_zeroed`.
+                    // `mem.slab[T](n)` — a zero-initialized buffer of `n` elements. Scalars
+                    // erase to `Value::Int(0)` (matching `bet_alloc_zeroed`); a `drip` element
+                    // (the `soa []Drip` case) zeroes each field, so `slab[i].field` reads a real
+                    // struct. The interpreter is layout-agnostic — a `soa` slab is just an array.
                     "mem" if method == "slab" => {
                         let vals = self.eval_args(env, args)?;
                         let n = match vals.as_slice() {
@@ -1237,7 +1280,17 @@ impl<'p> Interp<'p> {
                                 ));
                             }
                         };
-                        return Ok(vec![Value::Array(vec![Value::Int(0); n])]);
+                        let zero = match generics.first() {
+                            Some(t)
+                                if matches!(&t.kind, TypeKind::Named(n, _)
+                                    if self.drips.contains_key(n)) =>
+                            {
+                                self.zero_default(t, &HashMap::new())
+                                    .map_err(RunError::Type)?
+                            }
+                            _ => Value::Int(0),
+                        };
+                        return Ok(vec![Value::Array(vec![zero; n])]);
                     }
                     "math" => return self.call_math(env, method, args).map(|v| vec![v]),
                     "sys" => return self.call_sys(env, method, args).map(|v| vec![v]),
@@ -2348,6 +2401,7 @@ fn type_head(ty: &Type) -> &str {
     match &ty.kind {
         TypeKind::Named(name, _) => name,
         TypeKind::Slice(inner) | TypeKind::Tag(inner) | TypeKind::Crib(inner) => type_head(inner),
+        TypeKind::Soa(inner) => type_head(inner),
         TypeKind::Array(elem, _) => type_head(elem),
         TypeKind::Fn(..) => "finna",
         TypeKind::RawPtr => "rawptr",

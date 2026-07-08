@@ -166,6 +166,7 @@ impl Printer<'_> {
             TyKind::Ref(e) => format!("ref {}", self.ty(*e)),
             TyKind::Map(k, v) => format!("map[{}, {}]", self.ty(*k), self.ty(*v)),
             TyKind::Vec(e) => format!("vec[{}]", self.ty(*e)),
+            TyKind::Soa(e) => format!("soa {}", self.ty(*e)),
             TyKind::Rng => "rng".into(),
             TyKind::FnPtr(sig) => {
                 let s = self.m.sig(*sig);
@@ -1820,6 +1821,10 @@ impl Parser {
                 let e = self.ty()?;
                 self.expect(&Tok::RBracket)?;
                 Ok(self.m.intern_ty(TyKind::Vec(e)))
+            }
+            "soa" => {
+                let e = self.ty()?;
+                Ok(self.m.intern_ty(TyKind::Soa(e)))
             }
             "rng" => Ok(self.m.intern_ty(TyKind::Rng)),
             "fn" => {

@@ -609,6 +609,17 @@ impl<'a> Checker<'a> {
                     self.operand_kind(func, idx);
                     ty = match ty {
                         TyKind::Slice(e) | TyKind::Array(e, _) => self.module.ty(e).clone(),
+                        // A `soa` container indexes through to its element type; the transposed
+                        // layout is a backend concern (this projection pair must be followed by
+                        // a `Field` — the backend rejects a bare whole-element index).
+                        TyKind::Soa(inner) => match self.module.ty(inner).clone() {
+                            TyKind::Slice(e) | TyKind::Array(e, _) | TyKind::Vec(e) => {
+                                self.module.ty(e).clone()
+                            }
+                            other => {
+                                return self.bad_proj(func, format!("index into soa {other:?}"));
+                            }
+                        },
                         other => return self.bad_proj(func, format!("index into {other:?}")),
                     };
                 }
@@ -667,6 +678,29 @@ impl<'a> Checker<'a> {
                 Some(&e) => Some(self.module.ty(e).clone()),
                 None => self.bad_proj(func, format!("tuple has no element #{i}")),
             },
+            // Field(j) on a `soa []Drip` / `soa vec[Drip]` bundle is the j-th per-field
+            // sub-slice / vec handle (used to construct the bundle). Structural: `Slice(field_j)`
+            // or `Vec(field_j)`, no interning required.
+            TyKind::Soa(inner) => {
+                let (sub_elem, is_vec) = match self.module.ty(*inner) {
+                    TyKind::Slice(e) => (*e, false),
+                    TyKind::Vec(e) => (*e, true),
+                    other => return self.bad_proj(func, format!("field on soa {other:?}")),
+                };
+                let sid = match self.module.ty(sub_elem) {
+                    TyKind::Struct(s) => *s,
+                    other => return self.bad_proj(func, format!("soa field on {other:?}")),
+                };
+                let def = self.struct_def(func, sid)?;
+                match def.fields.get(i as usize) {
+                    Some(f) => Some(if is_vec {
+                        TyKind::Vec(f.ty)
+                    } else {
+                        TyKind::Slice(f.ty)
+                    }),
+                    None => self.bad_proj(func, format!("soa struct has no field #{i}")),
+                }
+            }
             other => self.bad_proj(func, format!("field access on {other:?}")),
         }
     }

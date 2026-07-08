@@ -47,7 +47,8 @@ all = [
   "functions.basic", "functions.multi-return", "functions.receivers",
   "functions.first-class", "functions.generics",
   # 05 structs
-  "structs.drip", "structs.value-copy", "structs.visibility", "structs.generic",
+  "structs.drip", "structs.value-copy", "structs.visibility", "structs.generic", "structs.soa",
+  "structs.soa-slice", "structs.soa-vec",
   # 06 sum types
   "sumtypes.moods", "sumtypes.vibe-match", "sumtypes.exhaustiveness", "sumtypes.struct-payload",
   # 07 errors
@@ -225,6 +226,24 @@ compiled = "pass"
 [[program]]
 path = "05-structs/drip-generic"
 covers = ["structs.generic"]
+interp = "pass"
+compiled = "pass"
+
+[[program]]
+path = "05-structs/soa-array"
+covers = ["structs.soa"]
+interp = "pass"
+compiled = "pass"
+
+[[program]]
+path = "05-structs/soa-slice"
+covers = ["structs.soa-slice"]
+interp = "pass"
+compiled = "pass"
+
+[[program]]
+path = "05-structs/soa-vec"
+covers = ["structs.soa-vec"]
 interp = "pass"
 compiled = "pass"
 

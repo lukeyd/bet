@@ -80,6 +80,8 @@ pub enum Token {
     Hush,
     #[token("crib")]
     Crib,
+    #[token("soa")]
+    Soa,
     #[token("cop")]
     Cop,
     #[token("evict")]

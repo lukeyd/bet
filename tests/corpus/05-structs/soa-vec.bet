@@ -1,0 +1,47 @@
+// soa-vec — a growable `soa vec[Drip]`: internally k runtime vec handles (one per field)
+// that grow in lockstep, reusing the `bet_vec_*` ABI. Push whole elements with `stack`, then
+// read AND write fields by index — the per-field vec write that `soa vec` enables (a plain
+// `vec[i].field = x` is rejected). The interpreter models it as a plain vec of structs (the
+// layout-agnostic oracle); output must match the compiled per-field-handle path.
+pull "spill"
+
+drip Particle {
+    flex x: int
+    flex hp: int
+    flex alive: bool
+}
+
+finna main() {
+    lowkey v: soa vec[Particle] = vec.new[Particle]()
+
+    lowkey i = 0
+    vibin i < 5 {
+        v.stack(Particle{ x: i, hp: 100, alive: i % 2 == 0 })
+        i = i + 1
+    }
+
+    // per-field write: bump each element's hp by its index * 10
+    i = 0
+    vibin i < 5 {
+        v[i].hp = v[i].hp + i * 10
+        i = i + 1
+    }
+
+    lowkey n = v.gang()
+    lowkey sumx = 0
+    lowkey sumhp = 0
+    lowkey alivecount = 0
+    i = 0
+    vibin i < n {
+        sumx = sumx + v[i].x
+        sumhp = sumhp + v[i].hp
+        fr v[i].alive {
+            alivecount = alivecount + 1
+        }
+        i = i + 1
+    }
+    spill.it(n)           // 5
+    spill.it(sumx)        // 0+1+2+3+4 = 10
+    spill.it(sumhp)       // 100+110+120+130+140 = 600
+    spill.it(alivecount)  // i=0,2,4 -> 3
+}
