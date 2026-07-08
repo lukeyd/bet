@@ -1,0 +1,34 @@
+// hello — a two-minute tour of bet, the language where the keywords are slang.
+// `pull` imports a stdlib module; `spill` is the output module (spill.it prints).
+pull "spill"
+
+// `finna` declares a function; `bet` returns a value; `fr`/`naw` are if/else.
+finna classify(n: int) -> str {
+    fr n < 0 {
+        bet "negative"
+    } naw fr n == 0 {
+        bet "zero"
+    } naw {
+        bet "positive"
+    }
+}
+
+finna main() {
+    spill.it("hi bestie, this is bet")
+
+    spill.it(classify(-3))
+    spill.it(classify(0))
+    spill.it(classify(7))
+
+    // `lowkey` declares a local; `vibin` loops while true; `skip`/`dip` are
+    // continue/break. Sum the odd numbers until the total passes 20.
+    lowkey sum = 0
+    lowkey i = 0
+    vibin i < 100 {
+        i = i + 1
+        fr sum > 20 { dip }
+        fr i % 2 == 0 { skip }
+        sum = sum + i
+    }
+    spill.it(sum)
+}

@@ -7,7 +7,7 @@ runtime stay in Rust (self-hosting means the frontend/middle-end, per convention
 still substantially not-Go). So a compile is:
 
 ```
-your.bet ──[ betfe : the bet-language frontend ]──▶ .mir ──[ bet : Rust backend + linker ]──▶ binary
+your.bet ──[ betfe : the bet language frontend ]──▶ .mir ──[ bet : Rust backend + linker ]──▶ binary
 ```
 
 Status: **done** — Milestone 7.1 (self-host stage 1) and Milestone 8 (fixpoint) are complete.

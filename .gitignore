@@ -41,6 +41,12 @@
 # Claude Code agent worktrees (transient isolated checkouts; never committed)
 /.claude/worktrees/
 
+# npm distribution: staged artifacts (`node npm/stage.mjs`) — demos are copied from
+# ports/ and the dist/ platform packages hold built binaries; neither is committed.
+/npm/betlang/demos/
+/npm/dist/
+/npm/**/*.tgz
+
 # OS / editor cruft
 .DS_Store
 .idea/

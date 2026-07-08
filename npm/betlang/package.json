@@ -1,0 +1,30 @@
+{
+  "name": "betlang",
+  "version": "0.1.0",
+  "description": "The `bet` programming language — slang keywords, arena/tag/holla memory model, games-first. This package runs .bet programs on the bundled interpreter: `npx betlang demo pong`.",
+  "keywords": ["bet", "language", "compiler", "interpreter", "programming-language"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lukeyd/bet.git"
+  },
+  "homepage": "https://github.com/lukeyd/bet#readme",
+  "bin": {
+    "bet": "bin/bet.js"
+  },
+  "files": [
+    "bin/",
+    "demos/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "@betlang/darwin-arm64": "0.1.0",
+    "@betlang/darwin-x64": "0.1.0",
+    "@betlang/linux-x64": "0.1.0",
+    "@betlang/linux-arm64": "0.1.0",
+    "@betlang/win32-x64": "0.1.0"
+  }
+}

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # betself — the `bet` toolchain driven by the SELF-HOSTED frontend.
 #
-#   .bet ──[betfe: the bet-language frontend]──▶ .mir ──[bet: Rust backend+link]──▶ binary
+#   .bet ──[betfe: the bet language frontend]──▶ .mir ──[bet: Rust backend+link]──▶ binary
 #
 # Drop-in for `bet build` / `bet run` on the self-host subset (everything betfe can lower,
 # i.e. the 57/59 corpus + betfe itself). Programs betfe can't lower yet emit a clear error
