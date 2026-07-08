@@ -695,3 +695,9 @@ size = 5
 # compiled path wraps to 4 per spec §2.4 — masked in corpus because 09-bit-math/wrapping
 # is "unsupported" on interp (math.lap). Needs its own fix + a corpus gate.
 status = "doing"
+
+[[task]]
+slug = "selfhost-soa"
+name = "selfhost: teach betfe the soa keyword (fix selfhost.yml drift from #50)"
+size = 2
+status = "doing"
