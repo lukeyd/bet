@@ -1,0 +1,46 @@
+// soa-array — a `soa` fixed array stores each field as its own parallel array, while
+// `ps[i].field` access reads/writes exactly like an array-of-structs. The interpreter is
+// layout-agnostic (the oracle); the compiled backend uses the transposed struct-of-arrays
+// layout. A mixed-width field (`bool` among `int`s) makes the SoA field offsets differ from
+// AoS, so a wrong GEP would diverge from the interpreter here.
+pull "spill"
+
+drip Particle {
+    flex x: int
+    flex hp: int
+    flex alive: bool
+}
+
+finna main() {
+    lowkey ps: soa Particle[4] = [
+        Particle{ x: 1, hp: 100, alive: nocap },
+        Particle{ x: 2, hp: 200, alive: cap },
+        Particle{ x: 3, hp: 300, alive: nocap },
+        Particle{ x: 4, hp: 400, alive: cap },
+    ]
+
+    // per-field mutation across all elements
+    lowkey i = 0
+    vibin i < 4 {
+        ps[i].x = ps[i].x + 10
+        ps[i].hp = ps[i].hp - 1
+        i = i + 1
+    }
+
+    // read back: an independent checksum over each field
+    lowkey sumx = 0
+    lowkey sumhp = 0
+    lowkey alivecount = 0
+    i = 0
+    vibin i < 4 {
+        sumx = sumx + ps[i].x
+        sumhp = sumhp + ps[i].hp
+        fr ps[i].alive {
+            alivecount = alivecount + 1
+        }
+        i = i + 1
+    }
+    spill.it(sumx)        // (1+2+3+4) + 4*10 = 50
+    spill.it(sumhp)       // (100+200+300+400) - 4 = 996
+    spill.it(alivecount)  // elements 0 and 2 are alive = 2
+}

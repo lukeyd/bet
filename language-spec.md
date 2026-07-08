@@ -48,13 +48,28 @@ A compiled, statically typed, general-purpose programming language whose keyword
 | boolean false | `cap` | a lie |
 | nil / none / no-error | `ghosted` | the value never showed up |
 | struct | `drip` | your data's outfit |
+| sum type / tagged union | `moods` | which mood is it in? one of several variants |
+| match on a `moods` | `vibe` | check the vibe — dispatch on the active variant |
 | import | `pull` | "pull up" — bring the module through |
+| FFI import | `extern` | `extern "C" finna SDL_Init(...)` — a foreign declaration |
 | panic | `yeet` | throw it away hard |
 | recover (panic boundary) | `sheesh` | exclamation at the catch site |
+| early-return-on-error | `bounce` | bounce out with the error, zeroing the rest |
 | spawn concurrent task | `slide` | slide into another thread |
+| explicit cast | `as` | `amt as i32` |
+| binding connective | `in` | `cop … in crib`, `squad x in coll`, `holla m = t in crib` |
 | public visibility | `flex` | exposed for everyone to see |
 | private visibility | `hush` | keep it quiet |
-| error type | `yikes` | self-explanatory |
+
+> **The lexer (`crates/frontend/src/lexer.rs`) and `spec/grammar.ebnf` are the normative
+> keyword list; this table is the friendly gloss.** The reserved words are exactly the
+> `#[token]` keywords there.
+
+**Predeclared, not reserved** (ordinary names — usable in expression position, shadowable but
+discouraged; see `spec/grammar.ebnf` §L2): `yikes` (the error type *and* its `yikes.new(...)`
+constructor namespace), the built-in type names (`int float bool str void rawptr`, the sized
+tower `i8`..`u64`/`f32`/`f64`, `vec2`..`mat4`), `scratch` (reached only as `mem.scratch()`),
+and the stdlib module nouns (`spill fs str math mem gg vec stash bytes …`).
 
 **Resolved conflicts:**
 - `cap` is exclusively the boolean false. `else` is `naw` (avoids parser ambiguity and user confusion).
@@ -67,16 +82,19 @@ A compiled, statically typed, general-purpose programming language whose keyword
 | declare an arena | `crib` | where your data lives |
 | allocate into an arena | `cop` | `cop Player{...} in frameCrib` |
 | free an entire arena (O(1)) | `evict` | everyone out at once; `evict <tag> in <crib>` evicts one slot |
-| per-frame scratch arena | `scratch` | built in, auto-evicted each frame |
 | generational handle type | `tag` | `tag Enemy` — a name you can call out |
 | checked handle access | `holla` | call out; either they answer or you're ghosted |
 | unchecked handle access | `trust()` | explicitly dangerous; greppable |
+| struct-of-arrays layout | `soa` | `soa Enemy[N]` — one keyword flips to parallel per-field arrays; cache-friendly, access unchanged |
+
+The per-frame scratch arena is reached as `mem.scratch()` — a stdlib call, not a keyword (it
+was previously listed here as `scratch`).
 
 ---
 
 ## 4. Syntax Overview
 
-C-family structure: braces, semicolon-free line-oriented statements (Go-style automatic termination — **open question: confirm ASI rules**), conventional operators (`+ - * / % == != < > <= >= && || !`), conventional literals.
+C-family structure: braces, semicolon-free line-oriented statements (Go-style automatic statement termination — implemented; rules in `spec/grammar.ebnf` §L6). Operators: arithmetic `+ - * / %`, comparison `== != < > <= >=`, logical `&& || !`, bitwise `& | ^ ~ << >>`, and their compound-assignment forms (`+= -= *= /= %= &= |= ^= <<= >>=`). Literals: decimal/hex/bin ints, floats, strings, byte chars.
 
 ### 4.1 Declarations
 
@@ -121,12 +139,41 @@ vibin condition {
 squad item in collection {
     ...
 }
+
+vibe shape {                     // match on a `moods` value (exhaustive)
+    Circle(r) { spill.it(r) }
+    Rect(w, h) { spill.it(w * h) }
+    naw { ... }                  // `naw` is the wildcard arm
+}
 ```
 
-### 4.4 Visibility & modules
+### 4.4 Sum types (`moods`)
+
+A `moods` is a tagged union of named variants, each with an optional payload; a value is
+scrutinized with `vibe` (checked for exhaustiveness):
+
+```
+moods Shape {
+    Circle(f64)
+    Rect(f64, f64)
+    Empty
+}
+```
+
+### 4.5 FFI (`extern`)
+
+```
+extern "C" finna SDL_Init(flags: u32) -> i32
+```
+
+`extern "ABI" finna name(params) [-> Type]` declares a foreign function; `rawptr` is the
+FFI raw-pointer type at the boundary.
+
+### 4.6 Visibility & modules
 
 - `pull "modname"` imports a module.
-- `flex` marks declarations/fields as exported; `hush` (or no modifier — **open question: default visibility**) keeps them module-private.
+- `flex` marks declarations/fields as exported; absence of a modifier makes them
+  module-private (the default is `hush`).
 
 ---
 
@@ -134,11 +181,27 @@ squad item in collection {
 
 - **Statically typed** with local type inference (`lowkey x = 5` infers `int`).
 - **Value types by default.** Structs (`drip`) are values; assignment copies. Reference semantics are explicit and rare.
-- Primitives: `int`, `float`, `bool`, `str`, plus sized variants (**open question: exact numeric tower — `i32`/`i64`/`f32`/`f64` spelling**).
+- Primitives: `int`, `float`, `bool`, `str`, plus the sized integer tower `i8 i16 i32 i64 u8 u16 u32 u64` and floats `f32 f64` (`int` = `i64`, `float` = `f64`); explicit wrap/trap arithmetic.
+- **Sum types (`moods`).** A tagged union of named variants with optional payloads, matched exhaustively with `vibe` (see §4.4). Values are laid out as a tag plus a payload union.
 - Slices/arrays: `[]Bullet`, `Enemy[1000]` (fixed).
+- **Struct-of-arrays (`soa`).** Prefix a container-of-`drip` with `soa` to lay it out as
+  parallel per-field arrays instead of array-of-structs — cache-friendly, auto-vectorizable
+  hot loops — while `arr[i].field` access stays byte-identical. One keyword is the whole
+  toggle:
+  ```
+  soa Enemy[1000] es          // fixed array   → { [1000 x hp], [1000 x pos], … }
+  soa []Enemy view            // slice          (e.g. mem.slab[Enemy](n))
+  soa vec[Enemy] pool         // growable vec   (one runtime handle per field)
+  ```
+  Access `es[i].hp` reads/writes one field; the layout is transposed underneath. The element
+  must be a flat `drip` (scalar/handle fields). A `soa` element is spread across the field
+  arrays, so it has **no single address** — copying, assigning, passing, or `squad`-iterating
+  a whole element (`let e = es[i]`) is a compile error; touch one field at a time. Rationale
+  and IR representation: [spec/midir.md](spec/midir.md) (`TyKind::Soa`).
 - Game-math types are built in via stdlib: `vec2`, `vec3`, `vec4`, `mat4` (SIMD-friendly layout).
 - `tag T` is a distinct nominal type (see §7). A `tag Enemy` is not interchangeable with a `tag Player` or a bare `Enemy`.
-- **Open questions:** generics (`squad[T]`?), method syntax on `drip` (Go-style receivers vs. dot-defined), interfaces/traits story.
+- **Generics** are ahead-of-time monomorphized (`drip Pair[T]`, `vec.new[int]()`); **methods** on `drip` use Go-style receivers (`finna (p: Player) hurt(...)`). Both are implemented.
+- **Open question:** interfaces/traits story (deferred past the v1 freeze — see §12).
 
 ---
 
@@ -160,7 +223,7 @@ finna loadSave(path: str) -> (SaveData, yikes) {
 - **`.tea()`** returns/wraps the error's message: calling `y.tea("context")` returns a new `yikes` wrapping the old one with added context (mirrors Go's `fmt.Errorf("...: %w", err)`). The tea is what actually happened.
 - **`ghosted`** is the nil error. The core idiom is `fr y != ghosted { ... }`.
 - **`yeet(msg)`** panics — for unrecoverable states only. **`sheesh`** recovers at a boundary (e.g., top of the frame loop). Rare and discouraged, exactly like Go's panic/recover.
-- **Proposed sugar (open question):** `bounce y` — early-returns zero values plus the error, collapsing the three-line check. Motivated by Go's most common ergonomic complaint; game code checks a lot of errors.
+- **`bounce y`** — early-returns zero values plus the error, collapsing the three-line check. Motivated by Go's most common ergonomic complaint (game code checks a lot of errors). Shipped (a reserved keyword; grammar `bounceStmt`).
 
 ---
 
@@ -378,7 +441,7 @@ finna loadSave(path: str) -> (SaveData, yikes) {
 - **Compiler & runtime language: Rust.** One language for both; `inkwell` for LLVM bindings; ecosystem (`logos`, `chumsky`, `salsa`, `tower-lsp`, native Cranelift) is the strongest available; painless cross-platform CI via Cargo.
 - **Backend: LLVM (pinned version), via inkwell.** Release builds through LLVM's optimizer; `lld` bundled for linking; DWARF/PDB debug info; runtime statically linked into every binary.
 - **Cranelift slot reserved** for fast debug builds later.
-- **Own mid-level IR between frontend and LLVM** (à la Rust MIR / Swift SIL). Hosts language-specific passes — arena lifetime analysis, allocator inlining, hoisting `holla` generation checks out of loops, fusing repeated `holla`s, SoA crib layout — and isolates the frontend from LLVM API churn while making Cranelift pluggable.
+- **Own mid-level IR between frontend and LLVM** (à la Rust MIR / Swift SIL). Hosts language-specific passes — arena lifetime analysis, allocator inlining, hoisting `holla` generation checks out of loops, fusing repeated `holla`s — carries the `soa` struct-of-arrays layout as a `TyKind::Soa` wrapper materialized in the backend (see spec/midir.md), and isolates the frontend from LLVM API churn while making Cranelift pluggable.
 - **Runtime:** Rust, `no_std`-flavored static library. Owns allocators/cribs/generations, scheduler for `slide`, per-OS syscall layer (libc on macOS/Windows; Go's raw-syscall breakage on macOS is the cautionary tale), signals, startup/shutdown.
 
 ### 11.2 Phase 0 contracts (blocking, ~2-6 weeks)

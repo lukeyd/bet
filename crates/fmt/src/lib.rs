@@ -727,6 +727,7 @@ fn type_str(t: &Type) -> String {
         TypeKind::Array(inner, n) => format!("{}[{}]", type_str(inner), n),
         TypeKind::Tag(inner) => format!("tag {}", type_str(inner)),
         TypeKind::Crib(inner) => format!("crib {}", type_str(inner)),
+        TypeKind::Soa(inner) => format!("soa {}", type_str(inner)),
         TypeKind::Fn(params, ret) => {
             format!("finna({}) -> {}", join_types(params), type_str(ret))
         }

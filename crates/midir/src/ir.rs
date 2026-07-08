@@ -98,6 +98,15 @@ pub enum TyKind {
     Slice(TyId),
     /// `T[N]` — a fixed-size array.
     Array(TyId, u64),
+    /// `soa C` — a struct-of-arrays layout wrapper. The inner id always resolves to a
+    /// container of a [`TyKind::Struct`] element: `Array(Struct, N)`, `Slice(Struct)`, or
+    /// `Vec(Struct)`. The container is stored transposed — one parallel array per struct
+    /// field — but `arr[i].field` accesses it with the same `Index`-then-`Field`
+    /// projection chain as an AoS container. Whole-element operations (taking the address
+    /// of, copying, or passing `arr[i]` by value) have no single-address representation and
+    /// are rejected in the frontend; see the backend's `place_ptr` for how the projection
+    /// pair is lowered (field-array first, then index).
+    Soa(TyId),
     /// `tag T` — an 8-byte generational handle into a typed crib.
     Tag(TyId),
     /// `crib T` — a crib (arena) handle, as a parameter or field type.

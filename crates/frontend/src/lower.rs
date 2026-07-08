@@ -447,6 +447,41 @@ impl LowerCtx {
                 let e = self.map_type(e)?;
                 Ok(self.m.intern_ty(TyKind::Crib(e)))
             }
+            ast::TypeKind::Soa(inner) => {
+                let inner_id = self.map_type(inner)?;
+                // `soa` wraps a container (array / slice / vec) of a `drip` element.
+                let elem = match self.m.ty(inner_id) {
+                    TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::Vec(e) => *e,
+                    _ => {
+                        return Err("nah — soa only wraps a container of a drip: \
+                             `soa Enemy[N]`, `soa []Enemy`, or `soa vec[Enemy]`."
+                            .into());
+                    }
+                };
+                let sid = match self.m.ty(elem) {
+                    TyKind::Struct(sid) => *sid,
+                    _ => {
+                        return Err("soa only vibes with a drip (struct) element — \
+                             that container's element ain't a drip."
+                            .into());
+                    }
+                };
+                // No soa inside soa — the transpose only goes one level deep.
+                let nested = self
+                    .m
+                    .struct_def(sid)
+                    .fields
+                    .iter()
+                    .find(|f| matches!(self.m.ty(f.ty), TyKind::Soa(_)))
+                    .map(|f| f.name.clone());
+                if let Some(fname) = nested {
+                    let sname = self.m.struct_def(sid).name.clone();
+                    return Err(format!(
+                        "no soa inside soa, fam — drip `{sname}` has a nested soa field `{fname}`."
+                    ));
+                }
+                Ok(self.m.intern_ty(TyKind::Soa(inner_id)))
+            }
             ast::TypeKind::RawPtr => Ok(self.m.intern_ty(TyKind::RawPtr)),
             ast::TypeKind::Fn(params, ret) => {
                 let params: Vec<TyId> = params
@@ -1175,10 +1210,88 @@ impl LowerCtx {
         }
         for (name, val) in v.targets.iter().zip(&v.values) {
             let (op, vty) = self.lower_expr(val, decl_ty)?;
+            self.deny_whole_soa_read(&op)?;
             let ty = decl_ty.unwrap_or(vty);
             let l = self.new_local(ty);
-            self.fb().assign(Place::local(l), Rvalue::Use(op));
+            if matches!(self.m.ty(ty), TyKind::Soa(_)) && !matches!(self.m.ty(vty), TyKind::Soa(_))
+            {
+                // Transposing a plain array into a `soa T[N]`: its storage is transposed, so a
+                // flat store won't do — scatter element-by-element into the field arrays. (A
+                // `soa`-typed RHS, e.g. `mem.slab[Drip]`, is already transposed: a direct copy.)
+                self.scatter_into_soa(&Place::local(l), op)?;
+            } else {
+                self.fb().assign(Place::local(l), Rvalue::Use(op));
+            }
             self.bind(name, l);
+        }
+        Ok(())
+    }
+
+    /// Store an array/soa source into a `soa` destination place by scattering each element's
+    /// fields into the parallel per-field arrays. Only a fixed-size `soa T[N]` destination is
+    /// supported so far (compile-time N to unroll); the element is always a `drip` struct
+    /// (enforced by `map_type`). `dest` must be a `soa` place; `src` an addressable operand.
+    fn scatter_into_soa(&mut self, dest: &Place, src: Operand) -> Result<(), String> {
+        let soa_ty = self.place_ty(dest)?;
+        let (elem, n) = match self.m.ty(soa_ty) {
+            TyKind::Soa(inner) => match self.m.ty(*inner) {
+                TyKind::Array(e, n) => (*e, *n),
+                _ => {
+                    return Err(
+                        "only a fixed-size `soa T[N]` can be built this way so far — \
+                         soa slices and vecs land in a later phase."
+                            .into(),
+                    );
+                }
+            },
+            _ => return Err("scatter target isn't a soa container".into()),
+        };
+        let src_place = self
+            .operand_place(src)
+            .ok_or_else(|| "a soa initializer must be an addressable array".to_string())?;
+        let sid = match self.m.ty(elem) {
+            TyKind::Struct(s) => *s,
+            _ => return Err("soa element isn't a drip".into()),
+        };
+        let nfields = self.m.struct_def(sid).fields.len() as u32;
+        let i64t = self.m.t_i64();
+        for i in 0..n {
+            let idx = Operand::Const(Const::Int(i as i128, i64t));
+            let d_i = extend(dest, Proj::Index(idx.clone()));
+            let s_i = extend(&src_place, Proj::Index(idx));
+            for j in 0..nfields {
+                let d = extend(&d_i, Proj::Field(j));
+                let s = extend(&s_i, Proj::Field(j));
+                self.fb().assign(d, Rvalue::Use(Operand::Copy(s)));
+            }
+        }
+        Ok(())
+    }
+
+    /// True if `place` denotes a *whole element* of a `soa` container — its final projection
+    /// is an `Index` whose base has a `soa` type. Such an element is spread across parallel
+    /// field arrays, so it has no single address/value; only `soa[i].field` is allowed.
+    fn is_whole_soa_elem(&self, place: &Place) -> bool {
+        if !matches!(place.proj.last(), Some(Proj::Index(_))) {
+            return false;
+        }
+        let mut base = place.clone();
+        base.proj.pop();
+        matches!(self.place_ty(&base), Ok(t) if matches!(self.m.ty(t), TyKind::Soa(_)))
+    }
+
+    /// Reject reading a whole `soa` element as a value (a copy, a call argument, a return).
+    /// The slang wording matches the rest of bet's diagnostics.
+    fn deny_whole_soa_read(&self, op: &Operand) -> Result<(), String> {
+        if let Operand::Copy(p) | Operand::Move(p) = op
+            && self.is_whole_soa_elem(p)
+        {
+            return Err(
+                "nah — can't yoink a whole soa element. soa spreads each field into \
+                 its own array, so there's no single element to grab. pull one field at a time \
+                 (e.g. arr[i].hp)."
+                    .into(),
+            );
         }
         Ok(())
     }
@@ -1220,6 +1333,7 @@ impl LowerCtx {
         let mut ops = Vec::with_capacity(vals.len());
         for (e, &rt) in vals.iter().zip(&rets) {
             let (op, _) = self.lower_expr(e, Some(rt))?;
+            self.deny_whole_soa_read(&op)?;
             ops.push(op);
         }
         self.term_ret(ops);
@@ -1324,10 +1438,37 @@ impl LowerCtx {
         if targets.len() != 1 || values.len() != 1 {
             return Err("only single-target assignment is lowered yet".into());
         }
+        // `soa_vec[i].field = x`: write a field through its per-field runtime handle (a vec
+        // element isn't an addressable place). The per-field write `soa vec` enables.
+        if op == ast::AssignOp::Eq
+            && let ExprKind::Field { base, name, .. } = &targets[0].kind
+            && let ExprKind::Index { base: vbase, index } = &base.kind
+            && let ExprKind::Name { name: vname, .. } = &vbase.kind
+            && let Some(local) = self.lookup_local(vname)
+            && let TyKind::Soa(inner) = self.m.ty(self.local_ty(local))
+            && let TyKind::Vec(e) = *self.m.ty(*inner)
+        {
+            return self.lower_soa_vec_write(local, e, index, name, &values[0]);
+        }
         let place = self.lower_place(&targets[0])?;
         let pty = self.place_ty(&place)?;
+        // A whole `soa` element can't be written as one value — set fields individually.
+        if self.is_whole_soa_elem(&place) {
+            return Err(
+                "can't slam a whole struct into a soa slot — set the fields one by one \
+                 (e.g. arr[i].hp = ...)."
+                    .into(),
+            );
+        }
         if op == ast::AssignOp::Eq {
             let (val, vty) = self.lower_expr(&values[0], Some(pty))?;
+            self.deny_whole_soa_read(&val)?;
+            // Transposing a plain array into a `soa T[N]` scatters element-by-element (its
+            // storage is transposed). A `soa`-typed RHS is already transposed: a direct copy.
+            if matches!(self.m.ty(pty), TyKind::Soa(_)) && !matches!(self.m.ty(vty), TyKind::Soa(_))
+            {
+                return self.scatter_into_soa(&place, val);
+            }
             // Coerce an integer RHS to the target's integer type (width/sign), e.g. an `int`
             // value stored into an `i16` slot (`beepbuf[i] = amp`). A no-op when the types match.
             let val = if matches!(self.m.ty(vty), TyKind::Int { .. })
@@ -1824,7 +1965,7 @@ impl LowerCtx {
                 method,
                 generics,
                 args,
-            } => self.lower_method(receiver, method, generics, args),
+            } => self.lower_method(receiver, method, generics, args, hint),
             ExprKind::Call { callee, args } => self.lower_call(callee, args, hint),
             ExprKind::Struct(lit) => self.lower_struct_lit(lit),
             ExprKind::Cop { init, crib } => self.lower_cop(init, crib),
@@ -2052,6 +2193,16 @@ impl LowerCtx {
     }
 
     fn lower_field(&mut self, base: &Expr, name: &str) -> Result<(Operand, TyId), String> {
+        // `soa_vec[i].field` reads a field through the per-field runtime handle (a vec element
+        // isn't an addressable place). Peek the container type off a name root without lowering.
+        if let ExprKind::Index { base: vbase, index } = &base.kind
+            && let ExprKind::Name { name: vname, .. } = &vbase.kind
+            && let Some(local) = self.lookup_local(vname)
+            && let TyKind::Soa(inner) = self.m.ty(self.local_ty(local))
+            && let TyKind::Vec(e) = *self.m.ty(*inner)
+        {
+            return self.lower_soa_vec_read(local, e, index, name);
+        }
         let (bop, bty) = self.lower_expr(base, None)?;
         let base_place = self
             .operand_place(bop)
@@ -2088,6 +2239,14 @@ impl LowerCtx {
             .ok_or_else(|| "indexing requires an addressable base".to_string())?;
         let elem = match self.m.ty(bty) {
             TyKind::Array(e, _) | TyKind::Slice(e) => *e,
+            // Indexing a `soa` container yields its (struct) element place. This is only
+            // valid when a field projection follows — a bare `soa[i]` whole-element read is
+            // rejected at the value-egress sites (see `ban_soa_elem`); the place produced
+            // here is consumed as a *place* by `lower_field`, never loaded as a whole struct.
+            TyKind::Soa(inner) => match self.m.ty(*inner) {
+                TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::Vec(e) => *e,
+                other => return Err(format!("soa index of {other:?}")),
+            },
             other => return Err(format!("indexing a non-array/slice value ({other:?})")),
         };
         let i64t = self.m.t_i64();
@@ -2155,6 +2314,13 @@ impl LowerCtx {
         }
         let (elem, n) = match self.m.ty(ity) {
             TyKind::Array(e, n) => (*e, *n),
+            TyKind::Soa(_) => {
+                return Err(
+                    "squad over a soa container binds a whole element, and soa don't do \
+                     that. loop by index instead (vibin i < N { ... arr[i].field ... })."
+                        .into(),
+                );
+            }
             other => {
                 return Err(format!(
                     "`squad` over a non-array value ({other:?}) is not yet lowered"
@@ -2236,6 +2402,7 @@ impl LowerCtx {
         method: &str,
         generics: &[ast::Type],
         args: &[ast::Arg],
+        hint: Option<TyId>,
     ) -> Result<(Operand, TyId), String> {
         // Stdlib module intrinsics (`math.lap`, ...) when the receiver is a bare module name.
         if let ExprKind::Name { name, .. } = &receiver.kind
@@ -2248,7 +2415,7 @@ impl LowerCtx {
                 return self.lower_stash_new(generics, args);
             }
             if name == "vec" && method == "new" {
-                return self.lower_vec_new(generics);
+                return self.lower_vec_new(generics, hint);
             }
             if name == "mem" && method == "slab" {
                 return self.lower_mem_slab(generics, args);
@@ -2278,6 +2445,11 @@ impl LowerCtx {
         let (bop, bty) = self.lower_expr(receiver, None)?;
         if let TyKind::Map(k, v) = *self.m.ty(bty) {
             return self.lower_stash_method(bop, k, v, method, args);
+        }
+        if let TyKind::Soa(inner) = *self.m.ty(bty)
+            && let TyKind::Vec(e) = *self.m.ty(inner)
+        {
+            return self.lower_soa_vec_method(bop, e, method, args);
         }
         if let TyKind::Vec(e) = *self.m.ty(bty) {
             return self.lower_vec_method(bop, e, method, args);
@@ -2600,6 +2772,12 @@ impl LowerCtx {
             return Err("`mem.slab` takes a single element count `n`".into());
         }
         let e = self.map_type(&generics[0])?;
+        // A `drip` element makes this a `soa` slab: one zeroed per-field array plus a fat
+        // sub-slice per field, bundled as a `soa []Drip`. (An AoS struct slab isn't supported
+        // — `mem.slab` needs a scalar-shaped element size/align, which SoA gives per field.)
+        if let TyKind::Struct(sid) = *self.m.ty(e) {
+            return self.lower_mem_slab_soa(sid, e, &args[0].value);
+        }
         let rawptr = self.m.intern_ty(TyKind::RawPtr);
         let usize_t = self.m.t_int(IntWidth::W64, false);
         let i64t = self.m.t_i64();
@@ -2652,12 +2830,113 @@ impl LowerCtx {
         Ok((Operand::Copy(Place::local(sl)), slice_ty))
     }
 
+    /// `mem.slab[Drip](n) -> soa []Drip` — the struct-of-arrays heap slab. Each field gets its
+    /// own `bet_alloc_zeroed(n * size_of[Tj], size_of[Tj])` array wrapped in a fat sub-slice;
+    /// the `k` sub-slices are bundled into a `soa []Drip`. Access is `slab[i].field`. Fields
+    /// must be scalar-shaped (their size is a valid alignment, as `mem.slab` already requires).
+    fn lower_mem_slab_soa(
+        &mut self,
+        sid: StructId,
+        elem: TyId,
+        count: &Expr,
+    ) -> Result<(Operand, TyId), String> {
+        let rawptr = self.m.intern_ty(TyKind::RawPtr);
+        let usize_t = self.m.t_int(IntWidth::W64, false);
+        let i64t = self.m.t_i64();
+
+        // Gather field types up front (avoids holding a borrow of `self.m` across lowering).
+        let fields: Vec<TyId> = self.m.struct_def(sid).fields.iter().map(|f| f.ty).collect();
+        for (j, &fty) in fields.iter().enumerate() {
+            if matches!(
+                self.m.ty(fty),
+                TyKind::Struct(_)
+                    | TyKind::Sum(_)
+                    | TyKind::Array(..)
+                    | TyKind::Tuple(_)
+                    | TyKind::Soa(_)
+            ) {
+                let fname = self.m.struct_def(sid).fields[j].name.clone();
+                return Err(format!(
+                    "soa mem.slab needs scalar-shaped fields — drip field `{fname}` is an \
+                     aggregate. keep soa slab drips flat (ints/floats/bools/handles)."
+                ));
+            }
+        }
+
+        // n, held in a usize local so each field's alloc reuses the same count.
+        let (n, nty) = self.lower_expr(count, Some(i64t))?;
+        let n_us = self.coerce_int(n, nty, usize_t);
+        let n_local = self.new_local(usize_t);
+        self.fb().assign(Place::local(n_local), Rvalue::Use(n_us));
+        let n_op = || Operand::Copy(Place::local(n_local));
+
+        let soa_ty = {
+            let slice_ty = self.m.intern_ty(TyKind::Slice(elem));
+            self.m.intern_ty(TyKind::Soa(slice_ty))
+        };
+        let bundle = self.new_local(soa_ty);
+
+        for (j, &fty) in fields.iter().enumerate() {
+            // esize = size_of[Tj]  (also the allocation alignment — valid for scalar fields).
+            let esize = self.new_local(usize_t);
+            self.fb().assign(Place::local(esize), Rvalue::SizeOf(fty));
+            // bytes = n * esize.
+            let bytes = self.new_local(usize_t);
+            self.fb().assign(
+                Place::local(bytes),
+                Rvalue::BinOp(
+                    BinOp::Mul,
+                    n_op(),
+                    Operand::Copy(Place::local(esize)),
+                    ArithMode::Wrap,
+                ),
+            );
+            // ptr = bet_alloc_zeroed(bytes, esize).
+            let ext = self.get_extern("bet_alloc_zeroed", vec![usize_t, usize_t], vec![rawptr]);
+            let ptr = self.new_local(rawptr);
+            self.fb().assign(
+                Place::local(ptr),
+                Rvalue::Call(
+                    Callee::Extern(ext),
+                    vec![
+                        Operand::Copy(Place::local(bytes)),
+                        Operand::Copy(Place::local(esize)),
+                    ],
+                ),
+            );
+            // bundle.field(j) = { ptr, n } over the fresh per-field storage.
+            let sub = extend(&Place::local(bundle), Proj::Field(j as u32));
+            self.fb().assign(
+                sub,
+                Rvalue::MakeSlice {
+                    data: Operand::Copy(Place::local(ptr)),
+                    len: n_op(),
+                    elem: fty,
+                },
+            );
+        }
+        Ok((Operand::Copy(Place::local(bundle)), soa_ty))
+    }
+
     /// `vec.new[T]()` — create an empty growable array. Lowered to `bet_vec_new(size_of[T])`.
-    fn lower_vec_new(&mut self, generics: &[ast::Type]) -> Result<(Operand, TyId), String> {
+    fn lower_vec_new(
+        &mut self,
+        generics: &[ast::Type],
+        hint: Option<TyId>,
+    ) -> Result<(Operand, TyId), String> {
         if generics.len() != 1 {
             return Err("`vec.new` takes one type argument `[T]`".into());
         }
         let e = self.map_type(&generics[0])?;
+        // A `soa vec[Drip]` hint makes this a struct-of-arrays vec: one runtime handle per
+        // field. (AoS `vec[Drip]` is a normal single-handle vec, so this is hint-driven.)
+        if let Some(h) = hint
+            && let TyKind::Soa(inner) = self.m.ty(h)
+            && matches!(self.m.ty(*inner), TyKind::Vec(ve) if *ve == e)
+            && let TyKind::Struct(sid) = *self.m.ty(e)
+        {
+            return self.lower_soa_vec_new(sid, e);
+        }
         let vec_ty = self.m.intern_ty(TyKind::Vec(e));
         let usize_t = self.m.t_int(IntWidth::W64, false);
         let esize = self.new_local(usize_t);
@@ -2672,6 +2951,224 @@ impl LowerCtx {
             ),
         );
         Ok((Operand::Copy(Place::local(tmp)), vec_ty))
+    }
+
+    /// `vec.new[Drip]()` in a `soa vec[Drip]` context — a bundle of `k` runtime vec handles,
+    /// one per struct field (all growing in lockstep). Reuses the `bet_vec_*` ABI unchanged.
+    /// Fields must be scalar-shaped (each handle stores a scalar-sized element), as `vec` and
+    /// `mem.slab` already require.
+    fn lower_soa_vec_new(&mut self, sid: StructId, elem: TyId) -> Result<(Operand, TyId), String> {
+        let usize_t = self.m.t_int(IntWidth::W64, false);
+        let fields: Vec<TyId> = self.m.struct_def(sid).fields.iter().map(|f| f.ty).collect();
+        for (j, &fty) in fields.iter().enumerate() {
+            if matches!(
+                self.m.ty(fty),
+                TyKind::Struct(_)
+                    | TyKind::Sum(_)
+                    | TyKind::Array(..)
+                    | TyKind::Tuple(_)
+                    | TyKind::Soa(_)
+            ) {
+                let fname = self.m.struct_def(sid).fields[j].name.clone();
+                return Err(format!(
+                    "soa vec needs scalar-shaped fields — drip field `{fname}` is an aggregate. \
+                     keep soa vec drips flat (ints/floats/bools/handles)."
+                ));
+            }
+        }
+        let soa_ty = {
+            let vt = self.m.intern_ty(TyKind::Vec(elem));
+            self.m.intern_ty(TyKind::Soa(vt))
+        };
+        let bundle = self.new_local(soa_ty);
+        for (j, &fty) in fields.iter().enumerate() {
+            let esize = self.new_local(usize_t);
+            self.fb().assign(Place::local(esize), Rvalue::SizeOf(fty));
+            let vec_j_ty = self.m.intern_ty(TyKind::Vec(fty));
+            let ext = self.get_extern("bet_vec_new", vec![usize_t], vec![vec_j_ty]);
+            let handle = self.new_local(vec_j_ty);
+            self.fb().assign(
+                Place::local(handle),
+                Rvalue::Call(
+                    Callee::Extern(ext),
+                    vec![Operand::Copy(Place::local(esize))],
+                ),
+            );
+            let slot = extend(&Place::local(bundle), Proj::Field(j as u32));
+            self.fb()
+                .assign(slot, Rvalue::Use(Operand::Copy(Place::local(handle))));
+        }
+        Ok((Operand::Copy(Place::local(bundle)), soa_ty))
+    }
+
+    /// Methods on a `soa vec[Drip]`: `stack` (push — scatter each field into its handle),
+    /// `gang` (length — from handle 0, all grow in lockstep). `pop` is rejected (it would
+    /// hand back a whole element, which soa can't).
+    fn lower_soa_vec_method(
+        &mut self,
+        soa_op: Operand,
+        elem: TyId,
+        method: &str,
+        args: &[ast::Arg],
+    ) -> Result<(Operand, TyId), String> {
+        let bundle = self
+            .operand_place(soa_op)
+            .ok_or_else(|| "a soa vec method needs an addressable receiver".to_string())?;
+        let rawptr = self.m.intern_ty(TyKind::RawPtr);
+        let usize_t = self.m.t_int(IntWidth::W64, false);
+        let sid = match self.m.ty(elem) {
+            TyKind::Struct(s) => *s,
+            _ => return Err("soa vec element isn't a drip".into()),
+        };
+        let fields: Vec<TyId> = self.m.struct_def(sid).fields.iter().map(|f| f.ty).collect();
+        match method {
+            "stack" => {
+                if args.len() != 1 {
+                    return Err("`vec.stack` takes a single element".into());
+                }
+                // Materialize the element, then push each field into its own handle.
+                let (val_op, _) = self.lower_expr(&args[0].value, Some(elem))?;
+                let el = self.new_local(elem);
+                self.fb().assign(Place::local(el), Rvalue::Use(val_op));
+                let mut last = None;
+                for (j, &fty) in fields.iter().enumerate() {
+                    let vec_j_ty = self.m.intern_ty(TyKind::Vec(fty));
+                    let fptr = self.new_local(rawptr);
+                    let fplace = extend(&Place::local(el), Proj::Field(j as u32));
+                    self.fb().assign(Place::local(fptr), Rvalue::AddrOf(fplace));
+                    let handle = Operand::Copy(extend(&bundle, Proj::Field(j as u32)));
+                    let ext = self.get_extern("bet_vec_push", vec![vec_j_ty, rawptr], vec![]);
+                    last = Some(self.emit_extern_call(
+                        ext,
+                        &[],
+                        vec![handle, Operand::Copy(Place::local(fptr))],
+                    )?);
+                }
+                last.ok_or_else(|| "a soa vec drip needs at least one field".to_string())
+            }
+            "gang" => {
+                if !args.is_empty() {
+                    return Err("`vec.gang` takes no arguments".into());
+                }
+                let f0 = *fields
+                    .first()
+                    .ok_or_else(|| "a soa vec drip needs at least one field".to_string())?;
+                let vec0_ty = self.m.intern_ty(TyKind::Vec(f0));
+                let handle0 = Operand::Copy(extend(&bundle, Proj::Field(0)));
+                let ext = self.get_extern("bet_vec_len", vec![vec0_ty], vec![usize_t]);
+                self.emit_extern_call(ext, &[usize_t], vec![handle0])
+            }
+            "pop" => Err(
+                "soa vec pop would hand back a whole element, and soa can't. read the \
+                 fields you need by index, or use a plain vec."
+                    .into(),
+            ),
+            other => Err(format!(
+                "`{other}` isn't a soa vec method — try stack / gang, or index a field \
+                 (v[i].field)."
+            )),
+        }
+    }
+
+    /// `soa_vec[i].field` — read field `field` of element `i` via `bet_vec_get` on that
+    /// field's handle (mirrors [`Self::lower_vec_index`], but selects the per-field vec).
+    fn lower_soa_vec_read(
+        &mut self,
+        bundle: LocalId,
+        elem: TyId,
+        index: &Expr,
+        field: &str,
+    ) -> Result<(Operand, TyId), String> {
+        let sid = match self.m.ty(elem) {
+            TyKind::Struct(s) => *s,
+            _ => return Err("soa vec element isn't a drip".into()),
+        };
+        let (j, fty) = {
+            let def = self.m.struct_def(sid);
+            let idx = def
+                .fields
+                .iter()
+                .position(|f| f.name == field)
+                .ok_or_else(|| format!("drip `{}` has no field `{field}`", def.name))?;
+            (idx as u32, def.fields[idx].ty)
+        };
+        let rawptr = self.m.intern_ty(TyKind::RawPtr);
+        let usize_t = self.m.t_int(IntWidth::W64, false);
+        let boolt = self.m.t_bool();
+        let vec_j_ty = self.m.intern_ty(TyKind::Vec(fty));
+        let (iop, ity) = self.lower_expr(index, Some(usize_t))?;
+        let i_us = self.coerce_int(iop, ity, usize_t);
+        let out = self.new_local(fty);
+        let out_ptr = self.new_local(rawptr);
+        self.fb()
+            .assign(Place::local(out_ptr), Rvalue::AddrOf(Place::local(out)));
+        let handle = Operand::Copy(extend(&Place::local(bundle), Proj::Field(j)));
+        let ext = self.get_extern("bet_vec_get", vec![vec_j_ty, usize_t, rawptr], vec![boolt]);
+        let ok = self.new_local(boolt);
+        self.fb().assign(
+            Place::local(ok),
+            Rvalue::Call(
+                Callee::Extern(ext),
+                vec![handle, i_us, Operand::Copy(Place::local(out_ptr))],
+            ),
+        );
+        Ok((Operand::Copy(Place::local(out)), fty))
+    }
+
+    /// `soa_vec[i].field = x` — write field `field` of element `i` via `bet_vec_set` on that
+    /// field's handle.
+    fn lower_soa_vec_write(
+        &mut self,
+        bundle: LocalId,
+        elem: TyId,
+        index: &Expr,
+        field: &str,
+        value: &Expr,
+    ) -> Result<(), String> {
+        let sid = match self.m.ty(elem) {
+            TyKind::Struct(s) => *s,
+            _ => return Err("soa vec element isn't a drip".into()),
+        };
+        let (j, fty) = {
+            let def = self.m.struct_def(sid);
+            let idx = def
+                .fields
+                .iter()
+                .position(|f| f.name == field)
+                .ok_or_else(|| format!("drip `{}` has no field `{field}`", def.name))?;
+            (idx as u32, def.fields[idx].ty)
+        };
+        let rawptr = self.m.intern_ty(TyKind::RawPtr);
+        let usize_t = self.m.t_int(IntWidth::W64, false);
+        let boolt = self.m.t_bool();
+        let vec_j_ty = self.m.intern_ty(TyKind::Vec(fty));
+        // value -> a slot (coerced to the field's integer width when relevant).
+        let (vop, vty) = self.lower_expr(value, Some(fty))?;
+        let vop = if matches!(self.m.ty(fty), TyKind::Int { .. })
+            && matches!(self.m.ty(vty), TyKind::Int { .. })
+        {
+            self.coerce_int(vop, vty, fty)
+        } else {
+            vop
+        };
+        let slot = self.new_local(fty);
+        self.fb().assign(Place::local(slot), Rvalue::Use(vop));
+        let sptr = self.new_local(rawptr);
+        self.fb()
+            .assign(Place::local(sptr), Rvalue::AddrOf(Place::local(slot)));
+        let (iop, ity) = self.lower_expr(index, Some(usize_t))?;
+        let i_us = self.coerce_int(iop, ity, usize_t);
+        let handle = Operand::Copy(extend(&Place::local(bundle), Proj::Field(j)));
+        let ext = self.get_extern("bet_vec_set", vec![vec_j_ty, usize_t, rawptr], vec![boolt]);
+        let ok = self.new_local(boolt);
+        self.fb().assign(
+            Place::local(ok),
+            Rvalue::Call(
+                Callee::Extern(ext),
+                vec![handle, i_us, Operand::Copy(Place::local(sptr))],
+            ),
+        );
+        Ok(())
     }
 
     /// Dispatch a method on a `vec[T]` value: `stack` (push), `pop`, or `gang` (length).
@@ -4481,6 +4978,7 @@ impl LowerCtx {
         for (i, a) in args.iter().enumerate() {
             let hint = params.get(i).copied();
             let (op, _) = self.lower_expr(&a.value, hint)?;
+            self.deny_whole_soa_read(&op)?;
             out.push(op);
         }
         Ok(out)
@@ -4693,6 +5191,20 @@ impl LowerCtx {
                 let bty = self.place_ty(&base_place)?;
                 match self.m.ty(bty) {
                     TyKind::Array(..) | TyKind::Slice(_) => {}
+                    // `soa[i].field = v` reaches here for the inner `soa[i]` place; the field
+                    // projection is appended by the caller. A bare `soa[i] = v` whole-element
+                    // write is rejected at `lower_assign` (see `ban_soa_elem`).
+                    TyKind::Soa(inner) => match self.m.ty(*inner) {
+                        TyKind::Array(..) | TyKind::Slice(_) => {}
+                        TyKind::Vec(_) => {
+                            return Err("writing a `soa vec` element by field isn't wired yet \
+                                 (vec SoA lands in a later phase)."
+                                .into());
+                        }
+                        other => {
+                            return Err(format!("cannot index-assign a soa {other:?}"));
+                        }
+                    },
                     TyKind::Vec(_) => {
                         return Err(
                             "cannot assign to a `vec` element (vec is append-only; use an array \
@@ -4918,6 +5430,12 @@ impl LowerCtx {
                 Proj::Index(_) => {
                     ty = match self.m.ty(ty) {
                         TyKind::Slice(e) | TyKind::Array(e, _) => *e,
+                        // A `soa` container indexes to its element type; the layout is a
+                        // backend concern, the element type is the inner container's element.
+                        TyKind::Soa(inner) => match self.m.ty(*inner) {
+                            TyKind::Slice(e) | TyKind::Array(e, _) | TyKind::Vec(e) => *e,
+                            other => return Err(format!("soa index of {other:?}")),
+                        },
                         other => return Err(format!("index of {other:?}")),
                     };
                 }

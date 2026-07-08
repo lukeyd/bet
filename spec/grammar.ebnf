@@ -50,9 +50,10 @@ ident    = letter { letter | digit } ;   (* a keyword (L2) is never an ident *)
    Declarations / bindings : finna bet lowkey facts drip moods pull extern
    Control flow            : fr naw vibin squad dip skip vibe
    Concurrency / panic     : slide yeet sheesh
+   Error / early-return    : bounce
    Booleans / nil          : nocap cap ghosted
    Visibility              : flex hush
-   Memory model            : crib cop evict tag holla trust in
+   Memory model            : crib cop evict tag holla trust in soa
    Casts                   : as
    Contextual (keyword only in position): trust (postfix), naw (else / match
      wildcard), ghosted (holla else-arm AND nil literal), in (cop/holla/squad).
@@ -170,12 +171,14 @@ bindTargets = ident { "," ident } ;               (* multi-value bind: a, y = f(
 
 (* --- S3. Types ----------------------------------------------------------- *)
 
-type      = sliceType | arrayType | tagType | cribType | fnType
+type      = sliceType | arrayType | tagType | cribType | soaType | fnType
           | "rawptr" | nameType ;
 sliceType = "[]" type ;                           (* []Bullet, []u8             *)
 arrayType = nameType "[" intLit "]" ;             (* Enemy[1000] (fixed)        *)
 tagType   = "tag" type ;                          (* tag Enemy (8-byte handle)  *)
 cribType  = "crib" type ;                         (* crib Enemy (param/field)   *)
+soaType   = "soa" type ;    (* struct-of-arrays layout on a container-of-drip:
+                               soa Enemy[N], soa []Enemy, soa vec[Enemy]        *)
 fnType    = "finna" "(" [ typeList ] ")" "->" type ;  (* finna(tag Mobj)->void  *)
 nameType  = ident [ "[" typeList "]" ] ;          (* int, str, vec3, stash[str,i64] *)
                                                   (* a map is stash[K, V] (§amend 8) *)

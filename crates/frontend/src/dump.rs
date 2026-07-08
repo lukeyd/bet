@@ -238,6 +238,10 @@ impl AstDump {
                 self.line(d, "crib-ty");
                 self.ty(d + 1, inner);
             }
+            TypeKind::Soa(inner) => {
+                self.line(d, "soa");
+                self.ty(d + 1, inner);
+            }
             TypeKind::Fn(params, ret) => {
                 self.line(d, "fn-ty");
                 self.line(d + 1, "params");
@@ -602,6 +606,7 @@ fn token_tag(t: &Token) -> &'static str {
         Token::Flex => "flex",
         Token::Hush => "hush",
         Token::Crib => "crib",
+        Token::Soa => "soa",
         Token::Cop => "cop",
         Token::Evict => "evict",
         Token::Tag => "tag",

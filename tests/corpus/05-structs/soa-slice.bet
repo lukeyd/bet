@@ -1,0 +1,48 @@
+// soa-slice — a heap `soa []Drip` from `mem.slab[Drip](n)`. Each field gets its own zeroed
+// slab; the slice is a bundle of per-field sub-slices, but `ps[i].field` access is identical
+// to a normal slice. Passing the bundle by value to a read-only function exercises aggregate
+// argument passing. The interpreter is layout-agnostic (the oracle); output must match.
+pull "spill"
+
+drip Particle {
+    flex x: int
+    flex hp: int
+    flex alive: bool
+}
+
+finna total_hp(ps: soa []Particle, n: int) -> int {
+    lowkey s = 0
+    lowkey i = 0
+    vibin i < n {
+        s = s + ps[i].hp
+        i = i + 1
+    }
+    bet s
+}
+
+finna main() {
+    lowkey n = 4
+    lowkey ps: soa []Particle = mem.slab[Particle](n)
+
+    lowkey i = 0
+    vibin i < n {
+        ps[i].x = i
+        ps[i].hp = 100 + i * 10
+        ps[i].alive = i % 2 == 0
+        i = i + 1
+    }
+
+    lowkey sumx = 0
+    lowkey alivecount = 0
+    i = 0
+    vibin i < n {
+        sumx = sumx + ps[i].x
+        fr ps[i].alive {
+            alivecount = alivecount + 1
+        }
+        i = i + 1
+    }
+    spill.it(sumx)              // 0+1+2+3 = 6
+    spill.it(total_hp(ps, n))  // 100+110+120+130 = 460
+    spill.it(alivecount)       // i=0,2 -> 2
+}
