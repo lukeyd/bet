@@ -682,3 +682,9 @@ size = 5
 # emits 24 NEON `.4s` ops at O2 vs 0 at O0, same output; zero-cost proven — soa_kernel.bet and the
 # hand-written aos_kernel.bet emit identical vector-op counts (tests/zero_cost.rs) + criterion bench.
 status = "doing"
+
+[[task]]
+slug = "selfhost-soa"
+name = "selfhost: teach betfe the soa keyword (fix selfhost.yml drift from #50)"
+size = 2
+status = "doing"

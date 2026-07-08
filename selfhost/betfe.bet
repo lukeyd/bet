@@ -107,7 +107,7 @@ finna hexVal(c: int) -> int {
     bet 0
 }
 
-// The 32 L2 keywords (dump tag == surface spelling, per dump.rs::token_tag).
+// The 33 L2 keywords (dump tag == surface spelling, per dump.rs::token_tag).
 finna isKeyword(w: str) -> bool {
     bet str.slaps(w, "finna") ||
         str.slaps(w, "bet") ||
@@ -134,6 +134,7 @@ finna isKeyword(w: str) -> bool {
         str.slaps(w, "flex") ||
         str.slaps(w, "hush") ||
         str.slaps(w, "crib") ||
+        str.slaps(w, "soa") ||
         str.slaps(w, "cop") ||
         str.slaps(w, "evict") ||
         str.slaps(w, "tag") ||
@@ -801,6 +802,16 @@ finna parseType(p: P) -> int {
     fr eat(p, "crib") {
         lowkey inner = parseType(p)
         lowkey n = mkNode(p, "crib-ty")
+        addKid(p, n, inner)
+        bet n
+    }
+    // `soa C` — struct-of-arrays layout wrapper; the inner parseType picks up the container
+    // form (mirrors parser.rs TypeKind::Soa). Lowering has no soa support yet, so mapTypeNode's
+    // fallthrough sentinels any program that USES one (C4 tolerates the sentinel; C1/C3 don't
+    // need it).
+    fr eat(p, "soa") {
+        lowkey inner = parseType(p)
+        lowkey n = mkNode(p, "soa")
         addKid(p, n, inner)
         bet n
     }
