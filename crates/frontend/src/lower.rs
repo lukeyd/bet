@@ -701,6 +701,16 @@ impl LowerCtx {
                 );
                 Operand::Copy(Place::local(tmp))
             }
+            TyKind::Simd { elem, lanes } => {
+                let z = self.zero_value(elem)?;
+                let ops = vec![z; lanes as usize];
+                let tmp = self.new_local(ty);
+                self.fb().assign(
+                    Place::local(tmp),
+                    Rvalue::Aggregate(AggKind::Simd(elem), ops),
+                );
+                Operand::Copy(Place::local(tmp))
+            }
             other => {
                 return Err(format!(
                     "a field of type {other:?} has no zero value; initialize it explicitly"
@@ -758,6 +768,12 @@ impl LowerCtx {
             // `rng` — an opaque seeded-PRNG handle (`math.cook`); no type arguments.
             "rng" => TyKind::Rng,
             _ => {
+                // First-class SIMD vector types: `<elem>x<N>` (e.g. `f32x4`, `i64x2`) and the
+                // `vec2`/`vec3`/`vec4` float aliases. Resolved by name like `rng`, no lexer change.
+                if let Some((elem_name, lanes)) = simd_type_name(name) {
+                    let elem = self.named_type(elem_name)?;
+                    return Ok(self.m.intern_ty(TyKind::Simd { elem, lanes }));
+                }
                 if let Some(&s) = self.structs.get(name) {
                     return Ok(self.m.intern_ty(TyKind::Struct(s)));
                 }
@@ -2098,6 +2114,26 @@ impl LowerCtx {
         } else {
             self.lower_expr(l, hint)?
         };
+        // Element-wise SIMD arithmetic/shift. A scalar right operand (`v >> 16`, `v * s`) is
+        // broadcast to a vector so the IR `BinOp` sees two same-type vectors; a vector right
+        // operand (`a + b`) passes through. Comparisons on vectors aren't part of the surface
+        // (min/max are methods), so they fall through to the scalar path.
+        if !irop.is_comparison()
+            && let TyKind::Simd { elem, .. } = *self.m.ty(lty)
+        {
+            let (ro, rty) = self.lower_expr(r, Some(elem))?;
+            let ro = if rty == lty {
+                ro
+            } else {
+                self.emit_simd(SimdOp::Splat, vec![ro], lty).0
+            };
+            let tmp = self.new_local(lty);
+            self.fb().assign(
+                Place::local(tmp),
+                Rvalue::BinOp(irop, lo, ro, ArithMode::Na),
+            );
+            return Ok((Operand::Copy(Place::local(tmp)), lty));
+        }
         let (ro, _) = self.lower_expr(r, Some(lty))?;
         let mode = self.arith_mode(lty, irop);
         let res_ty = if irop.is_comparison() {
@@ -2204,6 +2240,32 @@ impl LowerCtx {
             return self.lower_soa_vec_read(local, e, index, name);
         }
         let (bop, bty) = self.lower_expr(base, None)?;
+        // A `<N x elem>` SIMD lane read: `v.x`/`.y`/`.z`/`.w` extract lane 0/1/2/3 as a scalar.
+        // Lanes are read-only in v1 (no `v.x = ...`), so this yields a value, not a place.
+        if let TyKind::Simd { elem, lanes } = *self.m.ty(bty) {
+            let lane = match name {
+                "x" => 0u32,
+                "y" => 1,
+                "z" => 2,
+                "w" => 3,
+                other => return Err(format!("simd vector has no lane `{other}` (use x/y/z/w)")),
+            };
+            if lane >= lanes {
+                return Err(format!(
+                    "lane `.{name}` is out of range for a {lanes}-lane vector"
+                ));
+            }
+            let tmp = self.new_local(elem);
+            self.fb().assign(
+                Place::local(tmp),
+                Rvalue::Simd {
+                    op: SimdOp::Lane(lane),
+                    args: vec![bop],
+                    ty: elem,
+                },
+            );
+            return Ok((Operand::Copy(Place::local(tmp)), elem));
+        }
         let base_place = self
             .operand_place(bop)
             .ok_or_else(|| "field access requires an addressable base".to_string())?;
@@ -2456,6 +2518,9 @@ impl LowerCtx {
         }
         if matches!(*self.m.ty(bty), TyKind::Rng) {
             return self.lower_rng_method(bop, method, args);
+        }
+        if let TyKind::Simd { elem, lanes } = *self.m.ty(bty) {
+            return self.lower_simd_method(bop, bty, elem, lanes, method, args);
         }
         if self.is_yikes(bty) {
             return self.lower_yikes_method(bop, method, args);
@@ -3531,6 +3596,88 @@ impl LowerCtx {
                 Ok((out, i64t))
             }
             other => Err(format!("unknown `rng` method `{other}`")),
+        }
+    }
+
+    /// Emit an `Rvalue::Simd` into a fresh local and return it as an operand of type `ty`.
+    fn emit_simd(&mut self, op: SimdOp, args: Vec<Operand>, ty: TyId) -> (Operand, TyId) {
+        let tmp = self.new_local(ty);
+        self.fb()
+            .assign(Place::local(tmp), Rvalue::Simd { op, args, ty });
+        (Operand::Copy(Place::local(tmp)), ty)
+    }
+
+    /// Dispatch a method on a SIMD vector value. `vty` is the vector type, `elem` its scalar
+    /// element. Element-wise `+ - * / >> <<` are operators (handled by `lower_binary`); these are
+    /// the reductions, min/max/abs, and float length/normalize.
+    fn lower_simd_method(
+        &mut self,
+        recv: Operand,
+        vty: TyId,
+        elem: TyId,
+        _lanes: u32,
+        method: &str,
+        args: &[ast::Arg],
+    ) -> Result<(Operand, TyId), String> {
+        match method {
+            "min" | "max" => {
+                if args.len() != 1 {
+                    return Err(format!("`.{method}` takes one vector argument"));
+                }
+                let (w, _) = self.lower_expr(&args[0].value, Some(vty))?;
+                let op = if method == "min" {
+                    SimdOp::Min
+                } else {
+                    SimdOp::Max
+                };
+                Ok(self.emit_simd(op, vec![recv, w], vty))
+            }
+            "abs" => {
+                if !args.is_empty() {
+                    return Err("`.abs` takes no arguments".into());
+                }
+                Ok(self.emit_simd(SimdOp::Abs, vec![recv], vty))
+            }
+            "dot" => {
+                if args.len() != 1 {
+                    return Err("`.dot` takes one vector argument".into());
+                }
+                let (w, _) = self.lower_expr(&args[0].value, Some(vty))?;
+                Ok(self.emit_simd(SimdOp::Dot, vec![recv, w], elem))
+            }
+            "sum" => {
+                if !args.is_empty() {
+                    return Err("`.sum` takes no arguments".into());
+                }
+                Ok(self.emit_simd(SimdOp::Sum, vec![recv], elem))
+            }
+            // `v.scale(s)` = `v * splat(s)` — a convenience for the common scalar-broadcast multiply.
+            "scale" => {
+                if args.len() != 1 {
+                    return Err("`.scale` takes one scalar argument".into());
+                }
+                let (s, _) = self.lower_expr(&args[0].value, Some(elem))?;
+                let (splat, _) = self.emit_simd(SimdOp::Splat, vec![s], vty);
+                let tmp = self.new_local(vty);
+                self.fb().assign(
+                    Place::local(tmp),
+                    Rvalue::BinOp(BinOp::Mul, recv, splat, ArithMode::Na),
+                );
+                Ok((Operand::Copy(Place::local(tmp)), vty))
+            }
+            "length" => {
+                if !args.is_empty() {
+                    return Err("`.length` takes no arguments".into());
+                }
+                Ok(self.emit_simd(SimdOp::Length, vec![recv], elem))
+            }
+            "norm" => {
+                if !args.is_empty() {
+                    return Err("`.norm` takes no arguments".into());
+                }
+                Ok(self.emit_simd(SimdOp::Norm, vec![recv], vty))
+            }
+            other => Err(format!("unknown simd method `{other}`")),
         }
     }
 
@@ -4922,6 +5069,36 @@ impl LowerCtx {
                 }
                 return Err(format!("`{name}[..]` is not a known generic function"));
             }
+            // A call whose callee names a SIMD vector type constructs one: `f32x4(a,b,c,d)` builds
+            // the vector lane-by-lane; `f32x4(x)` broadcasts one scalar to every lane.
+            if simd_type_name(name).is_some() && !self.funcs.contains_key(name) {
+                let vty = self.named_type(name)?;
+                let (elem, lanes) = match *self.m.ty(vty) {
+                    TyKind::Simd { elem, lanes } => (elem, lanes),
+                    _ => unreachable!("simd_type_name matched a non-simd type"),
+                };
+                if args.len() == lanes as usize {
+                    let mut ops = Vec::with_capacity(args.len());
+                    for a in args {
+                        let (op, _) = self.lower_expr(&a.value, Some(elem))?;
+                        ops.push(op);
+                    }
+                    let tmp = self.new_local(vty);
+                    self.fb().assign(
+                        Place::local(tmp),
+                        Rvalue::Aggregate(AggKind::Simd(elem), ops),
+                    );
+                    return Ok((Operand::Copy(Place::local(tmp)), vty));
+                }
+                if args.len() == 1 {
+                    let (op, _) = self.lower_expr(&args[0].value, Some(elem))?;
+                    return Ok(self.emit_simd(SimdOp::Splat, vec![op], vty));
+                }
+                return Err(format!(
+                    "`{name}` takes {lanes} lane values or 1 scalar to splat, got {}",
+                    args.len()
+                ));
+            }
             // A call whose callee names a `moods` variant is a value constructor with payload.
             if self.variants.contains_key(name) && !self.funcs.contains_key(name) {
                 let (sid, variant) = self.resolve_variant(name, hint)?;
@@ -5520,6 +5697,34 @@ fn extend(base: &Place, p: Proj) -> Place {
     let mut place = base.clone();
     place.proj.push(p);
     place
+}
+
+/// Recognize a first-class SIMD vector type name: the `vec2`/`vec3`/`vec4` float aliases, or the
+/// generic `<elem>x<N>` form (`f32x4`, `i64x2`, …). Returns `(element type name, lane count)`, or
+/// `None` if `name` isn't a vector type. Lane counts are 2–4 in v1; the element must be a scalar
+/// numeric type name. Resolved as a plain type name (no lexer keyword), like `rng`.
+fn simd_type_name(name: &str) -> Option<(&str, u32)> {
+    match name {
+        "vec2" => Some(("f32", 2)),
+        "vec3" => Some(("f32", 3)),
+        "vec4" => Some(("f32", 4)),
+        _ => {
+            let idx = name.rfind('x')?;
+            if idx == 0 {
+                return None;
+            }
+            let (elem, rest) = (&name[..idx], &name[idx + 1..]);
+            let lanes: u32 = rest.parse().ok()?;
+            if !(2..=4).contains(&lanes) {
+                return None;
+            }
+            match elem {
+                "f32" | "f64" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
+                | "int" | "uint" => Some((elem, lanes)),
+                _ => None,
+            }
+        }
+    }
 }
 
 /// Map a non-short-circuit surface binary operator to its IR counterpart.

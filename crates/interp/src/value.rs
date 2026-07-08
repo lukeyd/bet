@@ -73,6 +73,39 @@ pub enum Value {
     /// `RngHandle`. The state and algorithm are `rt_abi::RngState`, the *same* generator the
     /// runtime uses, so `bet run` and a compiled binary draw the identical sequence.
     Rng(Rc<RefCell<rt_abi::RngState>>),
+    /// A first-class SIMD vector (`f32x4`, `i64x2`, …). Lanes are held in their element's true
+    /// type (see [`SimdVal`]) so the interpreter's element-wise arithmetic and reductions match
+    /// the compiled `<N x T>` path bit-for-bit — in particular `f32` lanes compute in `f32`.
+    Simd(SimdVal),
+}
+
+/// The lanes of a [`Value::Simd`], stored in the element's true type. Float lanes are computed in
+/// their real width (not the interpreter's usual `f64`) so `f32x4` arithmetic is bit-identical to
+/// the LLVM `<4 x float>` path. Integer lanes use the uniform `i64` domain like [`Value::Int`],
+/// so the surface element width (`i32` vs `i64`) is not tracked — programs must not rely on lane
+/// arithmetic overflowing at a narrower width (the corpus stays within range).
+#[derive(Clone, Debug, PartialEq)]
+pub enum SimdVal {
+    F32(Vec<f32>),
+    F64(Vec<f64>),
+    Int(Vec<i64>),
+}
+
+impl SimdVal {
+    /// The lane count.
+    pub fn len(&self) -> usize {
+        match self {
+            SimdVal::F32(v) => v.len(),
+            SimdVal::F64(v) => v.len(),
+            SimdVal::Int(v) => v.len(),
+        }
+    }
+
+    /// Whether the vector has no lanes (only for the `clippy::len_without_is_empty` lint; a real
+    /// SIMD value always has ≥ 2 lanes).
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// The default display of a value (corpus "Display rules"): the text `spill.it` prints before
@@ -126,6 +159,12 @@ pub fn display(v: &Value) -> String {
         }
         // A generator is never `spill`'d in a corpus program; this is diagnostic.
         Value::Rng(_) => "<rng>".to_string(),
+        // A vector is never `spill`'d bare (reduced to an int/lane first); this is diagnostic.
+        Value::Simd(sv) => match sv {
+            SimdVal::F32(v) => format!("{v:?}"),
+            SimdVal::F64(v) => format!("{v:?}"),
+            SimdVal::Int(v) => format!("{v:?}"),
+        },
     }
 }
 
@@ -160,6 +199,7 @@ impl Value {
             Value::Stash(_) => "stash",
             Value::Vec(_) => "vec",
             Value::Rng(_) => "rng",
+            Value::Simd(_) => "simd",
         }
     }
 }

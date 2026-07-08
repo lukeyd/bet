@@ -14,18 +14,22 @@ const USAGE: &str = "\
 bet — the bet compiler driver
 
 USAGE:
-    bet build <input.bet|input.mir> [-o <output>]
+    bet build [--release] <input.bet|input.mir> [-o <output>]
+    bet build [--release] --emit asm <input.bet> [-o <output.s>]
     bet build --emit <tokens|ast|mir> <input.bet>
     bet run   <input.bet>
     bet fmt   [--check] <input.bet>
 
 `build` compiles a program to a native executable, linking it against the bootstrap runtime.
 Requires a codegen-enabled build (`--features llvm`); without it, `build` reports that no code
-generator is present.
+generator is present. `--release` (alias `-O2`) runs the LLVM `default<O2>` optimization pipeline
+— inlining, SROA, and the loop/SLP vectorizers — so abstractions become zero-cost and `soa` loops
+auto-vectorize; the default is unoptimized `-O0` (fastest to build).
 
-`build --emit <kind>` instead prints a canonical textual dump of a frontend intermediate
-(`tokens`, `ast`, or `mir`) and stops — no backend, so it works in the default build. These
-dumps are the differential-testing surface for the self-hosted frontend.
+`build --emit asm` writes the target assembly (`.s`) instead of linking — honoring `--release`, so
+`--release --emit asm` shows the optimized (vectorized) code. `build --emit <tokens|ast|mir>`
+instead prints a canonical textual dump of a frontend intermediate and stops — no backend, so those
+work in the default build. The dumps are the differential-testing surface for the self-hosted frontend.
 
 `run` parses a `.bet` program and executes it on the tree-walking interpreter, writing its
 output to stdout. No codegen or LLVM is required.
@@ -119,6 +123,7 @@ fn build(args: &[String]) -> Result<(), String> {
     let mut output: Option<PathBuf> = None;
     let mut runtime = link::Runtime::Stub;
     let mut emit: Option<String> = None;
+    let mut opt = backend::OptLevel::O0;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -139,6 +144,8 @@ fn build(args: &[String]) -> Result<(), String> {
                     _ => return Err("`--runtime` needs `stub` or `real`".into()),
                 };
             }
+            "--release" | "-O2" => opt = backend::OptLevel::O2,
+            "-O0" => opt = backend::OptLevel::O0,
             flag if flag.starts_with('-') => return Err(format!("unknown flag `{flag}`")),
             path => {
                 if input.is_some() {
@@ -151,10 +158,25 @@ fn build(args: &[String]) -> Result<(), String> {
     }
     let input = input.ok_or("`bet build` needs an input file")?;
 
-    // `--emit=<kind>` short-circuits the native pipeline: print a canonical textual dump of a
-    // frontend intermediate (for differential-testing the self-hosted frontend) and stop. These
-    // never touch the backend, so they work in the default LLVM-free build.
+    // `--emit=<kind>` short-circuits the native link. `tokens`/`ast`/`mir` print a canonical
+    // textual dump of a frontend intermediate (for differential-testing the self-hosted frontend)
+    // and never touch the backend, so they work in the default LLVM-free build. `asm` instead runs
+    // the full backend (honoring `--release`) and writes the target assembly to the output file
+    // (default `<stem>.s`) without linking — for inspection and SIMD demos; it needs codegen.
     if let Some(kind) = emit {
+        if kind == "asm" {
+            let output = output.unwrap_or_else(|| default_output(&input).with_extension("s"));
+            let opts = backend::EmitOptions {
+                entry: Some("main".into()),
+                opt,
+                emit: backend::EmitKind::Assembly,
+                ..Default::default()
+            };
+            let asm = compile_object(&input, &opts)?;
+            std::fs::write(&output, &asm)
+                .map_err(|e| format!("writing {}: {e}", output.display()))?;
+            return Ok(());
+        }
         return emit_dump(&input, &kind);
     }
 
@@ -162,6 +184,7 @@ fn build(args: &[String]) -> Result<(), String> {
 
     let opts = backend::EmitOptions {
         entry: Some("main".into()),
+        opt,
         ..Default::default()
     };
     let object = compile_object(&input, &opts)?;

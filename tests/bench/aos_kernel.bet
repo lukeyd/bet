@@ -1,0 +1,40 @@
+// aos_kernel — the HAND-WRITTEN side of the zero-cost benchmark: two raw parallel `[]u32` slabs
+// with manual `a[i]` / `b[i]` indexing, doing exactly the same work as `soa_kernel.bet`. If the
+// `soa` keyword is truly zero-cost, this and the `soa` version compile to equivalent code and run
+// in the same time — the whole point of the benchmark.
+pull "spill"
+
+finna main() {
+    lowkey n = 1000000
+    lowkey a: []u32 = mem.slab[u32](n)
+    lowkey b: []u32 = mem.slab[u32](n)
+    lowkey un: u32 = 1000000
+
+    // seed b[i] = i
+    lowkey i: u32 = 0
+    vibin i < un {
+        b[i] = i
+        i = i + 1
+    }
+
+    // hot kernel, repeated: a[i] += b[i]
+    lowkey rounds: u32 = 64
+    lowkey r: u32 = 0
+    vibin r < rounds {
+        i = 0
+        vibin i < un {
+            a[i] = a[i] + b[i]
+            i = i + 1
+        }
+        r = r + 1
+    }
+
+    // checksum reduction so the work is observable and comparable to the SoA kernel
+    lowkey s: u32 = 0
+    i = 0
+    vibin i < un {
+        s = s + a[i]
+        i = i + 1
+    }
+    spill.it(s as int)
+}

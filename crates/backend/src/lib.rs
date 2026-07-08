@@ -24,6 +24,8 @@ pub struct EmitOptions {
     pub entry: Option<String>,
     /// Optimization level.
     pub opt: OptLevel,
+    /// What kind of artifact to emit — native object code (the default) or textual assembly.
+    pub emit: EmitKind,
 }
 
 impl Default for EmitOptions {
@@ -32,6 +34,7 @@ impl Default for EmitOptions {
             target: None,
             entry: None,
             opt: OptLevel::O0,
+            emit: EmitKind::Object,
         }
     }
 }
@@ -41,8 +44,20 @@ impl Default for EmitOptions {
 pub enum OptLevel {
     /// No optimization (allocas left for the register allocator; fastest to emit).
     O0,
-    /// Moderate optimization.
+    /// Moderate optimization: runs the LLVM `default<O2>` mid-level pipeline (inliner, mem2reg,
+    /// SROA, loop + SLP vectorizers) before codegen. This is what makes zero-cost abstractions
+    /// actually free and lets `soa` loops auto-vectorize.
     O2,
+}
+
+/// What kind of artifact [`compile_to_object`] / [`compile_mir_source`] returns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum EmitKind {
+    /// Native object code (`.o`) — the default; the driver links it into an executable.
+    #[default]
+    Object,
+    /// Textual target assembly (`.s`), for inspection and SIMD demos. Not linked.
+    Assembly,
 }
 
 /// Anything that can go wrong turning a module into an object.

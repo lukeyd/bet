@@ -1,0 +1,46 @@
+// soa_kernel — the `soa` ABSTRACTION side of the zero-cost benchmark. One declared struct with
+// ergonomic `cs[i].a` / `cs[i].b` element access; the compiler transposes `Cell` into parallel
+// per-field arrays behind the scenes. This must compile to the same machine code (and run at the
+// same speed) as `aos_kernel.bet`, which hand-rolls the same two parallel arrays. u32 fields make
+// arithmetic wrap (no overflow trap), and an unsigned loop counter increments without a trap
+// branch, so the hot loop is a clean countable loop the vectorizer turns into NEON.
+pull "spill"
+
+drip Cell {
+    flex a: u32
+    flex b: u32
+}
+
+finna main() {
+    lowkey n = 1000000
+    lowkey cs: soa []Cell = mem.slab[Cell](n)
+    lowkey un: u32 = 1000000
+
+    // seed b[i] = i
+    lowkey i: u32 = 0
+    vibin i < un {
+        cs[i].b = i
+        i = i + 1
+    }
+
+    // hot kernel, repeated: a[i] += b[i]
+    lowkey rounds: u32 = 64
+    lowkey r: u32 = 0
+    vibin r < rounds {
+        i = 0
+        vibin i < un {
+            cs[i].a = cs[i].a + cs[i].b
+            i = i + 1
+        }
+        r = r + 1
+    }
+
+    // checksum reduction so the work is observable and comparable to the AoS kernel
+    lowkey s: u32 = 0
+    i = 0
+    vibin i < un {
+        s = s + cs[i].a
+        i = i + 1
+    }
+    spill.it(s as int)
+}

@@ -106,3 +106,9 @@ jobs:
       # pass, so this step only ever fails on a real codegen regression.
       - name: corpus compiled differential column
         run: cargo xtask corpus --compiled
+
+      # The same differential, but every program built with `bet build --release` (the `-O2`
+      # pipeline: inliner, SROA, loop + SLP vectorizers). This gates that the optimizer introduces
+      # no interp/compiled divergence — the correctness insurance for turning optimization on.
+      - name: corpus compiled differential column (--release / O2)
+        run: cargo xtask corpus --compiled --release

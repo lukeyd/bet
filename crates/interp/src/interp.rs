@@ -10,7 +10,7 @@ use frontend::ast::{
 };
 
 use crate::error::RunError;
-use crate::value::{Value, display};
+use crate::value::{SimdVal, Value, display};
 
 /// Non-local control flow produced by executing a statement or block.
 enum Flow {
@@ -934,6 +934,21 @@ impl<'p> Interp<'p> {
                             field: name.clone(),
                         })
                     }
+                    // `v.x`/`.y`/`.z`/`.w` — read a SIMD lane as a scalar.
+                    Value::Simd(sv) => {
+                        let lane = match name.as_str() {
+                            "x" => 0,
+                            "y" => 1,
+                            "z" => 2,
+                            "w" => 3,
+                            other => {
+                                return Err(RunError::Type(format!(
+                                    "simd vector has no lane `{other}` (use x/y/z/w)"
+                                )));
+                            }
+                        };
+                        simd_lane(&sv, lane)
+                    }
                     other => Err(RunError::Type(format!(
                         "cannot read field `{name}` of {}",
                         other.type_name()
@@ -1437,6 +1452,13 @@ impl<'p> Interp<'p> {
                     other => Err(RunError::NotCallable(other.type_name().to_string())),
                 };
             }
+            // `f32x4(a,b,c,d)` / `i64x2(x)` — construct or splat a SIMD vector.
+            if let Some((elem, lanes)) = simd_type_name(name)
+                && !self.funcs.contains_key(name)
+            {
+                let vals = self.eval_args(env, args)?;
+                return build_simd(elem, lanes as usize, vals).map(|v| vec![v]);
+            }
             if let Some(info) = self.variants.get(name) {
                 let (moods, arity) = (info.moods.clone(), info.arity);
                 return self
@@ -1510,6 +1532,11 @@ impl<'p> Interp<'p> {
                 return Ok(vec![Value::Yikes(format!("{ctx}: {msg}"))]);
             }
             return Err(RunError::Undefined(format!("yikes.{method}")));
+        }
+        // SIMD vector methods: reductions, min/max/abs, and float length/normalize.
+        if let Value::Simd(sv) = &recv {
+            let sv = sv.clone();
+            return self.call_simd(env, sv, method, args).map(|v| vec![v]);
         }
         // `stash` methods dispatch on the reference-counted map (mutations are shared).
         if let Value::Stash(map) = &recv {
@@ -1867,6 +1894,69 @@ impl<'p> Interp<'p> {
             )))),
             ("cook", _) => Err(RunError::Type("`math.cook` takes a single int seed".into())),
             (other, _) => Err(RunError::Unsupported(format!("math.{other}"))),
+        }
+    }
+
+    /// SIMD vector methods: `min`/`max`/`abs`, the `dot`/`sum` reductions, `scale` (scalar
+    /// broadcast multiply), and float `length`/`norm`. Reductions fold lanes in order 0→N-1 and
+    /// float math runs in the lane's real width, so results match the compiled `<N x T>` path.
+    fn call_simd(
+        &mut self,
+        env: &mut Env,
+        sv: SimdVal,
+        method: &str,
+        args: &[Arg],
+    ) -> Result<Value, RunError> {
+        let vals = self.eval_args(env, args)?;
+        let one_vec = |vals: &[Value]| -> Result<SimdVal, RunError> {
+            match vals {
+                [Value::Simd(w)] => Ok(w.clone()),
+                _ => Err(RunError::Type(format!(
+                    "`.{method}` takes one vector argument"
+                ))),
+            }
+        };
+        match method {
+            "min" | "max" => Ok(Value::Simd(simd_minmax(
+                method == "min",
+                &sv,
+                &one_vec(&vals)?,
+            )?)),
+            "abs" => {
+                if !vals.is_empty() {
+                    return Err(RunError::Type("`.abs` takes no arguments".into()));
+                }
+                Ok(Value::Simd(simd_abs(&sv)))
+            }
+            "dot" => simd_dot(&sv, &one_vec(&vals)?),
+            "sum" => {
+                if !vals.is_empty() {
+                    return Err(RunError::Type("`.sum` takes no arguments".into()));
+                }
+                Ok(simd_reduce_add(&sv))
+            }
+            "scale" => match vals.as_slice() {
+                [s] => Ok(Value::Simd(
+                    simd_binary(BinOp::Mul, &sv, &splat_like(&sv, s)?).and_then(|v| match v {
+                        Value::Simd(out) => Ok(out),
+                        _ => Err(RunError::Type("scale produced a non-vector".into())),
+                    })?,
+                )),
+                _ => Err(RunError::Type("`.scale` takes one scalar argument".into())),
+            },
+            "length" => {
+                if !vals.is_empty() {
+                    return Err(RunError::Type("`.length` takes no arguments".into()));
+                }
+                simd_length(&sv)
+            }
+            "norm" => {
+                if !vals.is_empty() {
+                    return Err(RunError::Type("`.norm` takes no arguments".into()));
+                }
+                simd_norm(&sv)
+            }
+            other => Err(RunError::Undefined(format!("simd.{other}"))),
         }
     }
 
@@ -2484,12 +2574,361 @@ fn binary_op(op: BinOp, l: &Value, r: &Value) -> Result<Value, RunError> {
             (Value::Str(a), Value::Str(b)) if matches!(op, Add) => {
                 Ok(Value::Str(format!("{a}{b}")))
             }
+            // Element-wise SIMD arithmetic/shift; a scalar operand is broadcast to every lane
+            // (`v >> 16`, `v * s`), matching the frontend's splat on the compiled path.
+            (Value::Simd(a), Value::Simd(b)) => simd_binary(op, a, b),
+            (Value::Simd(a), Value::Int(_) | Value::Float(_)) => {
+                let bs = splat_like(a, r)?;
+                simd_binary(op, a, &bs)
+            }
+            (Value::Int(_) | Value::Float(_), Value::Simd(b)) => {
+                let a = splat_like(b, l)?;
+                simd_binary(op, &a, b)
+            }
             _ => Err(RunError::Type(format!(
                 "cannot apply `{op:?}` to {} and {}",
                 l.type_name(),
                 r.type_name()
             ))),
         },
+    }
+}
+
+/// Element-wise SIMD binary op. Float lanes compute in their real width (`f32`/`f64`) to match the
+/// compiled `<N x T>` path; integer lanes WRAP (no trap), like hardware SIMD.
+fn simd_binary(op: BinOp, l: &SimdVal, r: &SimdVal) -> Result<Value, RunError> {
+    let mismatch =
+        || RunError::Type("SIMD binary op on vectors of different element types".to_string());
+    match (l, r) {
+        (SimdVal::F32(a), SimdVal::F32(b)) => {
+            let out = a
+                .iter()
+                .zip(b)
+                .map(|(&x, &y)| f32_lane(op, x, y))
+                .collect::<Result<Vec<f32>, _>>()?;
+            Ok(Value::Simd(SimdVal::F32(out)))
+        }
+        (SimdVal::F64(a), SimdVal::F64(b)) => {
+            let out = a
+                .iter()
+                .zip(b)
+                .map(|(&x, &y)| f64_lane(op, x, y))
+                .collect::<Result<Vec<f64>, _>>()?;
+            Ok(Value::Simd(SimdVal::F64(out)))
+        }
+        (SimdVal::Int(a), SimdVal::Int(b)) => {
+            let out = a
+                .iter()
+                .zip(b)
+                .map(|(&x, &y)| int_lane(op, x, y))
+                .collect::<Result<Vec<i64>, _>>()?;
+            Ok(Value::Simd(SimdVal::Int(out)))
+        }
+        _ => Err(mismatch()),
+    }
+}
+
+fn int_lane(op: BinOp, x: i64, y: i64) -> Result<i64, RunError> {
+    use BinOp::*;
+    Ok(match op {
+        Add => x.wrapping_add(y),
+        Sub => x.wrapping_sub(y),
+        Mul => x.wrapping_mul(y),
+        Div if y == 0 => return Err(RunError::DivByZero),
+        Div => x.wrapping_div(y),
+        Rem if y == 0 => return Err(RunError::DivByZero),
+        Rem => x.wrapping_rem(y),
+        BitAnd => x & y,
+        BitOr => x | y,
+        BitXor => x ^ y,
+        Shl => x.wrapping_shl(y as u32),
+        Shr => x.wrapping_shr(y as u32),
+        _ => {
+            return Err(RunError::Type(format!(
+                "`{op:?}` is not an element-wise SIMD op"
+            )));
+        }
+    })
+}
+
+fn f32_lane(op: BinOp, x: f32, y: f32) -> Result<f32, RunError> {
+    use BinOp::*;
+    Ok(match op {
+        Add => x + y,
+        Sub => x - y,
+        Mul => x * y,
+        Div => x / y,
+        Rem => x % y,
+        _ => {
+            return Err(RunError::Type(format!(
+                "`{op:?}` is not an element-wise SIMD op"
+            )));
+        }
+    })
+}
+
+fn f64_lane(op: BinOp, x: f64, y: f64) -> Result<f64, RunError> {
+    use BinOp::*;
+    Ok(match op {
+        Add => x + y,
+        Sub => x - y,
+        Mul => x * y,
+        Div => x / y,
+        Rem => x % y,
+        _ => {
+            return Err(RunError::Type(format!(
+                "`{op:?}` is not an element-wise SIMD op"
+            )));
+        }
+    })
+}
+
+/// Broadcast a scalar `Value` to a vector shaped like `target`, converting to the lane type.
+fn splat_like(target: &SimdVal, s: &Value) -> Result<SimdVal, RunError> {
+    let n = target.len();
+    Ok(match target {
+        SimdVal::F32(_) => SimdVal::F32(vec![value_to_f64(s)? as f32; n]),
+        SimdVal::F64(_) => SimdVal::F64(vec![value_to_f64(s)?; n]),
+        SimdVal::Int(_) => SimdVal::Int(vec![value_to_i64(s)?; n]),
+    })
+}
+
+fn value_to_i64(v: &Value) -> Result<i64, RunError> {
+    match v {
+        Value::Int(i) => Ok(*i),
+        Value::Byte(b) => Ok(*b as i64),
+        Value::Bool(b) => Ok(*b as i64),
+        other => Err(RunError::Type(format!(
+            "cannot use {} as a SIMD integer lane",
+            other.type_name()
+        ))),
+    }
+}
+
+fn value_to_f64(v: &Value) -> Result<f64, RunError> {
+    match v {
+        Value::Float(f) => Ok(*f),
+        Value::Int(i) => Ok(*i as f64),
+        other => Err(RunError::Type(format!(
+            "cannot use {} as a SIMD float lane",
+            other.type_name()
+        ))),
+    }
+}
+
+/// Recognize a SIMD type name (`vec2/3/4` or `<elem>x<N>`). Mirrors the frontend's `simd_type_name`.
+fn simd_type_name(name: &str) -> Option<(&str, u32)> {
+    match name {
+        "vec2" => Some(("f32", 2)),
+        "vec3" => Some(("f32", 3)),
+        "vec4" => Some(("f32", 4)),
+        _ => {
+            let idx = name.rfind('x')?;
+            if idx == 0 {
+                return None;
+            }
+            let (elem, rest) = (&name[..idx], &name[idx + 1..]);
+            let lanes: u32 = rest.parse().ok()?;
+            if !(2..=4).contains(&lanes) {
+                return None;
+            }
+            match elem {
+                "f32" | "f64" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
+                | "int" | "uint" => Some((elem, lanes)),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// Build a `Value::Simd` from N lane values (or 1 to broadcast). Lanes are stored in the element
+/// type named by `elem` so float arithmetic runs at the right width.
+fn build_simd(elem: &str, lanes: usize, vals: Vec<Value>) -> Result<Value, RunError> {
+    let lane_vals: Vec<Value> = if vals.len() == lanes {
+        vals
+    } else if vals.len() == 1 {
+        vec![vals[0].clone(); lanes]
+    } else {
+        return Err(RunError::Type(format!(
+            "a {lanes}-lane vector takes {lanes} values or 1 to splat, got {}",
+            vals.len()
+        )));
+    };
+    let sv = match elem {
+        "f32" => SimdVal::F32(
+            lane_vals
+                .iter()
+                .map(|v| value_to_f64(v).map(|x| x as f32))
+                .collect::<Result<_, _>>()?,
+        ),
+        "f64" | "float" => SimdVal::F64(
+            lane_vals
+                .iter()
+                .map(value_to_f64)
+                .collect::<Result<_, _>>()?,
+        ),
+        _ => SimdVal::Int(
+            lane_vals
+                .iter()
+                .map(value_to_i64)
+                .collect::<Result<_, _>>()?,
+        ),
+    };
+    Ok(Value::Simd(sv))
+}
+
+/// Extract lane `i` of a vector as a scalar `Value` (`f32` lanes widen to the `f64` `Value::Float`).
+fn simd_lane(sv: &SimdVal, i: usize) -> Result<Value, RunError> {
+    let oob = || {
+        RunError::Type(format!(
+            "lane {i} out of range for a {}-lane vector",
+            sv.len()
+        ))
+    };
+    match sv {
+        SimdVal::F32(v) => v.get(i).map(|&x| Value::Float(x as f64)).ok_or_else(oob),
+        SimdVal::F64(v) => v.get(i).map(|&x| Value::Float(x)).ok_or_else(oob),
+        SimdVal::Int(v) => v.get(i).map(|&x| Value::Int(x)).ok_or_else(oob),
+    }
+}
+
+/// Element-wise min/max, replicating the backend's `compare + select` (so NaN handling matches:
+/// `min` = `a < b ? a : b`, `max` = `a > b ? a : b`).
+fn simd_minmax(is_min: bool, a: &SimdVal, b: &SimdVal) -> Result<SimdVal, RunError> {
+    fn pick<T: PartialOrd + Copy>(is_min: bool, x: T, y: T) -> T {
+        if is_min {
+            if x < y { x } else { y }
+        } else if x > y {
+            x
+        } else {
+            y
+        }
+    }
+    match (a, b) {
+        (SimdVal::F32(x), SimdVal::F32(y)) => Ok(SimdVal::F32(
+            x.iter().zip(y).map(|(&p, &q)| pick(is_min, p, q)).collect(),
+        )),
+        (SimdVal::F64(x), SimdVal::F64(y)) => Ok(SimdVal::F64(
+            x.iter().zip(y).map(|(&p, &q)| pick(is_min, p, q)).collect(),
+        )),
+        (SimdVal::Int(x), SimdVal::Int(y)) => Ok(SimdVal::Int(
+            x.iter().zip(y).map(|(&p, &q)| pick(is_min, p, q)).collect(),
+        )),
+        _ => Err(RunError::Type("SIMD min/max on mismatched vectors".into())),
+    }
+}
+
+/// Element-wise absolute value (`x < 0 ? -x : x`; integer negate wraps like the backend's `0 - v`).
+fn simd_abs(sv: &SimdVal) -> SimdVal {
+    match sv {
+        SimdVal::F32(v) => SimdVal::F32(v.iter().map(|&x| if x < 0.0 { -x } else { x }).collect()),
+        SimdVal::F64(v) => SimdVal::F64(v.iter().map(|&x| if x < 0.0 { -x } else { x }).collect()),
+        SimdVal::Int(v) => SimdVal::Int(
+            v.iter()
+                .map(|&x| if x < 0 { x.wrapping_neg() } else { x })
+                .collect(),
+        ),
+    }
+}
+
+/// Horizontal sum, folded left in lane order 0→N-1 (matching the backend's `reduce_add`).
+fn simd_reduce_add(sv: &SimdVal) -> Value {
+    match sv {
+        SimdVal::F32(v) => {
+            let mut s = v[0];
+            for &x in &v[1..] {
+                s += x;
+            }
+            Value::Float(s as f64)
+        }
+        SimdVal::F64(v) => {
+            let mut s = v[0];
+            for &x in &v[1..] {
+                s += x;
+            }
+            Value::Float(s)
+        }
+        SimdVal::Int(v) => {
+            let mut s = v[0];
+            for &x in &v[1..] {
+                s = s.wrapping_add(x);
+            }
+            Value::Int(s)
+        }
+    }
+}
+
+/// Dot product: element-wise multiply then a left fold over lanes 0→N-1 (backend order exactly).
+fn simd_dot(a: &SimdVal, b: &SimdVal) -> Result<Value, RunError> {
+    match (a, b) {
+        (SimdVal::F32(x), SimdVal::F32(y)) => {
+            let mut s = x[0] * y[0];
+            for i in 1..x.len() {
+                s += x[i] * y[i];
+            }
+            Ok(Value::Float(s as f64))
+        }
+        (SimdVal::F64(x), SimdVal::F64(y)) => {
+            let mut s = x[0] * y[0];
+            for i in 1..x.len() {
+                s += x[i] * y[i];
+            }
+            Ok(Value::Float(s))
+        }
+        (SimdVal::Int(x), SimdVal::Int(y)) => {
+            let mut s = x[0].wrapping_mul(y[0]);
+            for i in 1..x.len() {
+                s = s.wrapping_add(x[i].wrapping_mul(y[i]));
+            }
+            Ok(Value::Int(s))
+        }
+        _ => Err(RunError::Type("SIMD dot on mismatched vectors".into())),
+    }
+}
+
+/// Sum of squares of a float slice, folded left over lanes 0→N-1 (matching the backend's
+/// `reduce_add` of the element-wise `v * v`).
+fn sum_sq_f32(v: &[f32]) -> f32 {
+    let mut s = v[0] * v[0];
+    for &x in &v[1..] {
+        s += x * x;
+    }
+    s
+}
+
+fn sum_sq_f64(v: &[f64]) -> f64 {
+    let mut s = v[0] * v[0];
+    for &x in &v[1..] {
+        s += x * x;
+    }
+    s
+}
+
+/// Euclidean length `sqrt(dot(v, v))`, computed in the lane's float width (float vectors only).
+fn simd_length(sv: &SimdVal) -> Result<Value, RunError> {
+    match sv {
+        SimdVal::F32(v) => Ok(Value::Float(sum_sq_f32(v).sqrt() as f64)),
+        SimdVal::F64(v) => Ok(Value::Float(sum_sq_f64(v).sqrt())),
+        SimdVal::Int(_) => Err(RunError::Type("`.length` needs a float vector".into())),
+    }
+}
+
+/// Normalize a float vector to unit length: `v * (1 / length(v))`, per lane in the float width.
+fn simd_norm(sv: &SimdVal) -> Result<Value, RunError> {
+    match sv {
+        SimdVal::F32(v) => {
+            let inv = 1.0f32 / sum_sq_f32(v).sqrt();
+            Ok(Value::Simd(SimdVal::F32(
+                v.iter().map(|&x| x * inv).collect(),
+            )))
+        }
+        SimdVal::F64(v) => {
+            let inv = 1.0f64 / sum_sq_f64(v).sqrt();
+            Ok(Value::Simd(SimdVal::F64(
+                v.iter().map(|&x| x * inv).collect(),
+            )))
+        }
+        SimdVal::Int(_) => Err(RunError::Type("`.norm` needs a float vector".into())),
     }
 }
 

@@ -271,6 +271,10 @@ impl<'a> Checker<'a> {
                     }
                     AggKind::Tuple => None,
                     AggKind::Array(elem) => Some(TyKind::Array(*elem, ops.len() as u64)),
+                    AggKind::Simd(elem) => Some(TyKind::Simd {
+                        elem: *elem,
+                        lanes: ops.len() as u32,
+                    }),
                     AggKind::Sum { sum, variant } => {
                         if let Some(def) = self.sum_def(func, *sum) {
                             match def.variants.get(*variant as usize) {
@@ -296,6 +300,27 @@ impl<'a> Checker<'a> {
                         Some(TyKind::Sum(*sum))
                     }
                 }
+            }
+            Rvalue::Simd { op, args, ty } => {
+                for a in args {
+                    self.operand_kind(func, a);
+                }
+                let want = match op {
+                    SimdOp::Splat
+                    | SimdOp::Abs
+                    | SimdOp::Lane(_)
+                    | SimdOp::Sum
+                    | SimdOp::Length
+                    | SimdOp::Norm => 1,
+                    SimdOp::Min | SimdOp::Max | SimdOp::Dot => 2,
+                };
+                if args.len() != want {
+                    self.errors.push(ValidationError::BadShape {
+                        func: func.name.clone(),
+                        detail: format!("simd op {op:?} takes {want} arg(s), got {}", args.len()),
+                    });
+                }
+                Some(self.module.ty(*ty).clone())
             }
             Rvalue::Discriminant(op) => {
                 self.operand_kind(func, op);

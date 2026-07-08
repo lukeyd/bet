@@ -72,6 +72,8 @@ all = [
   # 12 doom (the doom-port language package: one-crib game state, per-slot evict,
   # file writes, callbacks, sized-int idioms)
   "doom.gamestate", "doom.evict-slot", "doom.fs-drop", "doom.fn-param", "doom.int-widths",
+  # 15 simd (first-class fixed-width vector types: `f32x4`/`i64x2`/`vec2..4`)
+  "simd.construct", "simd.arithmetic", "simd.lanes", "simd.minmax", "simd.reduce", "simd.float",
 ]
 
 # --- 01 basics --------------------------------------------------------------
@@ -536,5 +538,21 @@ compiled = "pass"
 [[program]]
 path = "12-doom/int-widths"
 covers = ["doom.int-widths", "values.casts", "values.numeric-tower"]
+interp = "pass"
+compiled = "pass"
+
+# --- 15 simd (first-class fixed-width vector types) -------------------------
+# `<N x T>` vectors that lower to LLVM vector types with single-instruction lane ops. Integer
+# lanes are exact on both paths; float lanes are held in true `f32` by the interpreter so `vec4`
+# math matches the compiled `<4 x float>` bit-for-bit. Both are interp == compiled at O0 and O2.
+[[program]]
+path = "15-simd/simd-int"
+covers = ["simd.construct", "simd.arithmetic", "simd.lanes", "simd.minmax", "simd.reduce"]
+interp = "pass"
+compiled = "pass"
+
+[[program]]
+path = "15-simd/simd-float"
+covers = ["simd.float", "simd.reduce"]
 interp = "pass"
 compiled = "pass"
