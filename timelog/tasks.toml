@@ -684,6 +684,19 @@ size = 5
 status = "doing"
 
 [[task]]
+slug = "npm-dist"
+name = "Distribution: betlang npm/npx package (shim + platform pkgs + demos + release workflow)"
+size = 5
+# Packaging DONE and verified end-to-end locally (pack -> install -> `bet demo hello` /
+# `run` / `--version` / clean `build` error on darwin-arm64). Remaining before "done":
+# create the betlang npm org, add NPM_TOKEN secret, tag npm-v0.1.0, verify the
+# release-npm.yml matrix (esp. Linux X11/ALSA deps + win32 leg) publishes cleanly.
+# Found along the way: interp does NOT wrap u8 arithmetic (250+10 -> 260) while the
+# compiled path wraps to 4 per spec §2.4 — masked in corpus because 09-bit-math/wrapping
+# is "unsupported" on interp (math.lap). Needs its own fix + a corpus gate.
+status = "doing"
+
+[[task]]
 slug = "selfhost-soa"
 name = "selfhost: teach betfe the soa keyword (fix selfhost.yml drift from #50)"
 size = 2

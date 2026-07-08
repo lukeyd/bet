@@ -1,0 +1,95 @@
+# release-npm — build the LLVM-free `bet` binary on native runners for every supported
+# platform and publish the npm packages: five @betlang/<platform> binary packages,
+# then the `betlang` shim package that fronts them (see npm/README.md).
+#
+# Trigger: push a tag `npm-v<version>` matching npm/betlang/package.json, or run
+# manually (workflow_dispatch publishes only if the version isn't already on npm).
+# Needs the NPM_TOKEN repo secret (granular token with publish rights to `betlang`
+# and the @betlang scope).
+name: release-npm
+
+on:
+  push:
+    tags: ["npm-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # npm --provenance
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux legs build on 22.04 (matching docker/Dockerfile) to keep the glibc
+          # floor low — a binary built on 24.04 won't run on 22.04-era distros. If
+          # GitHub retires these labels, move the Linux legs into docker/.
+          - { os: ubuntu-22.04,     platform: linux-x64 }
+          - { os: ubuntu-22.04-arm, platform: linux-arm64 }
+          - { os: macos-13,         platform: darwin-x64 }
+          - { os: macos-14,         platform: darwin-arm64 }
+          - { os: windows-2022,     platform: win32-x64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: npm-${{ matrix.platform }}
+      - name: install Linux build deps (X11 + ALSA for minifb/cpal)
+        if: startsWith(matrix.platform, 'linux')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libx11-dev libxkbcommon-dev libasound2-dev
+      - name: build bet (interpreter + desktop gg, no LLVM)
+        run: cargo build --locked --release -p driver --features gg-desktop
+      - name: smoke-test the binary
+        run: cargo run --locked --release -p driver --features gg-desktop -- run tests/corpus/01-basics/hello.bet
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bet-${{ matrix.platform }}
+          path: target/release/bet${{ matrix.platform == 'win32-x64' && '.exe' || '' }}
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          path: binaries
+      - name: check tag matches package version
+        if: startsWith(github.ref, 'refs/tags/npm-v')
+        run: |
+          pkg=$(node -p "require('./npm/betlang/package.json').version")
+          tag="${GITHUB_REF_NAME#npm-v}"
+          if [ "$pkg" != "$tag" ]; then
+            echo "tag npm-v$tag does not match npm/betlang/package.json version $pkg" >&2
+            exit 1
+          fi
+      - name: stage demos + platform packages
+        run: |
+          node npm/stage.mjs --demos
+          for p in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
+            node npm/stage.mjs --platform "$p" --binary "binaries/bet-$p/bet"
+          done
+          node npm/stage.mjs --platform win32-x64 --binary binaries/bet-win32-x64/bet.exe
+      - name: publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for d in npm/dist/*/; do
+            npm publish "$d" --access public --provenance
+          done
+      - name: publish betlang
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish npm/betlang --access public --provenance
