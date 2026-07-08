@@ -18,7 +18,7 @@ conventional names. Every stdlib API is allocator-aware.
 | `net` | networking | `slideInto` connect · `yap` send · `peep` receive · `ghost` disconnect |
 | `mem` | memory | `mem.crib(size)` · `mem.evict` · `mem.scratch()` · `mem.receipts()` |
 | `gg` | game loop / input / platform | `frame()` · `dt()` · `keys.pressed(k)` · `blit(fb)` · `audio(ring)` · `poll()->Event` · `ticks()` |
-| `vec` | vec2/3/4, mat4, SIMD | `add`, `scale`, `dot`, `cross`, `norm` |
+| `vec` | first-class SIMD (`f32x4`/`i64x2`/`vec2..4`); `mat4` planned | `+ - * /`, `.dot`, `.min/.max/.abs`, `.scale`, `.length/.norm`, `.x/.y/.z/.w` |
 | `stash` | hash maps (NEW) | `stash.new[K,V]()` · `.put` · `.peep` · `.yeet` · `.gang` |
 | `bytes` | binary I/O (NEW) | `readU32le(buf,off)` · `slice` · `cast[T]` (bounds-checked) |
 

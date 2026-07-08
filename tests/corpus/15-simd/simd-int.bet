@@ -1,0 +1,31 @@
+// simd-int — first-class integer SIMD vectors (`i32x4`, `i64x2`): construction, element-wise
+// arithmetic and shifts, lane reads, min/max/abs, and the dot/sum reductions. Integer lanes are
+// exact on both paths, so the interpreter (the oracle) and the compiled `<N x T>` code agree
+// byte-for-byte. The final block is the fixed-point `(a * b) >> 16` idiom the Doom port uses.
+pull "spill"
+
+finna main() {
+    lowkey a: i32x4 = i32x4(1, 2, 3, 4)
+    lowkey b: i32x4 = i32x4(5, 6, 7, 8)
+
+    lowkey c: i32x4 = a + b
+    spill.it(c.x + c.y + c.z + c.w) // [6,8,10,12] -> 36
+    spill.it(a.dot(b))              // 5+12+21+32 = 70
+
+    lowkey d: i32x4 = a * b
+    spill.it(d.sum())               // 70
+
+    spill.it(a.min(b).sum())        // [1,2,3,4] -> 10
+    spill.it(a.max(b).sum())        // [5,6,7,8] -> 26
+
+    lowkey n: i64x2 = i64x2(0 - 5, 9)
+    spill.it(n.abs().x)             // 5
+
+    lowkey sh: i64x2 = i64x2(4, 8) >> 1
+    spill.it(sh.x + sh.y)           // [2,4] -> 6
+
+    // fixed-point 16.16: (a * b) >> 16, widened per lane in i64 (bit-exact vs scalar fixedMul).
+    lowkey p: i64x2 = (i64x2(131072, 65536) * i64x2(98304, 131072)) >> 16
+    spill.it(p.x)                   // 2.0 * 1.5 = 3.0 -> 196608
+    spill.it(p.y)                   // 1.0 * 2.0 = 2.0 -> 131072
+}

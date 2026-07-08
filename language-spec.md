@@ -198,7 +198,14 @@ FFI raw-pointer type at the boundary.
   arrays, so it has **no single address** — copying, assigning, passing, or `squad`-iterating
   a whole element (`let e = es[i]`) is a compile error; touch one field at a time. Rationale
   and IR representation: [spec/midir.md](spec/midir.md) (`TyKind::Soa`).
-- Game-math types are built in via stdlib: `vec2`, `vec3`, `vec4`, `mat4` (SIMD-friendly layout).
+- **First-class SIMD vectors.** Fixed-width vector types `<elem>x<N>` (`f32x4`, `i32x4`, `i64x2`, …)
+  — plus the float aliases `vec2`/`vec3`/`vec4` — lower to LLVM `<N x T>` with **single-instruction
+  lane ops** (guaranteed SIMD, independent of the loop vectorizer). Construct with `f32x4(a,b,c,d)`
+  (or `f32x4(x)` to splat); element-wise `+ - * /` and shifts (a scalar operand broadcasts); read
+  lanes with `.x/.y/.z/.w`; reduce/transform with `.dot`/`.sum`/`.min`/`.max`/`.abs`/`.scale`, and
+  `.length`/`.norm` for float vectors. Integer lanes wrap (no per-lane trap); the interpreter holds
+  float lanes in their true width so `f32` results are bit-identical to the compiled path. `mat4`
+  (4×4 matrix ops) is still planned. Rationale/IR: [spec/midir.md](spec/midir.md) (`TyKind::Simd`).
 - `tag T` is a distinct nominal type (see §7). A `tag Enemy` is not interchangeable with a `tag Player` or a bare `Enemy`.
 - **Generics** are ahead-of-time monomorphized (`drip Pair[T]`, `vec.new[int]()`); **methods** on `drip` use Go-style receivers (`finna (p: Player) hurt(...)`). Both are implemented.
 - **Open question:** interfaces/traits story (deferred past the v1 freeze — see §12).

@@ -219,16 +219,12 @@ flex finna xyMovement(gt: tag gs.GameState, mo: tag think.Thinker) {
         }
         bet
     }
-    fr momx > MAXMOVE {
-        momx = MAXMOVE
-    } naw fr momx < (0 - MAXMOVE) {
-        momx = 0 - MAXMOVE
-    }
-    fr momy > MAXMOVE {
-        momy = MAXMOVE
-    } naw fr momy < (0 - MAXMOVE) {
-        momy = 0 - MAXMOVE
-    }
+    // SIMD: clamp (momx, momy) to [-MAXMOVE, MAXMOVE] as one `i32x2` max-then-min — identical to
+    // the pair of scalar `fr momx > MAXMOVE ... naw fr momx < -MAXMOVE ...` clamps.
+    lowkey mom: i32x2 = i32x2(momx, momy)
+    mom = mom.max(i32x2(0 - MAXMOVE, 0 - MAXMOVE)).min(i32x2(MAXMOVE, MAXMOVE))
+    momx = mom.x
+    momy = mom.y
     holla t = mo in gs.thinkers {
         t.mobj.momx = momx
         t.mobj.momy = momy

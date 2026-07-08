@@ -44,8 +44,14 @@ flex finna pThrust(gt: tag gs.GameState, pi: int, angle: u32, move: i32) {
     lowkey dmx: i32 = 0
     lowkey dmy: i32 = 0
     holla g = gt in gs.gsc {
-        dmx = fixed.fixedMul(move, g.info.finesine[fine + 2048])
-        dmy = fixed.fixedMul(move, g.info.finesine[fine])
+        // SIMD: the two fixed-point thrust components — dmx = FixedMul(move, cos), dmy =
+        // FixedMul(move, sin) — are one `i64x2` widening multiply + arithmetic `>> 16`. Lane-wise
+        // `((a as i64) * (b as i64)) >> 16` is bit-identical to `fixed.fixedMul` per lane.
+        lowkey mv: i64x2 = i64x2(move as i64, move as i64)
+        lowkey sn: i64x2 = i64x2(g.info.finesine[fine + 2048] as i64, g.info.finesine[fine] as i64)
+        lowkey pr: i64x2 = (mv * sn) >> 16
+        dmx = pr.x as i32
+        dmy = pr.y as i32
     } ghosted {
         yeet("gs")
     }

@@ -42,20 +42,22 @@ use inkwell::basic_block::BasicBlock;
 use inkwell::builder::{Builder, BuilderError};
 use inkwell::context::Context;
 use inkwell::module::{Linkage, Module as LlvmModule};
+use inkwell::passes::PassBuilderOptions;
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetData, TargetMachine,
     TargetTriple,
 };
 use inkwell::types::{
     BasicMetadataTypeEnum, BasicType, BasicTypeEnum, FunctionType, PointerType, StructType,
+    VectorType,
 };
 use inkwell::values::{
     ArrayValue, BasicMetadataValueEnum, BasicValueEnum, FunctionValue, GlobalValue, IntValue,
-    PointerValue,
+    PointerValue, VectorValue,
 };
 use inkwell::{AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel};
 
-use crate::{BackendError, EmitOptions, OptLevel};
+use crate::{BackendError, EmitKind, EmitOptions, OptLevel};
 use midir::*;
 
 fn lower_err(e: BuilderError) -> BackendError {
@@ -219,6 +221,16 @@ impl<'c> Cg<'c> {
             TyKind::Array(elem, n) => self.basic_ty(*elem)?.array_type(*n as u32).into(),
             // A `soa` container is stored transposed — one parallel array per struct field.
             TyKind::Soa(inner) => self.soa_llvm_ty(*inner)?,
+            // A `<N x elem>` SIMD vector — an LLVM vector type over the scalar element.
+            TyKind::Simd { elem, lanes } => match self.basic_ty(*elem)? {
+                BasicTypeEnum::IntType(it) => it.vec_type(*lanes).into(),
+                BasicTypeEnum::FloatType(ft) => ft.vec_type(*lanes).into(),
+                other => {
+                    return Err(BackendError::Lower(format!(
+                        "simd element must be a scalar int/float, got {other:?}"
+                    )));
+                }
+            },
             TyKind::Tuple(elems) => {
                 let fields: Vec<BasicTypeEnum> = elems
                     .iter()
@@ -315,6 +327,8 @@ impl<'c> Cg<'c> {
             // A `soa` container occupies the same total storage as its AoS inner (only the
             // field order within is transposed), so its word count is the inner's.
             TyKind::Soa(inner) => self.ty_words(*inner),
+            // A SIMD vector: one word per lane is a safe over-estimate (an `f32x4` is really 2).
+            TyKind::Simd { elem, lanes } => self.ty_words(*elem).saturating_mul(*lanes),
             TyKind::Tuple(elems) => elems.iter().map(|&t| self.ty_words(t)).sum(),
             TyKind::Struct(sid) => self
                 .m
@@ -610,6 +624,9 @@ impl<'c> Cg<'c> {
             Rvalue::Aggregate(kind, ops) => {
                 Ok(Some(self.lower_aggregate(func, locals, kind, ops)?))
             }
+            Rvalue::Simd { op, args, ty } => {
+                Ok(Some(self.lower_simd_op(func, locals, op, args, *ty)?))
+            }
             Rvalue::Discriminant(op) => Ok(Some(self.lower_discriminant(func, locals, op)?)),
         }
     }
@@ -688,7 +705,253 @@ impl<'c> Cg<'c> {
             AggKind::Sum { sum, variant } => {
                 self.build_sum_value(func, locals, *sum, *variant, ops)
             }
+            // `<N x elem>` SIMD construction from N lane operands.
+            AggKind::Simd(elem) => {
+                let elem_ty = self.basic_ty(*elem)?;
+                let n = ops.len() as u32;
+                let vec_ty = self.vec_ty_of(elem_ty, n)?;
+                let mut vals = Vec::with_capacity(ops.len());
+                for op in ops {
+                    vals.push(self.lower_operand(func, locals, op)?);
+                }
+                if vals.iter().all(is_const_value) {
+                    return Ok(VectorType::const_vector(&vals).into());
+                }
+                let mut acc = vec_ty.get_undef();
+                let i32t = self.cx.i32_type();
+                for (i, v) in vals.into_iter().enumerate() {
+                    let idx = i32t.const_int(i as u64, false);
+                    acc = self
+                        .builder
+                        .build_insert_element(acc, v, idx, "vins")
+                        .map_err(lower_err)?;
+                }
+                Ok(acc.into())
+            }
         }
+    }
+
+    /// The LLVM `<n x elem>` vector type for a scalar element type.
+    fn vec_ty_of(&self, elem: BasicTypeEnum<'c>, n: u32) -> Result<VectorType<'c>, BackendError> {
+        match elem {
+            BasicTypeEnum::IntType(it) => Ok(it.vec_type(n)),
+            BasicTypeEnum::FloatType(ft) => Ok(ft.vec_type(n)),
+            other => Err(BackendError::Lower(format!(
+                "simd element must be a scalar int/float, got {other:?}"
+            ))),
+        }
+    }
+
+    /// Broadcast a scalar to every lane of `vec_ty` (`n` lanes): insert at lane 0, then a
+    /// `shufflevector` with an all-zero mask.
+    fn build_splat(
+        &self,
+        scalar: BasicValueEnum<'c>,
+        vec_ty: VectorType<'c>,
+        n: u32,
+    ) -> Result<VectorValue<'c>, BackendError> {
+        let i32t = self.cx.i32_type();
+        let undef = vec_ty.get_undef();
+        let with0 = self
+            .builder
+            .build_insert_element(undef, scalar, i32t.const_zero(), "splat0")
+            .map_err(lower_err)?;
+        let mask_elems: Vec<IntValue> = (0..n).map(|_| i32t.const_zero()).collect();
+        let mask = VectorType::const_vector(&mask_elems);
+        self.builder
+            .build_shuffle_vector(with0, undef, mask, "splat")
+            .map_err(lower_err)
+    }
+
+    /// `sqrt(x)` via the `llvm.sqrt` intrinsic (the one intrinsic the backend uses). Correctly
+    /// rounded, so it matches the interpreter's `f32::sqrt`/`f64::sqrt`.
+    fn build_sqrt(
+        &self,
+        x: inkwell::values::FloatValue<'c>,
+    ) -> Result<inkwell::values::FloatValue<'c>, BackendError> {
+        let intr = inkwell::intrinsics::Intrinsic::find("llvm.sqrt")
+            .ok_or_else(|| BackendError::Lower("llvm.sqrt intrinsic not found".into()))?;
+        let fty: BasicTypeEnum = x.get_type().into();
+        let decl = intr
+            .get_declaration(&self.llm, &[fty])
+            .ok_or_else(|| BackendError::Lower("could not declare llvm.sqrt".into()))?;
+        let cs = self
+            .builder
+            .build_call(decl, &[x.into()], "sqrt")
+            .map_err(lower_err)?;
+        Ok(cs
+            .try_as_basic_value()
+            .left()
+            .ok_or_else(|| BackendError::Lower("llvm.sqrt returned no value".into()))?
+            .into_float_value())
+    }
+
+    /// The (element `TyId`, lane count) of a `TyKind::Simd`.
+    fn simd_parts(&self, ty: TyId) -> Result<(TyId, u32), BackendError> {
+        match self.m.ty(ty) {
+            TyKind::Simd { elem, lanes } => Ok((*elem, *lanes)),
+            other => Err(BackendError::Lower(format!(
+                "expected a simd type, got {other:?}"
+            ))),
+        }
+    }
+
+    /// Lower a non-arithmetic SIMD op (`Rvalue::Simd`): construction/broadcast, lane extraction,
+    /// min/max/abs, and the horizontal reductions. Element-wise `+ - * / >> <<` are lowered via
+    /// `lower_binop` (two vector operands) instead.
+    fn lower_simd_op(
+        &self,
+        func: &Func,
+        locals: &[Option<PointerValue<'c>>],
+        op: &SimdOp,
+        args: &[Operand],
+        ty: TyId,
+    ) -> Result<BasicValueEnum<'c>, BackendError> {
+        let b = &self.builder;
+        match op {
+            SimdOp::Splat => {
+                let scalar = self.lower_operand(func, locals, &args[0])?;
+                let (elem, n) = self.simd_parts(ty)?;
+                let vec_ty = self.vec_ty_of(self.basic_ty(elem)?, n)?;
+                Ok(self.build_splat(scalar, vec_ty, n)?.into())
+            }
+            SimdOp::Lane(i) => {
+                let v = self
+                    .lower_operand(func, locals, &args[0])?
+                    .into_vector_value();
+                let idx = self.cx.i32_type().const_int(*i as u64, false);
+                Ok(b.build_extract_element(v, idx, "lane").map_err(lower_err)?)
+            }
+            SimdOp::Min | SimdOp::Max => {
+                let a = self
+                    .lower_operand(func, locals, &args[0])?
+                    .into_vector_value();
+                let bb = self
+                    .lower_operand(func, locals, &args[1])?
+                    .into_vector_value();
+                let is_float =
+                    matches!(a.get_type().get_element_type(), BasicTypeEnum::FloatType(_));
+                let want_min = matches!(op, SimdOp::Min);
+                let mask = if is_float {
+                    let pred = if want_min {
+                        FloatPredicate::OLT
+                    } else {
+                        FloatPredicate::OGT
+                    };
+                    b.build_float_compare(pred, a, bb, "vcmp")
+                        .map_err(lower_err)?
+                } else {
+                    let signed = self.simd_signed(func, &args[0], &args[1]);
+                    let pred = match (want_min, signed) {
+                        (true, true) => IntPredicate::SLT,
+                        (true, false) => IntPredicate::ULT,
+                        (false, true) => IntPredicate::SGT,
+                        (false, false) => IntPredicate::UGT,
+                    };
+                    b.build_int_compare(pred, a, bb, "vcmp")
+                        .map_err(lower_err)?
+                };
+                Ok(b.build_select(mask, a, bb, "vsel").map_err(lower_err)?)
+            }
+            SimdOp::Abs => {
+                let v = self
+                    .lower_operand(func, locals, &args[0])?
+                    .into_vector_value();
+                if matches!(v.get_type().get_element_type(), BasicTypeEnum::FloatType(_)) {
+                    let zero = v.get_type().const_zero();
+                    let neg = b.build_float_neg(v, "vfneg").map_err(lower_err)?;
+                    let mask = b
+                        .build_float_compare(FloatPredicate::OLT, v, zero, "vlt0")
+                        .map_err(lower_err)?;
+                    Ok(b.build_select(mask, neg, v, "vabs").map_err(lower_err)?)
+                } else {
+                    let zero = v.get_type().const_zero();
+                    let neg = b.build_int_sub(zero, v, "vneg").map_err(lower_err)?;
+                    let mask = b
+                        .build_int_compare(IntPredicate::SLT, v, zero, "vlt0")
+                        .map_err(lower_err)?;
+                    Ok(b.build_select(mask, neg, v, "vabs").map_err(lower_err)?)
+                }
+            }
+            SimdOp::Dot => {
+                let a = self
+                    .lower_operand(func, locals, &args[0])?
+                    .into_vector_value();
+                let bb = self
+                    .lower_operand(func, locals, &args[1])?
+                    .into_vector_value();
+                let is_float =
+                    matches!(a.get_type().get_element_type(), BasicTypeEnum::FloatType(_));
+                let prod: VectorValue = if is_float {
+                    b.build_float_mul(a, bb, "vmul").map_err(lower_err)?
+                } else {
+                    b.build_int_mul(a, bb, "vmul").map_err(lower_err)?
+                };
+                self.reduce_add(prod, is_float)
+            }
+            SimdOp::Sum => {
+                let v = self
+                    .lower_operand(func, locals, &args[0])?
+                    .into_vector_value();
+                let is_float =
+                    matches!(v.get_type().get_element_type(), BasicTypeEnum::FloatType(_));
+                self.reduce_add(v, is_float)
+            }
+            SimdOp::Length => {
+                let v = self
+                    .lower_operand(func, locals, &args[0])?
+                    .into_vector_value();
+                let prod = b.build_float_mul(v, v, "vmul").map_err(lower_err)?;
+                let dot = self.reduce_add(prod, true)?.into_float_value();
+                Ok(self.build_sqrt(dot)?.into())
+            }
+            SimdOp::Norm => {
+                let v = self
+                    .lower_operand(func, locals, &args[0])?
+                    .into_vector_value();
+                let prod = b.build_float_mul(v, v, "vmul").map_err(lower_err)?;
+                let dot = self.reduce_add(prod, true)?.into_float_value();
+                let len = self.build_sqrt(dot)?;
+                let one = len.get_type().const_float(1.0);
+                let inv = b.build_float_div(one, len, "vinv").map_err(lower_err)?;
+                let (elem, n) = self.simd_parts(ty)?;
+                let vec_ty = self.vec_ty_of(self.basic_ty(elem)?, n)?;
+                let inv_vec = self.build_splat(inv.into(), vec_ty, n)?;
+                Ok(b.build_float_mul(v, inv_vec, "vnorm")
+                    .map_err(lower_err)?
+                    .into())
+            }
+        }
+    }
+
+    /// Horizontal sum of a vector's lanes, folded left in lane order 0→N-1 (the same order the
+    /// interpreter uses, so float reductions are bit-identical).
+    fn reduce_add(
+        &self,
+        v: VectorValue<'c>,
+        is_float: bool,
+    ) -> Result<BasicValueEnum<'c>, BackendError> {
+        let b = &self.builder;
+        let n = v.get_type().get_size();
+        let i32t = self.cx.i32_type();
+        let mut acc = b
+            .build_extract_element(v, i32t.const_zero(), "l0")
+            .map_err(lower_err)?;
+        for i in 1..n {
+            let lane = b
+                .build_extract_element(v, i32t.const_int(i as u64, false), "li")
+                .map_err(lower_err)?;
+            acc = if is_float {
+                b.build_float_add(acc.into_float_value(), lane.into_float_value(), "hadd")
+                    .map_err(lower_err)?
+                    .into()
+            } else {
+                b.build_int_add(acc.into_int_value(), lane.into_int_value(), "hadd")
+                    .map_err(lower_err)?
+                    .into()
+            };
+        }
+        Ok(acc)
     }
 
     /// Materialize a struct/tuple value by inserting each field into an undef aggregate.
@@ -825,10 +1088,91 @@ impl<'c> Cg<'c> {
             (BasicValueEnum::FloatValue(l), BasicValueEnum::FloatValue(r)) => {
                 self.lower_float_binop(op, l, r)
             }
+            // Element-wise SIMD arithmetic/shifts: LLVM's `build_int_*`/`build_float_*` are
+            // element-wise over vector operands (the inkwell math-value traits accept `VectorValue`),
+            // so `f32x4 + f32x4` emits a single `fadd <4 x float>`.
+            (BasicValueEnum::VectorValue(l), BasicValueEnum::VectorValue(r)) => {
+                let signed = self.simd_signed(func, a, b);
+                self.lower_vec_binop(op, l, r, signed)
+            }
             _ => Err(BackendError::Lower(
                 "binary op on non-scalar or mismatched operands".into(),
             )),
         }
+    }
+
+    /// Element-wise arithmetic/shift on two same-type SIMD vectors. Comparisons and float
+    /// bitwise/shift are not part of the vector-operator surface (min/max are [`SimdOp`]s).
+    fn lower_vec_binop(
+        &self,
+        op: BinOp,
+        l: VectorValue<'c>,
+        r: VectorValue<'c>,
+        signed: bool,
+    ) -> Result<BasicValueEnum<'c>, BackendError> {
+        let b = &self.builder;
+        let is_float = matches!(l.get_type().get_element_type(), BasicTypeEnum::FloatType(_));
+        let v: BasicValueEnum = if is_float {
+            match op {
+                BinOp::Add => b.build_float_add(l, r, "fadd").map_err(lower_err)?.into(),
+                BinOp::Sub => b.build_float_sub(l, r, "fsub").map_err(lower_err)?.into(),
+                BinOp::Mul => b.build_float_mul(l, r, "fmul").map_err(lower_err)?.into(),
+                BinOp::Div => b.build_float_div(l, r, "fdiv").map_err(lower_err)?.into(),
+                _ => {
+                    return Err(BackendError::Lower(format!(
+                        "unsupported SIMD float operator {op:?}"
+                    )));
+                }
+            }
+        } else {
+            match op {
+                BinOp::Add => b.build_int_add(l, r, "add").map_err(lower_err)?.into(),
+                BinOp::Sub => b.build_int_sub(l, r, "sub").map_err(lower_err)?.into(),
+                BinOp::Mul => b.build_int_mul(l, r, "mul").map_err(lower_err)?.into(),
+                BinOp::Div => if signed {
+                    b.build_int_signed_div(l, r, "sdiv")
+                } else {
+                    b.build_int_unsigned_div(l, r, "udiv")
+                }
+                .map_err(lower_err)?
+                .into(),
+                BinOp::Rem => if signed {
+                    b.build_int_signed_rem(l, r, "srem")
+                } else {
+                    b.build_int_unsigned_rem(l, r, "urem")
+                }
+                .map_err(lower_err)?
+                .into(),
+                BinOp::BitAnd => b.build_and(l, r, "and").map_err(lower_err)?.into(),
+                BinOp::BitOr => b.build_or(l, r, "or").map_err(lower_err)?.into(),
+                BinOp::BitXor => b.build_xor(l, r, "xor").map_err(lower_err)?.into(),
+                BinOp::Shl => b.build_left_shift(l, r, "shl").map_err(lower_err)?.into(),
+                BinOp::Shr => b
+                    .build_right_shift(l, r, signed, "shr")
+                    .map_err(lower_err)?
+                    .into(),
+                _ => {
+                    return Err(BackendError::Lower(format!(
+                        "unsupported SIMD int operator {op:?}"
+                    )));
+                }
+            }
+        };
+        Ok(v)
+    }
+
+    /// Whether a SIMD binop's integer lanes are signed (arithmetic vs logical shift, signed div).
+    /// Reads the element type off the operands' `Simd { elem }` midir type, like [`Self::int_signed`].
+    fn simd_signed(&self, func: &Func, a: &Operand, b: &Operand) -> bool {
+        for op in [a, b] {
+            if let Ok(Some(ty)) = self.operand_ty(func, op)
+                && let TyKind::Simd { elem, .. } = self.m.ty(ty)
+                && let TyKind::Int { signed, .. } = self.m.ty(*elem)
+            {
+                return *signed;
+            }
+        }
+        false
     }
 
     fn lower_int_binop(
@@ -1873,7 +2217,7 @@ impl<'c> Cg<'c> {
 
     // --- object emission ---
 
-    fn emit_object(&self, _opts: &EmitOptions) -> Result<Vec<u8>, BackendError> {
+    fn emit_object(&self, opts: &EmitOptions) -> Result<Vec<u8>, BackendError> {
         // The triple and data layout were set on the module in `compile`.
         if let Err(e) = self.llm.verify() {
             return Err(BackendError::Lower(format!(
@@ -1881,9 +2225,30 @@ impl<'c> Cg<'c> {
             )));
         }
 
+        // Run the mid-level optimization pipeline. At `-O0` we emit straight from the unoptimized
+        // module (fastest, allocas left for the register allocator). At `-O2` we run LLVM's new
+        // pass manager `default<O2>` pipeline — inliner, mem2reg, SROA, and the loop + SLP
+        // vectorizers — which is what collapses zero-cost abstractions and auto-vectorizes `soa`
+        // loops. We deliberately set no fast-math option (there is none on `PassBuilderOptions`,
+        // and the frontend never sets fast-math flags), so float results stay bit-identical to the
+        // interpreter oracle.
+        if opts.opt != OptLevel::O0 {
+            let pbo = PassBuilderOptions::create();
+            pbo.set_loop_vectorization(true);
+            pbo.set_loop_slp_vectorization(true);
+            pbo.set_loop_unrolling(true);
+            self.llm
+                .run_passes("default<O2>", &self.tm, pbo)
+                .map_err(|e| BackendError::Target(e.to_string()))?;
+        }
+
+        let file_type = match opts.emit {
+            EmitKind::Object => FileType::Object,
+            EmitKind::Assembly => FileType::Assembly,
+        };
         let buf = self
             .tm
-            .write_to_memory_buffer(&self.llm, FileType::Object)
+            .write_to_memory_buffer(&self.llm, file_type)
             .map_err(|e| BackendError::Target(e.to_string()))?;
         Ok(buf.as_slice().to_vec())
     }

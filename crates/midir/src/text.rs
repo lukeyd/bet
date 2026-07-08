@@ -168,6 +168,7 @@ impl Printer<'_> {
             TyKind::Vec(e) => format!("vec[{}]", self.ty(*e)),
             TyKind::Soa(e) => format!("soa {}", self.ty(*e)),
             TyKind::Rng => "rng".into(),
+            TyKind::Simd { elem, lanes } => format!("{}x{lanes}", self.ty(*elem)),
             TyKind::FnPtr(sig) => {
                 let s = self.m.sig(*sig);
                 let ps: Vec<String> = s.params.iter().map(|&t| self.ty(t)).collect();
@@ -312,7 +313,25 @@ impl Printer<'_> {
                         let vname = &def.variants[*variant as usize].name;
                         format!("make {}::{}({})", def.name, vname, a.join(", "))
                     }
+                    AggKind::Simd(elem) => {
+                        format!("simd[{}]({})", self.ty(*elem), a.join(", "))
+                    }
                 }
+            }
+            Rvalue::Simd { op, args, ty } => {
+                let a: Vec<String> = args.iter().map(|o| self.operand(o)).collect();
+                let name = match op {
+                    SimdOp::Splat => "splat".into(),
+                    SimdOp::Lane(i) => format!("lane.{i}"),
+                    SimdOp::Min => "min".into(),
+                    SimdOp::Max => "max".into(),
+                    SimdOp::Abs => "abs".into(),
+                    SimdOp::Dot => "dot".into(),
+                    SimdOp::Sum => "sum".into(),
+                    SimdOp::Length => "length".into(),
+                    SimdOp::Norm => "norm".into(),
+                };
+                format!("simd.{name}[{}]({})", self.ty(*ty), a.join(", "))
             }
             Rvalue::Discriminant(op) => format!("discriminant({})", self.operand(op)),
             Rvalue::Cop(crib, init) => {
@@ -1445,6 +1464,40 @@ impl Parser {
                 let args = self.arg_list()?;
                 Ok(Rvalue::Aggregate(AggKind::Array(elem), args))
             }
+            "simd" => {
+                self.pos += 1;
+                if self.eat(&Tok::Dot) {
+                    // `simd.<op>[ty](args)` — a non-arithmetic SIMD op.
+                    let opname = self.expect_ident()?;
+                    let op = match opname.as_str() {
+                        "splat" => SimdOp::Splat,
+                        "lane" => {
+                            self.expect(&Tok::Dot)?;
+                            SimdOp::Lane(self.bare_u64()? as u32)
+                        }
+                        "min" => SimdOp::Min,
+                        "max" => SimdOp::Max,
+                        "abs" => SimdOp::Abs,
+                        "dot" => SimdOp::Dot,
+                        "sum" => SimdOp::Sum,
+                        "length" => SimdOp::Length,
+                        "norm" => SimdOp::Norm,
+                        _ => return Err(self.err(&format!("unknown simd op `{opname}`"))),
+                    };
+                    self.expect(&Tok::LBracket)?;
+                    let ty = self.ty()?;
+                    self.expect(&Tok::RBracket)?;
+                    let args = self.arg_list()?;
+                    Ok(Rvalue::Simd { op, args, ty })
+                } else {
+                    // `simd[elem](args)` — lane-wise construction (operand count = lanes).
+                    self.expect(&Tok::LBracket)?;
+                    let elem = self.ty()?;
+                    self.expect(&Tok::RBracket)?;
+                    let args = self.arg_list()?;
+                    Ok(Rvalue::Aggregate(AggKind::Simd(elem), args))
+                }
+            }
             "addr_of" => {
                 self.pos += 1;
                 self.expect(&Tok::LParen)?;
@@ -1838,6 +1891,10 @@ impl Parser {
                 if let Some((width, signed)) = parse_int_suffix(&name) {
                     return Ok(self.m.intern_ty(TyKind::Int { width, signed }));
                 }
+                if let Some((elem_kind, lanes)) = split_simd_name(&name) {
+                    let elem = self.m.intern_ty(elem_kind);
+                    return Ok(self.m.intern_ty(TyKind::Simd { elem, lanes }));
+                }
                 if let Some(&s) = self.struct_ids.get(&name) {
                     return Ok(self.m.intern_ty(TyKind::Struct(s)));
                 }
@@ -1848,6 +1905,30 @@ impl Parser {
             }
         }
     }
+}
+
+/// Recognize a compact SIMD type name `<elem>x<lanes>` (e.g. `f32x4`, `i64x2`) as printed by the
+/// `ty` printer. Returns the element `TyKind` and lane count, or `None` if `name` isn't one.
+/// `elem` must be a scalar type name (`f32`/`f64`/an int suffix); `lanes` must be ≥ 2.
+fn split_simd_name(name: &str) -> Option<(TyKind, u32)> {
+    let idx = name.rfind('x')?;
+    if idx == 0 {
+        return None;
+    }
+    let (elem, rest) = (&name[..idx], &name[idx + 1..]);
+    let lanes: u32 = rest.parse().ok()?;
+    if lanes < 2 {
+        return None;
+    }
+    let elem_kind = match elem {
+        "f32" => TyKind::F32,
+        "f64" => TyKind::F64,
+        _ => {
+            let (width, signed) = parse_int_suffix(elem)?;
+            TyKind::Int { width, signed }
+        }
+    };
+    Some((elem_kind, lanes))
 }
 
 /// Split a numeric literal into its numeric part and an optional type suffix.

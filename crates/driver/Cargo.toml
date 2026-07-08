@@ -11,6 +11,13 @@ publish.workspace = true
 name = "bet"
 path = "src/main.rs"
 
+# Zero-cost-abstraction runtime benchmark (soa vs hand-written parallel arrays). Meaningful only
+# with codegen: `cargo bench -p driver --features llvm`; without it the kernels don't compile and
+# the bench skips. Uses criterion's own harness.
+[[bench]]
+name = "zero_cost"
+harness = false
+
 [dependencies]
 frontend = { path = "../frontend" }
 backend  = { path = "../backend" }
@@ -21,6 +28,10 @@ fmt      = { path = "../fmt" }
 # `bet` binary collides — a hard duplicate-symbol error on `rust-lld`. The driver only needs
 # their *archive names* (string literals in src/link.rs); the staticlibs are built as their own
 # workspace members and linked into the *compiled program* by name at `bet build` time.
+
+[dev-dependencies]
+# For the zero-cost runtime benchmark (benches/zero_cost.rs).
+criterion = { workspace = true }
 
 [features]
 default = []

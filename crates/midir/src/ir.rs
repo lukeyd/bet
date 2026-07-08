@@ -121,6 +121,14 @@ pub enum TyKind {
     /// `rng` — an opaque, runtime-backed seedable PRNG handle (`math.cook`). Carries no element
     /// type; the generator state lives behind the handle.
     Rng,
+    /// `<lanes x elem>` — a first-class fixed-width SIMD vector (e.g. `f32x4`, `i64x2`). Lowers to
+    /// an LLVM vector type; element-wise arithmetic/shifts reuse [`Rvalue::BinOp`] with two
+    /// Simd-typed operands (the backend emits `fadd <N x f32>` etc.), and the lane/reduction/min-max
+    /// ops are [`Rvalue::Simd`]. `elem` is a scalar [`TyKind::Int`]/`F32`/`F64`; `lanes` is 2/3/4.
+    Simd {
+        elem: TyId,
+        lanes: u32,
+    },
     /// A function-pointer value; the pointee signature is interned.
     FnPtr(SigId),
     /// An anonymous tuple, used to carry multi-value returns as one value.
@@ -352,6 +360,15 @@ pub enum Rvalue {
     Call(Callee, Vec<Operand>),
     /// Build a value-typed aggregate (a `drip` value or a tuple) from its fields.
     Aggregate(AggKind, Vec<Operand>),
+    /// A SIMD vector operation that is not plain element-wise arithmetic (which reuses
+    /// [`Rvalue::BinOp`]): lane construction/broadcast, lane extraction, min/max/abs, and the
+    /// horizontal reductions. `ty` is the RESULT type — the vector type for `Splat`/`Min`/`Max`/
+    /// `Abs`/`Norm`, or the scalar element type for `Lane`/`Dot`/`Sum`/`Length`.
+    Simd {
+        op: SimdOp,
+        args: Vec<Operand>,
+        ty: TyId,
+    },
     /// Read the discriminant of a sum value (for a `Switch`).
     Discriminant(Operand),
     /// `cop init in crib` — allocate into a crib. Yields `tag T` for a typed crib,
@@ -426,6 +443,34 @@ pub enum AggKind {
         sum: SumId,
         variant: u32,
     },
+    /// A `<N x elem>` SIMD vector built from `N` lane operands (`N` = operand count = lanes). The
+    /// `TyId` is the scalar element type, mirroring [`AggKind::Array`]. Broadcast (one scalar → all
+    /// lanes) is [`SimdOp::Splat`], not this.
+    Simd(TyId),
+}
+
+/// A SIMD vector operation carried by [`Rvalue::Simd`]. Element-wise `+ - * / >> <<` are NOT here —
+/// they reuse [`Rvalue::BinOp`] with two Simd-typed operands.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum SimdOp {
+    /// Broadcast one scalar operand to every lane (`args = [scalar]`; result vector type is `ty`).
+    Splat,
+    /// Extract lane `i` as a scalar (`args = [vec]`; result `ty` is the element type).
+    Lane(u32),
+    /// Element-wise minimum / maximum of two vectors (`args = [a, b]`).
+    Min,
+    Max,
+    /// Element-wise absolute value of one vector (`args = [v]`).
+    Abs,
+    /// Dot product of two vectors: element-wise multiply then a horizontal sum over lanes 0→N-1,
+    /// in order (`args = [a, b]`; result `ty` is the scalar element type).
+    Dot,
+    /// Horizontal sum of one vector's lanes, in order (`args = [v]`; scalar result).
+    Sum,
+    /// Euclidean length `sqrt(dot(v, v))` of one float vector (`args = [v]`; scalar float result).
+    Length,
+    /// Normalize a float vector to unit length: `v * splat(1 / length(v))` (`args = [v]`; vector result).
+    Norm,
 }
 
 /// How a `cop` initializes the freshly allocated slot.

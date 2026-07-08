@@ -648,3 +648,37 @@ slug = "docker-build"
 name = "Dockerized build/verify environment (Ubuntu 22.04 x86_64, Rust 1.96.1 + LLVM 18); confirm Doom port builds + passes headless oracle off-Mac"
 size = 3
 status = "doing"
+
+# ─────────────────────── Optimizer: make "SIMD + zero-cost vibes" true ───────────────────────
+# The backend ran ZERO optimization passes (emit_object went straight from verify to object at -O0),
+# so zero-cost abstractions weren't free and `soa`'s "auto-vectorizable" arrays never vectorized.
+
+[[task]]
+slug = "simd-types"
+name = "First-class SIMD vector types (f32x4/i32x4/i64x2/vec2..4): TyKind::Simd end-to-end + guaranteed SIMD; demonstrated in the Doom port"
+size = 13
+# DONE. Added `TyKind::Simd { elem, lanes }` across the midir contract (ir/text×2/validate + spec),
+# LLVM `<N x T>` codegen (element-wise BinOp on VectorValue, AggKind::Simd construct, Rvalue::Simd
+# for splat/lane/min/max/abs/dot/sum/length/norm; compare+select for min/max, one intrinsic
+# llvm.sqrt for length/norm), frontend surface (named `<elem>x<N>`+vec2/3/4 types, constructor
+# calls, `.x/.y/.z/.w` swizzle reads, method dispatch, scalar→vector splat in binops), and the
+# interpreter (Value::Simd with TRUE-typed lanes so f32 math is bit-identical). No rt-abi/runtime
+# change, no graph-allowlist change. Corpus 15-simd/{simd-int,simd-float} are interp==compiled at
+# O0 AND O2. Guaranteed SIMD proven: NEON (`add.4s`/`mul.4s`/`fmul.4s`/`fsqrt`/…) emitted even at
+# O0. DEMONSTRATED in the Doom port: P_Thrust (two FixedMuls -> one i64x2 `(mv*sn)>>16`) and the
+# P_XYMovement momentum clamp (-> i32x2 max.min) — demo1/demo2/demo3 sync streams byte-identical to
+# the oracle-verified scalar port. mat4, lane writes, 8/16-wide, and swizzle patterns deferred.
+status = "done"
+
+[[task]]
+slug = "opt-pipeline"
+name = "O2 pass pipeline (run_passes) + bet build --release + --emit asm; O2 corpus parity gate; zero-cost bench"
+size = 5
+# DONE. emit_object now runs LLVM's `default<O2>` new-PM pipeline (inliner/SROA/mem2reg + loop & SLP
+# vectorizers) when opt != O0; `bet build --release` (alias -O2) threads OptLevel::O2 through. No
+# fast-math set, so float results stay bit-identical to the interp oracle. `--emit asm` (new
+# EmitKind::Assembly) dumps optimized .s. Verified: `cargo xtask corpus --compiled --release` is
+# 69/69 (interp==compiled at O2, wired into backend-llvm.yml as a permanent gate); a soa u32 kernel
+# emits 24 NEON `.4s` ops at O2 vs 0 at O0, same output; zero-cost proven — soa_kernel.bet and the
+# hand-written aos_kernel.bet emit identical vector-op counts (tests/zero_cost.rs) + criterion bench.
+status = "doing"
