@@ -1,0 +1,32 @@
+// squadops-empty — vibeCheck/glowUp on a vec receiver, including the empty edge cases.
+// Exercises the vec receiver arm plus filter-to-empty and map-over-empty.
+pull "spill"
+pull "squadops"
+
+finna isNeg(n: int) -> bool { bet n < 0 }
+finna dbl(n: int) -> int { bet n * 2 }
+
+finna main() {
+    lowkey v = vec.new[int]()
+    v.stack(10)
+    v.stack(20)
+    v.stack(30)
+
+    // filter with a predicate that no element satisfies -> empty vec
+    lowkey none = v.vibeCheck(isNeg)
+    spill.it(none.gang())        // 0
+
+    // map over the empty result -> still empty
+    lowkey none2 = none.glowUp(dbl)
+    spill.it(none2.gang())       // 0
+
+    // map over the full vec still works
+    lowkey doubled = v.glowUp(dbl)
+    spill.it(doubled.gang())     // 3
+
+    lowkey sum = 0
+    squad d in doubled {
+        sum = sum + d
+    }
+    spill.it(sum)                // 20 + 40 + 60 = 120
+}

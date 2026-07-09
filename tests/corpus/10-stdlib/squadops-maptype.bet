@@ -1,0 +1,15 @@
+// squadops-maptype — glowUp mapping int -> vibe (bool): the result changes element type.
+// Exercises U != T, where the mapped-into vec holds a different element type than the source.
+pull "spill"
+pull "squadops"
+
+finna isBig(n: int) -> bool { bet n > 3 }
+
+finna main() {
+    lowkey xs = [1, 3, 5, 2, 9]
+    lowkey flags = xs.glowUp(isBig)   // [cap, cap, nocap, cap, nocap]
+    squad f in flags {
+        spill.it(f)
+    }
+    spill.it(flags.gang())            // 5
+}
