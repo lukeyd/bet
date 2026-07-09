@@ -394,6 +394,26 @@ covers = ["stdlib.squadops"]
 interp = "pass"
 compiled = "skip"
 
+# Compiled higher-order squadops: array `stack`/`pop` growth (in squadops.bet above) stays
+# interp-only, but `vibeCheck`/`glowUp` on both array and vec receivers lower natively.
+[[program]]
+path = "10-stdlib/squadops-chain"
+covers = ["stdlib.squadops"]
+interp = "pass"
+compiled = "pass"
+
+[[program]]
+path = "10-stdlib/squadops-maptype"
+covers = ["stdlib.squadops"]
+interp = "pass"
+compiled = "pass"
+
+[[program]]
+path = "10-stdlib/squadops-empty"
+covers = ["stdlib.squadops"]
+interp = "pass"
+compiled = "pass"
+
 [[program]]
 path = "10-stdlib/vec"
 covers = ["stdlib.vec"]

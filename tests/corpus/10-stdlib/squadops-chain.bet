@@ -1,0 +1,20 @@
+// squadops-chain — chained vibeCheck (filter) -> glowUp (map) on an array literal, compiled.
+// Exercises the array receiver flowing into the vec receiver: array.vibeCheck -> vec.glowUp.
+pull "spill"
+pull "squadops"
+
+finna isEven(n: int) -> bool { bet n % 2 == 0 }
+finna dbl(n: int) -> int { bet n * 2 }
+
+finna main() {
+    lowkey xs = [1, 2, 3, 4, 5, 6]
+    // filter evens -> [2, 4, 6], then map *2 -> [4, 8, 12]
+    lowkey ys = xs.vibeCheck(isEven).glowUp(dbl)
+    spill.it(ys.gang())     // 3
+
+    lowkey sum = 0
+    squad y in ys {
+        sum = sum + y
+    }
+    spill.it(sum)           // 4 + 8 + 12 = 24
+}

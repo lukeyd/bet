@@ -2516,6 +2516,9 @@ impl LowerCtx {
         if let TyKind::Vec(e) = *self.m.ty(bty) {
             return self.lower_vec_method(bop, e, method, args);
         }
+        if let TyKind::Array(e, n) = *self.m.ty(bty) {
+            return self.lower_array_method(bop, e, n, method, args);
+        }
         if matches!(*self.m.ty(bty), TyKind::Rng) {
             return self.lower_rng_method(bop, method, args);
         }
@@ -3376,10 +3379,329 @@ impl LowerCtx {
                 );
                 Ok((Operand::Copy(Place::local(result)), strt))
             }
+            // `v.vibeCheck(pred)` → filter: keep elements where `pred(x)` holds, into a new vec.
+            "vibeCheck" => self.build_filter(CollectionSrc::Vec { handle: vec_op }, e, args),
+            // `v.glowUp(f)` → map: `f(x)` for each element, into a new vec of the result type.
+            "glowUp" => self.build_map(CollectionSrc::Vec { handle: vec_op }, e, args),
             other => Err(format!(
-                "unknown `vec` method `{other}` (have: stack, pop, gang, append, str)"
+                "unknown `vec` method `{other}` (have: stack, pop, gang, append, str, vibeCheck, glowUp)"
             )),
         }
+    }
+
+    /// `arr.<method>(..)` for a fixed-size array receiver (`[1, 2, 3].glowUp(f)`). Arrays don't
+    /// grow, so mutators like `stack`/`pop` stay interp-only; the pure higher-order methods
+    /// `vibeCheck`/`glowUp` build a fresh heap `vec`, and `gang` is the compile-time length.
+    fn lower_array_method(
+        &mut self,
+        arr_op: Operand,
+        e: TyId,
+        n: u64,
+        method: &str,
+        args: &[ast::Arg],
+    ) -> Result<(Operand, TyId), String> {
+        match method {
+            "gang" => {
+                if !args.is_empty() {
+                    return Err("`gang` takes no arguments".into());
+                }
+                let usize_t = self.m.t_int(IntWidth::W64, false);
+                Ok((Operand::Const(Const::Int(n as i128, usize_t)), usize_t))
+            }
+            "vibeCheck" | "glowUp" => {
+                // The counter loop reads elements by `[i]`, so the array needs an address. A
+                // temporary like an array literal (`[1,2,3].glowUp(f)`) isn't a place — spill it.
+                let base = match self.operand_place(arr_op.clone()) {
+                    Some(p) => p,
+                    None => {
+                        let arr_ty = self.m.intern_ty(TyKind::Array(e, n));
+                        let tmp = self.new_local(arr_ty);
+                        self.fb().assign(Place::local(tmp), Rvalue::Use(arr_op));
+                        Place::local(tmp)
+                    }
+                };
+                let src = CollectionSrc::Array { base, n };
+                if method == "glowUp" {
+                    self.build_map(src, e, args)
+                } else {
+                    self.build_filter(src, e, args)
+                }
+            }
+            other => Err(format!(
+                "bruh, a squad literal ain't got a `.{other}()` — try gang, vibeCheck, or glowUp"
+            )),
+        }
+    }
+
+    /// `xs.glowUp(f)` — map. Allocate a fresh `vec[U]` (U = `f`'s return type), then for each
+    /// element push `f(x)`. Shared by the array and vec receivers via [`CollectionSrc`].
+    fn build_map(
+        &mut self,
+        src: CollectionSrc,
+        e: TyId,
+        args: &[ast::Arg],
+    ) -> Result<(Operand, TyId), String> {
+        if args.len() != 1 {
+            return Err("`glowUp` wants exactly one finna to map with".into());
+        }
+        let (fop, fty) = self.lower_expr(&args[0].value, None)?;
+        let sig = match self.m.ty(fty) {
+            TyKind::FnPtr(s) => self.m.sig(*s).clone(),
+            other => return Err(format!("`glowUp` wants a finna to map with, not {other:?}")),
+        };
+        if sig.params.len() != 1 || sig.params[0] != e {
+            return Err("`glowUp`'s finna gotta take one arg of the squad's element type".into());
+        }
+        if sig.rets.is_empty() {
+            return Err("`glowUp`'s finna gotta return something to map into".into());
+        }
+        // Spill the finna to a local so the indirect callee carries a known `FnPtr` place type
+        // (a bare `Const::FnRef` operand has none — the backend types the callee from its place).
+        let callee = self.spill_fn_value(fop, fty);
+        let u = self.rets_to_ty(&sig.rets);
+        let rawptr = self.m.intern_ty(TyKind::RawPtr);
+        let usize_t = self.m.t_int(IntWidth::W64, false);
+        let out_vec_ty = self.m.intern_ty(TyKind::Vec(u));
+
+        // out = bet_vec_new(sizeof(U))
+        let esize = self.new_local(usize_t);
+        self.fb().assign(Place::local(esize), Rvalue::SizeOf(u));
+        let new_ext = self.get_extern("bet_vec_new", vec![usize_t], vec![out_vec_ty]);
+        let out = self.new_local(out_vec_ty);
+        self.fb().assign(
+            Place::local(out),
+            Rvalue::Call(
+                Callee::Extern(new_ext),
+                vec![Operand::Copy(Place::local(esize))],
+            ),
+        );
+        let push_ext = self.get_extern("bet_vec_push", vec![out_vec_ty, rawptr], vec![]);
+
+        let (ctr, header, exit) = self.open_count_loop(&src, e)?;
+        // body: y = f(x); push its bytes onto `out`.
+        let x = self.emit_collection_read(&src, ctr, e);
+        let (y, _) = self.emit_call_result(
+            Callee::Indirect(callee),
+            &sig.rets,
+            vec![Operand::Copy(Place::local(x))],
+            u,
+        )?;
+        let yl = self.new_local(u);
+        self.fb().assign(Place::local(yl), Rvalue::Use(y));
+        let yptr = self.new_local(rawptr);
+        self.fb()
+            .assign(Place::local(yptr), Rvalue::AddrOf(Place::local(yl)));
+        self.emit_extern_call(
+            push_ext,
+            &[],
+            vec![
+                Operand::Copy(Place::local(out)),
+                Operand::Copy(Place::local(yptr)),
+            ],
+        )?;
+        self.close_count_loop(ctr, header, exit, usize_t);
+        Ok((Operand::Copy(Place::local(out)), out_vec_ty))
+    }
+
+    /// `xs.vibeCheck(pred)` — filter. Allocate a fresh `vec[T]`, then for each element for which
+    /// `pred(x)` is `true`, push `x`. Shared by the array and vec receivers via [`CollectionSrc`].
+    fn build_filter(
+        &mut self,
+        src: CollectionSrc,
+        e: TyId,
+        args: &[ast::Arg],
+    ) -> Result<(Operand, TyId), String> {
+        if args.len() != 1 {
+            return Err("`vibeCheck` wants exactly one finna to filter with".into());
+        }
+        let (fop, fty) = self.lower_expr(&args[0].value, None)?;
+        let sig = match self.m.ty(fty) {
+            TyKind::FnPtr(s) => self.m.sig(*s).clone(),
+            other => {
+                return Err(format!(
+                    "`vibeCheck` wants a finna to filter with, not {other:?}"
+                ));
+            }
+        };
+        let boolt = self.m.t_bool();
+        if sig.params.len() != 1 || sig.params[0] != e {
+            return Err(
+                "`vibeCheck`'s finna gotta take one arg of the squad's element type".into(),
+            );
+        }
+        if sig.rets.as_slice() != [boolt] {
+            return Err(
+                "`vibeCheck`'s finna gotta return a `vibe` (bool) — keep it or don't".into(),
+            );
+        }
+        // Spill the finna to a local so the indirect callee carries a known `FnPtr` place type.
+        let callee = self.spill_fn_value(fop, fty);
+        let rawptr = self.m.intern_ty(TyKind::RawPtr);
+        let usize_t = self.m.t_int(IntWidth::W64, false);
+        let out_vec_ty = self.m.intern_ty(TyKind::Vec(e));
+
+        // out = bet_vec_new(sizeof(T))
+        let esize = self.new_local(usize_t);
+        self.fb().assign(Place::local(esize), Rvalue::SizeOf(e));
+        let new_ext = self.get_extern("bet_vec_new", vec![usize_t], vec![out_vec_ty]);
+        let out = self.new_local(out_vec_ty);
+        self.fb().assign(
+            Place::local(out),
+            Rvalue::Call(
+                Callee::Extern(new_ext),
+                vec![Operand::Copy(Place::local(esize))],
+            ),
+        );
+        let push_ext = self.get_extern("bet_vec_push", vec![out_vec_ty, rawptr], vec![]);
+
+        let (ctr, header, exit) = self.open_count_loop(&src, e)?;
+        // body: keep = pred(x); if keep, push x. Falls through to the shared increment block.
+        let x = self.emit_collection_read(&src, ctr, e);
+        let (keep, _) = self.emit_call_result(
+            Callee::Indirect(callee),
+            &sig.rets,
+            vec![Operand::Copy(Place::local(x))],
+            boolt,
+        )?;
+        let body_end = self.cur;
+        let push_bb = self.new_block();
+        let xptr = self.new_local(rawptr);
+        self.fb()
+            .assign(Place::local(xptr), Rvalue::AddrOf(Place::local(x)));
+        self.emit_extern_call(
+            push_ext,
+            &[],
+            vec![
+                Operand::Copy(Place::local(out)),
+                Operand::Copy(Place::local(xptr)),
+            ],
+        )?;
+        let cont = self.new_block();
+        self.set_goto(push_bb, cont);
+        self.set_branch(body_end, keep, push_bb, cont);
+        self.select(cont);
+        self.close_count_loop(ctr, header, exit, usize_t);
+        Ok((Operand::Copy(Place::local(out)), out_vec_ty))
+    }
+
+    /// Open a counter loop over a collection: emit `ctr = 0`, the `ctr < len` header, and enter a
+    /// fresh body block. Returns `(ctr, header, exit)`; the caller fills the body then calls
+    /// [`Self::close_count_loop`] to wire the increment back to the header.
+    fn open_count_loop(
+        &mut self,
+        src: &CollectionSrc,
+        e: TyId,
+    ) -> Result<(LocalId, BlockId, BlockId), String> {
+        let usize_t = self.m.t_int(IntWidth::W64, false);
+        let boolt = self.m.t_bool();
+        let len = self.emit_collection_len(src, e);
+        let ctr = self.new_local(usize_t);
+        self.fb().assign(
+            Place::local(ctr),
+            Rvalue::Use(Operand::Const(Const::Int(0, usize_t))),
+        );
+        let pre = self.cur;
+        let header = self.reserve_block();
+        self.set_goto(pre, header);
+        self.select(header);
+        let cond = self.new_local(boolt);
+        self.fb().assign(
+            Place::local(cond),
+            Rvalue::BinOp(
+                BinOp::Lt,
+                Operand::Copy(Place::local(ctr)),
+                len,
+                ArithMode::Na,
+            ),
+        );
+        let header_end = self.cur;
+        let body_bb = self.new_block();
+        let exit = self.reserve_block();
+        self.set_branch(header_end, Operand::Copy(Place::local(cond)), body_bb, exit);
+        self.select(body_bb);
+        Ok((ctr, header, exit))
+    }
+
+    /// Close a counter loop opened by [`Self::open_count_loop`]: `ctr += 1`, jump back to the
+    /// header, then select the exit block so lowering continues after the loop.
+    fn close_count_loop(&mut self, ctr: LocalId, header: BlockId, exit: BlockId, usize_t: TyId) {
+        self.fb().assign(
+            Place::local(ctr),
+            Rvalue::BinOp(
+                BinOp::Add,
+                Operand::Copy(Place::local(ctr)),
+                Operand::Const(Const::Int(1, usize_t)),
+                ArithMode::Wrap,
+            ),
+        );
+        self.term_goto(header);
+        self.select(exit);
+    }
+
+    /// Store a function value into a fresh `FnPtr`-typed local and return a `Copy` of it. A bare
+    /// function name lowers to a `Const::FnRef` operand, which carries no place type; the backend
+    /// recovers an indirect callee's signature from its operand's place type, so it must be a
+    /// local. (Mirrors the spill in [`Self::lower_slide`].)
+    fn spill_fn_value(&mut self, fop: Operand, fty: TyId) -> Operand {
+        let fnl = self.new_local(fty);
+        self.fb().assign(Place::local(fnl), Rvalue::Use(fop));
+        Operand::Copy(Place::local(fnl))
+    }
+
+    /// The element count of a collection as a `usize` operand: a compile-time constant for a
+    /// fixed array, or a `bet_vec_len` call for a vec.
+    fn emit_collection_len(&mut self, src: &CollectionSrc, e: TyId) -> Operand {
+        let usize_t = self.m.t_int(IntWidth::W64, false);
+        match src {
+            CollectionSrc::Array { n, .. } => Operand::Const(Const::Int(*n as i128, usize_t)),
+            CollectionSrc::Vec { handle } => {
+                let vec_ty = self.m.intern_ty(TyKind::Vec(e));
+                let len_ext = self.get_extern("bet_vec_len", vec![vec_ty], vec![usize_t]);
+                let len = self.new_local(usize_t);
+                self.fb().assign(
+                    Place::local(len),
+                    Rvalue::Call(Callee::Extern(len_ext), vec![handle.clone()]),
+                );
+                Operand::Copy(Place::local(len))
+            }
+        }
+    }
+
+    /// Read element `ctr` of a collection into a fresh local of type `e` and return that local: an
+    /// `[i]` array read, or a `bet_vec_get` for a vec.
+    fn emit_collection_read(&mut self, src: &CollectionSrc, ctr: LocalId, e: TyId) -> LocalId {
+        let el = self.new_local(e);
+        match src {
+            CollectionSrc::Array { base, .. } => {
+                let elem = extend(base, Proj::Index(Operand::Copy(Place::local(ctr))));
+                self.fb()
+                    .assign(Place::local(el), Rvalue::Use(Operand::Copy(elem)));
+            }
+            CollectionSrc::Vec { handle } => {
+                let rawptr = self.m.intern_ty(TyKind::RawPtr);
+                let usize_t = self.m.t_int(IntWidth::W64, false);
+                let boolt = self.m.t_bool();
+                let vec_ty = self.m.intern_ty(TyKind::Vec(e));
+                let out_ptr = self.new_local(rawptr);
+                self.fb()
+                    .assign(Place::local(out_ptr), Rvalue::AddrOf(Place::local(el)));
+                let get_ext =
+                    self.get_extern("bet_vec_get", vec![vec_ty, usize_t, rawptr], vec![boolt]);
+                let got = self.new_local(boolt);
+                self.fb().assign(
+                    Place::local(got),
+                    Rvalue::Call(
+                        Callee::Extern(get_ext),
+                        vec![
+                            handle.clone(),
+                            Operand::Copy(Place::local(ctr)),
+                            Operand::Copy(Place::local(out_ptr)),
+                        ],
+                    ),
+                );
+            }
+        }
+        el
     }
 
     /// `v[i]` for a `vec[T]` — read element `i` into a fresh slot via `bet_vec_get` and yield it
@@ -5697,6 +6019,14 @@ fn extend(base: &Place, p: Proj) -> Place {
     let mut place = base.clone();
     place.proj.push(p);
     place
+}
+
+/// A collection receiver for the shared higher-order methods (`vibeCheck`/`glowUp`): either a
+/// fixed-size array (indexed by `[i]` against a place) or a `vec` (a runtime handle indexed via
+/// `bet_vec_get`). Lets `build_map`/`build_filter` run one loop over either receiver.
+enum CollectionSrc {
+    Array { base: Place, n: u64 },
+    Vec { handle: Operand },
 }
 
 /// Recognize a first-class SIMD vector type name: the `vec2`/`vec3`/`vec4` float aliases, or the
