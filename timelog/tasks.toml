@@ -793,3 +793,33 @@ slug = "branch-cleanup"
 name = "Housekeeping: review merged branches, commit timelog, prune stale branch"
 size = 1
 status = "doing"
+
+# ─────────────── Complete the self-hosted frontend (betfe parity + real DOOM) ───────────────
+# betfe drifted behind the Rust frontend: it lexes+parses everything but skips LOWERING for
+# modules, SIMD, and soa (all sentineled). Plan: ~/.claude/plans/let-s-revist-the-self-wiggly-fox.md.
+# Fanned out across worktree-isolated agents (SIMD / soa / modules) integrated serially, then a
+# capstone that un-excludes the gate and drives the real ports/doom through betfe.
+
+[[task]]
+slug = "selfhost-simd"
+name = "betfe: lower first-class SIMD (vec2/3/4, i32x4/i64x2, lanes, dot/sum/min/max/abs/scale/length) — 15-simd mir parity"
+size = 5
+status = "todo"
+
+[[task]]
+slug = "selfhost-modules"
+name = "betfe: multi-file modules (pull loader + resolve/mangle pass) + reference --emit mir goes multi-file; un-exclude 14-modules/12-doom from the selfhost gate"
+size = 13
+status = "todo"
+
+[[task]]
+slug = "selfhost-intrinsics"
+name = "betfe: stdlib-intrinsic + operator parity — teach betfe to lower the 8 recent-intrinsic corpus gaps (tag==ghosted, fs.peep, bytes-parse, stdin read-line, math.cook rng, vibeCheck/glowUp filter-map on squad)"
+size = 5
+status = "todo"
+
+[[task]]
+slug = "selfhost-doom"
+name = "betfe capstone: close any residual corpus gap + drive the real ports/doom through betfe (byte-identical .mir, doom-verify --sim-only green)"
+size = 8
+status = "todo"
