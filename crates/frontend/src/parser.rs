@@ -9,6 +9,14 @@
 use crate::ast::*;
 use crate::lexer::{Spanned, Token};
 
+/// Recursion cap for the recursive-descent parser (issue #38). Every recursive entry point
+/// (`parse_type`, the expression ladder via `expr`, and `unary_expr`'s self-recursion) bumps a
+/// depth counter; past this the parser returns a clean syntax error instead of overflowing the
+/// native stack on pathological input like `((((…))))`, `-----1`, or `tag tag tag … int` nested
+/// thousands deep. 256 is far deeper than any hand-written program nests, yet shallow enough to
+/// stay well inside the default main-thread stack.
+const MAX_DEPTH: u32 = 256;
+
 /// Parse a token stream into a [`Program`], or report the first syntax error.
 pub fn parse(tokens: &[Spanned]) -> Result<Program, String> {
     let eof = tokens.last().map(|s| s.span.end).unwrap_or(0);
@@ -17,6 +25,7 @@ pub fn parse(tokens: &[Spanned]) -> Result<Program, String> {
         pos: 0,
         eof,
         no_struct: false,
+        depth: 0,
     };
     p.program()
 }
@@ -29,11 +38,33 @@ struct Parser<'a> {
     /// only at the top level of an `fr`/`vibin`/`squad`/`vibe`/`holla` header (§L6 rule 3);
     /// any nested `(...)`/`[...]`/`{...}` re-enables struct literals.
     no_struct: bool,
+    /// Current recursion depth, bounded by [`MAX_DEPTH`] (issue #38).
+    depth: u32,
 }
 
 type PResult<T> = Result<T, String>;
 
 impl<'a> Parser<'a> {
+    // --- recursion guard (issue #38) ---
+
+    /// Bump the recursion depth, or bail with a clean syntax error past [`MAX_DEPTH`]. Every
+    /// guarded entry point pairs this with [`Self::exit_depth`] so the counter is restored on the
+    /// way out (including error unwinds).
+    fn enter_depth(&mut self) -> PResult<()> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            self.depth -= 1;
+            return Err(format!(
+                "yo, this is nested way too deep (over {MAX_DEPTH} levels) — flatten it out"
+            ));
+        }
+        Ok(())
+    }
+
+    fn exit_depth(&mut self) {
+        self.depth -= 1;
+    }
+
     // --- cursor primitives ---
 
     fn peek(&self) -> Option<&Token> {
@@ -430,6 +461,13 @@ impl<'a> Parser<'a> {
     // --- types --------------------------------------------------------------
 
     fn parse_type(&mut self) -> PResult<Type> {
+        self.enter_depth()?;
+        let r = self.parse_type_inner();
+        self.exit_depth();
+        r
+    }
+
+    fn parse_type_inner(&mut self) -> PResult<Type> {
         let lo = self.lo();
         // `[]T` — slice.
         if self.check(&Token::LBracket) {
@@ -808,7 +846,12 @@ impl<'a> Parser<'a> {
     }
 
     fn expr(&mut self) -> PResult<Expr> {
-        self.or_expr()
+        // Depth-guard the top of the ladder (issue #38): nested parens re-enter `expr` (via
+        // `full_expr`), so guarding here bounds `((((…))))` and general expression nesting.
+        self.enter_depth()?;
+        let r = self.or_expr();
+        self.exit_depth();
+        r
     }
 
     fn or_expr(&mut self) -> PResult<Expr> {
@@ -935,6 +978,15 @@ impl<'a> Parser<'a> {
     }
 
     fn unary_expr(&mut self) -> PResult<Expr> {
+        // Depth-guard the prefix chain (issue #38): `!`/`~`/`-` recurse into `unary_expr`
+        // without looping back through `expr`, so `-----1` needs its own guard.
+        self.enter_depth()?;
+        let r = self.unary_expr_inner();
+        self.exit_depth();
+        r
+    }
+
+    fn unary_expr_inner(&mut self) -> PResult<Expr> {
         let lo = self.lo();
         let op = match self.peek() {
             Some(Token::Bang) => UnOp::Not,
@@ -1412,5 +1464,67 @@ mod tests {
         let p = parse_src("finna main() {\n  fr ok { skip }\n}\n");
         let Item::Func(f) = &p.items[0] else { panic!() };
         assert!(matches!(f.body.stmts[0].kind, StmtKind::Fr(_)));
+    }
+
+    // --- issue #38: recursion-depth guard -----------------------------------
+
+    /// Parse `src` on a generously-sized stack and return the (expected) error. The guard fires at
+    /// [`MAX_DEPTH`], but on nextest's default 2 MiB worker thread the paren ladder (~16 native
+    /// frames per level) can exhaust the stack before the guard trips; the real CLI parses on the
+    /// 8 MiB main thread, where the guard fires with megabytes to spare. The point of the test is
+    /// that a clean `Err` is produced rather than a `SIGABRT`.
+    fn parse_err(src: &str) -> String {
+        let src = src.to_string();
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                let toks = tokenize(&src).expect("lex");
+                parse(&toks).expect_err("expected a parse error, not a stack overflow / abort")
+            })
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    /// Thousands of nested parens must yield a clean parse error, never abort the process.
+    #[test]
+    fn deep_paren_nesting_errors_not_aborts() {
+        let mut src = String::from("finna main() {\n  bet ");
+        src.push_str(&"(".repeat(5000));
+        src.push('1');
+        src.push_str(&")".repeat(5000));
+        src.push_str("\n}\n");
+        assert!(parse_err(&src).contains("deep"));
+    }
+
+    /// A prefix-operator chain (`- - - … 1`) recurses in `unary_expr`; the guard must catch it.
+    #[test]
+    fn deep_unary_nesting_errors_not_aborts() {
+        let mut src = String::from("finna main() {\n  bet ");
+        src.push_str(&"- ".repeat(5000));
+        src.push('1');
+        src.push_str("\n}\n");
+        assert!(parse_err(&src).contains("deep"));
+    }
+
+    /// A deeply nested type (`tag tag tag … int`) recurses in `parse_type`; the guard must catch it.
+    #[test]
+    fn deep_type_nesting_errors_not_aborts() {
+        let mut src = String::from("finna f(x: ");
+        src.push_str(&"tag ".repeat(5000));
+        src.push_str("int) {\n}\n");
+        assert!(parse_err(&src).contains("deep"));
+    }
+
+    /// The guard must not false-positive on ordinary, shallowly-nested source.
+    #[test]
+    fn moderate_nesting_still_parses() {
+        let mut src = String::from("finna main() {\n  bet ");
+        src.push_str(&"(".repeat(40));
+        src.push('1');
+        src.push_str(&")".repeat(40));
+        src.push_str("\n}\n");
+        // `parse_src` unwraps — this must succeed.
+        let _ = parse_src(&src);
     }
 }
