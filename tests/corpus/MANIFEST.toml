@@ -21,6 +21,10 @@
 #   * "pass" — `bet build` it to a native executable, run it, and assert its stdout equals
 #              `.expected` byte-for-byte AND equals the interpreter's stdout for the same
 #              program (the interp == compiled invariant). A failure is a hard error (ratchet).
+#   * "trap" — `bet build` it, run it, and assert it FAULTS at runtime (a bounds/overflow guard's
+#              `bet_panic` → SIGABRT / exit 134); any stdout before the trap must equal
+#              `.expected`. Pair with `interp = "unsupported"` (the interpreter errors on the same
+#              fault) so both columns assert the trap. Use for defined-to-fault programs (OOB etc.).
 #   * "skip" — not compiled/run (codegen out of scope for it for now).
 # `compiled` defaults to "skip" when omitted. Today only the `spill.it("literal")` tracer-bullet
 # programs are "pass"; the computed-value set is promoted as backend/runtime codegen grows.
@@ -48,7 +52,7 @@ all = [
   "functions.first-class", "functions.generics",
   # 05 structs
   "structs.drip", "structs.value-copy", "structs.visibility", "structs.generic", "structs.soa",
-  "structs.soa-slice", "structs.soa-vec",
+  "structs.soa-slice", "structs.soa-vec", "structs.soa-bounds",
   # 06 sum types
   "sumtypes.moods", "sumtypes.vibe-match", "sumtypes.exhaustiveness", "sumtypes.struct-payload",
   # 07 errors
@@ -72,6 +76,7 @@ all = [
   # 12 doom (the doom-port language package: one-crib game state, per-slot evict,
   # file writes, callbacks, sized-int idioms)
   "doom.gamestate", "doom.evict-slot", "doom.fs-drop", "doom.fn-param", "doom.int-widths",
+  "doom.tag-refs-scale",
   # 15 simd (first-class fixed-width vector types: `f32x4`/`i64x2`/`vec2..4`)
   "simd.construct", "simd.arithmetic", "simd.lanes", "simd.minmax", "simd.reduce", "simd.float",
 ]
@@ -248,6 +253,15 @@ path = "05-structs/soa-vec"
 covers = ["structs.soa-vec"]
 interp = "pass"
 compiled = "pass"
+
+# An out-of-range `soa` index must trap at runtime (issue #32): the backend now bounds-checks
+# the soa index path. `interp = "unsupported"` (the interpreter errors on the OOB) + `compiled =
+# "trap"` (the native binary aborts, SIGABRT / exit 134) so both columns assert the fault.
+[[program]]
+path = "05-structs/soa-oob"
+covers = ["structs.soa-bounds"]
+interp = "unsupported"
+compiled = "trap"
 
 # --- 06 sum types -----------------------------------------------------------
 [[program]]
@@ -564,6 +578,16 @@ compiled = "pass"
 [[program]]
 path = "12-doom/int-widths"
 covers = ["doom.int-widths", "values.casts", "values.numeric-tower"]
+interp = "pass"
+compiled = "pass"
+
+# The #72 regression guard: MANY `tag`/ref fields (four per node, N nodes) stored into a crib
+# and save/restored at scale (serialize links -> evict -> re-cop -> restore), then folded to a
+# checksum. Catches a mis-stored/mis-resolved tag (the 16-byte-Tag ABI class) as an interp !=
+# compiled divergence — the coverage the native-only DOOM saveg smoke lacked in `corpus`.
+[[program]]
+path = "12-doom/tag-refs-scale"
+covers = ["doom.tag-refs-scale"]
 interp = "pass"
 compiled = "pass"
 

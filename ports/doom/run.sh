@@ -22,6 +22,10 @@ export PATH="$HOME/.cargo/bin:$PATH"
 export LLVM_SYS_180_PREFIX="${LLVM_SYS_180_PREFIX:-/opt/homebrew/opt/llvm@18}"
 export LIBRARY_PATH="/opt/homebrew/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
 
+# Open the window at the largest square that fits the live display (gg detects the monitor at
+# runtime and centers DOOM in it, aspect-fit; the window stays resizable). No fixed size.
+export GG_FULLSQUARE=1
+
 WAD="${DOOM_WAD:-$REPO_ROOT/doom-reference/doom1.wad}"
 OUT="${DOOM_BIN:-/tmp/doom}"
 

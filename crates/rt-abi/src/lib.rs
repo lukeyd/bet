@@ -31,14 +31,27 @@ use core::ffi::c_void;
 /// long-running program that recycles one slot ~4 billion times, at which point a stale tag's
 /// generation could coincide with the live slot's again and a ghosted handle would silently
 /// resolve as live — an ABA use-after-free. A 64-bit horizon makes that wrap unreachable in
-/// any realistic execution. Widening it grows `Tag` from 8 to 16 bytes (`#[repr(C)]`: `slot`
-/// at offset 0, `generation` at offset 8; size 16, align 8), so the runtime and the LLVM
-/// backend both carry a `tag T` as the two-field struct `{ i32 slot, i64 generation }` passed
-/// by value across the ABI — no longer coerced to a single `i64` register.
+/// any realistic execution. Widening it grows `Tag` from 8 to 16 bytes, so the runtime and the
+/// LLVM backend both carry a `tag T` by value across the ABI as the struct below — no longer
+/// coerced to a single `i64` register.
+///
+/// The `u32 slot` + `u64 generation` layout has a natural 4-byte alignment gap between the two
+/// fields. That gap is made an **explicit `_pad` lane (always 0)**, NOT implicit padding, for
+/// soundness (issue #72): the LLVM backend lowers a tag store field-wise, and at `-O2` LLVM
+/// skips implicit struct padding — so a whole-tag store into an un-zeroed crib slot would leave
+/// bytes [4,8) undefined, and any aggregate copy of a tag-bearing struct then carries that
+/// garbage. With `_pad` a real field, every field-wise store writes it and every load reads a
+/// defined 0. `#[repr(C)]`: `slot`@0, `_pad`@4, `generation`@8; size 16, align 8 — carried as
+/// the three-field struct `{ i32 slot, i32 _pad, i64 generation }`. Only `slot`/`generation`
+/// are semantically meaningful; `_pad` must always be 0.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Tag {
     pub slot: u32,
+    /// The alignment gap between `slot` and `generation`, made an explicit always-0 field so it
+    /// is never undefined memory (issue #72). Not semantically meaningful; construct via the
+    /// [`Tag::new`] helper (or set `_pad: 0`) so it is always defined.
+    pub _pad: u32,
     pub generation: u64,
 }
 
@@ -46,8 +59,20 @@ impl Tag {
     /// The sentinel returned when a `cop` cannot allocate; always resolves as ghosted.
     pub const NULL: Tag = Tag {
         slot: u32::MAX,
+        _pad: 0,
         generation: 0,
     };
+
+    /// Construct a live tag with the pad lane defined (0). The only place `slot`/`generation`
+    /// are chosen; keeps the `_pad: 0` invariant in one spot (issue #72).
+    #[inline]
+    pub const fn new(slot: u32, generation: u64) -> Tag {
+        Tag {
+            slot,
+            _pad: 0,
+            generation,
+        }
+    }
 }
 
 /// An opaque handle to a crib (arena). Created by [`bet_crib_new`] / [`bet_crib_new_bump`].
@@ -520,9 +545,33 @@ mod tests {
     #[test]
     fn tag_is_sixteen_bytes() {
         // The 16-byte layout (u64 generation, issue #34) is load-bearing (spec §7.3) and is
-        // the exact `{ i32 slot, i64 generation }` the LLVM backend lowers `tag T` to.
+        // the exact `{ i32 slot, i32 _pad, i64 generation }` the LLVM backend lowers `tag T` to.
         assert_eq!(core::mem::size_of::<Tag>(), 16);
         assert_eq!(core::mem::align_of::<Tag>(), 8);
+    }
+
+    #[test]
+    fn tag_pad_lane_is_always_zero() {
+        // Issue #72: the alignment gap between `slot` (u32) and `generation` (u64) MUST be a
+        // defined, always-0 lane, not undefined padding — else a field-wise / -O2 store leaves
+        // bytes [4,8) garbage and a whole-tag aggregate copy carries it into a computed offset in
+        // the native DOOM sprite path. Read all 16 bytes of a constructed tag and assert [4,8)==0.
+        let tags = [
+            Tag::NULL,
+            Tag::new(0, 0),
+            Tag::new(u32::MAX, u64::MAX),
+            Tag::new(0x1234_5678, 0x9abc_def0_1234_5678),
+        ];
+        for t in tags {
+            let bytes: [u8; 16] = unsafe { core::mem::transmute::<Tag, [u8; 16]>(t) };
+            assert_eq!(
+                &bytes[4..8],
+                &[0u8; 4],
+                "tag pad lane must be zero for {t:?}"
+            );
+            // And `_pad` itself is exposed as 0.
+            assert_eq!(t._pad, 0);
+        }
     }
 
     #[test]

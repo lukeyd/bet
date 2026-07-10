@@ -72,6 +72,9 @@ fn link_unix(obj: &Path, libdir: &Path, out: &Path, runtime: Runtime) -> Result<
     for lib in unix_sys_libs() {
         cmd.arg(lib);
     }
+    for arg in main_stack_args() {
+        cmd.arg(arg);
+    }
     // The real runtime built with `gg-desktop` statically bundles minifb + cpal, whose macOS
     // framework dependencies are recorded as cargo link directives that do NOT survive into the
     // `.a` archive — so the final `cc` link must name them explicitly. Harmless when gg is
@@ -122,6 +125,35 @@ fn run_linker(mut cmd: Command, name: &str) -> Result<(), String> {
         return Err(format!("linker `{name}` failed ({status})"));
     }
     Ok(())
+}
+
+/// The main-thread stack size (bytes) a compiled program requests from the linker: 128 MiB.
+///
+/// A whole `bet` program is monomorphized into one `main` whose stack frame holds every
+/// function's locals — including the temporaries that zero-initialize large aggregates for a
+/// `cop T{}`. For a big program (the DOOM port's `GameState`, whose tag-heavy arrays roughly
+/// doubled when a `tag` became the 16-byte `{i32,i64}` handle, issue #34) that frame exceeds the
+/// OS default main-thread stack (8 MiB on macOS), so the program faults on the guard page at
+/// startup (issue #72: `saveg_smoke` measured a ~9.7 MiB `main` frame). The program's *heap*
+/// arenas are unaffected; this only widens the single main-thread stack the entry runs on. We
+/// raise it here rather than moving `main` to a worker thread, because macOS windowing (the
+/// `gg-desktop` platform layer) must run on the main thread.
+const MAIN_STACK_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Linker arguments that grow the executable's main-thread stack to [`MAIN_STACK_BYTES`].
+///
+/// macOS's `ld` takes `-stack_size <hex>` (a Mach-O load command) and enlarges the main thread's
+/// stack directly. On Linux the main thread's stack is governed by `RLIMIT_STACK`, not by any
+/// link-time flag (the ELF `-z stack-size=` field only sizes *thread* stacks), so a native build
+/// there would instead need `ulimit -s` or a worker-thread entry — we emit nothing rather than a
+/// flag that silently wouldn't apply. Empty elsewhere too (Windows would set it in `link_msvc`, if
+/// ever needed).
+fn main_stack_args() -> Vec<String> {
+    if cfg!(target_os = "macos") {
+        vec![format!("-Wl,-stack_size,{MAIN_STACK_BYTES:#x}")]
+    } else {
+        Vec::new()
+    }
 }
 
 /// Extra system libraries the Rust std bundled inside `librt_stub.a` needs (threads for

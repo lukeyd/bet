@@ -303,10 +303,8 @@ pub unsafe extern "C" fn bet_cop(handle: CribHandle) -> Tag {
     for (i, m) in t.meta.iter_mut().enumerate() {
         if !m.occupied {
             m.occupied = true;
-            return Tag {
-                slot: i as u32,
-                generation: m.generation,
-            };
+            // `Tag::new` keeps the `_pad` lane defined (0) — issue #72.
+            return Tag::new(i as u32, m.generation);
         }
     }
     Tag::NULL

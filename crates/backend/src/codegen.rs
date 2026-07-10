@@ -15,7 +15,7 @@
 //!   [`Rvalue::Trust`], [`Stmt::Evict`], and the [`Terminator::HollaCheck`] generational
 //!   access — each lowered to its `rt-abi` entry point (`bet_cop`, `bet_holla_check`,
 //!   `bet_slot_ptr`, `bet_evict`). A `tag T` is a 16-byte generational handle carried by value
-//!   as the struct `{ i32 slot, i64 generation }` (matching `rt_abi::Tag` after the issue-#34
+//!   as the struct `{ i32 slot, i32 _pad, i64 generation }` (matching `rt_abi::Tag` after issues #34/#72,
 //!   `u64`-generation widening); a `crib T`/`ref T`/`fn(..)` is a raw pointer.
 //! * **Control flow**: `switch`, `panic` (→ `bet_panic` + `unreachable`), and `unreachable`.
 //! * **Function values**: `@f` [`Const::FnRef`] and [`Callee::Indirect`] indirect calls.
@@ -209,15 +209,20 @@ impl<'c> Cg<'c> {
             .struct_type(&[self.ptr_ty().into(), self.cx.i64_type().into()], false)
     }
 
-    /// The LLVM struct `{ i32 slot, i64 generation }` a `tag T` is carried and passed by value
-    /// as — the exact 16-byte layout of `rt_abi::Tag` after the issue-#34 `u64`-generation
-    /// widening (slot at offset 0, generation at offset 8, size 16, align 8). Every entry point
+    /// The LLVM struct `{ i32 slot, i32 _pad, i64 generation }` a `tag T` is carried and passed
+    /// by value as — the exact 16-byte layout of `rt_abi::Tag`; the `_pad` lane makes the u32/u64
+    /// alignment gap an explicit always-0 field so a field-wise / -O2 store defines all 16 bytes
+    /// (issue #72; slot@0, _pad@4, generation@8, size 16, align 8). Every entry point
     /// that takes or returns a `Tag` (`bet_cop`, `bet_holla_check`, `bet_evict_slot`) uses this
     /// type, and it MUST be identical at all those call sites (`get_or_add` keeps the first
     /// declaration, so a divergent signature would silently mis-type the ABI).
     fn tag_ty(&self) -> StructType<'c> {
         self.cx.struct_type(
-            &[self.cx.i32_type().into(), self.cx.i64_type().into()],
+            &[
+                self.cx.i32_type().into(),
+                self.cx.i32_type().into(),
+                self.cx.i64_type().into(),
+            ],
             false,
         )
     }
@@ -229,7 +234,7 @@ impl<'c> Cg<'c> {
             TyKind::F32 => self.cx.f32_type().into(),
             TyKind::F64 => self.cx.f64_type().into(),
             TyKind::RawPtr => self.ptr_ty().into(),
-            // A `tag T` is the 16-byte `{ i32 slot, i64 generation }` handle (issue #34),
+            // A `tag T` is the 16-byte `{ i32 slot, i32 _pad, i64 generation }` handle (issues #34, #72),
             // passed by value across the `rt-abi` boundary as that struct.
             TyKind::Tag(_) => self.tag_ty().into(),
             // Crib handles, live refs, and function values are all raw pointers.
@@ -346,7 +351,7 @@ impl<'c> Cg<'c> {
             | TyKind::Map(_, _)
             | TyKind::Vec(_)
             | TyKind::Rng => 1,
-            // A `tag T` is the 16-byte `{ i32, i64 }` handle (issue #34), and `str`/slices are
+            // A `tag T` is the 16-byte `{ i32, i32, i64 }` handle (issues #34, #72), and `str`/slices are
             // fat `(ptr, len)` values — two words each.
             TyKind::Tag(_) | TyKind::Str | TyKind::Slice(_) => 2,
             TyKind::Array(elem, n) => self.ty_words(*elem).saturating_mul(*n as u32),
@@ -581,7 +586,7 @@ impl<'c> Cg<'c> {
                 Ok(())
             }
             // `evict tag in crib` — free one slot. The tag rides by value as the
-            // `{ i32, i64 }` struct (issue #34), exactly as in `bet_holla_check`.
+            // `{ i32, i32, i64 }` struct (issues #34, #72), exactly as in `bet_holla_check`.
             Stmt::EvictSlot { crib, tag } => {
                 let crib_v = self.lower_operand(func, locals, crib)?.into_pointer_value();
                 let tag_v = self.lower_operand(func, locals, tag)?;
@@ -1127,7 +1132,7 @@ impl<'c> Cg<'c> {
                 self.lower_vec_binop(op, l, r, signed)
             }
             // Aggregate operands reach here for `tag`/`ref` equality: `Tag` lowers to the struct
-            // `{ i32 slot, i64 generation }`, so `tag == ghosted` / `t1 != t2` is a field-wise compare
+            // `{ i32 slot, i32 _pad, i64 generation }`, so `tag == ghosted` / `t1 != t2` is a field-wise
             // (before the generation counter widened to u64, a Tag was a scalar `i64` and this went
             // through the Int arm). Only `==`/`!=` are defined on aggregates.
             (BasicValueEnum::StructValue(l), BasicValueEnum::StructValue(r)) => {
@@ -1140,7 +1145,8 @@ impl<'c> Cg<'c> {
     }
 
     /// Lower `==` / `!=` on two aggregate (struct) operands — the `tag`/`ref` equality case, where
-    /// `Tag` is `{ i32 slot, i64 generation }`. Compares each field and AND-s the results (negated
+    /// `Tag` is `{ i32 slot, i32 _pad, i64 generation }`. Compares each field and AND-s the results
+    /// (the `_pad` lane is always 0 on both sides, so it never affects the result; negated
     /// for `!=`). Non-equality ops, mismatched struct types, or non-scalar fields stay a lowering
     /// error, matching the interpreter, which only defines equality on tags.
     fn lower_agg_eq(
@@ -1898,7 +1904,7 @@ impl<'c> Cg<'c> {
     }
 
     /// `tag.trust() in crib` — unchecked resolve to a `ref` (a raw slot pointer). Extracts the
-    /// slot index (struct field 0 of the `{ i32 slot, i64 generation }` tag) and calls
+    /// slot index (struct field 0 of the `{ i32 slot, i32 _pad, i64 generation }` tag) and calls
     /// `bet_slot_ptr`.
     fn lower_trust(
         &self,
@@ -2118,9 +2124,12 @@ impl<'c> Cg<'c> {
                             };
                             // `soa T[N]` field `j` is the inline `[N x Tj]` array; `soa []T`
                             // field `j` is a fat sub-slice whose data pointer must be loaded.
-                            let (elem, is_slice) = match self.m.ty(*inner) {
-                                TyKind::Array(e, _) => (*e, false),
-                                TyKind::Slice(e) => (*e, true),
+                            // `static_len` carries `N` for the inline case so the index can be
+                            // bounds-checked against it (issue #32); the slice case loads its
+                            // runtime length below.
+                            let (elem, is_slice, static_len) = match self.m.ty(*inner) {
+                                TyKind::Array(e, n) => (*e, false, Some(*n)),
+                                TyKind::Slice(e) => (*e, true, None),
                                 other => {
                                     return Err(BackendError::Lower(format!(
                                         "soa index for {other:?} isn't implemented yet"
@@ -2146,8 +2155,22 @@ impl<'c> Cg<'c> {
                                 })?;
                             let elem_llvm = self.basic_ty(field_ty)?;
                             ptr = if is_slice {
-                                // Sub-slice: load its data pointer (fat field 0), then index.
+                                // Sub-slice: bounds-check against its runtime length (fat field
+                                // 1), mirroring the `Slice` arm, then load its data pointer (fat
+                                // field 0) and index (issue #32).
                                 let fat = self.fat_ptr_ty();
+                                let len_addr = self
+                                    .builder
+                                    .build_struct_gep(fat, field_slot, 1, "soa.sub.len")
+                                    .map_err(|_| {
+                                        BackendError::Lower("soa sub-slice len gep".into())
+                                    })?;
+                                let len = self
+                                    .builder
+                                    .build_load(self.cx.i64_type(), len_addr, "soa.sub.len.val")
+                                    .map_err(lower_err)?
+                                    .into_int_value();
+                                self.bounds_check(idx_v, len, mode)?;
                                 let data_addr = self
                                     .builder
                                     .build_struct_gep(fat, field_slot, 0, "soa.sub.ptr")
@@ -2161,7 +2184,13 @@ impl<'c> Cg<'c> {
                                     .into_pointer_value();
                                 self.gep_index_elem(elem_llvm, data, idx_v)?
                             } else {
-                                // Inline field-array: index straight off it.
+                                // Inline field-array: bounds-check against the static extent `N`
+                                // (issue #32), then index straight off it.
+                                let len = self.cx.i64_type().const_int(
+                                    static_len.expect("inline soa array has a static length"),
+                                    false,
+                                );
+                                self.bounds_check(idx_v, len, mode)?;
                                 self.gep_index_elem(elem_llvm, field_slot, idx_v)?
                             };
                             ty = field_ty;
@@ -2261,15 +2290,16 @@ impl<'c> Cg<'c> {
                 )),
             },
             // `ghosted` in a tag context is the null tag (`rt_abi::Tag::NULL`: slot=u32::MAX,
-            // generation=0), built as the `{ i32 slot, i64 generation }` struct value (issue
+            // _pad=0, generation=0), built as the `{ i32 slot, i32 _pad, i64 generation }` struct value (issues
             // #34). Its slot is out of range for any crib, so it always resolves as ghosted.
             // Other (contextual) uses of `ghosted` are not supported yet.
             Const::Ghosted => {
                 let slot = self.cx.i32_type().const_int(0xFFFF_FFFF, false);
+                let pad = self.cx.i32_type().const_zero();
                 let generation = self.cx.i64_type().const_zero();
                 Ok(self
                     .tag_ty()
-                    .const_named_struct(&[slot.into(), generation.into()])
+                    .const_named_struct(&[slot.into(), pad.into(), generation.into()])
                     .into())
             }
             // A null pointer: the zero-default for handle-shaped struct fields (fn values,

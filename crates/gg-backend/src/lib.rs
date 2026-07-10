@@ -514,11 +514,47 @@ mod imp {
             pub x: f64,
             pub y: f64,
         }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        pub struct CGSize {
+            pub width: f64,
+            pub height: f64,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        pub struct CGRect {
+            pub origin: CGPoint,
+            pub size: CGSize,
+        }
         #[link(name = "CoreGraphics", kind = "framework")]
         unsafe extern "C" {
             pub fn CGWarpMouseCursorPosition(new_cursor_position: CGPoint) -> i32;
             pub fn CGAssociateMouseAndMouseCursorPosition(connected: i32) -> i32;
+            // The bounds (in logical points — the same space minifb sizes windows in) of the
+            // main display, used to size the `GG_FULLSQUARE` max-square window.
+            pub fn CGMainDisplayID() -> u32;
+            pub fn CGDisplayBounds(display: u32) -> CGRect;
         }
+    }
+
+    /// The main display's logical size in points, or `(0, 0)` if it can't be determined. macOS
+    /// uses CoreGraphics (the point-space bounds, so it's Retina-correct); elsewhere it's unknown
+    /// and callers fall back to a frame-relative window size.
+    #[cfg(target_os = "macos")]
+    fn display_size() -> (usize, usize) {
+        // SAFETY: both are pure CoreGraphics queries with no arguments to validate, always linked
+        // on macOS (see the `cg` module's framework link).
+        unsafe {
+            let b = cg::CGDisplayBounds(cg::CGMainDisplayID());
+            (
+                b.size.width.max(0.0) as usize,
+                b.size.height.max(0.0) as usize,
+            )
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    fn display_size() -> (usize, usize) {
+        (0, 0)
     }
 
     /// An uploaded texture: premultiplied `0xAARR_GGBB` pixels, row-major `w * h`.
@@ -1050,7 +1086,21 @@ mod imp {
                     scale_mode: minifb::ScaleMode::Stretch,
                     ..minifb::WindowOptions::default()
                 };
-                minifb::Window::new(&title, cw * 2, ch * 2, opts)
+                // Default: ~2x the logical frame. With `GG_FULLSQUARE` set (the DOOM launcher
+                // exports it) open the largest square that fits the main display instead — a ~6%
+                // margin keeps it clear of the menu bar/dock — so the aspect-fit compositor shows
+                // the frame as large as possible, centered in a square window. Falls back to the
+                // 2x size when the display size is unknown or would be smaller than that.
+                let (open_w, open_h) = if std::env::var_os("GG_FULLSQUARE").is_some() {
+                    let (dw, dh) = display_size();
+                    let side = ((dw.min(dh) as f64 * 0.94) as usize)
+                        .max(cw * 2)
+                        .max(ch * 2);
+                    (side, side)
+                } else {
+                    (cw * 2, ch * 2)
+                };
+                minifb::Window::new(&title, open_w, open_h, opts)
                     .expect("gg: failed to open the minifb window")
             });
             let (win_w, win_h) = window.get_size();
