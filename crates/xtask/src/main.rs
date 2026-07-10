@@ -688,6 +688,13 @@ enum CompiledMode {
     /// `.expected` byte-for-byte AND equals the interpreter's stdout for the same program
     /// (interp == compiled — the differential invariant). A failure here is a hard error.
     Pass,
+    /// Must `bet build` to a native executable that then TRAPS at runtime — a caught safety
+    /// fault (a bounds/overflow guard's `bet_panic`, which `abort()`s: SIGABRT → exit 134).
+    /// Any stdout printed *before* the trap must equal `.expected` byte-for-byte. This is the
+    /// only way to gate a program whose defined behaviour is to fault (e.g. an out-of-bounds
+    /// index), since `pass` requires a clean exit. Pair it with `interp = "unsupported"` — the
+    /// interpreter errors on the same fault, so the interp column asserts the trap too.
+    Trap,
     /// Not compiled or run. The default: codegen for this program is out of scope until the
     /// backend/runtime grow to cover it (then flip it to `pass`).
     #[default]
@@ -908,7 +915,7 @@ fn corpus_compiled(root: &Path, real_runtime: bool, release: bool) -> Result<()>
     for prog in &manifest.program {
         match prog.compiled {
             CompiledMode::Skip => skipped += 1,
-            CompiledMode::Pass => {
+            CompiledMode::Pass | CompiledMode::Trap => {
                 want_pass += 1;
                 match run_compiled_program(
                     &bin,
@@ -916,6 +923,7 @@ fn corpus_compiled(root: &Path, real_runtime: bool, release: bool) -> Result<()>
                     &tmp,
                     &prog.path,
                     prog.interp,
+                    prog.compiled,
                     real_runtime,
                     release,
                 ) {
@@ -954,12 +962,16 @@ fn corpus_compiled(root: &Path, real_runtime: bool, release: bool) -> Result<()>
 /// width-carrying wrapping arithmetic) there is no interpreter output to diff against, so the
 /// compiled gate is `.expected`-only. Otherwise a preformatted `FAIL ...` line for the first
 /// failing stage.
+// A test-runner helper threading the manifest fields + run options straight through; a params
+// struct would only obscure the one call site.
+#[allow(clippy::too_many_arguments)]
 fn run_compiled_program(
     bin: &Path,
     dir: &Path,
     tmp: &Path,
     stem: &str,
     interp_mode: InterpMode,
+    compiled_mode: CompiledMode,
     real_runtime: bool,
     release: bool,
 ) -> Result<(), String> {
@@ -995,19 +1007,43 @@ fn run_compiled_program(
         ));
     }
 
-    // 2. Run the freshly linked native executable.
+    // 2. Run the freshly linked native executable — its exit is gated by `compiled_mode`.
     let run = std::process::Command::new(&exe)
         .output()
         .map_err(|e| format!("  FAIL {stem} — spawning compiled `{}`: {e}", exe.display()))?;
-    if !run.status.success() {
-        return Err(format!(
-            "  FAIL {stem} — compiled program exited non-zero (exit {}): {}",
-            run.status.code().unwrap_or(-1),
-            short(&run.stderr),
-        ));
+    match compiled_mode {
+        CompiledMode::Pass => {
+            if !run.status.success() {
+                return Err(format!(
+                    "  FAIL {stem} — compiled program exited non-zero (exit {}): {}",
+                    run.status.code().unwrap_or(-1),
+                    short(&run.stderr),
+                ));
+            }
+        }
+        CompiledMode::Trap => {
+            // This program's defined behaviour is to fault: a bounds/overflow guard calls
+            // `bet_panic`, which `abort()`s — SIGABRT (signal 6), reported as exit 134. A clean
+            // exit means the guard did NOT fire (e.g. the soa bounds check silently regressed) —
+            // a hard failure, which is the whole point of gating it here.
+            use std::os::unix::process::ExitStatusExt;
+            let trapped = run.status.signal() == Some(6) || run.status.code() == Some(134);
+            if !trapped {
+                return Err(format!(
+                    "  FAIL {stem} — expected a runtime trap (SIGABRT / exit 134) but the \
+                     program exited {}; a safety guard that should have fired did not",
+                    run.status
+                        .code()
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| format!("via signal {:?}", run.status.signal())),
+                ));
+            }
+        }
+        CompiledMode::Skip => unreachable!("skip programs are never run"),
     }
 
-    // 3a. Compiled stdout must equal the golden `.expected` byte-for-byte.
+    // 3a. Any stdout produced (fully for `pass`, up to the fault for `trap`) must equal the
+    // golden `.expected` byte-for-byte.
     if run.stdout != expected {
         return Err(format!(
             "  FAIL {stem} — compiled stdout != .expected\n\
@@ -1017,10 +1053,11 @@ fn run_compiled_program(
         ));
     }
 
-    // 3b. The differential invariant — only meaningful when the interpreter actually runs this
-    // program (`interp = pass`). For `unsupported`/`skip` programs there is no interpreter output
-    // to compare, so the compiled gate above (`.expected`) stands on its own.
-    if matches!(interp_mode, InterpMode::Pass) {
+    // 3b. The differential invariant — only for a cleanly-exiting `pass` program whose
+    // interpreter also runs it (`interp = pass`). A `trap` program faults in both interp and
+    // compiled, so the interp column (`interp = "unsupported"`) asserts the interp trap; there is
+    // no clean stdout to diff here. For `unsupported`/`skip` interp there is no output to compare.
+    if compiled_mode == CompiledMode::Pass && matches!(interp_mode, InterpMode::Pass) {
         let interp = std::process::Command::new(bin)
             .arg("run")
             .arg(&bet)

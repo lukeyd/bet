@@ -2118,9 +2118,12 @@ impl<'c> Cg<'c> {
                             };
                             // `soa T[N]` field `j` is the inline `[N x Tj]` array; `soa []T`
                             // field `j` is a fat sub-slice whose data pointer must be loaded.
-                            let (elem, is_slice) = match self.m.ty(*inner) {
-                                TyKind::Array(e, _) => (*e, false),
-                                TyKind::Slice(e) => (*e, true),
+                            // `static_len` carries `N` for the inline case so the index can be
+                            // bounds-checked against it (issue #32); the slice case loads its
+                            // runtime length below.
+                            let (elem, is_slice, static_len) = match self.m.ty(*inner) {
+                                TyKind::Array(e, n) => (*e, false, Some(*n)),
+                                TyKind::Slice(e) => (*e, true, None),
                                 other => {
                                     return Err(BackendError::Lower(format!(
                                         "soa index for {other:?} isn't implemented yet"
@@ -2146,8 +2149,22 @@ impl<'c> Cg<'c> {
                                 })?;
                             let elem_llvm = self.basic_ty(field_ty)?;
                             ptr = if is_slice {
-                                // Sub-slice: load its data pointer (fat field 0), then index.
+                                // Sub-slice: bounds-check against its runtime length (fat field
+                                // 1), mirroring the `Slice` arm, then load its data pointer (fat
+                                // field 0) and index (issue #32).
                                 let fat = self.fat_ptr_ty();
+                                let len_addr = self
+                                    .builder
+                                    .build_struct_gep(fat, field_slot, 1, "soa.sub.len")
+                                    .map_err(|_| {
+                                        BackendError::Lower("soa sub-slice len gep".into())
+                                    })?;
+                                let len = self
+                                    .builder
+                                    .build_load(self.cx.i64_type(), len_addr, "soa.sub.len.val")
+                                    .map_err(lower_err)?
+                                    .into_int_value();
+                                self.bounds_check(idx_v, len, mode)?;
                                 let data_addr = self
                                     .builder
                                     .build_struct_gep(fat, field_slot, 0, "soa.sub.ptr")
@@ -2161,7 +2178,13 @@ impl<'c> Cg<'c> {
                                     .into_pointer_value();
                                 self.gep_index_elem(elem_llvm, data, idx_v)?
                             } else {
-                                // Inline field-array: index straight off it.
+                                // Inline field-array: bounds-check against the static extent `N`
+                                // (issue #32), then index straight off it.
+                                let len = self.cx.i64_type().const_int(
+                                    static_len.expect("inline soa array has a static length"),
+                                    false,
+                                );
+                                self.bounds_check(idx_v, len, mode)?;
                                 self.gep_index_elem(elem_llvm, field_slot, idx_v)?
                             };
                             ty = field_ty;

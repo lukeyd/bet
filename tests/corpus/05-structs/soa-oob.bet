@@ -1,0 +1,36 @@
+// soa-oob — indexing a `soa` container out of range must TRAP at runtime, exactly like an
+// out-of-bounds array or slice index (issue #32). The backend's `place_ptr` soa arm now emits a
+// bounds check — against the static `[N]` extent for a `soa T[N]`, or the loaded sub-slice
+// length for a `soa []T` — before the per-field GEP, matching the interpreter's OOB panic.
+// Previously the soa arm GEP'd with an unchecked index: `soa[i].field` with out-of-range `i`
+// was a silent out-of-bounds read/write.
+//
+// The two in-bounds prints establish the `.expected` (each `spill.it` flushes immediately, so
+// the output survives the abort); the final read at index 4 of a length-4 soa faults —
+// `bet_panic` → `abort()` → SIGABRT / exit 134. Gated `compiled = "trap"`, `interp =
+// "unsupported"` so both the compiled and interp columns assert the fault.
+pull "spill"
+
+drip Particle {
+    flex x: int
+    flex hp: int
+    flex alive: bool
+}
+
+finna main() {
+    lowkey ps: soa Particle[4] = [
+        Particle{ x: 1, hp: 100, alive: nocap },
+        Particle{ x: 2, hp: 200, alive: cap },
+        Particle{ x: 3, hp: 300, alive: nocap },
+        Particle{ x: 4, hp: 400, alive: cap },
+    ]
+
+    // In-bounds per-field access reads exactly like an array-of-structs.
+    spill.it(ps[0].x)   // 1
+    spill.it(ps[3].hp)  // 400
+
+    // Out-of-bounds: index 4 of a length-4 soa. The bounds check fires `bet_panic` → abort.
+    // A dynamic index keeps the frontend from folding the fault away at compile time.
+    lowkey i = 4
+    spill.it(ps[i].x)   // TRAP — "index out of bounds"; no further output
+}
