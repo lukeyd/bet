@@ -705,6 +705,77 @@ name = "selfhost: teach betfe the soa keyword (fix selfhost.yml drift from #50)"
 size = 2
 status = "doing"
 
+# ─────────────────── Security review batch (cwage issues #30–#48) ───────────────────
+# Full-tree security review (tracking issue #49). Fanned out across 10 worktree-isolated
+# branches partitioned by file ownership, integrated serially onto main by the root. Each
+# slug matches the --task the corresponding agent clocked in with.
+
+[[task]]
+slug = "sec-review"
+name = "Security batch: root coordination — issue triage, fan-out plan, serial integration"
+size = 2
+status = "done"
+
+[[task]]
+slug = "sec-runtime-backend"
+name = "Security #34/#35/#44/#32/#36: rt-abi Tag u64 + runtime alloc/handle hardening + backend bounds/overflow/UB guards + 16-byte Tag ABI (LLVM-verified)"
+size = 13
+status = "done"
+
+[[task]]
+slug = "sec-midir-downcast"
+name = "Security #48: midir::validate rejects sum downcasts not dominated by a discriminant Switch (dominator analysis)"
+size = 5
+status = "done"
+
+[[task]]
+slug = "sec-interp-frontend"
+name = "Security #38/#40: parser/interp/fmt recursion depth guards + interp program-driven allocation caps (DoS)"
+size = 5
+status = "done"
+
+[[task]]
+slug = "sec-loader"
+name = "Security #39: confine module-loader pull imports to the project root (path traversal)"
+size = 3
+status = "done"
+
+[[task]]
+slug = "sec-doom-savegame"
+name = "Security #37: validate DOOM savegame/demo file-supplied counts & indices (OOB writes)"
+size = 3
+status = "done"
+
+[[task]]
+slug = "sec-doom-alloc"
+name = "Security #41: cap DOOM WAD/map loader allocations from untrusted length fields (OOM DoS)"
+size = 3
+status = "done"
+
+[[task]]
+slug = "sec-gg"
+name = "Security #43: clamp gg-backend present() per-row read to stride (OOB read)"
+size = 1
+status = "done"
+
+[[task]]
+slug = "sec-docker"
+name = "Security #33/#45: harden Docker build/verify supply chain (checksums, key fingerprint, drop world-writable toolchain)"
+size = 2
+status = "done"
+
+[[task]]
+slug = "sec-ci"
+name = "Security #30/#46: drop Intel macOS runner, SHA-pin third-party actions, least-privilege GITHUB_TOKEN"
+size = 2
+status = "done"
+
+[[task]]
+slug = "sec-timelog"
+name = "Security #47: sanitize path-injected values (--task slug, hook session_id) in timelog scripts"
+size = 1
+status = "done"
+
 [[task]]
 slug = "www-lang-reference"
 name = "Docs: implemented-only language reference (keywords/types/memory/intrinsics) for betlang-www"
