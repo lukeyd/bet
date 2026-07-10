@@ -47,6 +47,7 @@ pull "vec"
 pull "str"
 pull "../defs/gs" as gs
 pull "../defs/think" as think
+pull "../defs/info" as info
 pull "../util/bstream" as bstream
 pull "../p/p_setup" as psetup
 pull "../p/p_think" as pthink
@@ -508,6 +509,11 @@ flex finna unArchiveWorld(gt: tag gs.GameState, buf: []u8, cur0: int) -> int {
     holla g = gt in gs.gsc {
         lowkey nsec: int = bstream.rdI32(buf, cur) as int
         cur = cur + 4
+        // id loops on the engine's own numsectors; a file count that disagrees means the save
+        // was tampered with (or is for another level) — loop indices must stay inside the slabs.
+        fr nsec != g.level.numsectors as int {
+            yeet("P_UnArchiveWorld: sector count doesn't match the level, this save is sus")
+        }
         lowkey i: int = 0
         vibin i < nsec {
             g.level.secFloorH[i] = (bstream.rdI16(buf, cur) << 16) as i32
@@ -531,6 +537,9 @@ flex finna unArchiveWorld(gt: tag gs.GameState, buf: []u8, cur0: int) -> int {
         }
         lowkey nlines: int = bstream.rdI32(buf, cur) as int
         cur = cur + 4
+        fr nlines != g.level.numlines as int {
+            yeet("P_UnArchiveWorld: line count doesn't match the level, this save is sus")
+        }
         i = 0
         vibin i < nlines {
             g.level.lineFlags[i] = bstream.rdI16(buf, cur) as i32
@@ -664,8 +673,12 @@ flex finna archiveThinkers(gt: tag gs.GameState, b: vec[int]) {
 flex finna readMobj(gt: tag gs.GameState, buf: []u8, cur0: int, tIdx: vec[int], trIdx: vec[int]) -> int {
     lowkey base: int = cur0
     lowkey mo: tag think.Thinker = cop think.Thinker{ funcId: think.FUNC_MOBJ as i32 } in gs.thinkers
+    lowkey typeIdx: int = 0
+    lowkey spriteIdx: int = 0
+    lowkey stateIdx: int = 0
     holla t = mo in gs.thinkers {
         t.mobj.typeIdx = bstream.rdI32(buf, base + 0 * 4) as i32
+        typeIdx = t.mobj.typeIdx as int
         t.mobj.x = bstream.rdI32(buf, base + 1 * 4) as i32
         t.mobj.y = bstream.rdI32(buf, base + 2 * 4) as i32
         t.mobj.z = bstream.rdI32(buf, base + 3 * 4) as i32
@@ -678,8 +691,10 @@ flex finna readMobj(gt: tag gs.GameState, buf: []u8, cur0: int, tIdx: vec[int], 
         t.mobj.height = bstream.rdI32(buf, base + 10 * 4) as i32
         t.mobj.angle = bstream.rdU32(buf, base + 11 * 4) as u32
         t.mobj.spriteIdx = bstream.rdI32(buf, base + 12 * 4) as i32
+        spriteIdx = t.mobj.spriteIdx as int
         t.mobj.frame = bstream.rdI32(buf, base + 13 * 4) as i32
         t.mobj.stateIdx = bstream.rdI32(buf, base + 14 * 4) as i32
+        stateIdx = t.mobj.stateIdx as int
         t.mobj.tics = bstream.rdI32(buf, base + 15 * 4) as i32
         t.mobj.flags = bstream.rdI32(buf, base + 16 * 4) as i32
         t.mobj.health = bstream.rdI32(buf, base + 17 * 4) as i32
@@ -700,6 +715,17 @@ flex finna readMobj(gt: tag gs.GameState, buf: []u8, cur0: int, tIdx: vec[int], 
         t.mobj.tracer = ghosted
     } ghosted {
         yeet("mo")
+    }
+    // file-supplied indices become table lookups (mobjinfo/sprites/states) downstream — reject any
+    // that can't index their table before a crafted save turns them into an out-of-bounds read.
+    fr typeIdx < 0 || typeIdx >= info.NUMMOBJTYPES {
+        yeet("P_UnArchiveThinkers: mobj type out of range, this save is sus")
+    }
+    fr spriteIdx < 0 || spriteIdx >= info.NUMSPRITES {
+        yeet("P_UnArchiveThinkers: sprite index out of range, this save is sus")
+    }
+    fr stateIdx < 0 || stateIdx >= info.NUMSTATES {
+        yeet("P_UnArchiveThinkers: state index out of range, this save is sus")
     }
     tIdx.stack(bstream.rdI32(buf, base + 30 * 4) as int)
     trIdx.stack(bstream.rdI32(buf, base + 31 * 4) as int)
@@ -874,6 +900,17 @@ flex finna readSpecial(gt: tag gs.GameState, buf: []u8, cur0: int, funcId: int) 
     } ghosted {
         yeet("sp")
     }
+    // secnum is a file-supplied sector index that setSectorSpecialData writes into secLinks[secnum]
+    // — reject anything outside the live sector table before it can scribble out of bounds.
+    lowkey nsec: int = 0
+    holla g = gt in gs.gsc {
+        nsec = g.level.numsectors as int
+    } ghosted {
+        yeet("gs")
+    }
+    fr secnum < 0 || secnum >= nsec {
+        yeet("P_UnArchiveSpecials: sector number out of range, this save is sus")
+    }
     pthink.addThinker(gt, sp)
     // id: door/ceiling/floor/plat re-point sector->specialdata; lights do not.
     fr funcId == think.FUNC_DOOR || funcId == think.FUNC_CEILING || funcId == think.FUNC_FLOOR || funcId == think.FUNC_PLAT {
@@ -1004,6 +1041,11 @@ flex finna saveGame(gt: tag gs.GameState, path: str, description: str) -> bool {
 
 flex finna loadGame(gt: tag gs.GameState, path: str) -> bool {
     lowkey buf: []u8 = fs.peep(path)
+    lowkey blen: int = str.len(str.fromBytesTrust(buf))
+    // too small to even hold the 8-byte magic+version header — not a save we can read.
+    fr blen < 8 {
+        bet cap
+    }
     lowkey cur: int = 0
     // header magic + version
     lowkey m0: int = bstream.rdU8(buf, 0) as int
@@ -1018,8 +1060,18 @@ flex finna loadGame(gt: tag gs.GameState, path: str) -> bool {
         bet cap
     }
     cur = 8
+    // descLen is a signed i16 straight from the file: a negative value would rewind the cursor and
+    // an oversized one would skip past the buffer — both let the reads below walk out of bounds.
     lowkey descLen: int = bstream.rdI16(buf, cur) as int
+    fr descLen < 0 || cur + 2 + descLen > blen {
+        yeet("P_LoadGame: description length is cooked, this save is sus")
+    }
     cur = cur + 2 + descLen
+    // the fixed header past the description is 8 i32 fields + 4 playeringame bytes (36 bytes); bail
+    // if the file is truncated so the sequential reads below can't run off the end of the buffer.
+    fr cur + 36 > blen {
+        yeet("P_LoadGame: save file is truncated, this save is sus")
+    }
     lowkey episode: int = bstream.rdI32(buf, cur) as int
     cur = cur + 4
     lowkey map: int = bstream.rdI32(buf, cur) as int
