@@ -268,7 +268,7 @@ evict frameCrib                     // O(1) mass free
 lowkey e: tag Enemy = cop Enemy{ hp: 50 } in enemies
 ```
 
-A `tag T` is **8 bytes: slot index + generation counter.** It is plain, copyable data — storable in any struct, passable anywhere, held for any duration. No lifetimes, no borrow checking, no GC tracing. Cross-references and cycles are trivially fine because a tag is just numbers.
+A `tag T` is **16 bytes: a `u32` slot index, a 4-byte always-zero pad lane, and a `u64` generation counter** (the pad lane makes the `u32`/`u64` alignment gap an explicit defined field rather than undefined padding — issue #72). It is plain, copyable data — storable in any struct, passable anywhere, held for any duration. No lifetimes, no borrow checking, no GC tracing. Cross-references and cycles are trivially fine because a tag is just numbers.
 
 Generation counters exist because slots are reused: when Enemy #7 (gen 3) dies and a new enemy spawns into slot 7 (gen 4), stale tags still say gen 3 and are safely detected as dead — preventing the "attack an innocent bystander" class of bug.
 

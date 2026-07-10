@@ -491,10 +491,8 @@ pub unsafe extern "C" fn bet_cop(handle: CribHandle) -> Tag {
         Some(slot) => {
             let m = &mut t.slots[slot as usize];
             m.occupied = true;
-            Tag {
-                slot,
-                generation: m.generation,
-            }
+            // `Tag::new` keeps the `_pad` lane defined (0) — issue #72.
+            Tag::new(slot, m.generation)
         }
         None => Tag::NULL,
     }

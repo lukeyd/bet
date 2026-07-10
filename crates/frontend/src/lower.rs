@@ -1952,7 +1952,31 @@ impl LowerCtx {
                 Some(t) if self.is_yikes(t) => {
                     Ok(self.build_yikes(false, Operand::Const(Const::Str(String::new()))))
                 }
-                Some(t) => Ok((Operand::Const(Const::Ghosted), t)),
+                // `ghosted` is the null/dead value of a tag or handle-shaped type, and it MUST
+                // lower to a value matching the target's storage (issue #72): a `tag` is the
+                // 16-byte null-tag STRUCT (`Const::Ghosted`), but a fn value / `vec`/`stash`/`rng`
+                // handle / raw pointer / crib is a null POINTER (`Const::NullPtr`). Emitting the
+                // tag struct into a pointer-shaped local stored 16 bytes into an 8-byte slot and
+                // clobbered the adjacent local once a `tag` grew to 16 bytes (#34) — the DOOM
+                // native regression. This mirrors `zero_value`.
+                Some(t) => {
+                    let val = match self.m.ty(t) {
+                        TyKind::Tag(_) => Const::Ghosted,
+                        TyKind::FnPtr(_)
+                        | TyKind::Map(_, _)
+                        | TyKind::Vec(_)
+                        | TyKind::Rng
+                        | TyKind::RawPtr
+                        | TyKind::Crib(_) => Const::NullPtr,
+                        other => {
+                            return Err(format!(
+                                "`ghosted` is only valid for a tag or handle-shaped type, not \
+                                 {other:?}"
+                            ));
+                        }
+                    };
+                    Ok((Operand::Const(val), t))
+                }
                 None => Err("`ghosted` needs a known type context to lower".into()),
             },
             ExprKind::Name { name, generics } => {
