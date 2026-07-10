@@ -1,0 +1,21 @@
+// shift_mask.mir — `shl`/`shr` mask the shift amount to `[0, bit_width)` (`amt & (bits - 1)`)
+// before shifting (security issue #36), matching the interpreter's `wrapping_shl`/`wrapping_shr`
+// and dodging LLVM's shift-past-width UB. Signed `shr` is arithmetic, unsigned `shr` is logical;
+// both still mask. A dynamic (non-constant) shift amount is the case the mask actually protects.
+// Compile-only. (Security #36.)
+
+fn shifts(%0: i64, %1: i64) -> i64 {
+  let %2: i64
+  let %3: i64
+  bb0:
+    %2 = shl.na(%0, %1)
+    %3 = shr.na(%2, %1)
+    return %3
+}
+
+fn ushift(%0: u32, %1: u32) -> u32 {
+  let %2: u32
+  bb0:
+    %2 = shr.na(%0, %1)
+    return %2
+}

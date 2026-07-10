@@ -129,7 +129,11 @@ struct TypedCrib {
 #[derive(Clone, Copy)]
 struct SlotMeta {
     occupied: bool,
-    generation: u32,
+    /// A `u64` generation counter (issue #34), mirroring `runtime`'s `SlotMeta` and
+    /// `rt_abi::Tag::generation` so the stub stays a byte-for-byte drop-in twin. The wrapping
+    /// bumps in `bet_evict` / `bet_evict_slot` make a stale tag's generation unable to alias a
+    /// reused slot's (ABA use-after-free defense).
+    generation: u64,
 }
 
 struct BumpCrib {

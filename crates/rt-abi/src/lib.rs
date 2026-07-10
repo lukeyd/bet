@@ -23,14 +23,23 @@ use core::ffi::c_void;
 // Shared ABI types.
 // ---------------------------------------------------------------------------
 
-/// A generational handle into a typed crib: an 8-byte `(slot, generation)` pair (spec §7.3).
+/// A generational handle into a typed crib: a 16-byte `(slot, generation)` pair (spec §7.3).
 /// Plain, copyable data — storable anywhere, valid for any duration; validity is checked at
 /// access time via [`bet_holla_check`].
+///
+/// The `generation` counter is a **`u64`** (issue #34): a 32-bit counter can wrap in a
+/// long-running program that recycles one slot ~4 billion times, at which point a stale tag's
+/// generation could coincide with the live slot's again and a ghosted handle would silently
+/// resolve as live — an ABA use-after-free. A 64-bit horizon makes that wrap unreachable in
+/// any realistic execution. Widening it grows `Tag` from 8 to 16 bytes (`#[repr(C)]`: `slot`
+/// at offset 0, `generation` at offset 8; size 16, align 8), so the runtime and the LLVM
+/// backend both carry a `tag T` as the two-field struct `{ i32 slot, i64 generation }` passed
+/// by value across the ABI — no longer coerced to a single `i64` register.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Tag {
     pub slot: u32,
-    pub generation: u32,
+    pub generation: u64,
 }
 
 impl Tag {
@@ -509,10 +518,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tag_is_eight_bytes() {
-        // The 8-byte layout is load-bearing (spec §7.3) and shared with `midir`'s tag type.
-        assert_eq!(core::mem::size_of::<Tag>(), 8);
-        assert_eq!(core::mem::align_of::<Tag>(), 4);
+    fn tag_is_sixteen_bytes() {
+        // The 16-byte layout (u64 generation, issue #34) is load-bearing (spec §7.3) and is
+        // the exact `{ i32 slot, i64 generation }` the LLVM backend lowers `tag T` to.
+        assert_eq!(core::mem::size_of::<Tag>(), 16);
+        assert_eq!(core::mem::align_of::<Tag>(), 8);
     }
 
     #[test]

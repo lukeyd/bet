@@ -14,8 +14,9 @@
 //! * **The `tag`/`holla`/crib memory model**: [`Rvalue::Cop`] (typed struct alloc),
 //!   [`Rvalue::Trust`], [`Stmt::Evict`], and the [`Terminator::HollaCheck`] generational
 //!   access — each lowered to its `rt-abi` entry point (`bet_cop`, `bet_holla_check`,
-//!   `bet_slot_ptr`, `bet_evict`). A `tag T` is an 8-byte handle carried as `i64` (matching
-//!   the C-ABI coercion of `rt_abi::Tag`); a `crib T`/`ref T`/`fn(..)` is a raw pointer.
+//!   `bet_slot_ptr`, `bet_evict`). A `tag T` is a 16-byte generational handle carried by value
+//!   as the struct `{ i32 slot, i64 generation }` (matching `rt_abi::Tag` after the issue-#34
+//!   `u64`-generation widening); a `crib T`/`ref T`/`fn(..)` is a raw pointer.
 //! * **Control flow**: `switch`, `panic` (→ `bet_panic` + `unreachable`), and `unreachable`.
 //! * **Function values**: `@f` [`Const::FnRef`] and [`Callee::Indirect`] indirect calls.
 //! * **Aggregates & sums**: [`Rvalue::Aggregate`] (`drip` structs, tuples, and by-value
@@ -53,7 +54,7 @@ use inkwell::types::{
 };
 use inkwell::values::{
     ArrayValue, BasicMetadataValueEnum, BasicValueEnum, FunctionValue, GlobalValue, IntValue,
-    PointerValue, VectorValue,
+    PointerValue, StructValue, VectorValue,
 };
 use inkwell::{AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel};
 
@@ -107,6 +108,19 @@ fn const_array<'c>(elem_ty: BasicTypeEnum<'c>, vals: &[BasicValueEnum<'c>]) -> A
             t.const_array(&e)
         }
     }
+}
+
+/// Whether a place's computed address will be dereferenced or merely taken — it decides how the
+/// array/slice bounds check (issue #32) treats the one-past-the-end index.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IndexMode {
+    /// The address is loaded from / stored through, so an index must be strictly in bounds
+    /// (`idx < len`) — the interpreter's "index out of bounds" rule.
+    Access,
+    /// Only the address is taken (`AddrOf`); the one-past-the-end slot (`idx == len`) is a legal
+    /// address — the base of an empty tail sub-slice like `str.sub(s, len, len)` — so only a
+    /// truly past-the-end index (`idx > len`) panics.
+    Addr,
 }
 
 pub fn compile(module: &Module, opts: &EmitOptions) -> Result<Vec<u8>, BackendError> {
@@ -195,6 +209,19 @@ impl<'c> Cg<'c> {
             .struct_type(&[self.ptr_ty().into(), self.cx.i64_type().into()], false)
     }
 
+    /// The LLVM struct `{ i32 slot, i64 generation }` a `tag T` is carried and passed by value
+    /// as — the exact 16-byte layout of `rt_abi::Tag` after the issue-#34 `u64`-generation
+    /// widening (slot at offset 0, generation at offset 8, size 16, align 8). Every entry point
+    /// that takes or returns a `Tag` (`bet_cop`, `bet_holla_check`, `bet_evict_slot`) uses this
+    /// type, and it MUST be identical at all those call sites (`get_or_add` keeps the first
+    /// declaration, so a divergent signature would silently mis-type the ABI).
+    fn tag_ty(&self) -> StructType<'c> {
+        self.cx.struct_type(
+            &[self.cx.i32_type().into(), self.cx.i64_type().into()],
+            false,
+        )
+    }
+
     fn basic_ty(&self, ty: TyId) -> Result<BasicTypeEnum<'c>, BackendError> {
         Ok(match self.m.ty(ty) {
             TyKind::Bool => self.cx.bool_type().into(),
@@ -202,10 +229,9 @@ impl<'c> Cg<'c> {
             TyKind::F32 => self.cx.f32_type().into(),
             TyKind::F64 => self.cx.f64_type().into(),
             TyKind::RawPtr => self.ptr_ty().into(),
-            // A `tag T` is an 8-byte `(slot, generation)` handle. It is passed by value across
-            // the `rt-abi` boundary, where the C ABI coerces the two-`u32` `rt_abi::Tag` to a
-            // single 64-bit integer register on our targets — so we carry it as `i64`.
-            TyKind::Tag(_) => self.cx.i64_type().into(),
+            // A `tag T` is the 16-byte `{ i32 slot, i64 generation }` handle (issue #34),
+            // passed by value across the `rt-abi` boundary as that struct.
+            TyKind::Tag(_) => self.tag_ty().into(),
             // Crib handles, live refs, and function values are all raw pointers.
             TyKind::Crib(_)
             | TyKind::Ref(_)
@@ -314,15 +340,15 @@ impl<'c> Cg<'c> {
             | TyKind::F32
             | TyKind::F64
             | TyKind::RawPtr
-            | TyKind::Tag(_)
             | TyKind::Crib(_)
             | TyKind::Ref(_)
             | TyKind::FnPtr(_)
             | TyKind::Map(_, _)
             | TyKind::Vec(_)
             | TyKind::Rng => 1,
-            // `str` and slices are fat `(ptr, len)` values (two words).
-            TyKind::Str | TyKind::Slice(_) => 2,
+            // A `tag T` is the 16-byte `{ i32, i64 }` handle (issue #34), and `str`/slices are
+            // fat `(ptr, len)` values — two words each.
+            TyKind::Tag(_) | TyKind::Str | TyKind::Slice(_) => 2,
             TyKind::Array(elem, n) => self.ty_words(*elem).saturating_mul(*n as u32),
             // A `soa` container occupies the same total storage as its AoS inner (only the
             // field order within is transposed), so its word count is the inner's.
@@ -530,8 +556,9 @@ impl<'c> Cg<'c> {
                         (None, Some(_)) => Ok(()),
                     };
                 }
-                // Projected lvalue: compute its address and store through it.
-                let (ptr, _ty) = self.place_ptr(func, locals, place)?;
+                // Projected lvalue: compute its address and store through it (a write ⇒ the
+                // index must be strictly in bounds).
+                let (ptr, _ty) = self.place_ptr(func, locals, place, IndexMode::Access)?;
                 match val {
                     Some(v) => {
                         self.builder.build_store(ptr, v).map_err(lower_err)?;
@@ -553,17 +580,16 @@ impl<'c> Cg<'c> {
                     .map_err(lower_err)?;
                 Ok(())
             }
-            // `evict tag in crib` — free one slot. The tag rides as `i64` exactly as in
-            // `bet_holla_check` (the C ABI coerces the two-`u32` `rt_abi::Tag` to one
-            // 64-bit register on our targets).
+            // `evict tag in crib` — free one slot. The tag rides by value as the
+            // `{ i32, i64 }` struct (issue #34), exactly as in `bet_holla_check`.
             Stmt::EvictSlot { crib, tag } => {
                 let crib_v = self.lower_operand(func, locals, crib)?.into_pointer_value();
-                let tag_v = self.lower_operand(func, locals, tag)?.into_int_value();
+                let tag_v = self.lower_operand(func, locals, tag)?;
                 let evict_slot = self.get_or_add(
                     "bet_evict_slot",
                     self.cx
                         .void_type()
-                        .fn_type(&[self.ptr_ty().into(), self.cx.i64_type().into()], false),
+                        .fn_type(&[self.ptr_ty().into(), self.tag_ty().into()], false),
                 );
                 self.builder
                     .build_call(evict_slot, &[crib_v.into(), tag_v.into()], "")
@@ -582,7 +608,9 @@ impl<'c> Cg<'c> {
     ) -> Result<Option<BasicValueEnum<'c>>, BackendError> {
         match rv {
             Rvalue::Use(op) => Ok(Some(self.lower_operand(func, locals, op)?)),
-            Rvalue::BinOp(op, a, b, _mode) => Ok(Some(self.lower_binop(func, locals, *op, a, b)?)),
+            Rvalue::BinOp(op, a, b, mode) => {
+                Ok(Some(self.lower_binop(func, locals, *op, a, b, *mode)?))
+            }
             Rvalue::UnOp(op, a) => Ok(Some(self.lower_unop(func, locals, *op, a)?)),
             Rvalue::Cast(op, ty, kind) => Ok(Some(self.lower_cast(func, locals, op, *ty, *kind)?)),
             Rvalue::StrPtr(op) => Ok(Some(self.str_projection(func, locals, op, 0)?)),
@@ -591,7 +619,9 @@ impl<'c> Cg<'c> {
             Rvalue::SlicePtr(op) => Ok(Some(self.str_projection(func, locals, op, 0)?)),
             Rvalue::SliceLen(op) => Ok(Some(self.str_projection(func, locals, op, 1)?)),
             Rvalue::AddrOf(place) => {
-                let (ptr, _ty) = self.place_ptr(func, locals, place)?;
+                // Taking an address only — the one-past-the-end slot is a legal base (e.g. the
+                // empty tail sub-slice `str.sub(s, len, len)`), so bounds-check inclusively.
+                let (ptr, _ty) = self.place_ptr(func, locals, place, IndexMode::Addr)?;
                 Ok(Some(ptr.into()))
             }
             Rvalue::MakeSlice { data, len, .. } => {
@@ -1077,13 +1107,14 @@ impl<'c> Cg<'c> {
         op: BinOp,
         a: &Operand,
         b: &Operand,
+        mode: ArithMode,
     ) -> Result<BasicValueEnum<'c>, BackendError> {
         let lv = self.lower_operand(func, locals, a)?;
         let rv = self.lower_operand(func, locals, b)?;
         match (lv, rv) {
             (BasicValueEnum::IntValue(l), BasicValueEnum::IntValue(r)) => {
                 let signed = self.int_signed(func, a, b);
-                self.lower_int_binop(op, l, r, signed)
+                self.lower_int_binop(op, l, r, signed, mode)
             }
             (BasicValueEnum::FloatValue(l), BasicValueEnum::FloatValue(r)) => {
                 self.lower_float_binop(op, l, r)
@@ -1095,10 +1126,74 @@ impl<'c> Cg<'c> {
                 let signed = self.simd_signed(func, a, b);
                 self.lower_vec_binop(op, l, r, signed)
             }
+            // Aggregate operands reach here for `tag`/`ref` equality: `Tag` lowers to the struct
+            // `{ i32 slot, i64 generation }`, so `tag == ghosted` / `t1 != t2` is a field-wise compare
+            // (before the generation counter widened to u64, a Tag was a scalar `i64` and this went
+            // through the Int arm). Only `==`/`!=` are defined on aggregates.
+            (BasicValueEnum::StructValue(l), BasicValueEnum::StructValue(r)) => {
+                self.lower_agg_eq(op, l, r)
+            }
             _ => Err(BackendError::Lower(
                 "binary op on non-scalar or mismatched operands".into(),
             )),
         }
+    }
+
+    /// Lower `==` / `!=` on two aggregate (struct) operands — the `tag`/`ref` equality case, where
+    /// `Tag` is `{ i32 slot, i64 generation }`. Compares each field and AND-s the results (negated
+    /// for `!=`). Non-equality ops, mismatched struct types, or non-scalar fields stay a lowering
+    /// error, matching the interpreter, which only defines equality on tags.
+    fn lower_agg_eq(
+        &self,
+        op: BinOp,
+        l: StructValue<'c>,
+        r: StructValue<'c>,
+    ) -> Result<BasicValueEnum<'c>, BackendError> {
+        let want_eq = match op {
+            BinOp::Eq => true,
+            BinOp::Ne => false,
+            _ => {
+                return Err(BackendError::Lower(
+                    "only == / != are defined on aggregate (tag) operands".into(),
+                ));
+            }
+        };
+        if l.get_type() != r.get_type() {
+            return Err(BackendError::Lower(
+                "equality on mismatched aggregate operands".into(),
+            ));
+        }
+        let b = &self.builder;
+        let mut all_eq: Option<IntValue<'c>> = None;
+        for i in 0..l.get_type().count_fields() {
+            let lf = b.build_extract_value(l, i, "lf").map_err(lower_err)?;
+            let rf = b.build_extract_value(r, i, "rf").map_err(lower_err)?;
+            let feq = match (lf, rf) {
+                (BasicValueEnum::IntValue(x), BasicValueEnum::IntValue(y)) => b
+                    .build_int_compare(IntPredicate::EQ, x, y, "feq")
+                    .map_err(lower_err)?,
+                (BasicValueEnum::FloatValue(x), BasicValueEnum::FloatValue(y)) => b
+                    .build_float_compare(FloatPredicate::OEQ, x, y, "feq")
+                    .map_err(lower_err)?,
+                _ => {
+                    return Err(BackendError::Lower(
+                        "equality on an aggregate with a non-scalar field".into(),
+                    ));
+                }
+            };
+            all_eq = Some(match all_eq {
+                None => feq,
+                Some(prev) => b.build_and(prev, feq, "aeq").map_err(lower_err)?,
+            });
+        }
+        // A field-less struct compares equal; every real Tag has fields.
+        let all_eq = all_eq.unwrap_or_else(|| self.cx.bool_type().const_int(1, false));
+        let result = if want_eq {
+            all_eq
+        } else {
+            b.build_not(all_eq, "ane").map_err(lower_err)?
+        };
+        Ok(result.into())
     }
 
     /// Element-wise arithmetic/shift on two same-type SIMD vectors. Comparisons and float
@@ -1175,43 +1270,246 @@ impl<'c> Cg<'c> {
         false
     }
 
+    // --- runtime safety guards (issues #32, #36) ---
+
+    /// Emit a runtime guard: if `cond` (an `i1`) is set, branch to a fresh block that calls
+    /// `bet_panic(msg)` and is `unreachable`; otherwise fall through into a fresh continuation
+    /// block. Splits the current basic block and leaves the builder positioned at the
+    /// continuation, so lowering resumes on the safe path. Modeled on the `Terminator::Panic`
+    /// arm and the `HollaCheck` branch pattern — the shared primitive behind the div-by-zero,
+    /// overflow-trap, and bounds-check guards.
+    fn guard_panic(&self, cond: IntValue<'c>, msg: &str) -> Result<(), BackendError> {
+        let cur_fn = self
+            .builder
+            .get_insert_block()
+            .and_then(|bb| bb.get_parent())
+            .ok_or_else(|| BackendError::Lower("panic guard outside a function".into()))?;
+        let panic_bb = self.cx.append_basic_block(cur_fn, "panic");
+        let cont_bb = self.cx.append_basic_block(cur_fn, "cont");
+        self.builder
+            .build_conditional_branch(cond, panic_bb, cont_bb)
+            .map_err(lower_err)?;
+        // Panic edge: `bet_panic(msg, len)` then `unreachable` (same shape as Terminator::Panic).
+        self.builder.position_at_end(panic_bb);
+        let g = self
+            .builder
+            .build_global_string_ptr(msg, "panicmsg")
+            .map_err(lower_err)?;
+        let len = self.cx.i64_type().const_int(msg.len() as u64, false);
+        let panic = self.get_or_add(
+            "bet_panic",
+            self.cx
+                .void_type()
+                .fn_type(&[self.ptr_ty().into(), self.cx.i64_type().into()], false),
+        );
+        self.builder
+            .build_call(panic, &[g.as_pointer_value().into(), len.into()], "")
+            .map_err(lower_err)?;
+        self.builder.build_unreachable().map_err(lower_err)?;
+        // Safe edge: resume lowering here.
+        self.builder.position_at_end(cont_bb);
+        Ok(())
+    }
+
+    /// Zero-extend an integer to `i64` (a no-op if it already is), so a bounds compare can be
+    /// done in one width regardless of the index/length types.
+    fn zext_to_i64(&self, v: IntValue<'c>) -> Result<IntValue<'c>, BackendError> {
+        if v.get_type().get_bit_width() < 64 {
+            self.builder
+                .build_int_z_extend(v, self.cx.i64_type(), "zext64")
+                .map_err(lower_err)
+        } else {
+            Ok(v)
+        }
+    }
+
+    /// Bounds-check an array/slice index before the element GEP, matching the interpreter's
+    /// "index out of bounds" panic (issue #32). An [`IndexMode::Access`] must be strictly in
+    /// bounds (`idx >= len` panics); an [`IndexMode::Addr`] (a bare `AddrOf`) may name the
+    /// one-past-the-end slot, so only `idx > len` panics. Both operands widen to `i64` so a
+    /// narrow index and an `i64` slice length compare in one type.
+    fn bounds_check(
+        &self,
+        idx: IntValue<'c>,
+        len: IntValue<'c>,
+        mode: IndexMode,
+    ) -> Result<(), BackendError> {
+        let idx = self.zext_to_i64(idx)?;
+        let len = self.zext_to_i64(len)?;
+        let pred = match mode {
+            IndexMode::Access => IntPredicate::UGE,
+            IndexMode::Addr => IntPredicate::UGT,
+        };
+        let oob = self
+            .builder
+            .build_int_compare(pred, idx, len, "oob")
+            .map_err(lower_err)?;
+        self.guard_panic(oob, "index out of bounds")
+    }
+
+    /// Mask a shift amount to `[0, bit_width)` (`amt & (bit_width - 1)`) before a shift, matching
+    /// the interpreter's `wrapping_shl`/`wrapping_shr` and dodging LLVM's shift-past-width UB. Our
+    /// integer widths are powers of two, so `bit_width - 1` is the exact mask.
+    fn mask_shift_amount(
+        &self,
+        shifted: IntValue<'c>,
+        amt: IntValue<'c>,
+    ) -> Result<IntValue<'c>, BackendError> {
+        let bits = shifted.get_type().get_bit_width();
+        let mask = amt.get_type().const_int((bits - 1) as u64, false);
+        self.builder
+            .build_and(amt, mask, "shmask")
+            .map_err(lower_err)
+    }
+
+    /// Emit an overflow-checked `add`/`sub`/`mul` via `llvm.{s,u}{add,sub,mul}.with.overflow`
+    /// (`name`), panicking on the overflow bit (`Trap` arith mode). The intrinsic returns
+    /// `{ iN result, i1 overflow }`; panic on the bit, yield the result.
+    fn checked_arith(
+        &self,
+        name: &str,
+        l: IntValue<'c>,
+        r: IntValue<'c>,
+    ) -> Result<BasicValueEnum<'c>, BackendError> {
+        let intr = inkwell::intrinsics::Intrinsic::find(name)
+            .ok_or_else(|| BackendError::Lower(format!("{name} intrinsic not found")))?;
+        let ity: BasicTypeEnum = l.get_type().into();
+        let decl = intr
+            .get_declaration(&self.llm, &[ity])
+            .ok_or_else(|| BackendError::Lower(format!("could not declare {name}")))?;
+        let agg = self
+            .builder
+            .build_call(decl, &[l.into(), r.into()], "ovf")
+            .map_err(lower_err)?
+            .try_as_basic_value()
+            .left()
+            .ok_or_else(|| BackendError::Lower(format!("{name} returned no value")))?
+            .into_struct_value();
+        let res = self
+            .builder
+            .build_extract_value(agg, 0, "ovf.res")
+            .map_err(lower_err)?;
+        let bit = self
+            .builder
+            .build_extract_value(agg, 1, "ovf.bit")
+            .map_err(lower_err)?
+            .into_int_value();
+        self.guard_panic(bit, "arithmetic overflow")?;
+        Ok(res)
+    }
+
+    /// Guard an integer `div`/`rem`: panic on a zero divisor, and (for signed division) on the
+    /// `INT_MIN / -1` overflow — both a hardware trap / LLVM UB — mapping each to the
+    /// interpreter's panic.
+    fn guard_div(
+        &self,
+        l: IntValue<'c>,
+        r: IntValue<'c>,
+        signed: bool,
+    ) -> Result<(), BackendError> {
+        let zero = r.get_type().const_zero();
+        let is_zero = self
+            .builder
+            .build_int_compare(IntPredicate::EQ, r, zero, "divzero")
+            .map_err(lower_err)?;
+        self.guard_panic(is_zero, "divide by zero")?;
+        if signed {
+            let bits = l.get_type().get_bit_width();
+            let int_min = l.get_type().const_int(1u64 << (bits - 1), false);
+            let neg_one = r.get_type().const_all_ones();
+            let l_min = self
+                .builder
+                .build_int_compare(IntPredicate::EQ, l, int_min, "lmin")
+                .map_err(lower_err)?;
+            let r_neg1 = self
+                .builder
+                .build_int_compare(IntPredicate::EQ, r, neg_one, "rneg1")
+                .map_err(lower_err)?;
+            let both = self
+                .builder
+                .build_and(l_min, r_neg1, "divovf")
+                .map_err(lower_err)?;
+            self.guard_panic(both, "divide overflow")?;
+        }
+        Ok(())
+    }
+
     fn lower_int_binop(
         &self,
         op: BinOp,
         l: IntValue<'c>,
         r: IntValue<'c>,
         signed: bool,
+        mode: ArithMode,
     ) -> Result<BasicValueEnum<'c>, BackendError> {
         let b = &self.builder;
-        // Overflow mode is currently ignored: both `wrap` and `trap` lower to plain wrapping
-        // arithmetic (release semantics). Trap-on-overflow instrumentation lands later.
+        // `Trap` arith mode (signed arithmetic) traps on overflow via the checked intrinsics;
+        // `Wrap`/`Na` stay plain wrapping arithmetic. Div/rem always guard the zero-divisor
+        // (and signed `INT_MIN / -1`) UB, and shifts always mask the amount — the safety guards
+        // are unconditional, matching the interpreter (issues #32, #36).
+        let trap = mode == ArithMode::Trap;
         let v: BasicValueEnum = match op {
+            BinOp::Add if trap => {
+                let name = if signed {
+                    "llvm.sadd.with.overflow"
+                } else {
+                    "llvm.uadd.with.overflow"
+                };
+                self.checked_arith(name, l, r)?
+            }
+            BinOp::Sub if trap => {
+                let name = if signed {
+                    "llvm.ssub.with.overflow"
+                } else {
+                    "llvm.usub.with.overflow"
+                };
+                self.checked_arith(name, l, r)?
+            }
+            BinOp::Mul if trap => {
+                let name = if signed {
+                    "llvm.smul.with.overflow"
+                } else {
+                    "llvm.umul.with.overflow"
+                };
+                self.checked_arith(name, l, r)?
+            }
             BinOp::Add => b.build_int_add(l, r, "add").map_err(lower_err)?.into(),
             BinOp::Sub => b.build_int_sub(l, r, "sub").map_err(lower_err)?.into(),
             BinOp::Mul => b.build_int_mul(l, r, "mul").map_err(lower_err)?.into(),
-            BinOp::Div => if signed {
-                b.build_int_signed_div(l, r, "sdiv")
-            } else {
-                b.build_int_unsigned_div(l, r, "udiv")
+            BinOp::Div => {
+                self.guard_div(l, r, signed)?;
+                if signed {
+                    b.build_int_signed_div(l, r, "sdiv")
+                } else {
+                    b.build_int_unsigned_div(l, r, "udiv")
+                }
+                .map_err(lower_err)?
+                .into()
             }
-            .map_err(lower_err)?
-            .into(),
-            BinOp::Rem => if signed {
-                b.build_int_signed_rem(l, r, "srem")
-            } else {
-                b.build_int_unsigned_rem(l, r, "urem")
+            BinOp::Rem => {
+                self.guard_div(l, r, signed)?;
+                if signed {
+                    b.build_int_signed_rem(l, r, "srem")
+                } else {
+                    b.build_int_unsigned_rem(l, r, "urem")
+                }
+                .map_err(lower_err)?
+                .into()
             }
-            .map_err(lower_err)?
-            .into(),
             BinOp::BitAnd => b.build_and(l, r, "and").map_err(lower_err)?.into(),
             BinOp::BitOr => b.build_or(l, r, "or").map_err(lower_err)?.into(),
             BinOp::BitXor => b.build_xor(l, r, "xor").map_err(lower_err)?.into(),
-            BinOp::Shl => b.build_left_shift(l, r, "shl").map_err(lower_err)?.into(),
+            BinOp::Shl => {
+                let amt = self.mask_shift_amount(l, r)?;
+                b.build_left_shift(l, amt, "shl").map_err(lower_err)?.into()
+            }
             // Arithmetic shift for signed, logical for unsigned.
-            BinOp::Shr => b
-                .build_right_shift(l, r, signed, "shr")
-                .map_err(lower_err)?
-                .into(),
+            BinOp::Shr => {
+                let amt = self.mask_shift_amount(l, r)?;
+                b.build_right_shift(l, amt, signed, "shr")
+                    .map_err(lower_err)?
+                    .into()
+            }
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                 let pred = int_predicate(op, signed);
                 b.build_int_compare(pred, l, r, "cmp")
@@ -1323,18 +1621,38 @@ impl<'c> Cg<'c> {
                 .into()
             }
             CastKind::FloatToInt => {
+                // Saturating float→int (issue #36): a plain `fptosi`/`fptoui` is UB when the
+                // value is out of the target's range or NaN. The `llvm.fpto{s,u}i.sat`
+                // intrinsics clamp to the min/max and yield 0 for NaN — matching the
+                // interpreter, which saturates and maps NaN→0. We still make the NaN→0 explicit
+                // with a `select` (pure value, no branch) to be robust across LLVM versions.
                 let signed = matches!(self.m.ty(target), TyKind::Int { signed: true, .. });
-                if signed {
-                    b.build_float_to_signed_int(v.into_float_value(), tgt.into_int_type(), "fptosi")
+                let src = v.into_float_value();
+                let int_ty = tgt.into_int_type();
+                let name = if signed {
+                    "llvm.fptosi.sat"
                 } else {
-                    b.build_float_to_unsigned_int(
-                        v.into_float_value(),
-                        tgt.into_int_type(),
-                        "fptoui",
-                    )
-                }
-                .map_err(lower_err)?
-                .into()
+                    "llvm.fptoui.sat"
+                };
+                let intr = inkwell::intrinsics::Intrinsic::find(name)
+                    .ok_or_else(|| BackendError::Lower(format!("{name} intrinsic not found")))?;
+                let int_basic: BasicTypeEnum = int_ty.into();
+                let float_basic: BasicTypeEnum = src.get_type().into();
+                let decl = intr
+                    .get_declaration(&self.llm, &[int_basic, float_basic])
+                    .ok_or_else(|| BackendError::Lower(format!("could not declare {name}")))?;
+                let sat = b
+                    .build_call(decl, &[src.into()], "fptosat")
+                    .map_err(lower_err)?
+                    .try_as_basic_value()
+                    .left()
+                    .ok_or_else(|| BackendError::Lower(format!("{name} returned no value")))?
+                    .into_int_value();
+                let is_nan = b
+                    .build_float_compare(FloatPredicate::UNO, src, src, "isnan")
+                    .map_err(lower_err)?;
+                b.build_select(is_nan, int_ty.const_zero(), sat, "ftoi.sat")
+                    .map_err(lower_err)?
             }
             CastKind::FloatResize => {
                 let src = v.into_float_value();
@@ -1480,7 +1798,7 @@ impl<'c> Cg<'c> {
         if let CopInit::SumVariant(sum, variant, ops) = init {
             let cop = self.get_or_add(
                 "bet_cop",
-                self.cx.i64_type().fn_type(&[self.ptr_ty().into()], false),
+                self.tag_ty().fn_type(&[self.ptr_ty().into()], false),
             );
             let tag = self
                 .builder
@@ -1488,12 +1806,11 @@ impl<'c> Cg<'c> {
                 .map_err(lower_err)?
                 .try_as_basic_value()
                 .left()
-                .ok_or_else(|| BackendError::Lower("bet_cop returned void".into()))?
-                .into_int_value();
+                .ok_or_else(|| BackendError::Lower("bet_cop returned void".into()))?;
             let holla = self.get_or_add(
                 "bet_holla_check",
                 self.ptr_ty()
-                    .fn_type(&[self.ptr_ty().into(), self.cx.i64_type().into()], false),
+                    .fn_type(&[self.ptr_ty().into(), self.tag_ty().into()], false),
             );
             let storage = self
                 .builder
@@ -1504,7 +1821,7 @@ impl<'c> Cg<'c> {
                 .ok_or_else(|| BackendError::Lower("bet_holla_check returned void".into()))?
                 .into_pointer_value();
             self.store_sum_into(func, locals, storage, *sum, *variant, ops)?;
-            return Ok(Some(tag.into()));
+            return Ok(Some(tag));
         }
 
         let CopInit::StructLit(sid, fields) = init else {
@@ -1544,7 +1861,7 @@ impl<'c> Cg<'c> {
         } else {
             let cop = self.get_or_add(
                 "bet_cop",
-                self.cx.i64_type().fn_type(&[self.ptr_ty().into()], false),
+                self.tag_ty().fn_type(&[self.ptr_ty().into()], false),
             );
             let tag = self
                 .builder
@@ -1552,12 +1869,11 @@ impl<'c> Cg<'c> {
                 .map_err(lower_err)?
                 .try_as_basic_value()
                 .left()
-                .ok_or_else(|| BackendError::Lower("bet_cop returned void".into()))?
-                .into_int_value();
+                .ok_or_else(|| BackendError::Lower("bet_cop returned void".into()))?;
             let holla = self.get_or_add(
                 "bet_holla_check",
                 self.ptr_ty()
-                    .fn_type(&[self.ptr_ty().into(), self.cx.i64_type().into()], false),
+                    .fn_type(&[self.ptr_ty().into(), self.tag_ty().into()], false),
             );
             let storage = self
                 .builder
@@ -1567,7 +1883,7 @@ impl<'c> Cg<'c> {
                 .left()
                 .ok_or_else(|| BackendError::Lower("bet_holla_check returned void".into()))?
                 .into_pointer_value();
-            (storage, tag.into())
+            (storage, tag)
         };
 
         for (fidx, op) in fields {
@@ -1582,7 +1898,8 @@ impl<'c> Cg<'c> {
     }
 
     /// `tag.trust() in crib` — unchecked resolve to a `ref` (a raw slot pointer). Extracts the
-    /// slot index from the low 32 bits of the tag and calls `bet_slot_ptr`.
+    /// slot index (struct field 0 of the `{ i32 slot, i64 generation }` tag) and calls
+    /// `bet_slot_ptr`.
     fn lower_trust(
         &self,
         func: &Func,
@@ -1591,11 +1908,12 @@ impl<'c> Cg<'c> {
         tag: &Operand,
     ) -> Result<BasicValueEnum<'c>, BackendError> {
         let crib_v = self.lower_operand(func, locals, crib)?.into_pointer_value();
-        let tag_v = self.lower_operand(func, locals, tag)?.into_int_value();
+        let tag_v = self.lower_operand(func, locals, tag)?.into_struct_value();
         let slot = self
             .builder
-            .build_int_truncate(tag_v, self.cx.i32_type(), "slot")
-            .map_err(lower_err)?;
+            .build_extract_value(tag_v, 0, "slot")
+            .map_err(lower_err)?
+            .into_int_value();
         let slot_ptr = self.get_or_add(
             "bet_slot_ptr",
             self.ptr_ty()
@@ -1621,7 +1939,8 @@ impl<'c> Cg<'c> {
         match op {
             Operand::Const(c) => self.lower_const(c),
             Operand::Copy(p) | Operand::Move(p) => {
-                let (ptr, ty) = self.place_ptr(func, locals, p)?;
+                // A read ⇒ the index must be strictly in bounds.
+                let (ptr, ty) = self.place_ptr(func, locals, p, IndexMode::Access)?;
                 let bt = self.basic_ty(ty)?;
                 self.builder.build_load(bt, ptr, "load").map_err(lower_err)
             }
@@ -1636,6 +1955,7 @@ impl<'c> Cg<'c> {
         func: &Func,
         locals: &[Option<PointerValue<'c>>],
         place: &Place,
+        mode: IndexMode,
     ) -> Result<(PointerValue<'c>, TyId), BackendError> {
         let mut ptr = locals[place.local.index()]
             .ok_or_else(|| BackendError::Lower("addressing a void/zero-sized local".into()))?;
@@ -1744,17 +2064,31 @@ impl<'c> Cg<'c> {
                 Proj::Index(idx) => {
                     let idx_v = self.lower_operand(func, locals, idx)?.into_int_value();
                     match self.m.ty(ty) {
-                        // An array is stored inline: GEP straight off its address.
-                        TyKind::Array(e, _) => {
+                        // An array is stored inline: GEP straight off its address. The length is
+                        // the static extent `n` — bounds-check against it (issue #32).
+                        TyKind::Array(e, n) => {
                             let elem_llvm = self.basic_ty(*e)?;
+                            let len = self.cx.i64_type().const_int(*n, false);
+                            self.bounds_check(idx_v, len, mode)?;
                             ptr = self.gep_index_elem(elem_llvm, ptr, idx_v)?;
                             ty = *e;
                         }
                         // A slice is a fat `{ ptr, len }`: `ptr` is the address of that value, so
-                        // load its data pointer (field 0) before indexing the backing storage.
+                        // load its length (field 1) to bounds-check (issue #32), then its data
+                        // pointer (field 0) before indexing the backing storage.
                         TyKind::Slice(e) => {
                             let elem_llvm = self.basic_ty(*e)?;
                             let fat = self.fat_ptr_ty();
+                            let len_addr = self
+                                .builder
+                                .build_struct_gep(fat, ptr, 1, "slice.len")
+                                .map_err(|_| BackendError::Lower("slice len gep".into()))?;
+                            let len = self
+                                .builder
+                                .build_load(self.cx.i64_type(), len_addr, "slice.len.val")
+                                .map_err(lower_err)?
+                                .into_int_value();
+                            self.bounds_check(idx_v, len, mode)?;
                             let data_ptr_addr = self
                                 .builder
                                 .build_struct_gep(fat, ptr, 0, "slice.ptr")
@@ -1927,9 +2261,17 @@ impl<'c> Cg<'c> {
                 )),
             },
             // `ghosted` in a tag context is the null tag (`rt_abi::Tag::NULL`: slot=u32::MAX,
-            // generation=0), which packs to `0xFFFF_FFFF` as an `i64` and always resolves as
-            // ghosted. Other (contextual) uses of `ghosted` are not supported yet.
-            Const::Ghosted => Ok(self.cx.i64_type().const_int(0xFFFF_FFFF, false).into()),
+            // generation=0), built as the `{ i32 slot, i64 generation }` struct value (issue
+            // #34). Its slot is out of range for any crib, so it always resolves as ghosted.
+            // Other (contextual) uses of `ghosted` are not supported yet.
+            Const::Ghosted => {
+                let slot = self.cx.i32_type().const_int(0xFFFF_FFFF, false);
+                let generation = self.cx.i64_type().const_zero();
+                Ok(self
+                    .tag_ty()
+                    .const_named_struct(&[slot.into(), generation.into()])
+                    .into())
+            }
             // A null pointer: the zero-default for handle-shaped struct fields (fn values,
             // `vec`/`stash`/`rng` handles, raw pointers). Safe to hold/overwrite; a crash
             // only on use, like any zeroed handle in C.
@@ -2084,12 +2426,12 @@ impl<'c> Cg<'c> {
                 live,
                 ghosted,
             } => {
-                let tag_v = self.lower_operand(func, locals, tag)?.into_int_value();
+                let tag_v = self.lower_operand(func, locals, tag)?;
                 let crib_v = self.lower_operand(func, locals, crib)?.into_pointer_value();
                 let holla = self.get_or_add(
                     "bet_holla_check",
                     self.ptr_ty()
-                        .fn_type(&[self.ptr_ty().into(), self.cx.i64_type().into()], false),
+                        .fn_type(&[self.ptr_ty().into(), self.tag_ty().into()], false),
                 );
                 let storage = self
                     .builder
@@ -2100,8 +2442,8 @@ impl<'c> Cg<'c> {
                     .ok_or_else(|| BackendError::Lower("bet_holla_check returned void".into()))?
                     .into_pointer_value();
                 // Bind `resolved` to the storage pointer (valid only on the live edge; the
-                // ghosted edge, by contract, never reads it).
-                let (dest, _ty) = self.place_ptr(func, locals, resolved)?;
+                // ghosted edge, by contract, never reads it). A plain local binding — no index.
+                let (dest, _ty) = self.place_ptr(func, locals, resolved, IndexMode::Access)?;
                 self.builder.build_store(dest, storage).map_err(lower_err)?;
                 // Live iff the checked resolve returned non-null.
                 let is_null = self

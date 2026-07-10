@@ -55,7 +55,7 @@ all = [
   "errors.yikes", "errors.tea", "errors.bounce", "errors.yeet-sheesh",
   # 08 memory model
   "memory.crib", "memory.cop-evict", "memory.tag", "memory.holla-ghosted",
-  "memory.trust", "memory.scratch", "memory.generation-reuse",
+  "memory.trust", "memory.scratch", "memory.generation-reuse", "memory.tag-eq",
   # 09 bit math
   "bits.operators", "bits.bam-angles", "bits.wrapping", "bits.fixed-point",
   # 10 stdlib
@@ -321,6 +321,12 @@ compiled = "pass"
 [[program]]
 path = "08-memory/holla-ghosted"
 covers = ["memory.holla-ghosted"]
+interp = "pass"
+compiled = "pass"
+
+[[program]]
+path = "08-memory/tag-eq-ghosted"
+covers = ["memory.tag-eq"]
 interp = "pass"
 compiled = "pass"
 

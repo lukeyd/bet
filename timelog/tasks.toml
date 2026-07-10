@@ -282,8 +282,11 @@ size = 13
 # element type); (2) shared-handle semantics in the interp (Value::Vec is Rc<RefCell>, so a vec
 # passed to a fn / in a struct aliases like the compiled VecHandle — was value-copied). Both were
 # hard blockers, now differential-green (10-stdlib/vec-aggregates, vec-shared). vec[struct] and
-# vec[sum] both work. Remaining sliver: higher-order .vibeCheck/.glowUp on vec on the COMPILED
-# path (interp done) + squadops.bet -> vec.new rewrite (not on the compiler's critical path).
+# vec[sum] both work. Higher-order .vibeCheck (filter) / .glowUp (map) now lower on the COMPILED
+# path too — for BOTH fixed-array and vec receivers (monomorphic, result is a heap vec; shared
+# build_map/build_filter over a CollectionSrc in lower.rs). Differential-green via new
+# 10-stdlib/squadops-{chain,maptype,empty} (compiled=pass). squadops.bet itself stays interp-only:
+# its array stack/pop needs fixed-array growth, a separate problem out of this scope.
 status = "doing"
 
 [[task]]
@@ -772,3 +775,15 @@ slug = "sec-timelog"
 name = "Security #47: sanitize path-injected values (--task slug, hook session_id) in timelog scripts"
 size = 1
 status = "done"
+
+[[task]]
+slug = "www-lang-reference"
+name = "Docs: implemented-only language reference (keywords/types/memory/intrinsics) for betlang-www"
+size = 3
+status = "done"
+
+[[task]]
+slug = "branch-cleanup"
+name = "Housekeeping: review merged branches, commit timelog, prune stale branch"
+size = 1
+status = "doing"

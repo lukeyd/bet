@@ -72,6 +72,18 @@ flex facts ST_VERTICAL: i32 = 1
 flex facts ST_POSITIVE: i32 = 2
 flex facts ST_NEGATIVE: i32 = 3
 
+// NATIVE-SAFETY caps for the geometry/thing loaders that have no gs.MAX* constant (sec #41). Each
+// slab is sized by an attacker-controlled lump length, so a forged/oversized lump is a multi-GB
+// OOM (and, uncapped, a runaway spawn loop for THINGS). Every real map is orders of magnitude
+// under these ceilings (E1M1 is in the hundreds); the values mirror vanilla's on-disk index widths
+// (i16 vertex/side/subsector/node refs => 32768; u16 seg refs => 65536).
+flex facts MAXVERTEXES: int = 32768
+flex facts MAXSIDEDEFS: int = 32768
+flex facts MAXSUBSECTORS: int = 32768
+flex facts MAXNODES: int = 32768
+flex facts MAXSEGS: int = 65536
+flex facts MAXTHINGS: int = 32768
+
 // ===========================================================================================
 // map-lump loaders (id's load order in P_SetupLevel is: blockmap, vertexes, sectors, sidedefs,
 // linedefs, subsectors, nodes, segs — "most of this ordering is important")
@@ -81,6 +93,9 @@ flex facts ST_NEGATIVE: i32 = 3
 flex finna loadVertexes(gt: tag gs.GameState, lump: int) {
     lowkey ofs = wad.lumpNum(gt, lump)
     lowkey num = wad.lumpLength(gt, lump) / 4
+    fr num < 0 || num > MAXVERTEXES {
+        yeet("P_LoadVertexes: too many vertexes")
+    }
     holla g = gt in gs.gsc {
         g.level.numvertexes = num as i32
         g.level.vtxX = mem.slab[i32](num)
@@ -167,6 +182,9 @@ flex finna loadSectors(gt: tag gs.GameState, lump: int) {
 flex finna loadSideDefs(gt: tag gs.GameState, lump: int) {
     lowkey ofs = wad.lumpNum(gt, lump)
     lowkey num = wad.lumpLength(gt, lump) / 30
+    fr num < 0 || num > MAXSIDEDEFS {
+        yeet("P_LoadSideDefs: too many sidedefs")
+    }
     holla g = gt in gs.gsc {
         g.level.numsides = num as i32
         g.level.sdTexOfs = mem.slab[i32](num)
@@ -194,6 +212,11 @@ flex finna loadSideDefs(gt: tag gs.GameState, lump: int) {
             botName = bstream.name8(g.wad.buf, e + 12)
             midName = bstream.name8(g.wad.buf, e + 20)
             secnum = bstream.rdI16(g.wad.buf, e + 28)
+            // sec #42: sdSector[i] is later used as a sector index (lineFront/segFront). Reject a
+            // crafted sidedef pointing outside the sector slab (size numsectors).
+            fr secnum < 0 || secnum >= g.level.numsectors as int {
+                yeet("P_LoadSideDefs: sector index out of range")
+            }
         } ghosted {
             yeet("gs")
         }
@@ -248,6 +271,14 @@ flex finna loadLineDefs(gt: tag gs.GameState, lump: int) {
             lowkey tg = bstream.rdI16(g.wad.buf, e + 8) as int
             lowkey s0 = bstream.rdI16(g.wad.buf, e + 10) as int
             lowkey s1 = bstream.rdI16(g.wad.buf, e + 12) as int
+            // sec #42: v1/v2 index vtxX/vtxY (size numvertexes); s0/s1 (sentinel -1 = one-sided)
+            // index sdSector below. Reject a crafted linedef whose refs fall outside their slabs.
+            fr v1 < 0 || v1 >= g.level.numvertexes as int || v2 < 0 || v2 >= g.level.numvertexes as int {
+                yeet("P_LoadLineDefs: vertex index out of range")
+            }
+            fr s0 < -1 || s0 >= g.level.numsides as int || s1 < -1 || s1 >= g.level.numsides as int {
+                yeet("P_LoadLineDefs: sidedef index out of range")
+            }
             g.level.lineV1[i] = v1 as i32
             g.level.lineV2[i] = v2 as i32
             g.level.lineFlags[i] = flags as i32
@@ -312,6 +343,9 @@ flex finna loadLineDefs(gt: tag gs.GameState, lump: int) {
 flex finna loadSubsectors(gt: tag gs.GameState, lump: int) {
     lowkey ofs = wad.lumpNum(gt, lump)
     lowkey num = wad.lumpLength(gt, lump) / 4
+    fr num < 0 || num > MAXSUBSECTORS {
+        yeet("P_LoadSubsectors: too many subsectors")
+    }
     holla g = gt in gs.gsc {
         g.level.numsubsectors = num as i32
         g.level.ssSector = mem.slab[i32](num)
@@ -334,6 +368,9 @@ flex finna loadSubsectors(gt: tag gs.GameState, lump: int) {
 flex finna loadNodes(gt: tag gs.GameState, lump: int) {
     lowkey ofs = wad.lumpNum(gt, lump)
     lowkey num = wad.lumpLength(gt, lump) / 28
+    fr num < 0 || num > MAXNODES {
+        yeet("P_LoadNodes: too many nodes")
+    }
     holla g = gt in gs.gsc {
         g.level.numnodes = num as i32
         g.level.nodeX = mem.slab[i32](num)
@@ -369,6 +406,9 @@ flex finna loadNodes(gt: tag gs.GameState, lump: int) {
 flex finna loadSegs(gt: tag gs.GameState, lump: int) {
     lowkey ofs = wad.lumpNum(gt, lump)
     lowkey num = wad.lumpLength(gt, lump) / 12
+    fr num < 0 || num > MAXSEGS {
+        yeet("P_LoadSegs: too many segs")
+    }
     holla g = gt in gs.gsc {
         g.level.numsegs = num as i32
         g.level.segV1 = mem.slab[i32](num)
@@ -388,6 +428,11 @@ flex finna loadSegs(gt: tag gs.GameState, lump: int) {
             lowkey ldnum = bstream.rdI16(g.wad.buf, e + 6) as int
             lowkey side = bstream.rdI16(g.wad.buf, e + 8) as int
             lowkey offRaw = bstream.rdI16(g.wad.buf, e + 10) as int
+            // sec #42: ldnum indexes lineSide0/1 + lineFlags (size numlines); the derived sdIdx /
+            // otherIdx index sdSector (size numsides). Reject crafted seg cross-refs before use.
+            fr ldnum < 0 || ldnum >= g.level.numlines as int {
+                yeet("P_LoadSegs: linedef index out of range")
+            }
             g.level.segV1[i] = v1 as i32
             g.level.segV2[i] = v2 as i32
             g.level.segAngle[i] = (angRaw << 16) as u32
@@ -399,6 +444,9 @@ flex finna loadSegs(gt: tag gs.GameState, lump: int) {
             } naw {
                 sdIdx = g.level.lineSide1[ldnum] as int
             }
+            fr sdIdx < 0 || sdIdx >= g.level.numsides as int {
+                yeet("P_LoadSegs: sidedef index out of range")
+            }
             g.level.segSide[i] = sdIdx as i32
             g.level.segFront[i] = g.level.sdSector[sdIdx]
             fr ((g.level.lineFlags[ldnum] as int) & doomdef.ML_TWOSIDED) != 0 {
@@ -407,6 +455,9 @@ flex finna loadSegs(gt: tag gs.GameState, lump: int) {
                     otherIdx = g.level.lineSide1[ldnum] as int
                 } naw {
                     otherIdx = g.level.lineSide0[ldnum] as int
+                }
+                fr otherIdx < -1 || otherIdx >= g.level.numsides as int {
+                    yeet("P_LoadSegs: sidedef index out of range")
                 }
                 fr otherIdx != -1 {
                     g.level.segBack[i] = g.level.sdSector[otherIdx]
@@ -439,10 +490,20 @@ flex finna loadBlockMap(gt: tag gs.GameState, lump: int) {
         g.level.bmapWidth = width as i32
         g.level.bmapHeight = height as i32
         lowkey cells = width * height
+        // sec #42: width/height are signed i16s, so a crafted BLOCKMAP can make cells negative —
+        // the signed `> MAXBLOCKS` cap only catches the high side. Reject the low side first.
+        fr cells < 0 {
+            yeet("P_LoadBlockMap: bad blockmap dimensions")
+        }
         fr cells > gs.MAXBLOCKS {
             yeet("P_LoadBlockMap: too many blocks")
         }
         lowkey arrLen = count - 4
+        // sec #42: a <8-byte lump makes arrLen (count-4) negative; a dimension pair larger than the
+        // header-less lump makes the offset-table fill (blockmap[0..cells)) overrun the slab below.
+        fr arrLen < 0 || cells > arrLen {
+            yeet("P_LoadBlockMap: blockmap lump too small")
+        }
         g.level.blockmap = mem.slab[i32](arrLen)
         // offset table: on-disk offsets count shorts from the lump start (past the 4-short header),
         // so rebase by -4 into the header-less array.
@@ -493,7 +554,15 @@ flex finna groupLines(gt: tag gs.GameState) {
         lowkey i = 0
         vibin i < nsub {
             lowkey fseg = g.level.ssFirstLine[i] as int
+            // sec #42: firstseg indexes segSide (size numsegs); segSide[fseg] indexes sdSector
+            // (size numsides). Reject a crafted subsector before dereferencing either slab.
+            fr fseg < 0 || fseg >= g.level.numsegs as int {
+                yeet("P_GroupLines: seg index out of range")
+            }
             lowkey sd = g.level.segSide[fseg] as int
+            fr sd < 0 || sd >= g.level.numsides as int {
+                yeet("P_GroupLines: sidedef index out of range")
+            }
             g.level.ssSector[i] = g.level.sdSector[sd]
             i = i + 1
         }
@@ -595,6 +664,9 @@ flex finna isCommercialThing(t: int) -> bool {
 flex finna loadThings(gt: tag gs.GameState, lump: int) {
     lowkey ofs = wad.lumpNum(gt, lump)
     lowkey num = wad.lumpLength(gt, lump) / 10
+    fr num < 0 || num > MAXTHINGS {
+        yeet("P_LoadThings: too many things")
+    }
     lowkey gm = 0
     holla g = gt in gs.gsc {
         g.level.numthings = num as i32
@@ -633,6 +705,11 @@ flex finna loadThings(gt: tag gs.GameState, lump: int) {
 // struct. Called by P_SpawnMapThing for type<=4 in single-player.
 flex finna spawnPlayer(gt: tag gs.GameState, mx: int, my: int, mangle: int, mtype: int) {
     lowkey pnum = mtype - 1
+    // sec #42: pnum indexes playeringame/players (size MAXPLAYERS). The spawnMapThing caller now
+    // gates 1<=mtype<=4, but keep this defensive since spawnPlayer is module-public.
+    fr pnum < 0 || pnum >= MAXPLAYERS {
+        yeet("P_SpawnPlayer: player index out of range")
+    }
     lowkey pig = cap
     holla g = gt in gs.gsc {
         pig = g.shell.playeringame[pnum]
@@ -696,7 +773,10 @@ flex finna spawnMapThing(gt: tag gs.GameState, mx: int, my: int, mangle: int, mt
         bet
     }
     // player start (1..4): save the spot; spawn now unless deathmatch
-    fr mtype <= 4 {
+    // sec #42: the old `mtype <= 4` admitted 0/negative doomednums, driving `pn = mtype-1` to
+    // playerstarts[-1]. Gate the low side too; 0/negative falls through to the doomednum search
+    // (which yeets "Unknown type"), matching id's I_Error for an unknown thing type.
+    fr mtype >= 1 && mtype <= 4 {
         holla g = gt in gs.gsc {
             lowkey pn = mtype - 1
             g.shell.playerstarts[pn].x = mx as i32

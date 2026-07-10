@@ -2,7 +2,7 @@ name: ci
 
 on:
   # Path-filtered to CORE (the Rust compiler + its test goldens + build config) so the
-  # expensive 6-way `test` matrix and the `lint` job don't fire on changes that can't affect
+  # expensive 5-way `test` matrix and the `lint` job don't fire on changes that can't affect
   # them: self-hosted bet source (selfhost/**, verified by selfhost.yml), game ports
   # (ports/**), the bet-source stdlib scaffolding (std/**), or docs. Every input the `lint`
   # job reads (crates, corpus, the Rust configs) is in this list, so gating the whole workflow
@@ -45,6 +45,12 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege: lint + test only build/test/lint the workspace — they never write to the
+# repo, packages, or checks. Default the whole workflow to a read-only GITHUB_TOKEN (scope up
+# per-job only if a future job genuinely needs more).
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -53,11 +59,11 @@ jobs:
   lint:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: install pinned toolchain
         run: rustup show          # reads rust-toolchain.toml (channel + rustfmt + clippy)
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: taiki-e/install-action@c7eb1735f09259a5035e8e5d44b1406b1cddc0fb # v2.83.0
         with:
           tool: cargo-deny
       - name: rustfmt
@@ -80,7 +86,9 @@ jobs:
       - name: cargo-deny
         run: cargo deny check
 
-  # Build + test natively on all six OS/arch combos (no cross-compile needed).
+  # Build + test natively on all five OS/arch combos (no cross-compile needed). The x86_64
+  # macOS combo (macos-13 / x86_64-apple-darwin) was dropped because GitHub is retiring the
+  # Intel macOS image; macos-14 (arm64) keeps Darwin coverage.
   test:
     strategy:
       fail-fast: false
@@ -88,19 +96,18 @@ jobs:
         include:
           - { os: ubuntu-24.04,     target: x86_64-unknown-linux-gnu }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
-          - { os: macos-13,         target: x86_64-apple-darwin }
           - { os: macos-14,         target: aarch64-apple-darwin }
           - { os: windows-2022,     target: x86_64-pc-windows-msvc }
           - { os: windows-11-arm,   target: aarch64-pc-windows-msvc }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: install pinned toolchain
         run: rustup show
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: ${{ matrix.target }}
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@c7eb1735f09259a5035e8e5d44b1406b1cddc0fb # v2.83.0
         with:
           tool: nextest
       - name: build

@@ -12,6 +12,46 @@ use frontend::ast::{
 use crate::error::RunError;
 use crate::value::{SimdVal, Value, display};
 
+/// Recursion cap for the evaluator (issue #38). Every `eval_expr` and `call_fn` entry bumps a
+/// shared depth counter; past this it returns [`RunError::RecursionLimit`] instead of overflowing
+/// the native stack. This catches both unbounded `finna` recursion (a missing base case) and the
+/// deep left-nested `Binary` AST from `1 + 1 + 1 + …` (which the parser builds iteratively, so it
+/// parses fine but recurses here at eval time). 1024 is far above any real program's nesting yet
+/// fires with megabytes of headroom on a standard 8 MiB main-thread stack.
+const MAX_DEPTH: u32 = 1024;
+
+/// Element ceiling for a single program-driven allocation (issue #40). Chosen so a hostile
+/// 2-liner (`mem.slab[int](1 << 40)`, a `drip` with an `int[1000000000]` field, or
+/// `gg.blit(px, 0x7fffffff, 0x7fffffff)`) returns a clean [`RunError::AllocLimit`] instead of
+/// OOM-killing the host or panicking on `Vec` capacity overflow. 16 Mi elements is far above any
+/// real corpus program — a 4K RGBA framebuffer is ~8.3 Mi pixels and corpus arrays run in the
+/// thousands — while bounding a `u32` framebuffer to 64 MB and a `Value` array to ~1.3 GB worst
+/// case (a bounded single allocation, not an OOM-kill).
+const MAX_ALLOC_ELEMS: usize = 16 * 1024 * 1024;
+
+/// Check a program-requested element count against [`MAX_ALLOC_ELEMS`], returning it on success
+/// or an [`RunError::AllocLimit`] before any allocation happens (issue #40).
+fn checked_alloc(requested: u128) -> Result<usize, RunError> {
+    if requested > MAX_ALLOC_ELEMS as u128 {
+        Err(RunError::AllocLimit {
+            requested,
+            cap: MAX_ALLOC_ELEMS,
+        })
+    } else {
+        Ok(requested as usize)
+    }
+}
+
+/// The number of `Value` cells a value occupies, counting every container node (so an empty array
+/// still costs 1). Used to bound nested `int[N][M]` products in [`Interp::zero_default`] before the
+/// outer `vec![z; n]` clones the inner value `n` times.
+fn value_cells(v: &Value) -> u128 {
+    match v {
+        Value::Array(xs) => 1 + xs.iter().map(value_cells).sum::<u128>(),
+        _ => 1,
+    }
+}
+
 /// Non-local control flow produced by executing a statement or block.
 enum Flow {
     /// Fell off the end normally.
@@ -165,6 +205,8 @@ pub struct Interp<'p> {
     /// The declared return type of each `finna` on the active call stack, so `bounce` can build
     /// a correctly-shaped `(value, yikes)` early return.
     ret_stack: Vec<&'p RetType>,
+    /// Current evaluation/call recursion depth, bounded by [`MAX_DEPTH`] (issue #38).
+    depth: u32,
     out: Vec<u8>,
 }
 
@@ -181,6 +223,7 @@ impl<'p> Interp<'p> {
             arenas: HashMap::new(),
             next_arena: 0,
             ret_stack: Vec::new(),
+            depth: 0,
             out: Vec::new(),
         };
         // First pass: functions, methods, moods variants, and top-level cribs (order-independent).
@@ -280,9 +323,39 @@ impl<'p> Interp<'p> {
         &self.out
     }
 
+    // ---- recursion guard (issue #38) ------------------------------------------
+
+    /// Bump the recursion depth, or bail with [`RunError::RecursionLimit`] past [`MAX_DEPTH`].
+    /// Every guarded entry point pairs this with [`Self::exit_depth`] so the counter is restored
+    /// on the way out (including error unwinds).
+    fn enter_depth(&mut self) -> Result<(), RunError> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            self.depth -= 1;
+            return Err(RunError::RecursionLimit { depth: MAX_DEPTH });
+        }
+        Ok(())
+    }
+
+    fn exit_depth(&mut self) {
+        self.depth -= 1;
+    }
+
     // ---- calls ----------------------------------------------------------------
 
     fn call_fn(
+        &mut self,
+        f: &'p FnDecl,
+        args: Vec<Value>,
+        receiver: Option<Value>,
+    ) -> Result<Vec<Value>, RunError> {
+        self.enter_depth()?;
+        let r = self.call_fn_inner(f, args, receiver);
+        self.exit_depth();
+        r
+    }
+
+    fn call_fn_inner(
         &mut self,
         f: &'p FnDecl,
         args: Vec<Value>,
@@ -915,6 +988,15 @@ impl<'p> Interp<'p> {
 
     /// Evaluate an expression that must yield exactly one value.
     fn eval_expr(&mut self, env: &mut Env, e: &Expr) -> Result<Value, RunError> {
+        // Depth-guard the whole expression tree (issue #38): a deep left-nested `Binary` AST
+        // (`1 + 1 + 1 + …`) recurses here, and unbounded `finna` recursion flows through here too.
+        self.enter_depth()?;
+        let r = self.eval_expr_inner(env, e);
+        self.exit_depth();
+        r
+    }
+
+    fn eval_expr_inner(&mut self, env: &mut Env, e: &Expr) -> Result<Value, RunError> {
         match &e.kind {
             // Literals arrive normalized to `i128`; the value model stores an `i64`, so a
             // literal above `i64::MAX` truncates two's-complement (as the old `u64` path did).
@@ -1147,11 +1229,17 @@ impl<'p> Interp<'p> {
             for fd in &decl.fields {
                 if !fields.contains_key(&fd.name) {
                     let v = self.zero_default(&fd.ty, &subst).map_err(|why| {
-                        RunError::Type(format!(
-                            "`{}` field `{}` cannot zero-default ({why}); initialize it \
-                             explicitly",
-                            lit.name, fd.name
-                        ))
+                        // An alloc-cap breach keeps its own variant; other reasons get the
+                        // field-context wrapper.
+                        if matches!(why, RunError::AllocLimit { .. }) {
+                            why
+                        } else {
+                            RunError::Type(format!(
+                                "`{}` field `{}` cannot zero-default ({why}); initialize it \
+                                 explicitly",
+                                lit.name, fd.name
+                            ))
+                        }
                     })?;
                     fields.insert(fd.name.clone(), v);
                 }
@@ -1162,9 +1250,10 @@ impl<'p> Interp<'p> {
 
     /// The zero value for a struct field's declared type (see [`Self::eval_struct_lit`]).
     /// `subst` maps the enclosing drip's generic parameter names to the literal's type args.
-    /// Errors (with a reason) on a type with no meaningful zero — a `moods` sum, or an
-    /// unsubstituted type parameter.
-    fn zero_default(&self, ty: &Type, subst: &HashMap<&str, &Type>) -> Result<Value, String> {
+    /// Errors ([`RunError::Type`]) on a type with no meaningful zero — a `moods` sum, or an
+    /// unsubstituted type parameter — or [`RunError::AllocLimit`] on an oversized fixed array
+    /// (issue #40; the outer product is bounded before the inner value is cloned `n` times).
+    fn zero_default(&self, ty: &Type, subst: &HashMap<&str, &Type>) -> Result<Value, RunError> {
         match &ty.kind {
             TypeKind::Named(name, args) => {
                 if let Some(&sub) = subst.get(name.as_str()) {
@@ -1196,13 +1285,18 @@ impl<'p> Interp<'p> {
                                 fields,
                             })
                         }
-                        None => Err(format!("`{name}` has no zero value")),
+                        None => Err(RunError::Type(format!("`{name}` has no zero value"))),
                     },
                 }
             }
             TypeKind::Slice(_) => Ok(Value::Array(Vec::new())),
             TypeKind::Array(elem, n) => {
                 let z = self.zero_default(elem, subst)?;
+                // Bound the *total* element count before cloning (issue #40): a nested
+                // `int[100000][100000]` must not multiply into an OOM / capacity-overflow panic.
+                // The inner recursion already bounded `z`, so `n * cells(z)` is the whole cost.
+                let total = (*n as u128).saturating_mul(value_cells(&z));
+                checked_alloc(total)?;
                 Ok(Value::Array(vec![z; *n as usize]))
             }
             // A null tag: always resolves as ghosted under `holla` (and `evict .. in ..`).
@@ -1300,11 +1394,14 @@ impl<'p> Interp<'p> {
                                 if matches!(&t.kind, TypeKind::Named(n, _)
                                     if self.drips.contains_key(n)) =>
                             {
-                                self.zero_default(t, &HashMap::new())
-                                    .map_err(RunError::Type)?
+                                self.zero_default(t, &HashMap::new())?
                             }
                             _ => Value::Int(0),
                         };
+                        // Bound the allocation before it happens (issue #40): a drip element may
+                        // itself carry fixed arrays, so charge `n * cells(zero)`.
+                        let total = (n as u128).saturating_mul(value_cells(&zero));
+                        checked_alloc(total)?;
                         return Ok(vec![Value::Array(vec![zero; n])]);
                     }
                     "math" => return self.call_math(env, method, args).map(|v| vec![v]),
@@ -2081,12 +2178,15 @@ impl<'p> Interp<'p> {
         match (method, vals.as_slice()) {
             // `gg.blit(pixels, w, h)` presents a tightly packed `w * h` framebuffer (stride == w).
             ("blit", [pixels, Value::Int(w), Value::Int(h)]) if *w >= 0 && *h >= 0 => {
+                // Bound `w * h` before resizing (issue #40): huge or overflowing dimensions must
+                // return a clean AllocLimit, never OOM or panic on `Vec` capacity overflow.
+                let n = checked_alloc((*w as u128).saturating_mul(*h as u128))?;
                 let (w, h) = (*w as u32, *h as u32);
                 let mut buf = marshal_ints(pixels, |i| i as u32).ok_or_else(|| {
                     RunError::Type("`gg.blit` needs an array of pixel integers".into())
                 })?;
                 // Never let the backend read past the marshaled buffer: pad short frames to w*h.
-                buf.resize((w as usize) * (h as usize), 0);
+                buf.resize(n, 0);
                 gg_backend::present(buf.as_ptr(), w, h, w);
                 Ok(Vec::new())
             }
@@ -2292,12 +2392,15 @@ impl<'p> Interp<'p> {
             // framebuffer, aspect-fit (integer nearest-neighbor, centered letterbox) into the
             // window — `gg.blit`'s input model with `gg.flush`'s scaling.
             ("show", [pixels, Value::Int(w), Value::Int(h)]) if *w >= 0 && *h >= 0 => {
+                // Bound `w * h` before resizing (issue #40): huge or overflowing dimensions must
+                // return a clean AllocLimit, never OOM or panic on `Vec` capacity overflow.
+                let n = checked_alloc((*w as u128).saturating_mul(*h as u128))?;
                 let (w, h) = (*w as u32, *h as u32);
                 let mut buf = marshal_ints(pixels, |i| i as u32).ok_or_else(|| {
                     RunError::Type("`gg.show` needs an array of pixel integers".into())
                 })?;
                 // Never let the backend read past the marshaled buffer: pad short frames to w*h.
-                buf.resize((w as usize) * (h as usize), 0);
+                buf.resize(n, 0);
                 gg_backend::show(buf.as_ptr(), w, h);
                 Ok(Vec::new())
             }
@@ -3184,5 +3287,104 @@ mod gg_marshal_tests {
                 "sound off={off} len={len}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod dos_tests {
+    //! Issue #38 (recursion → uncatchable stack-overflow DoS) and issue #40 (uncapped
+    //! program-controlled allocation → OOM / capacity-overflow panic). Every hostile input here
+    //! must surface a normal [`RunError`], never abort the process.
+    use super::*;
+
+    /// Run `f` on a generously-sized stack so a guard set at [`MAX_DEPTH`] fires *before* a real
+    /// stack overflow, letting the deep-recursion tests observe the clean error rather than a
+    /// SIGABRT. (`RunError` isn't `Send` — it holds `Rc`s — so the closure asserts internally and
+    /// returns a plain `bool`.)
+    fn on_big_stack(f: impl FnOnce() -> bool + Send + 'static) -> bool {
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(f)
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    fn run(src: &str) -> Result<String, RunError> {
+        let program = frontend::parse(src).expect("parse");
+        crate::run_to_string(&program)
+    }
+
+    /// A `finna` with no base case must return `RecursionLimit`, not overflow the native stack.
+    #[test]
+    fn unbounded_recursion_yields_recursion_limit() {
+        let hit = on_big_stack(|| {
+            let src = "finna boom() -> int { bet boom() }\nfinna main() { lowkey x = boom() }\n";
+            matches!(run(src), Err(RunError::RecursionLimit { .. }))
+        });
+        assert!(hit, "expected RecursionLimit for unbounded recursion");
+    }
+
+    /// `1 + 1 + 1 + …` parses fine (the parser builds it iteratively) but evaluates as a deep
+    /// left-nested `Binary` AST — the eval guard must catch it before the stack blows.
+    #[test]
+    fn deep_binary_ast_yields_recursion_limit() {
+        let hit = on_big_stack(|| {
+            let mut src = String::from("finna main() { lowkey x = 1");
+            for _ in 0..20_000 {
+                src.push_str("+1");
+            }
+            src.push_str("\n}\n");
+            matches!(run(&src), Err(RunError::RecursionLimit { .. }))
+        });
+        assert!(
+            hit,
+            "expected RecursionLimit for a deep left-nested Binary AST"
+        );
+    }
+
+    /// A moderately deep expression (well under the cap) must still evaluate — the guard must not
+    /// false-positive on ordinary programs.
+    #[test]
+    fn moderately_deep_expression_still_evaluates() {
+        let ok = on_big_stack(|| {
+            let mut src = String::from("finna main() { spill.it(0");
+            for _ in 0..500 {
+                src.push_str("+1");
+            }
+            src.push_str(") }\n");
+            run(&src).as_deref() == Ok("500\n")
+        });
+        assert!(ok, "a 500-deep sum must evaluate to 500");
+    }
+
+    /// `mem.slab[int](1_000_000_000)` must return `AllocLimit` before allocating.
+    #[test]
+    fn huge_slab_yields_alloc_limit() {
+        let src = "finna main() { lowkey x = mem.slab[int](1000000000) }\n";
+        assert!(matches!(run(src), Err(RunError::AllocLimit { .. })));
+    }
+
+    /// A `drip` field typed `int[1000000000]`, zero-defaulted by a struct literal, must return
+    /// `AllocLimit` — not OOM, not a `Vec` capacity-overflow panic.
+    #[test]
+    fn huge_array_field_yields_alloc_limit() {
+        let src = "drip Big { buf: int[1000000000] }\nfinna main() { lowkey b = Big{} }\n";
+        assert!(matches!(run(src), Err(RunError::AllocLimit { .. })));
+    }
+
+    /// `gg.blit` with dimensions whose product overflows must return `AllocLimit`, not panic on
+    /// the `usize` multiply / `Vec` resize.
+    #[test]
+    fn gg_blit_oversized_dims_yield_alloc_limit() {
+        let src = "finna main() { lowkey px = [0]\n  gg.blit(px, 2000000000, 2000000000) }\n";
+        assert!(matches!(run(src), Err(RunError::AllocLimit { .. })));
+    }
+
+    /// A modestly-sized slab must still allocate fine (the cap must not break real programs).
+    #[test]
+    fn modest_slab_still_allocates() {
+        let src = "finna main() {\n  lowkey xs = mem.slab[int](1024)\n  spill.it(xs[1000])\n}\n";
+        assert_eq!(run(src).unwrap(), "0\n");
     }
 }

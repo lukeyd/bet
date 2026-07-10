@@ -1,0 +1,19 @@
+// tag-eq-ghosted — direct `==`/`!=` between a tag and the null `ghosted` literal. This is a
+// binary op, distinct from the `holla ... ghosted` block (which lowers to a runtime check), so
+// it exercises Tag-struct equality on the compiled path — a regression guard for the u64
+// generation-counter layout (a Tag is `{slot, generation}`, not a scalar; see backend lower_binop).
+pull "spill"
+
+drip Enemy { flex id: int }
+
+crib slots: Enemy[4]
+
+finna main() {
+    lowkey live = cop Enemy{ id: 7 } in slots
+    lowkey nul: tag Enemy = ghosted
+
+    spill.it(live == ghosted)
+    spill.it(nul == ghosted)
+    spill.it(live != ghosted)
+    spill.it(nul != ghosted)
+}

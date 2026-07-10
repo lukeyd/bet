@@ -37,7 +37,12 @@ fi
 sec "0. shareware doom1.wad"
 # The shareware WAD is freely redistributable; its DEMO1/2/3 lumps drive the demo playback.
 WAD_DIR="doom-reference"; WAD="$WAD_DIR/doom1.wad"
-WAD_MD5_GOOD="f0cefca49926d00903cf57551d901abe"   # canonical v1.9 shareware doom1.wad
+# #33: gate the WAD on SHA-256, not md5 (md5 is collision-broken and unfit for integrity). This is
+# the canonical v1.9 shareware doom1.wad (4,196,020 bytes; md5 f0cefca49926d00903cf57551d901abe,
+# sha1 5b2e249b9c5133ec987b3ea77596381dc0d6bc1d).
+# NOTE(sec #33): sha256 of the canonical v1.9 shareware doom1.wad (4196020 bytes), cross-checked
+#   against the published md5 + sha1 above. Fails closed via the compare below on any mismatch.
+WAD_SHA256_GOOD="1d7d43be501e67d927e415e0b8f3e29c3bf33075e859721816f652a526cac771"
 WAD_URLS=(
   "https://distro.ibiblio.org/slitaz/sources/packages/d/doom1.wad"
   "https://github.com/Akbar30Bill/DOOM_wads/raw/master/doom1.wad"
@@ -50,10 +55,10 @@ if [[ ! -f "$WAD" ]]; then
   done
 fi
 if [[ -f "$WAD" ]]; then
-  got="$(md5sum "$WAD" | cut -d' ' -f1)"
-  echo "doom1.wad: $(stat -c %s "$WAD") bytes  md5=$got"
-  if [[ "$got" == "$WAD_MD5_GOOD" ]]; then ok "WAD present (canonical v1.9 shareware)"
-  else bad "WAD md5 mismatch (got $got, want $WAD_MD5_GOOD) — demo/golden checks may diverge"; fi
+  got="$(sha256sum "$WAD" | cut -d' ' -f1)"
+  echo "doom1.wad: $(stat -c %s "$WAD") bytes  sha256=$got"
+  if [[ "$got" == "$WAD_SHA256_GOOD" ]]; then ok "WAD present (canonical v1.9 shareware)"
+  else bad "WAD sha256 mismatch (got $got, want $WAD_SHA256_GOOD) — demo/golden checks may diverge"; fi
 else
   bad "WAD download failed — drop a shareware doom1.wad in $WAD_DIR/ and re-run"
 fi

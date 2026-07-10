@@ -1,0 +1,25 @@
+// ftoi_sat.mir — float→int casts lower to the SATURATING `llvm.fptosi.sat`/`llvm.fptoui.sat`
+// intrinsics plus an explicit `NaN → 0` select (security issue #36), matching the interpreter
+// (saturate to the min/max, map NaN to 0) instead of LLVM's out-of-range/NaN UB. Signed and
+// unsigned targets, from both `f64` and `f32` sources. Compile-only. (Security #36.)
+
+fn to_i32(%0: f64) -> i32 {
+  let %1: i32
+  bb0:
+    %1 = cast.ftoi(%0 as i32)
+    return %1
+}
+
+fn to_u8(%0: f64) -> u8 {
+  let %1: u8
+  bb0:
+    %1 = cast.ftoi(%0 as u8)
+    return %1
+}
+
+fn to_i64_from_f32(%0: f32) -> i64 {
+  let %1: i64
+  bb0:
+    %1 = cast.ftoi(%0 as i64)
+    return %1
+}
