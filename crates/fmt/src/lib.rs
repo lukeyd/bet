@@ -721,29 +721,54 @@ fn assign_op_str(op: AssignOp) -> &'static str {
 // Types.
 // ---------------------------------------------------------------------------
 
+/// Depth ceiling for type pretty-printing (issue #38), a stack-overflow backstop mirroring the
+/// parser's recursion guard. A *parsed* type can never reach this — the parser caps type nesting
+/// far lower — so this only fires on a pathologically deep hand-built AST, where we emit a
+/// truncation marker instead of recursing off the stack.
+const MAX_TYPE_DEPTH: usize = 1024;
+
 fn type_str(t: &Type) -> String {
+    type_str_depth(t, 0)
+}
+
+fn type_str_depth(t: &Type, depth: usize) -> String {
+    if depth >= MAX_TYPE_DEPTH {
+        return "…".to_string();
+    }
+    let d = depth + 1;
     match &t.kind {
-        TypeKind::Slice(inner) => format!("[]{}", type_str(inner)),
-        TypeKind::Array(inner, n) => format!("{}[{}]", type_str(inner), n),
-        TypeKind::Tag(inner) => format!("tag {}", type_str(inner)),
-        TypeKind::Crib(inner) => format!("crib {}", type_str(inner)),
-        TypeKind::Soa(inner) => format!("soa {}", type_str(inner)),
+        TypeKind::Slice(inner) => format!("[]{}", type_str_depth(inner, d)),
+        TypeKind::Array(inner, n) => format!("{}[{}]", type_str_depth(inner, d), n),
+        TypeKind::Tag(inner) => format!("tag {}", type_str_depth(inner, d)),
+        TypeKind::Crib(inner) => format!("crib {}", type_str_depth(inner, d)),
+        TypeKind::Soa(inner) => format!("soa {}", type_str_depth(inner, d)),
         TypeKind::Fn(params, ret) => {
-            format!("finna({}) -> {}", join_types(params), type_str(ret))
+            format!(
+                "finna({}) -> {}",
+                join_types_depth(params, d),
+                type_str_depth(ret, d)
+            )
         }
         TypeKind::RawPtr => "rawptr".to_string(),
         TypeKind::Named(name, generics) => {
             if generics.is_empty() {
                 name.clone()
             } else {
-                format!("{}[{}]", name, join_types(generics))
+                format!("{}[{}]", name, join_types_depth(generics, d))
             }
         }
     }
 }
 
 fn join_types(ts: &[Type]) -> String {
-    ts.iter().map(type_str).collect::<Vec<_>>().join(", ")
+    join_types_depth(ts, 0)
+}
+
+fn join_types_depth(ts: &[Type], depth: usize) -> String {
+    ts.iter()
+        .map(|t| type_str_depth(t, depth))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 // ---------------------------------------------------------------------------
@@ -916,5 +941,27 @@ mod tests {
     #[test]
     fn parse_error_is_reported() {
         assert!(format_source("finna (").is_err());
+    }
+
+    /// Issue #38: `type_str` must not overflow the stack on a pathologically deep type. The
+    /// parser caps type nesting far below this, so such a type is only reachable via a hand-built
+    /// AST — but pretty-printing it must still terminate with a truncation marker.
+    #[test]
+    fn deeply_nested_type_truncates_without_overflow() {
+        use super::{MAX_TYPE_DEPTH, type_str};
+        use frontend::ast::{Span, Type, TypeKind};
+
+        let mut t = Type {
+            kind: TypeKind::Named("int".into(), vec![]),
+            span: Span::DUMMY,
+        };
+        for _ in 0..(MAX_TYPE_DEPTH + 2000) {
+            t = Type {
+                kind: TypeKind::Tag(Box::new(t)),
+                span: Span::DUMMY,
+            };
+        }
+        let s = type_str(&t);
+        assert!(s.contains('…'), "expected a truncation marker");
     }
 }

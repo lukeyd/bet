@@ -39,6 +39,16 @@ pub enum RunError {
     Yeet(Value),
     /// A grammatically valid construct the interpreter does not yet evaluate.
     Unsupported(String),
+    /// Evaluation nested deeper than the interpreter's recursion cap (issue #38) — reported
+    /// instead of overflowing the native stack. Fires on unbounded `finna` recursion (a missing
+    /// base case) and on evaluating a pathologically deep AST such as the left-nested `Binary`
+    /// tree from `1 + 1 + 1 + …`. `depth` is the cap that was hit.
+    RecursionLimit { depth: u32 },
+    /// A program-controlled allocation size exceeded the interpreter's cap (issue #40) — reported
+    /// *before* allocating, so a hostile size (`mem.slab[int](1 << 40)`, an `int[1000000000]`
+    /// field, or a `gg` framebuffer whose `w * h` overflows) can't OOM the host or panic on `Vec`
+    /// capacity overflow. `requested` is the element count asked for; `cap` is the ceiling.
+    AllocLimit { requested: u128, cap: usize },
     /// Writing captured output to the sink failed.
     Io(String),
 }
@@ -67,6 +77,15 @@ impl std::fmt::Display for RunError {
             RunError::BadFormat(m) => write!(f, "bad format string: {m}"),
             RunError::Yeet(v) => write!(f, "yeet: {}", crate::value::display(v)),
             RunError::Unsupported(m) => write!(f, "unsupported construct: {m}"),
+            RunError::RecursionLimit { depth } => write!(
+                f,
+                "recursion limit exceeded (depth {depth}); likely unbounded recursion \
+                 (a missing base case) or an over-deep expression"
+            ),
+            RunError::AllocLimit { requested, cap } => write!(
+                f,
+                "allocation too large: requested {requested} element(s), cap is {cap}"
+            ),
             RunError::Io(m) => write!(f, "output error: {m}"),
         }
     }
