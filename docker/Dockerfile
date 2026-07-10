@@ -7,10 +7,12 @@
 # The image contains NO project source — the repo is bind-mounted at /work at run time (see
 # compose.yaml), so a code change never means an image rebuild.
 #
-# TODO(sec #45, optional): pin the base image by digest for reproducibility, e.g.
-#   FROM ubuntu:22.04@sha256:<digest from `docker buildx imagetools inspect ubuntu:22.04`>
-# Left unpinned because the digest cannot be determined in this offline environment.
-FROM ubuntu:22.04
+# Base image pinned by digest for a fully reproducible chain (sec #45). The digest is the
+# `ubuntu:22.04` linux multi-arch manifest list (OCI image index) — arch-independent, so the
+# amd64 image the build actually targets is still selected underneath it. Resolved with
+# `docker buildx imagetools inspect ubuntu:22.04` (cross-checked via the registry
+# Docker-Content-Digest header); re-pin from the same command on a deliberate base bump.
+FROM ubuntu:22.04@sha256:0e0a0fc6d18feda9db1590da249ac93e8d5abfea8f4c3c0c849ce512b5ef8982
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ENV DEBIAN_FRONTEND=noninteractive
@@ -28,17 +30,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # 2) LLVM 18 from the official apt.llvm.org repo (jammy). Provides llvm-config-18 and the static
 #    archives that llvm-sys 180 links against, plus clang/lld. Its own layer so tweaking the
 #    app-dependency list above never re-downloads ~half a gigabyte of LLVM.
-# #45: the apt.llvm.org signing key is fetched over TLS and then trusted blindly — a compromised
-# mirror or a MITM that can present a valid cert could swap in its own key and sign malicious
-# packages. Fetch the key to a file, dearmor it, and verify its fingerprint against a pinned,
-# out-of-band value (fail closed) before trusting it. LLVM_KEY_FPR is the published fingerprint of
-# the apt.llvm.org archive signing key (key 0x15CF4D18AF4F7421, listed at https://apt.llvm.org/).
-# TODO(sec #45): confirm this fingerprint against https://apt.llvm.org/ before merge, and — for
-#   defence-in-depth / offline builds — additionally vendor the key bytes at
-#   docker/llvm-snapshot.gpg.key and `COPY` them in instead of fetching over the network.
+# #45: the apt.llvm.org signing key is now VENDORED at docker/llvm-snapshot.gpg.key and COPYed in
+# below, instead of being fetched over TLS and trusted blindly — that removed the last build-time
+# network fetch a compromised mirror or MITM (even one with a valid cert) could swap. Defence in
+# depth: the vendored key is STILL dearmored and its fingerprint verified against a pinned,
+# out-of-band value (fail closed) before it becomes the signed-by keyring for ~0.5 GB of LLVM.
+# LLVM_KEY_FPR is the published fingerprint of the apt.llvm.org archive signing key
+# (key 0x15CF4D18AF4F7421, listed at https://apt.llvm.org/); the vendored key bytes were confirmed
+# to carry exactly this fingerprint before commit.
 ARG LLVM_KEY_FPR=6084F3CF814B57C1CF12EFD515CF4D18AF4F7421
-RUN curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm-snapshot.gpg.key \
- && gpg --dearmor -o /usr/share/keyrings/llvm.gpg /tmp/llvm-snapshot.gpg.key \
+COPY llvm-snapshot.gpg.key /tmp/llvm-snapshot.gpg.key
+RUN gpg --dearmor -o /usr/share/keyrings/llvm.gpg /tmp/llvm-snapshot.gpg.key \
  && got_fpr="$(gpg --show-keys --with-colons /usr/share/keyrings/llvm.gpg \
         | awk -F: '/^fpr:/ {print $10; exit}')" \
  && if [[ "$got_fpr" != "$LLVM_KEY_FPR" ]]; then \
