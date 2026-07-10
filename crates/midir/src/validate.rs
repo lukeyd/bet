@@ -7,6 +7,7 @@
 //! rather than reported as an error.
 
 use crate::ir::*;
+use std::collections::HashMap;
 
 /// A single well-formedness problem.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -38,6 +39,15 @@ pub enum ValidationError {
     BadShape { func: String, detail: String },
     #[error("function `{func}`: type mismatch — {detail}")]
     TypeMismatch { func: String, detail: String },
+    #[error(
+        "function `{func}` bb{block}: downcast to variant #{variant} is not dominated by a \
+         `Switch` on this value's discriminant selecting that variant (type-confusion risk)"
+    )]
+    DowncastUnguarded {
+        func: String,
+        block: u32,
+        variant: u32,
+    },
 }
 
 /// Validate a whole module. `Ok(())` means well-formed; otherwise every problem found.
@@ -87,6 +97,59 @@ impl<'a> Checker<'a> {
                 self.check_stmt(func, block.id, stmt);
             }
             self.check_term(func, block.id, &block.term, nblocks);
+        }
+
+        // Defense-in-depth: every sum `Downcast` must be dominated by a discriminant guard.
+        self.check_downcast_guards(func);
+    }
+
+    // --- sum-downcast guard analysis (cwage security issue #48) ---
+    //
+    // A `Proj::Downcast(v)` positions into a sum's payload and overlays the requested
+    // variant's fields WITHOUT checking the runtime discriminant (the backend emits a raw
+    // pointer-cast). That is sound only where control flow has already proven the
+    // discriminant equals `v`. The frontend always guarantees this by dominating each
+    // downcast with a `Switch` on `Discriminant(scrutinee)`, but hand-written IR (a `.mir`
+    // fed through `compile_mir_source`) could emit a `Downcast` with no such guard and
+    // silently type-confuse the payload. This pass rejects any downcast that is not
+    // dominated by the matching discriminant test, so the guarantee no longer rests on the
+    // frontend alone.
+    //
+    // Method: build a dominator tree over the function's CFG, resolve every `Switch` whose
+    // scrutinee is a single-assignment discriminant temp back to the sum place it reads the
+    // discriminant of, and require each `Downcast(v)` on place `P` to be reachable only
+    // through the case-`v` edge of a `Switch` on `Discriminant(P)`.
+    //
+    // Residual gap (best-effort, matching the rest of this file): we do not track a
+    // reassignment of the *scrutinee sum place itself* between the guarding switch and the
+    // downcast. The frontend never does that — it reads every arm payload as the first
+    // statements of the arm block — and closing it would require full place-granular
+    // reaching-definitions. Everything else (a missing guard, the wrong variant, a
+    // discriminant temp that is overwritten before the switch, an unguarded default edge) is
+    // rejected.
+    fn check_downcast_guards(&mut self, func: &Func) {
+        let sites = collect_downcast_sites(func);
+        if sites.is_empty() {
+            return;
+        }
+        let n = func.blocks.len();
+        let entry = func.entry.index();
+        if entry >= n {
+            // Entry is out of range — already reported as `BadEntry`; can't analyze the CFG.
+            return;
+        }
+        let preds = compute_preds(func);
+        let doms = compute_dominators(n, entry, &preds);
+        let guards = collect_switch_guards(func, &doms);
+
+        for site in &sites {
+            if !site_is_guarded(site, &guards, &doms, &preds) {
+                self.errors.push(ValidationError::DowncastUnguarded {
+                    func: func.name.clone(),
+                    block: site.block as u32,
+                    variant: site.variant,
+                });
+            }
         }
     }
 
@@ -854,5 +917,558 @@ impl<'a> Checker<'a> {
                 });
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sum-downcast guard analysis (helpers for `Checker::check_downcast_guards`).
+//
+// These are free functions over a single `Func`'s CFG (block index == `BlockId`, per the
+// `midir` invariant). They never touch `Module`, so the checker can push errors while they
+// borrow `func` immutably. Block indices are used throughout; any control-flow target that
+// is out of range is skipped (the structural pass already reports it as `BadTarget`).
+// ---------------------------------------------------------------------------
+
+/// A single `Proj::Downcast(v)` occurrence: the block it lives in, the sum place it overlays
+/// (the projection prefix up to — but not including — the downcast), and the claimed variant.
+struct DowncastSite {
+    block: usize,
+    prefix: Place,
+    variant: u32,
+}
+
+/// A `Switch` resolved back to a discriminant guard: the block holding it, the sum place its
+/// scrutinee reads the discriminant of, and its case/default targets (as block indices).
+struct SwitchGuard {
+    block: usize,
+    sum_place: Place,
+    cases: Vec<(u64, usize)>,
+    default: usize,
+}
+
+/// The successor block ids of a terminator (empty for `Return`/`Panic`/`Unreachable`).
+fn successors(term: &Terminator) -> Vec<BlockId> {
+    match term {
+        Terminator::Goto(bb) => vec![*bb],
+        Terminator::Branch {
+            then_bb, else_bb, ..
+        } => vec![*then_bb, *else_bb],
+        Terminator::Switch { cases, default, .. } => {
+            let mut v: Vec<BlockId> = cases.iter().map(|(_, bb)| *bb).collect();
+            v.push(*default);
+            v
+        }
+        Terminator::HollaCheck { live, ghosted, .. } => vec![*live, *ghosted],
+        Terminator::Return(_) | Terminator::Panic(_) | Terminator::Unreachable => Vec::new(),
+    }
+}
+
+/// Distinct predecessors of each block, derived from terminator successors.
+fn compute_preds(func: &Func) -> Vec<Vec<usize>> {
+    let n = func.blocks.len();
+    let mut preds = vec![Vec::new(); n];
+    for (i, block) in func.blocks.iter().enumerate() {
+        for s in successors(&block.term) {
+            let si = s.index();
+            if si < n && !preds[si].contains(&i) {
+                preds[si].push(i);
+            }
+        }
+    }
+    preds
+}
+
+/// A dominator matrix: `dom[b][a] == true` iff block `a` dominates block `b`. Standard
+/// iterative set fixpoint (`dom(b) = {b} ∪ ⋂ dom(pred(b))`); the CFG is small so the O(n³)
+/// worst case is irrelevant. Unreachable blocks (no predecessors) resolve to `{b}`, which is
+/// harmless — nothing downstream relies on their dominators.
+fn compute_dominators(n: usize, entry: usize, preds: &[Vec<usize>]) -> Vec<Vec<bool>> {
+    let mut dom = vec![vec![true; n]; n];
+    for (a, slot) in dom[entry].iter_mut().enumerate() {
+        *slot = a == entry;
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in 0..n {
+            if b == entry {
+                continue;
+            }
+            let mut new = vec![false; n];
+            new[b] = true;
+            if !preds[b].is_empty() {
+                let mut inter = vec![true; n];
+                for &p in &preds[b] {
+                    for (slot, &pd) in inter.iter_mut().zip(dom[p].iter()) {
+                        *slot = *slot && pd;
+                    }
+                }
+                for (slot, &id) in new.iter_mut().zip(inter.iter()) {
+                    *slot = *slot || id;
+                }
+            }
+            if new != dom[b] {
+                dom[b] = new;
+                changed = true;
+            }
+        }
+    }
+    dom
+}
+
+/// Every `Downcast` in the function, with the block and prefix place it applies to. Walks all
+/// places reachable from statements and terminators (including places nested inside `Index`
+/// operands), so no downcast can hide from the guard check.
+fn collect_downcast_sites(func: &Func) -> Vec<DowncastSite> {
+    let mut out = Vec::new();
+    for (i, block) in func.blocks.iter().enumerate() {
+        for stmt in &block.stmts {
+            match stmt {
+                Stmt::Assign(place, rv) => {
+                    sites_in_place(i, place, &mut out);
+                    sites_in_rvalue(i, rv, &mut out);
+                }
+                Stmt::Evict(op) => sites_in_operand(i, op, &mut out),
+                Stmt::EvictSlot { crib, tag } => {
+                    sites_in_operand(i, crib, &mut out);
+                    sites_in_operand(i, tag, &mut out);
+                }
+                Stmt::Nop => {}
+            }
+        }
+        sites_in_term(i, &block.term, &mut out);
+    }
+    out
+}
+
+fn sites_in_place(block: usize, place: &Place, out: &mut Vec<DowncastSite>) {
+    for (k, proj) in place.proj.iter().enumerate() {
+        match proj {
+            Proj::Downcast(v) => out.push(DowncastSite {
+                block,
+                prefix: Place {
+                    local: place.local,
+                    proj: place.proj[..k].to_vec(),
+                },
+                variant: *v,
+            }),
+            Proj::Index(op) => sites_in_operand(block, op, out),
+            Proj::Field(_) | Proj::Deref => {}
+        }
+    }
+}
+
+fn sites_in_operand(block: usize, op: &Operand, out: &mut Vec<DowncastSite>) {
+    match op {
+        Operand::Copy(p) | Operand::Move(p) => sites_in_place(block, p, out),
+        Operand::Const(_) => {}
+    }
+}
+
+fn sites_in_rvalue(block: usize, rv: &Rvalue, out: &mut Vec<DowncastSite>) {
+    match rv {
+        Rvalue::Use(op)
+        | Rvalue::UnOp(_, op)
+        | Rvalue::Cast(op, _, _)
+        | Rvalue::Discriminant(op)
+        | Rvalue::StrPtr(op)
+        | Rvalue::StrLen(op)
+        | Rvalue::SlicePtr(op)
+        | Rvalue::SliceLen(op) => sites_in_operand(block, op, out),
+        Rvalue::BinOp(_, a, b, _) | Rvalue::Trust(a, b) => {
+            sites_in_operand(block, a, out);
+            sites_in_operand(block, b, out);
+        }
+        Rvalue::Call(callee, args) => {
+            if let Callee::Indirect(op) = callee {
+                sites_in_operand(block, op, out);
+            }
+            for a in args {
+                sites_in_operand(block, a, out);
+            }
+        }
+        Rvalue::Aggregate(_, ops) | Rvalue::Simd { args: ops, .. } => {
+            for a in ops {
+                sites_in_operand(block, a, out);
+            }
+        }
+        Rvalue::Cop(crib, init) => {
+            sites_in_operand(block, crib, out);
+            match init {
+                CopInit::StructLit(_, fields) => {
+                    for (_, op) in fields {
+                        sites_in_operand(block, op, out);
+                    }
+                }
+                CopInit::SumVariant(_, _, ops) => {
+                    for op in ops {
+                        sites_in_operand(block, op, out);
+                    }
+                }
+            }
+        }
+        Rvalue::AddrOf(place) => sites_in_place(block, place, out),
+        Rvalue::MakeSlice { data, len, .. } | Rvalue::MakeStr { data, len } => {
+            sites_in_operand(block, data, out);
+            sites_in_operand(block, len, out);
+        }
+        Rvalue::CribNew { .. } | Rvalue::CribGlobal(_) | Rvalue::SizeOf(_) => {}
+    }
+}
+
+fn sites_in_term(block: usize, term: &Terminator, out: &mut Vec<DowncastSite>) {
+    match term {
+        Terminator::Goto(_) | Terminator::Unreachable => {}
+        Terminator::Branch { cond, .. } => sites_in_operand(block, cond, out),
+        Terminator::Switch { scrutinee, .. } => sites_in_operand(block, scrutinee, out),
+        Terminator::HollaCheck {
+            tag,
+            crib,
+            resolved,
+            ..
+        } => {
+            sites_in_operand(block, tag, out);
+            sites_in_operand(block, crib, out);
+            sites_in_place(block, resolved, out);
+        }
+        Terminator::Return(vals) => {
+            for op in vals {
+                sites_in_operand(block, op, out);
+            }
+        }
+        Terminator::Panic(op) => sites_in_operand(block, op, out),
+    }
+}
+
+/// The bare local a switch scrutinee reads, if the scrutinee is a plain (unprojected) local.
+fn scrutinee_local(op: &Operand) -> Option<LocalId> {
+    match op {
+        Operand::Copy(p) | Operand::Move(p) if p.proj.is_empty() => Some(p.local),
+        _ => None,
+    }
+}
+
+/// Resolve every `Switch` into a discriminant guard we can trust. A switch guards variant
+/// membership only if its scrutinee is a discriminant temp that is (a) assigned **exactly
+/// once** in the whole function — so its value at the switch is unambiguous and cannot have
+/// been overwritten with an unrelated integer — via `temp = discriminant(P)`, and (b) that
+/// sole assignment dominates the switch. The recovered `P` is the sum place the switch
+/// discriminates over.
+fn collect_switch_guards(func: &Func, doms: &[Vec<bool>]) -> Vec<SwitchGuard> {
+    let n = func.blocks.len();
+    // Count bare-local assignments and remember the sole `= discriminant(place)` for each.
+    let mut assign_count: HashMap<u32, u32> = HashMap::new();
+    let mut disc_def: HashMap<u32, (usize, Place)> = HashMap::new();
+    for (i, block) in func.blocks.iter().enumerate() {
+        for stmt in &block.stmts {
+            if let Stmt::Assign(place, rv) = stmt
+                && place.proj.is_empty()
+            {
+                *assign_count.entry(place.local.0).or_insert(0) += 1;
+                if let Rvalue::Discriminant(Operand::Copy(p) | Operand::Move(p)) = rv {
+                    disc_def.insert(place.local.0, (i, p.clone()));
+                }
+            }
+        }
+        // `holla`'s `resolved` binding is also a def of its (bare) local.
+        if let Terminator::HollaCheck { resolved, .. } = &block.term
+            && resolved.proj.is_empty()
+        {
+            *assign_count.entry(resolved.local.0).or_insert(0) += 1;
+        }
+    }
+
+    let mut guards = Vec::new();
+    for (i, block) in func.blocks.iter().enumerate() {
+        let Terminator::Switch {
+            scrutinee,
+            cases,
+            default,
+        } = &block.term
+        else {
+            continue;
+        };
+        let Some(local) = scrutinee_local(scrutinee) else {
+            continue;
+        };
+        if assign_count.get(&local.0).copied() != Some(1) {
+            continue; // Not a single-assignment temp — its value at the switch is not trusted.
+        }
+        let Some((def_block, place)) = disc_def.get(&local.0) else {
+            continue; // The sole assignment is not a `discriminant(..)`.
+        };
+        if !doms[i][*def_block] {
+            continue; // The discriminant read must dominate the switch.
+        }
+        let cases_idx: Vec<(u64, usize)> = cases
+            .iter()
+            .filter_map(|(cv, bb)| {
+                let t = bb.index();
+                (t < n).then_some((*cv, t))
+            })
+            .collect();
+        let d = default.index();
+        guards.push(SwitchGuard {
+            block: i,
+            sum_place: place.clone(),
+            cases: cases_idx,
+            default: if d < n { d } else { usize::MAX },
+        });
+    }
+    guards
+}
+
+/// Is this downcast dominated by a discriminant guard that proves its variant?
+///
+/// True iff some guard switches on `Discriminant(prefix)` and has a case-`v` edge to a block
+/// `t` such that entering `t` proves `discriminant == v` and `t` dominates the downcast:
+///
+/// * `t` dominates the downcast's block (so every path to it passes through `t`),
+/// * `t`'s only predecessor is the switch block (so `t` is entered only across this edge),
+/// * and `t` is the target of case value `v` alone — never another case or the `default`
+///   edge (so crossing into `t` genuinely pins the discriminant to `v`).
+///
+/// The `default` edge is never accepted: a default arm does not pin the discriminant to any
+/// single variant, so a downcast reached only through it is rejected (conservative).
+fn site_is_guarded(
+    site: &DowncastSite,
+    guards: &[SwitchGuard],
+    doms: &[Vec<bool>],
+    preds: &[Vec<usize>],
+) -> bool {
+    let d = site.block;
+    let v = site.variant as u64;
+    for g in guards {
+        if g.sum_place != site.prefix {
+            continue;
+        }
+        for &(cv, t) in &g.cases {
+            if cv != v {
+                continue;
+            }
+            let single_pred = preds[t].len() == 1 && preds[t][0] == g.block;
+            if doms[d][t] && single_pred && case_target_is_exclusive(g, t, v) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// True iff block `t` is reached from switch `g` only by case value `v`: `t` is not the
+/// `default` target, and no other case value also targets `t`.
+fn case_target_is_exclusive(g: &SwitchGuard, t: usize, v: u64) -> bool {
+    if g.default == t {
+        return false;
+    }
+    g.cases.iter().all(|&(cv, tt)| tt != t || cv == v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::build::FuncBuilder;
+
+    /// A module with `sum Opt { None, Some(i64) }`; returns `(module, opt_ty, i64, u32)`.
+    fn opt_module() -> (Module, TyId, TyId, TyId) {
+        let mut m = Module::new();
+        let i64t = m.t_i64();
+        let u32t = m.t_u32();
+        let opt = m.add_sum(SumDef {
+            name: "Opt".into(),
+            variants: vec![
+                Variant {
+                    name: "None".into(),
+                    payload: vec![],
+                },
+                Variant {
+                    name: "Some".into(),
+                    payload: vec![i64t],
+                },
+            ],
+        });
+        let opt_ty = m.intern_ty(TyKind::Sum(opt));
+        (m, opt_ty, i64t, u32t)
+    }
+
+    /// The canonical frontend `vibe` shape: `disc = discriminant(x)`, a `Switch` on it, and
+    /// each arm reading its payload through `downcast(variant).field(j)`. Must validate.
+    #[test]
+    fn guarded_downcast_validates() {
+        let (mut m, opt_ty, i64t, u32t) = opt_module();
+        let mut fb = FuncBuilder::new("unwrap_or_zero", vec![opt_ty], vec![i64t]);
+        let arg = fb.param(0);
+        let disc = fb.local(u32t);
+        let payload = fb.local(i64t);
+        let bb0 = fb.block();
+        let bb_none = fb.block();
+        let bb_some = fb.block();
+        let bb_def = fb.block();
+
+        fb.at(bb0);
+        fb.assign(fb.place(disc), Rvalue::Discriminant(fb.copy(fb.place(arg))));
+        fb.switch(
+            fb.copy(fb.place(disc)),
+            vec![(0, bb_none), (1, bb_some)],
+            bb_def,
+        );
+
+        fb.at(bb_none);
+        fb.ret(vec![Operand::Const(Const::Int(0, i64t))]);
+
+        fb.at(bb_some); // reached only when discriminant == 1 (Some)
+        let src = fb.field(&fb.downcast(&fb.place(arg), 1), 0);
+        fb.assign(fb.place(payload), Rvalue::Use(fb.copy(src)));
+        fb.ret(vec![fb.copy(fb.place(payload))]);
+
+        fb.at(bb_def);
+        fb.unreachable();
+
+        m.add_func(fb.finish());
+        validate(&m).expect("a discriminant-guarded downcast must validate");
+    }
+
+    /// The same guard, but the downcast lives in a block only *dominated by* the arm (not the
+    /// arm itself) — exercises the dominator check beyond the trivial `arm == downcast` case.
+    #[test]
+    fn guarded_downcast_in_dominated_block_validates() {
+        let (mut m, opt_ty, i64t, u32t) = opt_module();
+        let mut fb = FuncBuilder::new("nested", vec![opt_ty], vec![i64t]);
+        let arg = fb.param(0);
+        let disc = fb.local(u32t);
+        let payload = fb.local(i64t);
+        let bb0 = fb.block();
+        let bb_none = fb.block();
+        let bb_some = fb.block();
+        let bb_inner = fb.block();
+        let bb_def = fb.block();
+
+        fb.at(bb0);
+        fb.assign(fb.place(disc), Rvalue::Discriminant(fb.copy(fb.place(arg))));
+        fb.switch(
+            fb.copy(fb.place(disc)),
+            vec![(0, bb_none), (1, bb_some)],
+            bb_def,
+        );
+
+        fb.at(bb_none);
+        fb.ret(vec![Operand::Const(Const::Int(0, i64t))]);
+
+        fb.at(bb_some);
+        fb.goto(bb_inner);
+
+        fb.at(bb_inner); // dominated by bb_some, whose sole predecessor is the case-1 edge
+        let src = fb.field(&fb.downcast(&fb.place(arg), 1), 0);
+        fb.assign(fb.place(payload), Rvalue::Use(fb.copy(src)));
+        fb.ret(vec![fb.copy(fb.place(payload))]);
+
+        fb.at(bb_def);
+        fb.unreachable();
+
+        m.add_func(fb.finish());
+        validate(&m).expect("a downcast dominated by the guarded arm must validate");
+    }
+
+    /// A downcast with no discriminant test anywhere is a type-confusion hole — reject it.
+    #[test]
+    fn unguarded_downcast_rejected() {
+        let (mut m, opt_ty, i64t, _u32t) = opt_module();
+        let mut fb = FuncBuilder::new("wild_downcast", vec![opt_ty], vec![i64t]);
+        let arg = fb.param(0);
+        let payload = fb.local(i64t);
+        let bb0 = fb.block();
+        let bb1 = fb.block();
+
+        fb.at(bb0);
+        fb.goto(bb1); // no discriminant guard at all
+
+        fb.at(bb1);
+        let src = fb.field(&fb.downcast(&fb.place(arg), 1), 0);
+        fb.assign(fb.place(payload), Rvalue::Use(fb.copy(src)));
+        fb.ret(vec![fb.copy(fb.place(payload))]);
+
+        m.add_func(fb.finish());
+        let errs = validate(&m).expect_err("an unguarded downcast must be rejected");
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::DowncastUnguarded { variant: 1, .. })),
+            "{errs:?}"
+        );
+    }
+
+    /// The switch proves variant 0 (None) on this edge, but the arm downcasts variant 1
+    /// (Some) — the classic guarded-but-wrong-variant confusion. Reject it.
+    #[test]
+    fn mismatched_variant_downcast_rejected() {
+        let (mut m, opt_ty, i64t, u32t) = opt_module();
+        let mut fb = FuncBuilder::new("confused", vec![opt_ty], vec![i64t]);
+        let arg = fb.param(0);
+        let disc = fb.local(u32t);
+        let payload = fb.local(i64t);
+        let bb0 = fb.block();
+        let bb_none = fb.block();
+        let bb_some = fb.block();
+        let bb_def = fb.block();
+
+        fb.at(bb0);
+        fb.assign(fb.place(disc), Rvalue::Discriminant(fb.copy(fb.place(arg))));
+        fb.switch(
+            fb.copy(fb.place(disc)),
+            vec![(0, bb_none), (1, bb_some)],
+            bb_def,
+        );
+
+        fb.at(bb_none); // reached only when discriminant == 0 (None)...
+        let src = fb.field(&fb.downcast(&fb.place(arg), 1), 0); // ...but claims Some (variant 1)!
+        fb.assign(fb.place(payload), Rvalue::Use(fb.copy(src)));
+        fb.ret(vec![fb.copy(fb.place(payload))]);
+
+        fb.at(bb_some);
+        fb.ret(vec![Operand::Const(Const::Int(0, i64t))]);
+
+        fb.at(bb_def);
+        fb.unreachable();
+
+        m.add_func(fb.finish());
+        let errs = validate(&m).expect_err("a variant-mismatched downcast must be rejected");
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::DowncastUnguarded { variant: 1, .. })),
+            "{errs:?}"
+        );
+    }
+
+    /// A downcast reached only through the `default` edge is not pinned to any variant, so it
+    /// must be rejected (the default arm proves nothing about the discriminant).
+    #[test]
+    fn default_edge_downcast_rejected() {
+        let (mut m, opt_ty, i64t, u32t) = opt_module();
+        let mut fb = FuncBuilder::new("default_downcast", vec![opt_ty], vec![i64t]);
+        let arg = fb.param(0);
+        let disc = fb.local(u32t);
+        let payload = fb.local(i64t);
+        let bb0 = fb.block();
+        let bb_none = fb.block();
+        let bb_def = fb.block();
+
+        fb.at(bb0);
+        fb.assign(fb.place(disc), Rvalue::Discriminant(fb.copy(fb.place(arg))));
+        fb.switch(fb.copy(fb.place(disc)), vec![(0, bb_none)], bb_def);
+
+        fb.at(bb_none);
+        fb.ret(vec![Operand::Const(Const::Int(0, i64t))]);
+
+        fb.at(bb_def); // the default arm — discriminant is only known to be != 0
+        let src = fb.field(&fb.downcast(&fb.place(arg), 1), 0);
+        fb.assign(fb.place(payload), Rvalue::Use(fb.copy(src)));
+        fb.ret(vec![fb.copy(fb.place(payload))]);
+
+        m.add_func(fb.finish());
+        let errs = validate(&m).expect_err("a default-edge downcast must be rejected");
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e, ValidationError::DowncastUnguarded { variant: 1, .. })),
+            "{errs:?}"
+        );
     }
 }
