@@ -1,0 +1,44 @@
+// tag16.mir — the 16-byte `{ i32 slot, i64 generation }` tag (security issue #34, the u64
+// generation widening) across every backend ABI site: `cop` (bet_cop RETURNS the tag struct),
+// `holla_check` (PASSES the tag struct by value), `trust` (extracts slot = struct field 0),
+// `evictslot` (bet_evict_slot TAKES the tag struct), and `ghosted` (the null-tag struct
+// `{ 0xFFFFFFFF, 0 }`). Each `bet_cop`/`bet_holla_check`/`bet_evict_slot` declaration must agree
+// on the tag struct type. Compile-only. (Security #34, backend half.)
+
+struct Cell { flex value: i64 }
+
+fn make(%0: crib Cell) -> tag Cell {
+  let %1: tag Cell
+  bb0:
+    %1 = cop(%0, Cell{0: 9i64})
+    return %1
+}
+
+fn read(%0: tag Cell, %1: crib Cell) -> i64 {
+  let %2: ref Cell
+  bb0:
+    holla_check(%0, %1, %2) -> bb1 else bb2
+  bb1:
+    return %2.deref.field(0)
+  bb2:
+    return -1i64
+}
+
+fn touch(%0: tag Cell, %1: crib Cell) -> void {
+  let %2: ref Cell
+  bb0:
+    %2 = trust(%1, %0)
+    %2.deref.field(0) = add.trap(%2.deref.field(0), 1i64)
+    return
+}
+
+fn free_one(%0: crib Cell, %1: tag Cell) -> void {
+  bb0:
+    evictslot %0, %1
+    return
+}
+
+fn null_tag() -> tag Cell {
+  bb0:
+    return ghosted
+}

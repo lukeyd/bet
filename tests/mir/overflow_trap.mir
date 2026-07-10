@@ -1,0 +1,23 @@
+// overflow_trap.mir — `trap`-mode add/sub/mul lower to the checked
+// `llvm.sadd/ssub/smul.with.overflow` intrinsics and branch to `bet_panic` on the overflow bit
+// (security issue #32); `wrap`-mode stays plain wrapping arithmetic. `trapping` chains all three
+// signed trapping ops (three guards → three block splits); `wrapping` shows the unchecked path.
+// Compile-only. (Security #32.)
+
+fn trapping(%0: i64, %1: i64) -> i64 {
+  let %2: i64
+  let %3: i64
+  let %4: i64
+  bb0:
+    %2 = add.trap(%0, %1)
+    %3 = sub.trap(%2, %1)
+    %4 = mul.trap(%3, %1)
+    return %4
+}
+
+fn wrapping(%0: u64, %1: u64) -> u64 {
+  let %2: u64
+  bb0:
+    %2 = add.wrap(%0, %1)
+    return %2
+}

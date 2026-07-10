@@ -1,0 +1,36 @@
+// oob_index.mir — array/slice indexing emits a bounds-check guard (security issue #32): an
+// unsigned idx-vs-len compare that conditionally branches to a `bet_panic` block, then continues
+// on a fresh block. `read_arr` reads an array element (Access mode: `idx < n`, the static
+// extent); `read_slice` reads a slice element (Access mode against the fat-pointer length field);
+// `tail_addr` takes the ONE-PAST-THE-END address of a slice (Addr mode: `idx <= len` is legal —
+// the base of an empty tail sub-slice like `str.sub(s, len, len)`). Compile-only: proves the
+// guarded, block-split module still verifies. (Security #32.)
+
+fn read_arr(%0: [i64; 4], %1: i64) -> i64 {
+  let %2: i64
+  bb0:
+    %2 = %0.index(%1)
+    return %2
+}
+
+fn read_slice(%0: [i64; 8], %1: i64) -> i64 {
+  let %2: rawptr
+  let %3: []i64
+  let %4: i64
+  bb0:
+    %2 = addr_of(%0)
+    %3 = make_slice[i64](%2, 8u64)
+    %4 = %3.index(%1)
+    return %4
+}
+
+fn tail_addr(%0: [i64; 4]) -> rawptr {
+  let %1: rawptr
+  let %2: []i64
+  let %3: rawptr
+  bb0:
+    %1 = addr_of(%0)
+    %2 = make_slice[i64](%1, 4u64)
+    %3 = addr_of(%2.index(4i64))
+    return %3
+}

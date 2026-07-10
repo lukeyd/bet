@@ -146,3 +146,48 @@ fn slice_mir_compiles() {
 fn print_mir_compiles() {
     compile_fixture("print.mir");
 }
+
+// --- security-hardening batch: the memory-safety guards emitted by codegen must all produce a
+// module that still passes LLVM verification (`compile_fixture` verifies via `compile`). These
+// exercise the guard/mask/saturation codegen and the 16-byte Tag ABI (issues #32, #34, #36). ---
+
+/// Array/slice indexing emits a bounds-check guard (Access `idx < len`, Addr `idx <= len` for a
+/// one-past-the-end address) that branches to `bet_panic` and splits the block. (Issue #32.)
+#[test]
+fn oob_index_mir_compiles() {
+    compile_fixture("oob_index.mir");
+}
+
+/// Div/rem guard a zero divisor (and, when signed, `INT_MIN / -1`) with a branch to `bet_panic`.
+/// (Issue #36.)
+#[test]
+fn div_guard_mir_compiles() {
+    compile_fixture("div_guard.mir");
+}
+
+/// `shl`/`shr` mask the shift amount to `[0, bit_width)` before shifting. (Issue #36.)
+#[test]
+fn shift_mask_mir_compiles() {
+    compile_fixture("shift_mask.mir");
+}
+
+/// `trap`-mode add/sub/mul emit `llvm.{s,u}{add,sub,mul}.with.overflow` + a branch on the
+/// overflow bit. (Issue #32.)
+#[test]
+fn overflow_trap_mir_compiles() {
+    compile_fixture("overflow_trap.mir");
+}
+
+/// Float→int casts lower to the saturating `llvm.fpto{s,u}i.sat` intrinsics with a NaN→0 select.
+/// (Issue #36.)
+#[test]
+fn ftoi_sat_mir_compiles() {
+    compile_fixture("ftoi_sat.mir");
+}
+
+/// The 16-byte `{ i32 slot, i64 generation }` tag flows consistently through `cop`,
+/// `holla_check`, `trust`, `evictslot`, and `ghosted`. (Issue #34, backend half.)
+#[test]
+fn tag16_mir_compiles() {
+    compile_fixture("tag16.mir");
+}
