@@ -1958,7 +1958,8 @@ impl LowerCtx {
                 // handle / raw pointer / crib is a null POINTER (`Const::NullPtr`). Emitting the
                 // tag struct into a pointer-shaped local stored 16 bytes into an 8-byte slot and
                 // clobbered the adjacent local once a `tag` grew to 16 bytes (#34) — the DOOM
-                // native regression. This mirrors `zero_value`.
+                // native regression. Mirrors `zero_value`'s tag/handle arms (and errors on the
+                // value types `ghosted` has no null form for).
                 Some(t) => {
                     let val = match self.m.ty(t) {
                         TyKind::Tag(_) => Const::Ghosted,
@@ -1970,8 +1971,8 @@ impl LowerCtx {
                         | TyKind::Crib(_) => Const::NullPtr,
                         other => {
                             return Err(format!(
-                                "`ghosted` is only valid for a tag or handle-shaped type, not \
-                                 {other:?}"
+                                "you can't ghost a {other:?} — `ghosted` only fits a tag or a \
+                                 handle-shaped type (fn / vec / stash / rng / rawptr / crib)"
                             ));
                         }
                     };

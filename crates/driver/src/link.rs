@@ -140,14 +140,17 @@ fn run_linker(mut cmd: Command, name: &str) -> Result<(), String> {
 /// `gg-desktop` platform layer) must run on the main thread.
 const MAIN_STACK_BYTES: u64 = 128 * 1024 * 1024;
 
-/// Linker arguments that grow the executable's main-thread stack to [`MAIN_STACK_BYTES`]. macOS's
-/// `ld` takes `-stack_size <hex>` (a Mach-O load command); ELF linkers (GNU ld / lld) take
-/// `-z stacksize=<n>`. Empty elsewhere (Windows sets it in `link_msvc`, if ever needed).
+/// Linker arguments that grow the executable's main-thread stack to [`MAIN_STACK_BYTES`].
+///
+/// macOS's `ld` takes `-stack_size <hex>` (a Mach-O load command) and enlarges the main thread's
+/// stack directly. On Linux the main thread's stack is governed by `RLIMIT_STACK`, not by any
+/// link-time flag (the ELF `-z stack-size=` field only sizes *thread* stacks), so a native build
+/// there would instead need `ulimit -s` or a worker-thread entry — we emit nothing rather than a
+/// flag that silently wouldn't apply. Empty elsewhere too (Windows would set it in `link_msvc`, if
+/// ever needed).
 fn main_stack_args() -> Vec<String> {
     if cfg!(target_os = "macos") {
         vec![format!("-Wl,-stack_size,{MAIN_STACK_BYTES:#x}")]
-    } else if cfg!(target_os = "linux") {
-        vec![format!("-Wl,-z,stacksize={MAIN_STACK_BYTES}")]
     } else {
         Vec::new()
     }
