@@ -3866,7 +3866,7 @@ finna lowerExpr(c: LowerCtx, p: P, idx: int, hint: str) -> (str, str) {
 
 // The stdlib module namespaces (mirror is_module).
 finna isModule(name: str) -> bool {
-    bet str.slaps(name, "spill") || str.slaps(name, "str") || str.slaps(name, "math") || str.slaps(name, "mem") || str.slaps(name, "bytes") || str.slaps(name, "fmt") || str.slaps(name, "stash") || str.slaps(name, "vec") || str.slaps(name, "yikes") || str.slaps(name, "fs") || str.slaps(name, "sys")
+    bet str.slaps(name, "spill") || str.slaps(name, "str") || str.slaps(name, "math") || str.slaps(name, "mem") || str.slaps(name, "bytes") || str.slaps(name, "fmt") || str.slaps(name, "stash") || str.slaps(name, "vec") || str.slaps(name, "yikes") || str.slaps(name, "fs") || str.slaps(name, "sys") || str.slaps(name, "gg")
 }
 
 // `str_ptr(s)` / `str_len(s)` into fresh temps; return their ids.
@@ -4345,6 +4345,208 @@ finna lowerIntrinsic(c: LowerCtx, p: P, module: str, method: str, methodIdx: int
         lowkey so, st = lowerMemSlab(c, p, methodIdx)
         bet so, st
     }
+    // --- gg platform module (graphics/audio/input): the 12 intrinsics the DOOM port needs ---
+    // `gg.ticks()` -> int — monotonic nanosecond timer, presented as int (mirror lower.rs gg.ticks).
+    fr str.slaps(module, "gg") && str.slaps(method, "ticks") {
+        getExtern(c, "extern \"C\" fn bet_gg_ticks() -> u64")
+        lowkey tkArgs = vec.new[str]()
+        lowkey raw = emitExternCall(c, "u64", "bet_gg_ticks", tkArgs)
+        lowkey v = coerceInt(c, reg(raw), "u64", "i64")
+        bet v, "i64"
+    }
+    // `gg.pending()` -> int — interleaved i16 samples still queued in the raw ring, as int.
+    fr str.slaps(module, "gg") && str.slaps(method, "pending") {
+        getExtern(c, "extern \"C\" fn bet_gg_pending() -> u64")
+        lowkey pnArgs = vec.new[str]()
+        lowkey raw = emitExternCall(c, "u64", "bet_gg_pending", pnArgs)
+        lowkey v = coerceInt(c, reg(raw), "u64", "i64")
+        bet v, "i64"
+    }
+    // `gg.title(name)` — set the window title from a string (its `{ptr, len}`). Void statement.
+    fr str.slaps(module, "gg") && str.slaps(method, "title") {
+        lowkey s, sty = lowerExpr(c, p, argValue(p, argsW, 0), "str")
+        lowkey ptr = emitStrPtr(c, s)
+        lowkey len = emitStrLen(c, s)
+        getExtern(c, "extern \"C\" fn bet_gg_title(rawptr, u64) -> void")
+        lowkey tlArgs = vec.new[str]()
+        tlArgs.stack(reg(ptr))
+        tlArgs.stack(reg(len))
+        lowkey r = emitExternCall(c, "void", "bet_gg_title", tlArgs)
+        bet reg(r), "void"
+    }
+    // `gg.stop(voiceId)` — stop a voice. Void statement.
+    fr str.slaps(module, "gg") && str.slaps(method, "stop") {
+        lowkey v0, vt0 = lowerExpr(c, p, argValue(p, argsW, 0), "u32")
+        lowkey vc = coerceInt(c, v0, vt0, "u32")
+        getExtern(c, "extern \"C\" fn bet_gg_stop(u32) -> void")
+        lowkey stArgs = vec.new[str]()
+        stArgs.stack(vc)
+        lowkey r = emitExternCall(c, "void", "bet_gg_stop", stArgs)
+        bet reg(r), "void"
+    }
+    // `gg.play(soundId, loop, volume)` -> int — start a voice; returns its 1-based id.
+    fr str.slaps(module, "gg") && str.slaps(method, "play") {
+        lowkey s0, st0 = lowerExpr(c, p, argValue(p, argsW, 0), "u32")
+        lowkey sc = coerceInt(c, s0, st0, "u32")
+        lowkey l0, lt0 = lowerExpr(c, p, argValue(p, argsW, 1), "u32")
+        lowkey lc = coerceInt(c, l0, lt0, "u32")
+        lowkey v0, vt0 = lowerExpr(c, p, argValue(p, argsW, 2), "u32")
+        lowkey vc = coerceInt(c, v0, vt0, "u32")
+        getExtern(c, "extern \"C\" fn bet_gg_play(u32, u32, u32) -> u32")
+        lowkey plArgs = vec.new[str]()
+        plArgs.stack(sc)
+        plArgs.stack(lc)
+        plArgs.stack(vc)
+        lowkey id = emitExternCall(c, "u32", "bet_gg_play", plArgs)
+        lowkey out = coerceInt(c, reg(id), "u32", "i64")
+        bet out, "i64"
+    }
+    // `gg.tune(voiceId, volume, pan)` — live-update a playing voice's volume/pan. Void statement.
+    fr str.slaps(module, "gg") && str.slaps(method, "tune") {
+        lowkey v0, vt0 = lowerExpr(c, p, argValue(p, argsW, 0), "u32")
+        lowkey vc = coerceInt(c, v0, vt0, "u32")
+        lowkey o0, ot0 = lowerExpr(c, p, argValue(p, argsW, 1), "u32")
+        lowkey oc = coerceInt(c, o0, ot0, "u32")
+        lowkey pa0, pat0 = lowerExpr(c, p, argValue(p, argsW, 2), "u32")
+        lowkey pac = coerceInt(c, pa0, pat0, "u32")
+        getExtern(c, "extern \"C\" fn bet_gg_tune(u32, u32, u32) -> void")
+        lowkey tnArgs = vec.new[str]()
+        tnArgs.stack(vc)
+        tnArgs.stack(oc)
+        tnArgs.stack(pac)
+        lowkey r = emitExternCall(c, "void", "bet_gg_tune", tnArgs)
+        bet reg(r), "void"
+    }
+    // `gg.mouseDelta()` -> (int, int) — raw mouse movement since the last call. The ABI packs two
+    // SIGNED i32s `(dx as u32) << 32 | (dy as u32)`; each half truncates to i32 then SIGN-extends.
+    fr str.slaps(module, "gg") && str.slaps(method, "mouseDelta") {
+        getExtern(c, "extern \"C\" fn bet_gg_mouse_delta() -> u64")
+        lowkey mdArgs = vec.new[str]()
+        lowkey raw = emitExternCall(c, "u64", "bet_gg_mouse_delta", mdArgs)
+        lowkey xsh = newLocal(c, "u64")
+        lowkey xb = sbNew()
+        xb.add("shr.na(")
+        xb.add(reg(raw))
+        xb.add(", 32u64)")
+        emitAssign(c, xsh, xb.finish())
+        lowkey dxi = coerceInt(c, reg(xsh), "u64", "i32")
+        lowkey dx = coerceInt(c, dxi, "i32", "i64")
+        lowkey dyi = coerceInt(c, reg(raw), "u64", "i32")
+        lowkey dy = coerceInt(c, dyi, "i32", "i64")
+        lowkey tup = newLocal(c, "(i64, i64)")
+        lowkey tb = sbNew()
+        tb.add("tuple(")
+        tb.add(dx)
+        tb.add(", ")
+        tb.add(dy)
+        tb.add(")")
+        emitAssign(c, tup, tb.finish())
+        bet reg(tup), "(i64, i64)"
+    }
+    // `gg.audioSpec()` -> (int, int) — the audio device's output `(rate, channels)`. The ABI packs
+    // `rate << 32 | channels`; unpack rate by a right shift and channels by truncating the low 32.
+    fr str.slaps(module, "gg") && str.slaps(method, "audioSpec") {
+        getExtern(c, "extern \"C\" fn bet_gg_audio_spec() -> u64")
+        lowkey asArgs = vec.new[str]()
+        lowkey raw = emitExternCall(c, "u64", "bet_gg_audio_spec", asArgs)
+        lowkey rsh = newLocal(c, "u64")
+        lowkey rb = sbNew()
+        rb.add("shr.na(")
+        rb.add(reg(raw))
+        rb.add(", 32u64)")
+        emitAssign(c, rsh, rb.finish())
+        lowkey rate = coerceInt(c, reg(rsh), "u64", "i64")
+        lowkey chu = coerceInt(c, reg(raw), "u64", "u32")
+        lowkey ch = coerceInt(c, chu, "u32", "i64")
+        lowkey tup = newLocal(c, "(i64, i64)")
+        lowkey tb = sbNew()
+        tb.add("tuple(")
+        tb.add(rate)
+        tb.add(", ")
+        tb.add(ch)
+        tb.add(")")
+        emitAssign(c, tup, tb.finish())
+        bet reg(tup), "(i64, i64)"
+    }
+    // `gg.poll()` -> (int, int) — poll the next input event into a stack slot, then return
+    // `(kind, code)` zero-extended to int; the `bool` result and `x`/`y` are ignored.
+    fr str.slaps(module, "gg") && str.slaps(method, "poll") {
+        ensureGgEvent(c)
+        lowkey ev = newLocal(c, "__gg_Event")
+        lowkey evPtr = emitAddrOf(c, reg(ev))
+        getExtern(c, "extern \"C\" fn bet_gg_poll(rawptr) -> bool")
+        lowkey pollArgs = vec.new[str]()
+        pollArgs.stack(reg(evPtr))
+        lowkey discard = emitExternCall(c, "bool", "bet_gg_poll", pollArgs)
+        lowkey kind = coerceInt(c, cat2(reg(ev), ".field(0)"), "u32", "i64")
+        lowkey code = coerceInt(c, cat2(reg(ev), ".field(1)"), "u32", "i64")
+        lowkey tup = newLocal(c, "(i64, i64)")
+        lowkey tb = sbNew()
+        tb.add("tuple(")
+        tb.add(kind)
+        tb.add(", ")
+        tb.add(code)
+        tb.add(")")
+        emitAssign(c, tup, tb.finish())
+        bet reg(tup), "(i64, i64)"
+    }
+    // `gg.audio(samples, cnt)` — submit `cnt` interleaved stereo frames. Void statement.
+    fr str.slaps(module, "gg") && str.slaps(method, "audio") {
+        lowkey frames = ggBufferBasePtr(c, p, argValue(p, argsW, 0))
+        fr !lcOk(c) {
+            bet "0i64", "i64"
+        }
+        lowkey cnt, cty = lowerExpr(c, p, argValue(p, argsW, 1), "u64")
+        lowkey cntc = coerceInt(c, cnt, cty, "u64")
+        getExtern(c, "extern \"C\" fn bet_gg_audio(rawptr, u64) -> void")
+        lowkey adArgs = vec.new[str]()
+        adArgs.stack(frames)
+        adArgs.stack(cntc)
+        lowkey r = emitExternCall(c, "void", "bet_gg_audio", adArgs)
+        bet reg(r), "void"
+    }
+    // `gg.show(pixels, w, h)` — present a tightly packed fixed-logical-size `w * h` framebuffer,
+    // aspect-fit into the live window. Takes the base pointer + dims directly (no stride). Void.
+    fr str.slaps(module, "gg") && str.slaps(method, "show") {
+        lowkey pixels = ggBufferBasePtr(c, p, argValue(p, argsW, 0))
+        fr !lcOk(c) {
+            bet "0i64", "i64"
+        }
+        lowkey w0, wt0 = lowerExpr(c, p, argValue(p, argsW, 1), "u32")
+        lowkey wc = coerceInt(c, w0, wt0, "u32")
+        lowkey h0, ht0 = lowerExpr(c, p, argValue(p, argsW, 2), "u32")
+        lowkey hc = coerceInt(c, h0, ht0, "u32")
+        getExtern(c, "extern \"C\" fn bet_gg_show(rawptr, u32, u32) -> void")
+        lowkey shArgs = vec.new[str]()
+        shArgs.stack(pixels)
+        shArgs.stack(wc)
+        shArgs.stack(hc)
+        lowkey r = emitExternCall(c, "void", "bet_gg_show", shArgs)
+        bet reg(r), "void"
+    }
+    // `gg.sound(buf, byteOff, byteLen, channels, rate)` -> int — register a PCM sound from a byte
+    // view of `buf`; returns its 1-based id.
+    fr str.slaps(module, "gg") && str.slaps(method, "sound") {
+        lowkey ptr = ggBufferBytePtr(c, p, argValue(p, argsW, 0), argValue(p, argsW, 1))
+        fr !lcOk(c) {
+            bet "0i64", "i64"
+        }
+        lowkey l0, lt0 = lowerExpr(c, p, argValue(p, argsW, 2), "u64")
+        lowkey lc = coerceInt(c, l0, lt0, "u64")
+        lowkey ch0, cht0 = lowerExpr(c, p, argValue(p, argsW, 3), "u32")
+        lowkey chc = coerceInt(c, ch0, cht0, "u32")
+        lowkey r0, rt0 = lowerExpr(c, p, argValue(p, argsW, 4), "u32")
+        lowkey rc = coerceInt(c, r0, rt0, "u32")
+        getExtern(c, "extern \"C\" fn bet_gg_sound(rawptr, u64, u32, u32) -> u32")
+        lowkey sndArgs = vec.new[str]()
+        sndArgs.stack(ptr)
+        sndArgs.stack(lc)
+        sndArgs.stack(chc)
+        sndArgs.stack(rc)
+        lowkey id = emitExternCall(c, "u32", "bet_gg_sound", sndArgs)
+        lowkey out = coerceInt(c, reg(id), "u32", "i64")
+        bet out, "i64"
+    }
     lcFail(c)
     bet "0i64", "i64"
 }
@@ -4492,6 +4694,79 @@ finna lowerSoaVecWrite(c: LowerCtx, p: P, indexIdx: int, valueIdx: int, bundleRe
     args.stack(iu)
     args.stack(reg(sptr))
     lowkey ok = emitExternCall(c, "bool", "bet_vec_set", args)
+}
+
+// Lazily register the `__gg_Event` struct on first use by `gg.poll` (mirror the frontend's cached
+// event_struct): the extern fills this caller-provided slot, then its fields are read back.
+finna ensureGgEvent(c: LowerCtx) {
+    fr !isStruct(c, "__gg_Event") {
+        c.structNames.stack("__gg_Event")
+        c.structDecls.stack("struct __gg_Event { hush kind: u32, hush code: u32, hush x: i32, hush y: i32 }")
+        addField(c, "__gg_Event", "kind", "u32", 0)
+        addField(c, "__gg_Event", "code", "u32", 1)
+        addField(c, "__gg_Event", "x", "i32", 2)
+        addField(c, "__gg_Event", "y", "i32", 3)
+    }
+}
+
+// `gg` buffer base pointer (mirror buffer_base_ptr): `addr_of` the buffer's first element. For a
+// slice the base is `buf.index(0i64)`; for an array the buffer place itself. Returns the rawptr
+// operand, or fails (lcFail) if the argument is not an addressable array/slice.
+finna ggBufferBasePtr(c: LowerCtx, p: P, argNode: int) -> str {
+    lowkey buf, bty = lowerExpr(c, p, argNode, "")
+    fr !isPlace(buf) {
+        lcFail(c)
+        bet "%0"
+    }
+    lowkey base = buf
+    fr isSliceTy(bty) {
+        base = cat2(buf, ".index(0i64)")
+    } naw fr !isArrayTy(bty) {
+        lcFail(c)
+        bet "%0"
+    }
+    lowkey ptr = emitAddrOf(c, base)
+    bet reg(ptr)
+}
+
+// Like ggBufferBasePtr but a raw pointer `byteOff` BYTES into the buffer (mirror buffer_byte_ptr):
+// midir has no ptr+int arithmetic, so the byte offset becomes an element index `byteOff / sizeof(T)`
+// via an element-granular index. Returns the rawptr operand.
+finna ggBufferBytePtr(c: LowerCtx, p: P, bufNode: int, offNode: int) -> str {
+    lowkey buf, bty = lowerExpr(c, p, bufNode, "")
+    fr !isPlace(buf) {
+        lcFail(c)
+        bet "%0"
+    }
+    lowkey elem = ""
+    fr isArrayTy(bty) {
+        elem = arrayElem(bty)
+    } naw fr isSliceTy(bty) {
+        elem = sliceElem(bty)
+    } naw {
+        lcFail(c)
+        bet "%0"
+    }
+    lowkey off, offty = lowerExpr(c, p, offNode, "i64")
+    lowkey offc = coerceInt(c, off, offty, "i64")
+    lowkey esizeUs = newLocal(c, "u64")
+    emitAssign(c, esizeUs, cat3("size_of[", elem, "]"))
+    lowkey esize = coerceInt(c, reg(esizeUs), "u64", "i64")
+    lowkey idx = newLocal(c, "i64")
+    lowkey db = sbNew()
+    db.add("div.trap(")
+    db.add(offc)
+    db.add(", ")
+    db.add(esize)
+    db.add(")")
+    emitAssign(c, idx, db.finish())
+    lowkey eb = sbNew()
+    eb.add(buf)
+    eb.add(".index(")
+    eb.add(reg(idx))
+    eb.add(")")
+    lowkey ptr = emitAddrOf(c, eb.finish())
+    bet reg(ptr)
 }
 
 // Serialize a map key to (ptr, len) operands (mirror serialize_key): a str key uses str_ptr/str_len;
@@ -6267,6 +6542,11 @@ finna lowerAssign(c: LowerCtx, p: P, stmtIdx: int) {
                 lowkey place, fty = fieldAccessStr(c, p, fieldNode)
                 fr lcOk(c) {
                     lowkey val, vty = lowerExpr(c, p, kidAt(p, vw, 0), fty)
+                    // Coerce an int RHS to the field's int type (width/sign), e.g. `3i64` into an
+                    // i32 field -> cast.trunc (mirror lower_assign). A no-op when the types match.
+                    fr isIntTy(fty) && isIntTy(vty) {
+                        val = coerceInt(c, val, vty, fty)
+                    }
                     emitPlaceAssign(c, place, val)
                 }
             }
@@ -6284,6 +6564,9 @@ finna lowerAssign(c: LowerCtx, p: P, stmtIdx: int) {
             lowkey iop, ity = lowerExpr(c, p, kidAt(p, idxNode, 1), "i64")
             lowkey place = cat2(bop, cat3(".index(", iop, ")"))
             lowkey val, vty = lowerExpr(c, p, kidAt(p, vw, 0), elem)
+            fr isIntTy(elem) && isIntTy(vty) {
+                val = coerceInt(c, val, vty, elem)
+            }
             emitPlaceAssign(c, place, val)
         }
     } naw {
