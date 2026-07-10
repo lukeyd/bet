@@ -703,7 +703,9 @@ status = "doing"
 slug = "selfhost-soa"
 name = "selfhost: teach betfe the soa keyword (fix selfhost.yml drift from #50)"
 size = 2
-status = "doing"
+# DONE. betfe now LOWERS soa (not just lex/parse): mapTypeNode soa/array branches + per-field
+# element access (05-structs/soa-* byte-identical). Folded into the self-hosted-frontend completion.
+status = "done"
 
 # ─────────────────── Security review batch (cwage issues #30–#48) ───────────────────
 # Full-tree security review (tracking issue #49). Fanned out across 10 worktree-isolated
@@ -804,22 +806,36 @@ status = "doing"
 slug = "selfhost-simd"
 name = "betfe: lower first-class SIMD (vec2/3/4, i32x4/i64x2, lanes, dot/sum/min/max/abs/scale/length) — 15-simd mir parity"
 size = 5
-status = "todo"
+# DONE. mapTypeNode + constructor/splat + lane reads + element-wise binops + methods; 15-simd
+# byte-identical. Also normalized whole-number float-literal emission (latent-bug fix).
+status = "done"
 
 [[task]]
 slug = "selfhost-modules"
 name = "betfe: multi-file modules (pull loader + resolve/mangle pass) + reference --emit mir goes multi-file; un-exclude 14-modules/12-doom from the selfhost gate"
 size = 13
-status = "todo"
+# DONE. betfe import-graph loader (DFS/dedup/cycle/confinement/aliases/post-order) + resolve/mangle
+# ($idx$ scheme, flex/hush, ns.fn->Call, ns.CONST->Name) merged into one arena before lowering;
+# main --emit mir loads from the entry path. Reference --emit mir routes multi-file via
+# frontend::load (dump::mir_program). 14-modules/12-doom carve-out removed from the gate.
+status = "done"
 
 [[task]]
 slug = "selfhost-intrinsics"
 name = "betfe: stdlib-intrinsic + operator parity — teach betfe to lower the 8 recent-intrinsic corpus gaps (tag==ghosted, fs.peep, bytes-parse, stdin read-line, math.cook rng, vibeCheck/glowUp filter-map on squad)"
 size = 5
-status = "todo"
+# DONE. All 8 targets byte-identical (== / != ghosted on handle types, fs.peep/drop,
+# bytes.readU16le/I16le, sys.peep stdin, math.cook rng + methods, vibeCheck/glowUp on squad).
+status = "done"
 
 [[task]]
 slug = "selfhost-doom"
 name = "betfe capstone: close any residual corpus gap + drive the real ports/doom through betfe (byte-identical .mir, doom-verify --sim-only green)"
 size = 8
-status = "todo"
+# DONE. Closed the DOOM place-access family (nested field chains, array-of-drips element fields,
+# handle-typed struct fields, fn-field dispatch, nested holla, cop{} zero-defaults), yeet/fs.drop/
+# mem.slab, the 12 gg platform intrinsics, and place-assign int coercion. betfe --emit mir
+# ports/doom/doom.bet is byte-identical to the reference across all 137,429 lines; the betfe-built
+# DOOM binary runs headless demo3 with a demo-sync stream bit-identical to the reference-built one.
+# Also added `betfe --emit failall` (gap enumerator). Full corpus now 81/83 (2 by-design), fixpoint held.
+status = "done"
