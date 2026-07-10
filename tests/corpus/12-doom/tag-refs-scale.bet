@@ -1,0 +1,156 @@
+// tag-refs-scale — the #72 regression guard: store MANY `tag`/ref fields into crib-resident
+// aggregates and save/restore them at scale, mirroring the DOOM savegame's target/tracer link
+// fixup (`p_saveg.fixupThinkerRefs`) that regressed when a `tag` became the 16-byte `{i32,i64}`
+// handle (issue #34, PR #59). Each `Node` carries four `tag Node` cross-links; N nodes are copped
+// into a crib, cross-linked, then SERIALIZED (every link recorded as a slot index), the crib is
+// evicted, N fresh nodes are re-copped, and every link is RESTORED from its serial. A fold over
+// the restored links must equal the fold over the originals — so any mis-stored / mis-resolved
+// tag (a residual 8-byte-tag assumption, a bad struct GEP of a tag field, a nested-holla write
+// that doesn't commit) diverges here, tripping `corpus --compiled` (interp == compiled).
+pull "spill"
+pull "vec"
+
+flex facts N: int = 96
+
+flex drip Node {
+    flex serial: i32
+    flex a: tag Node   // (i + 1) mod N
+    flex b: tag Node   // (i + N - 1) mod N
+    flex c: tag Node   // (i*7 + 3) mod N
+    flex d: tag Node   // (i*13 + 5) mod N
+}
+
+flex crib nodes: Node[128]
+
+// The serial (slot ordinal) a link points at: read the target's `.serial`. A null/ghosted link
+// yields -1. Mirrors p_saveg.serialOf.
+flex finna serialOf(t: tag Node) -> int {
+    lowkey s = -1
+    holla n = t in nodes {
+        s = n.serial as int
+    } ghosted {
+        s = -1
+    }
+    bet s
+}
+
+// Fold every node's four link serials into a running checksum (order-sensitive).
+flex finna foldLinks(handles: vec[tag Node]) -> int {
+    lowkey acc = 2166136261
+    lowkey i = 0
+    vibin i < N {
+        lowkey t: tag Node = handles[i]
+        // Read the four link tags into locals, CLOSE the holla, THEN resolve serials — never
+        // resolve one crib inside an open holla on the same crib (nested-holla gotcha).
+        lowkey ta: tag Node = ghosted
+        lowkey tb: tag Node = ghosted
+        lowkey tc: tag Node = ghosted
+        lowkey td: tag Node = ghosted
+        holla n = t in nodes {
+            ta = n.a
+            tb = n.b
+            tc = n.c
+            td = n.d
+        } ghosted {
+        }
+        lowkey sa = serialOf(ta)
+        lowkey sb = serialOf(tb)
+        lowkey sc = serialOf(tc)
+        lowkey sd = serialOf(td)
+        acc = (acc * 16777619 + sa) & 4294967295
+        acc = (acc * 16777619 + sb) & 4294967295
+        acc = (acc * 16777619 + sc) & 4294967295
+        acc = (acc * 16777619 + sd) & 4294967295
+        i = i + 1
+    }
+    bet acc
+}
+
+// cop N fresh nodes (serial = ordinal); return the handle table (slot i -> its tag).
+flex finna spawnNodes() -> vec[tag Node] {
+    lowkey handles = vec.new[tag Node]()
+    lowkey i = 0
+    vibin i < N {
+        lowkey t = cop Node{ serial: i as i32 } in nodes
+        handles.stack(t)
+        i = i + 1
+    }
+    bet handles
+}
+
+// Link every node deterministically from the handle table (four tag stores per node).
+flex finna linkNodes(handles: vec[tag Node]) {
+    lowkey i = 0
+    vibin i < N {
+        lowkey t: tag Node = handles[i]
+        holla n = t in nodes {
+            n.a = handles[(i + 1) % N]
+            n.b = handles[(i + N - 1) % N]
+            n.c = handles[(i * 7 + 3) % N]
+            n.d = handles[(i * 13 + 5) % N]
+        } ghosted {
+        }
+        i = i + 1
+    }
+}
+
+finna main() {
+    // ---- ORIGINAL: cop + cross-link at scale ----
+    lowkey h0 = spawnNodes()
+    linkNodes(h0)
+    lowkey fp1 = foldLinks(h0)
+
+    // ---- SERIALIZE every link to a slot index (4 * N ints) ----
+    lowkey aSer = vec.new[int]()
+    lowkey bSer = vec.new[int]()
+    lowkey cSer = vec.new[int]()
+    lowkey dSer = vec.new[int]()
+    lowkey i = 0
+    vibin i < N {
+        lowkey t: tag Node = h0[i]
+        lowkey ta: tag Node = ghosted
+        lowkey tb: tag Node = ghosted
+        lowkey tc: tag Node = ghosted
+        lowkey td: tag Node = ghosted
+        holla n = t in nodes {
+            ta = n.a
+            tb = n.b
+            tc = n.c
+            td = n.d
+        } ghosted {
+        }
+        aSer.stack(serialOf(ta))
+        bSer.stack(serialOf(tb))
+        cSer.stack(serialOf(tc))
+        dSer.stack(serialOf(td))
+        i = i + 1
+    }
+
+    // ---- RESET the crib and re-cop a fresh generation ----
+    evict nodes
+    lowkey h1 = spawnNodes()
+
+    // ---- RESTORE: rebuild every link from its serialized slot index ----
+    i = 0
+    vibin i < N {
+        lowkey t: tag Node = h1[i]
+        holla n = t in nodes {
+            n.a = h1[aSer[i]]
+            n.b = h1[bSer[i]]
+            n.c = h1[cSer[i]]
+            n.d = h1[dSer[i]]
+        } ghosted {
+        }
+        i = i + 1
+    }
+    lowkey fp2 = foldLinks(h1)
+
+    spill.it(N)
+    spill.it(fp1)
+    spill.it(fp2)
+    fr fp1 == fp2 {
+        spill.it("RESTORE-OK")
+    } naw {
+        spill.it("RESTORE-MISMATCH")
+    }
+}

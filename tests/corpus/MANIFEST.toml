@@ -76,6 +76,7 @@ all = [
   # 12 doom (the doom-port language package: one-crib game state, per-slot evict,
   # file writes, callbacks, sized-int idioms)
   "doom.gamestate", "doom.evict-slot", "doom.fs-drop", "doom.fn-param", "doom.int-widths",
+  "doom.tag-refs-scale",
   # 15 simd (first-class fixed-width vector types: `f32x4`/`i64x2`/`vec2..4`)
   "simd.construct", "simd.arithmetic", "simd.lanes", "simd.minmax", "simd.reduce", "simd.float",
 ]
@@ -577,6 +578,16 @@ compiled = "pass"
 [[program]]
 path = "12-doom/int-widths"
 covers = ["doom.int-widths", "values.casts", "values.numeric-tower"]
+interp = "pass"
+compiled = "pass"
+
+# The #72 regression guard: MANY `tag`/ref fields (four per node, N nodes) stored into a crib
+# and save/restored at scale (serialize links -> evict -> re-cop -> restore), then folded to a
+# checksum. Catches a mis-stored/mis-resolved tag (the 16-byte-Tag ABI class) as an interp !=
+# compiled divergence — the coverage the native-only DOOM saveg smoke lacked in `corpus`.
+[[program]]
+path = "12-doom/tag-refs-scale"
+covers = ["doom.tag-refs-scale"]
 interp = "pass"
 compiled = "pass"
 
