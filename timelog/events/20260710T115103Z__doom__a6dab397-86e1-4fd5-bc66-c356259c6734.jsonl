@@ -1,0 +1,4 @@
+{"ts":"2026-07-10T11:51:03Z","agent":"agent","task":"doom","event":"in","activity":"debugging","note":""}
+{"ts":"2026-07-10T12:31:59Z","agent":"agent","event":"switch","activity":"testing","note":""}
+{"ts":"2026-07-10T12:41:33Z","agent":"agent","event":"switch","activity":"reviewing","note":""}
+{"ts":"2026-07-10T12:44:04Z","agent":"agent","event":"out","activity":"","note":""}

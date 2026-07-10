@@ -723,6 +723,12 @@ size = 13
 status = "done"
 
 [[task]]
+slug = "sec-72-tag-padding"
+name = "Fix #72: eliminate the 16-byte Tag's undef padding lane (explicit _pad:u32 field in rt-abi/runtime/rt-stub + codegen), the #34-exposed DOOM render miscompile; keep u64 generation"
+size = 5
+status = "doing"
+
+[[task]]
 slug = "sec-midir-downcast"
 name = "Security #48: midir::validate rejects sum downcasts not dominated by a discriminant Switch (dominator analysis)"
 size = 5
