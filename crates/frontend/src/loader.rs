@@ -65,13 +65,21 @@ where
     R: FnMut(&Path) -> std::io::Result<String>,
 {
     let entry = normalize(entry);
-    // Confine every import to the directory the entry file lives in. `root_lexical` is the
-    // always-on floor (and the only check possible for the in-memory test reader, whose paths
-    // are fictional). `root_canonical` is set only when the entry sits on a real filesystem —
-    // it resolves symlinks so a symlinked `.bet` file can't escape the project either.
-    let root_dir = entry.parent().unwrap_or_else(|| Path::new(""));
-    let root_lexical = normalize(root_dir);
-    let root_canonical = root_dir.canonicalize().ok();
+    let entry_dir = entry
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .to_path_buf();
+    // Confine every import under a project root so `pull` can't read files outside it. The root is
+    // the build's working directory when the entry lives inside it — the project/sandbox boundary,
+    // which lets multi-directory projects import siblings (`../defs`, `../p`) while still rejecting
+    // climbs to arbitrary host paths and absolute imports. It falls back to the entry's own
+    // directory for an entry given outside CWD, and `root_canonical` is `None` for the in-memory
+    // test reader (fictional paths), where `root_lexical` is the confinement floor instead.
+    let cwd = std::env::current_dir()
+        .ok()
+        .and_then(|c| c.canonicalize().ok());
+    let root_canonical = import_root(&entry, &entry_dir, cwd.as_deref());
+    let root_lexical = normalize(&entry_dir);
     // The root's user-facing name: its own file name, never its absolute directory.
     let display = entry
         .file_name()
@@ -84,6 +92,7 @@ where
         stack: Vec::new(),
         root_lexical,
         root_canonical,
+        cwd,
     };
     b.load_file(&entry, &display, true)?;
     Ok(ModuleGraph { modules: b.modules })
@@ -97,11 +106,14 @@ struct GraphBuilder<'r, R> {
     /// The active DFS path — path plus its user-facing display name — for cycle detection and
     /// a readable, leak-free cycle message.
     stack: Vec<(PathBuf, String)>,
-    /// Lexically-normalized import root: every resolved import must stay under it.
+    /// Lexically-normalized floor used only when `root_canonical` is `None` (the in-memory reader).
     root_lexical: PathBuf,
-    /// Canonicalized import root when the entry is a real file; tightens confinement so a
-    /// symlinked escape is also rejected. `None` for the in-memory reader.
+    /// Canonicalized project root (CWD, or the entry's dir for an out-of-tree entry) when the entry
+    /// is a real file; resolved-target confinement checks against it. `None` for the in-memory reader.
     root_canonical: Option<PathBuf>,
+    /// Canonicalized working directory, used to absolutize a relative import target that doesn't
+    /// exist yet (a missing import) so its confinement can still be judged. `None` if unavailable.
+    cwd: Option<PathBuf>,
 }
 
 impl<R> GraphBuilder<'_, R>
@@ -187,21 +199,48 @@ where
         Ok(idx)
     }
 
-    /// Is `target` confined to the import root? Lexical containment is always required (and is
-    /// the sole check for the in-memory reader, whose paths never touch disk). When the entry
-    /// lives on a real filesystem, an existing target is additionally canonicalized so a
-    /// symlinked escape resolves to a path outside the root and is rejected.
+    /// Is `target` confined under the project root? On a real filesystem the target is resolved to
+    /// an absolute path — canonicalized when it exists (so a symlinked escape resolves outside the
+    /// root and is rejected), else absolutized lexically (so a not-yet-existing in-root import still
+    /// validates) — and required to start with the root. For the in-memory reader (no `root_canonical`)
+    /// lexical containment under `root_lexical` is the check.
     fn confined(&self, target: &Path) -> bool {
-        if !normalize(target).starts_with(&self.root_lexical) {
-            return false;
+        match &self.root_canonical {
+            Some(root) => {
+                let abs = target
+                    .canonicalize()
+                    .unwrap_or_else(|_| self.absolutize(target));
+                abs.starts_with(root)
+            }
+            None => normalize(target).starts_with(&self.root_lexical),
         }
-        if let Some(root) = &self.root_canonical
-            && let Ok(canon) = target.canonicalize()
-        {
-            return canon.starts_with(root);
-        }
-        true
     }
+
+    /// Resolve a (possibly relative, possibly missing) target to a lexical absolute path: an
+    /// absolute target is normalized in place; a relative one is joined onto the working directory.
+    fn absolutize(&self, target: &Path) -> PathBuf {
+        if target.is_absolute() {
+            normalize(target)
+        } else if let Some(cwd) = &self.cwd {
+            normalize(&cwd.join(target))
+        } else {
+            normalize(target)
+        }
+    }
+}
+
+/// Choose the import-confinement root: the canonical working directory when the entry resolves
+/// inside it (the project/sandbox boundary — allows in-project sibling imports like `../defs`),
+/// otherwise the entry's own directory (for an entry passed as a path outside CWD). Returns `None`
+/// when nothing resolves on disk (the in-memory test reader), where a lexical floor is used instead.
+fn import_root(entry: &Path, entry_dir: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
+    if let Some(cwd) = cwd
+        && let Ok(entry_abs) = entry.canonicalize()
+        && entry_abs.starts_with(cwd)
+    {
+        return Some(cwd.to_path_buf());
+    }
+    entry_dir.canonicalize().ok()
 }
 
 /// Reject an absolute `pull` target (a leading `/` or drive prefix) — imports must be relative so
@@ -424,10 +463,13 @@ mod tests {
 
     #[test]
     fn parent_traversal_import_is_rejected() {
-        // `pull "../../etc/hostname"` must not escape the project (issue #39).
+        // A `..` chain that climbs out of the project root must be rejected (issue #39).
         let err = graph(
-            "main.bet",
-            &[("main.bet", "pull \"../../etc/hostname\"\nfinna main() {}\n")],
+            "proj/main.bet",
+            &[(
+                "proj/main.bet",
+                "pull \"../../etc/hostname\"\nfinna main() {}\n",
+            )],
         )
         .unwrap_err();
         let CompileError::Load(m) = err else {
