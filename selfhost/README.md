@@ -10,9 +10,16 @@ still substantially not-Go). So a compile is:
 your.bet ──[ betfe : the bet language frontend ]──▶ .mir ──[ bet : Rust backend + linker ]──▶ binary
 ```
 
-Status: **done** — Milestone 7.1 (self-host stage 1) and Milestone 8 (fixpoint) are complete.
-`betfe --emit mir <file>` is byte-identical to `bet build --emit mir <file>` for all 57 lowerable
-corpus programs and for betfe's own 27k-line source; the stage-2/stage-3 rebuild is stable.
+Status: **done** — Milestone 7.1 (self-host stage 1) and Milestone 8 (fixpoint) are complete, and
+betfe has since been brought to **full parity** with the reference frontend: multi-file modules
+(`pull`), first-class SIMD, `soa`, every recent stdlib intrinsic, and the `gg` platform module all
+lower. `betfe --emit mir <file>` is byte-identical to `bet build --emit mir <file>` for **81 of 83**
+corpus programs (the other two are interp-only — the reference can't lower them either) and for
+betfe's own source; the stage-2/stage-3 rebuild is stable. As the capstone, `betfe --emit mir
+ports/doom/doom.bet` is **byte-identical across all 137,429 lines** of the real 97-file DOOM port,
+and the betfe-built DOOM binary runs the headless `demo3` timedemo with a demo-sync stream
+bit-identical to the reference-built binary's. (`betfe --emit failall <entry>` lists every function
+that fails to lower — the gap enumerator used to drive large multi-file ports.)
 
 ---
 

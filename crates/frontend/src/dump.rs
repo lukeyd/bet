@@ -51,6 +51,19 @@ pub fn mir(src: &str) -> Result<String, CompileError> {
     Ok(midir::print(&module))
 }
 
+/// Dump the `.mir` textual IR for a whole *program* rooted at `entry`, resolving its `pull`
+/// imports across files first (mirrors what `bet build`/`run` do — [`crate::load`] then
+/// [`crate::compile_program`]). For a single-file entry (or one that only `pull`s built-in
+/// modules) `load` yields the same single-module program, so the emitted `.mir` is byte-identical
+/// to [`mir`] on that file's source — the multi-file path is a strict superset. This is what
+/// `bet build --emit mir` uses so the merged, resolved, mangled program has a reference dump the
+/// self-hosted frontend can be diffed against.
+pub fn mir_program(entry: &std::path::Path) -> Result<String, CompileError> {
+    let program = crate::load(entry)?;
+    let module = crate::compile_program(&program)?;
+    Ok(midir::print(&module))
+}
+
 /// Dump the parsed AST as a canonical, indented tree: one node per line, two spaces per depth
 /// level, scalar payloads (names, literals, operators, visibility) inlined on the node's line and
 /// child nodes on following lines one level deeper. Spans are omitted (like the token dump), so the
