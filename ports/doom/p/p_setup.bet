@@ -72,6 +72,18 @@ flex facts ST_VERTICAL: i32 = 1
 flex facts ST_POSITIVE: i32 = 2
 flex facts ST_NEGATIVE: i32 = 3
 
+// NATIVE-SAFETY caps for the geometry/thing loaders that have no gs.MAX* constant (sec #41). Each
+// slab is sized by an attacker-controlled lump length, so a forged/oversized lump is a multi-GB
+// OOM (and, uncapped, a runaway spawn loop for THINGS). Every real map is orders of magnitude
+// under these ceilings (E1M1 is in the hundreds); the values mirror vanilla's on-disk index widths
+// (i16 vertex/side/subsector/node refs => 32768; u16 seg refs => 65536).
+flex facts MAXVERTEXES: int = 32768
+flex facts MAXSIDEDEFS: int = 32768
+flex facts MAXSUBSECTORS: int = 32768
+flex facts MAXNODES: int = 32768
+flex facts MAXSEGS: int = 65536
+flex facts MAXTHINGS: int = 32768
+
 // ===========================================================================================
 // map-lump loaders (id's load order in P_SetupLevel is: blockmap, vertexes, sectors, sidedefs,
 // linedefs, subsectors, nodes, segs — "most of this ordering is important")
@@ -81,6 +93,9 @@ flex facts ST_NEGATIVE: i32 = 3
 flex finna loadVertexes(gt: tag gs.GameState, lump: int) {
     lowkey ofs = wad.lumpNum(gt, lump)
     lowkey num = wad.lumpLength(gt, lump) / 4
+    fr num < 0 || num > MAXVERTEXES {
+        yeet("P_LoadVertexes: too many vertexes")
+    }
     holla g = gt in gs.gsc {
         g.level.numvertexes = num as i32
         g.level.vtxX = mem.slab[i32](num)
@@ -167,6 +182,9 @@ flex finna loadSectors(gt: tag gs.GameState, lump: int) {
 flex finna loadSideDefs(gt: tag gs.GameState, lump: int) {
     lowkey ofs = wad.lumpNum(gt, lump)
     lowkey num = wad.lumpLength(gt, lump) / 30
+    fr num < 0 || num > MAXSIDEDEFS {
+        yeet("P_LoadSideDefs: too many sidedefs")
+    }
     holla g = gt in gs.gsc {
         g.level.numsides = num as i32
         g.level.sdTexOfs = mem.slab[i32](num)
@@ -312,6 +330,9 @@ flex finna loadLineDefs(gt: tag gs.GameState, lump: int) {
 flex finna loadSubsectors(gt: tag gs.GameState, lump: int) {
     lowkey ofs = wad.lumpNum(gt, lump)
     lowkey num = wad.lumpLength(gt, lump) / 4
+    fr num < 0 || num > MAXSUBSECTORS {
+        yeet("P_LoadSubsectors: too many subsectors")
+    }
     holla g = gt in gs.gsc {
         g.level.numsubsectors = num as i32
         g.level.ssSector = mem.slab[i32](num)
@@ -334,6 +355,9 @@ flex finna loadSubsectors(gt: tag gs.GameState, lump: int) {
 flex finna loadNodes(gt: tag gs.GameState, lump: int) {
     lowkey ofs = wad.lumpNum(gt, lump)
     lowkey num = wad.lumpLength(gt, lump) / 28
+    fr num < 0 || num > MAXNODES {
+        yeet("P_LoadNodes: too many nodes")
+    }
     holla g = gt in gs.gsc {
         g.level.numnodes = num as i32
         g.level.nodeX = mem.slab[i32](num)
@@ -369,6 +393,9 @@ flex finna loadNodes(gt: tag gs.GameState, lump: int) {
 flex finna loadSegs(gt: tag gs.GameState, lump: int) {
     lowkey ofs = wad.lumpNum(gt, lump)
     lowkey num = wad.lumpLength(gt, lump) / 12
+    fr num < 0 || num > MAXSEGS {
+        yeet("P_LoadSegs: too many segs")
+    }
     holla g = gt in gs.gsc {
         g.level.numsegs = num as i32
         g.level.segV1 = mem.slab[i32](num)
@@ -595,6 +622,9 @@ flex finna isCommercialThing(t: int) -> bool {
 flex finna loadThings(gt: tag gs.GameState, lump: int) {
     lowkey ofs = wad.lumpNum(gt, lump)
     lowkey num = wad.lumpLength(gt, lump) / 10
+    fr num < 0 || num > MAXTHINGS {
+        yeet("P_LoadThings: too many things")
+    }
     lowkey gm = 0
     holla g = gt in gs.gsc {
         g.level.numthings = num as i32
