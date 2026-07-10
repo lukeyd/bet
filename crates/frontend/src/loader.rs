@@ -157,9 +157,11 @@ where
                     "namespace `{name}` is imported twice — add an `as` alias"
                 )));
             }
-            // Reject a traversal in the import string itself before touching the filesystem, then
-            // confine the resolved target under the project root as defense in depth.
-            reject_escape(&p.module)?;
+            // Reject an absolute import string outright, then confine the resolved target under the
+            // project root — `confined` is what bounds `..` hops: a `..` that stays inside the root
+            // (e.g. `sub/mod` pulling `../state`) is fine, one that climbs out is rejected below,
+            // before any file read.
+            reject_absolute(&p.module)?;
             let target_display = format!("{}.bet", p.module);
             let target_path = normalize(&parent.join(&target_display));
             if !self.confined(&target_path) {
@@ -202,25 +204,18 @@ where
     }
 }
 
-/// Reject a `pull` target that could climb out of the project: an absolute path, or any `..`
-/// parent-dir hop (anywhere in the string). Reports only the module string as the user wrote it,
-/// so the message can't leak a resolved filesystem path.
-fn reject_escape(module: &str) -> Result<(), CompileError> {
+/// Reject an absolute `pull` target (a leading `/` or drive prefix) — imports must be relative so
+/// they resolve against the importing file and stay inside the project. `..` hops are *not* rejected
+/// here: whether a `..` climbs out of the root is decided by `confined` on the resolved path, which
+/// correctly allows an in-root sibling hop (`../state`) while rejecting an escape. Reports only the
+/// module string as the user wrote it, so the message can't leak a resolved filesystem path.
+fn reject_absolute(module: &str) -> Result<(), CompileError> {
     for comp in Path::new(module).components() {
-        match comp {
-            Component::ParentDir => {
-                return Err(CompileError::Load(format!(
-                    "pull \"{module}\" tries to climb out of the project with `..` — imports \
-                     gotta stay inside the crib, no cap"
-                )));
-            }
-            Component::RootDir | Component::Prefix(_) => {
-                return Err(CompileError::Load(format!(
-                    "pull \"{module}\" is an absolute path — keep imports relative and inside \
-                     the project, fr"
-                )));
-            }
-            _ => {}
+        if matches!(comp, Component::RootDir | Component::Prefix(_)) {
+            return Err(CompileError::Load(format!(
+                "pull \"{module}\" is an absolute path — keep imports relative and inside \
+                 the project, fr"
+            )));
         }
     }
     Ok(())
@@ -476,6 +471,26 @@ mod tests {
         assert_eq!(g.modules.len(), 3);
         let names: Vec<&str> = root(&g).imports.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, ["geometry", "x"]);
+    }
+
+    #[test]
+    fn in_root_parent_hop_is_allowed() {
+        // A `..` that stays inside the project root must load (regression: the confinement fix
+        // must not blanket-reject `..`). Mirrors corpus `12-doom/gamestate-crib`: a subdir module
+        // pulls `../state`, resolving to a sibling of the entry — still under the root.
+        let g = graph(
+            "proj/main.bet",
+            &[
+                ("proj/main.bet", "pull \"sub/mod\" as m\nfinna main() {}\n"),
+                ("proj/sub/mod.bet", "pull \"../state\"\nflex finna f() {}\n"),
+                ("proj/state.bet", "flex finna g() {}\n"),
+            ],
+        )
+        .unwrap();
+        assert!(
+            g.modules.iter().any(|m| m.stem == "state"),
+            "../state should resolve to the in-root sibling and load"
+        );
     }
 
     #[test]
