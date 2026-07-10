@@ -53,6 +53,13 @@ case "$cmd" in
   in)
     [ -n "$activity" ] || die "usage: timelog.sh in <activity> --task <slug> [--note ..]"
     [ -n "$task" ]     || die "'in' requires --task <slug> (see timelog/tasks.toml)"
+    # $task is interpolated into the logfile path below, so it must be a bare
+    # tasks.toml slug — never a path. Enforce ^[A-Za-z0-9._-]+$ and reject the
+    # pure-dot traversal names (which the char-class alone would let through).
+    case "$task" in
+      *[!A-Za-z0-9._-]*) die "invalid --task '$task': slug must match [A-Za-z0-9._-]+ (a timelog/tasks.toml name, not a path)" ;;
+      .|..)              die "invalid --task '$task': slug must be a timelog/tasks.toml name, not a path" ;;
+    esac
     validate_activity "$activity"
     mkdir -p "$EVENTS"
     uuid=$(uuidgen | tr 'A-Z' 'a-z')

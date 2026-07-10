@@ -18,16 +18,26 @@ if [ -z "$ROOT" ]; then
 fi
 EVENTS="$ROOT/timelog/events"
 
+json_escape() {
+  # escape backslash + double-quote, drop control chars/newlines
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\n\r\t'
+}
+
 payload=$(cat 2>/dev/null || true)
 sid=$(printf '%s' "$payload"  | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
 tool=$(printf '%s' "$payload" | sed -n 's/.*"tool_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
-[ -n "$sid" ]  || sid=unknown
+# $sid is interpolated into the logfile path below, so it must be a bare token —
+# never a path. Enforce ^[A-Za-z0-9_-]+$; anything else (incl. empty, '/', '..')
+# falls back to a safe literal so the heartbeat can never escape timelog/events/.
+case "$sid" in
+  ""|*[!A-Za-z0-9_-]*) sid=unknown ;;
+esac
 [ -n "$tool" ] || tool=unknown
 
 mkdir -p "$EVENTS" 2>/dev/null || exit 0
 ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 day=$(date -u +%Y%m%d)
-printf '{"ts":"%s","event":"tool","tool":"%s","session":"%s"}\n' "$ts" "$tool" "$sid" \
+printf '{"ts":"%s","event":"tool","tool":"%s","session":"%s"}\n' "$ts" "$(json_escape "$tool")" "$sid" \
   >> "$EVENTS/${day}__auto-${sid}.jsonl" 2>/dev/null || true
 
 exit 0
