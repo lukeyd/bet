@@ -41,7 +41,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::sync::{Mutex, OnceLock};
-use std::thread::JoinHandle;
+use std::thread::{JoinHandle, ThreadId};
 // `Instant` backs only the headless `bet_gg_ticks`; the desktop build gets its clock from
 // `gg-backend`, so gate the import to avoid an unused-import warning under `gg-desktop`.
 #[cfg(not(feature = "gg-desktop"))]
@@ -186,10 +186,45 @@ pub unsafe extern "C" fn bet_ctx_pop() {
 }
 
 // ---------------------------------------------------------------------------
+// Handle thread-affinity (issue #44).
+//
+// crib/stash/vec/rng handles are **single-threaded**: their accessors reborrow a raw handle as
+// `&`/`&mut` with no synchronization, and `bet_slide` spawns real OS threads (see [`bet_slide`]),
+// so touching a handle from a thread other than the one that created it is a data race (aliasing
+// UB). Every handle is stamped with its creating thread's id at construction and every accessor
+// re-checks it, turning that latent UB into a deterministic, fail-closed abort. This ENFORCES the
+// contract that used to be only documented; it is not a `Sync` refactor (concurrent handle access
+// is *rejected*, not synchronized) — that stays a later milestone alongside the M:N scheduler.
+// ---------------------------------------------------------------------------
+
+/// The id of the OS thread running right now: stamped into every handle at creation and
+/// re-checked on every access to enforce the single-thread contract (issue #44).
+#[inline]
+fn owning_thread() -> ThreadId {
+    std::thread::current().id()
+}
+
+/// Abort (fail-closed) if `owner` is not the current thread — the single-thread handle contract
+/// (issue #44). `kind` names the handle kind for the diagnostic. Cheap on the happy path (one
+/// thread-id compare, no allocation); the message is only built when the guard trips.
+#[inline]
+fn check_affinity(owner: ThreadId, kind: &str) {
+    if owner != owning_thread() {
+        die(&format!(
+            "{kind} handle used from a thread that did not create it \
+             (crib/stash/vec/rng handles are single-threaded — see bet_slide)"
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Cribs.
 // ---------------------------------------------------------------------------
 
 struct Crib {
+    /// The thread that created this crib. Every accessor asserts the caller is this thread and
+    /// aborts otherwise (issue #44) — crib handles are single-threaded (see [`bet_slide`]).
+    owner: ThreadId,
     kind: CribKind,
 }
 
@@ -325,21 +360,27 @@ impl BumpCrib {
 }
 
 /// Reborrow a crib handle as `&mut Crib`, for the mutating entry points (`cop`, `evict`,
-/// `bump_alloc`). Caller guarantees the handle is live and that the crib is not being touched
-/// from another thread — a crib handle is **single-threaded** and must not cross a `bet_slide`
-/// task boundary (see [`bet_slide`]); the ABI does not synchronize crib access (issue #44).
+/// `bump_alloc`). A crib handle is **single-threaded**: this asserts the caller is the thread
+/// that created the crib and [`die`]s (fail-closed abort) otherwise, so a handle that escapes
+/// across a `bet_slide` task boundary (see [`bet_slide`]) is caught rather than racing. The ABI
+/// still does not *synchronize* concurrent access — it now *rejects* it, at runtime (issue #44).
+/// Caller guarantees the handle is live.
 unsafe fn crib<'a>(h: CribHandle) -> &'a mut Crib {
-    unsafe { &mut *(h.0 as *mut Crib) }
+    let c = unsafe { &mut *(h.0 as *mut Crib) };
+    check_affinity(c.owner, "crib");
+    c
 }
 
 /// Shared reborrow of a crib handle as `&Crib` — the read-only counterpart of [`crib`], for the
 /// entry points that only *read* the crib (`bet_holla_check`, `bet_slot_ptr`). Taking `&`
 /// rather than `&mut` means a resolve asserts no unique access, so two concurrent checked
-/// resolves of the same crib can never form overlapping `&mut`s (issue #44). The single-threaded
-/// contract (no crib handle across a `bet_slide` boundary) still holds and is what makes even a
-/// shared read sound; this only removes the *spurious* `&mut` the resolve never needed.
+/// resolves of the same crib can never form overlapping `&mut`s. Like [`crib`], it enforces the
+/// single-thread contract (issue #44): it [`die`]s if the handle is touched from a thread other
+/// than its creator, so even a shared read across a `bet_slide` boundary fails closed.
 unsafe fn crib_ref<'a>(h: CribHandle) -> &'a Crib {
-    unsafe { &*(h.0 as *const Crib) }
+    let c = unsafe { &*(h.0 as *const Crib) };
+    check_affinity(c.owner, "crib");
+    c
 }
 
 #[unsafe(no_mangle)]
@@ -369,6 +410,7 @@ pub unsafe extern "C" fn bet_crib_new(
     // the list identically so a reused slot matches the one first handed out.
     let free: Vec<u32> = (0..capacity).collect();
     let boxed = Box::new(Crib {
+        owner: owning_thread(),
         kind: CribKind::Typed(TypedCrib {
             elem_size,
             elem_align: elem_align.max(1),
@@ -383,6 +425,7 @@ pub unsafe extern "C" fn bet_crib_new(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bet_crib_new_bump(reserve: usize) -> CribHandle {
     let boxed = Box::new(Crib {
+        owner: owning_thread(),
         kind: CribKind::Bump(BumpCrib::new(reserve)),
     });
     CribHandle(Box::into_raw(boxed) as *mut c_void)
@@ -701,17 +744,33 @@ pub unsafe extern "C" fn bet_read_line(out_len: *mut usize) -> *mut u8 {
 // ---------------------------------------------------------------------------
 
 struct StashMap {
+    /// Creating thread — the single-thread affinity token checked by every accessor (issue #44).
+    owner: ThreadId,
     val_size: usize,
     entries: HashMap<Vec<u8>, Vec<u8>>,
 }
 
+/// Reborrow a stash handle as `&mut StashMap`, for the mutating entry points (`put`, `del`).
+/// Enforces the single-thread contract (issue #44): [`die`]s if touched off its creating thread.
 unsafe fn stash_ref<'a>(map: MapHandle) -> &'a mut StashMap {
-    unsafe { &mut *(map.0 as *mut StashMap) }
+    let m = unsafe { &mut *(map.0 as *mut StashMap) };
+    check_affinity(m.owner, "stash");
+    m
+}
+
+/// Shared reborrow of a stash handle as `&StashMap`, for the read-only entry points (`get`,
+/// `len`) — mirrors [`crib_ref`] so concurrent reads within the single-thread model never mint
+/// overlapping `&mut`. Enforces the same single-thread affinity check (issue #44).
+unsafe fn stash_ref_shared<'a>(map: MapHandle) -> &'a StashMap {
+    let m = unsafe { &*(map.0 as *const StashMap) };
+    check_affinity(m.owner, "stash");
+    m
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bet_map_new(val_size: usize) -> MapHandle {
     let m = Box::new(StashMap {
+        owner: owning_thread(),
         val_size,
         entries: HashMap::new(),
     });
@@ -738,7 +797,7 @@ pub unsafe extern "C" fn bet_map_get(
     key_len: usize,
     out_val: *mut u8,
 ) -> bool {
-    let m = unsafe { stash_ref(map) };
+    let m = unsafe { stash_ref_shared(map) };
     let key = unsafe { std::slice::from_raw_parts(key_ptr, key_len) };
     match m.entries.get(key) {
         Some(v) => {
@@ -758,7 +817,7 @@ pub unsafe extern "C" fn bet_map_del(map: MapHandle, key_ptr: *const u8, key_len
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bet_map_len(map: MapHandle) -> usize {
-    unsafe { stash_ref(map) }.entries.len()
+    unsafe { stash_ref_shared(map) }.entries.len()
 }
 
 #[unsafe(no_mangle)]
@@ -774,6 +833,8 @@ pub unsafe extern "C" fn bet_map_free(map: MapHandle) {
 // ---------------------------------------------------------------------------
 
 struct DynVec {
+    /// Creating thread — the single-thread affinity token checked by every accessor (issue #44).
+    owner: ThreadId,
     elem_size: usize,
     data: Vec<u8>,
 }
@@ -785,13 +846,28 @@ impl DynVec {
     }
 }
 
+/// Reborrow a vec handle as `&mut DynVec`, for the mutating entry points (`push`, `pop`, `set`,
+/// `extend`). Enforces the single-thread contract (issue #44): [`die`]s if touched off its
+/// creating thread.
 unsafe fn vec_ref<'a>(vec: VecHandle) -> &'a mut DynVec {
-    unsafe { &mut *(vec.0 as *mut DynVec) }
+    let v = unsafe { &mut *(vec.0 as *mut DynVec) };
+    check_affinity(v.owner, "vec");
+    v
+}
+
+/// Shared reborrow of a vec handle as `&DynVec`, for the read-only entry points (`get`, `len`,
+/// `data`) — mirrors [`crib_ref`] so concurrent reads within the single-thread model never mint
+/// overlapping `&mut`. Enforces the same single-thread affinity check (issue #44).
+unsafe fn vec_ref_shared<'a>(vec: VecHandle) -> &'a DynVec {
+    let v = unsafe { &*(vec.0 as *const DynVec) };
+    check_affinity(v.owner, "vec");
+    v
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bet_vec_new(elem_size: usize) -> VecHandle {
     let v = Box::new(DynVec {
+        owner: owning_thread(),
         elem_size,
         data: Vec::new(),
     });
@@ -820,7 +896,7 @@ pub unsafe extern "C" fn bet_vec_pop(vec: VecHandle, out_elem: *mut u8) -> bool 
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bet_vec_get(vec: VecHandle, idx: usize, out_elem: *mut u8) -> bool {
-    let v = unsafe { vec_ref(vec) };
+    let v = unsafe { vec_ref_shared(vec) };
     if idx >= v.len() {
         return false;
     }
@@ -843,12 +919,12 @@ pub unsafe extern "C" fn bet_vec_set(vec: VecHandle, idx: usize, elem_ptr: *cons
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bet_vec_len(vec: VecHandle) -> usize {
-    unsafe { vec_ref(vec) }.len()
+    unsafe { vec_ref_shared(vec) }.len()
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bet_vec_data(vec: VecHandle) -> *const u8 {
-    unsafe { vec_ref(vec) }.data.as_ptr()
+    unsafe { vec_ref_shared(vec) }.data.as_ptr()
 }
 
 #[unsafe(no_mangle)]
@@ -870,13 +946,29 @@ pub unsafe extern "C" fn bet_vec_free(vec: VecHandle) {
 // the state and delegate, so the interpreter and compiled code share one implementation.
 // ---------------------------------------------------------------------------
 
+/// The boxed rng: the shared-ABI [`RngState`] plus this runtime's single-thread affinity token
+/// (issue #44). `RngState` itself lives in `rt-abi` (the frozen cross-team contract), so the
+/// owner token is added here in a runtime-local wrapper rather than by touching the ABI type.
+struct RngBox {
+    owner: ThreadId,
+    state: RngState,
+}
+
+/// Reborrow an rng handle as `&mut RngState`. Every rng op advances the PRNG state, so there is
+/// no read-only rng entry point — all take `&mut`. Enforces the single-thread contract (issue
+/// #44): [`die`]s if touched off its creating thread.
 unsafe fn rng_ref<'a>(rng: RngHandle) -> &'a mut RngState {
-    unsafe { &mut *(rng.0 as *mut RngState) }
+    let b = unsafe { &mut *(rng.0 as *mut RngBox) };
+    check_affinity(b.owner, "rng");
+    &mut b.state
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bet_rng_new(seed: u64) -> RngHandle {
-    RngHandle(Box::into_raw(Box::new(RngState::new(seed))) as *mut c_void)
+    RngHandle(Box::into_raw(Box::new(RngBox {
+        owner: owning_thread(),
+        state: RngState::new(seed),
+    })) as *mut c_void)
 }
 
 #[unsafe(no_mangle)]
@@ -897,7 +989,7 @@ pub unsafe extern "C" fn bet_rng_upto(rng: RngHandle, n: u64) -> u64 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bet_rng_free(rng: RngHandle) {
     if !rng.0.is_null() {
-        drop(unsafe { Box::from_raw(rng.0 as *mut RngState) });
+        drop(unsafe { Box::from_raw(rng.0 as *mut RngBox) });
     }
 }
 
@@ -929,15 +1021,18 @@ unsafe impl Send for SendPtr {}
 
 /// Spawn a task on a fresh OS thread (no M:N runtime yet).
 ///
-/// **Handle threading contract (issue #44):** crib, `stash`, `vec`, and `rng` handles are
-/// **single-threaded**. Their accessors ([`crib`]/[`crib_ref`], `stash_ref`, `vec_ref`,
-/// `rng_ref`) reborrow the raw handle as `&`/`&mut` with *no* internal synchronization, so
-/// resolving the same handle from two threads at once is a data race. A handle must therefore
-/// never be captured by `entry`/`arg` and used inside the spawned task while the parent (or
-/// another task) still uses it. `bet_slide` maps each task to its own thread; only `Send`-safe,
-/// owned data should cross the boundary. Full M:N scheduling with cross-task-safe handles is a
-/// later milestone and out of scope here — this is the documented single-threaded guarantee the
-/// read-only `&`-borrows above rely on.
+/// **Handle threading contract (issue #44) — now ENFORCED, fail-closed:** crib, `stash`, `vec`,
+/// and `rng` handles are **single-threaded**. Their accessors ([`crib`]/[`crib_ref`],
+/// [`stash_ref`]/[`stash_ref_shared`], [`vec_ref`]/[`vec_ref_shared`], [`rng_ref`]) reborrow the
+/// raw handle as `&`/`&mut` with *no* internal synchronization, so resolving the same handle from
+/// two threads at once would be a data race. Each handle is therefore stamped with its creating
+/// thread's id at construction, and every accessor re-checks it: capturing a handle into
+/// `entry`/`arg` and touching it inside the spawned task trips the guard and [`die`]s
+/// ([`process::abort`](std::process::abort), no unwind across FFI) rather than racing. `bet_slide`
+/// maps each task to its own thread; only `Send`-safe, owned data should cross the boundary. This
+/// enforcement is *not* a `Sync` refactor — cross-thread handle access is rejected, not
+/// synchronized; full M:N scheduling with genuinely cross-task-safe handles stays a later
+/// milestone. The runtime check is what now makes the read-only `&`-borrows above sound.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bet_slide(entry: extern "C" fn(*mut u8), arg: *mut u8) -> TaskHandle {
     let sp = SendPtr(arg as usize);

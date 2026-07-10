@@ -426,3 +426,87 @@ fn recover_boundaries_nest() {
         bet_recover_end(outer);
     }
 }
+
+// ===========================================================================
+// Single-thread handle contract (issue #44) — enforcement is fail-closed.
+// ===========================================================================
+
+/// Env flag that flips this test binary into "child" mode: perform the offending cross-thread
+/// handle access and let the affinity guard abort the process. The parent re-execs this same
+/// binary with the flag set and asserts the child died by SIGABRT.
+const CROSS_THREAD_CHILD_ENV: &str = "BET_RT_TEST_CROSS_THREAD_ABORT";
+
+/// A `bet_slide` task entry: `arg` is a `CribHandle`'s raw pointer created on the PARENT thread.
+/// Touching the crib here — on the spawned task's own thread — must trip the single-thread
+/// affinity guard in `crib()` and abort the whole process (issue #44). This is exactly the
+/// escape the finding describes: a handle captured into a `bet_slide` task.
+#[allow(clippy::not_unsafe_ptr_arg_deref)] // signature is fixed by the `slide` ABI
+extern "C" fn touch_crib_from_task(arg: *mut u8) {
+    let stolen = CribHandle(arg as *mut std::ffi::c_void);
+    // Routes through `crib()` → `check_affinity` → `die` → `process::abort`.
+    let _ = unsafe { bet_cop(stolen) };
+}
+
+/// Child-mode body: create a crib on THIS thread, then hand its handle to a `bet_slide` task on
+/// a different thread. The guard must abort before the join can return.
+fn cross_thread_child() {
+    unsafe {
+        let crib = bet_crib_new(8, 8, 1);
+        let task = bet_slide(touch_crib_from_task, crib.0 as *mut u8);
+        // The task aborts the whole process; this join never returns cleanly.
+        bet_task_join(task);
+        // Reached only if the guard FAILED to fire (a regression); free and fall through so the
+        // parent observes a clean exit and its assertion fails loudly.
+        bet_crib_free(crib);
+    }
+}
+
+/// Using a handle from a thread that did not create it must **abort** (fail-closed), proving the
+/// single-thread contract is enforced at runtime, not merely documented (issue #44). Because
+/// `die`→`process::abort` kills the whole process, this is checked out-of-process: the parent
+/// re-execs this test binary in child mode and asserts the child died by SIGABRT with the
+/// contract diagnostic on stderr. Works under both `cargo test` and `nextest` (the child is just
+/// the standard libtest CLI filtered to this one test).
+#[test]
+fn cross_thread_handle_use_aborts() {
+    if std::env::var_os(CROSS_THREAD_CHILD_ENV).is_some() {
+        // Child mode: do the offending thing and (expect to) abort before returning.
+        cross_thread_child();
+        // Only reached if the guard did not fire; exit 0 makes the parent's assertion fail.
+        std::process::exit(0);
+    }
+
+    // Parent mode: re-exec ourselves in child mode and observe the abort.
+    let exe = std::env::current_exe().expect("locate this test binary");
+    let output = std::process::Command::new(exe)
+        .args(["cross_thread_handle_use_aborts", "--exact"])
+        .env(CROSS_THREAD_CHILD_ENV, "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("re-exec this test binary in child mode");
+
+    assert!(
+        !output.status.success(),
+        "cross-thread handle use must abort, but the child exited successfully"
+    );
+
+    // `die` → `process::abort` raises SIGABRT (signal 6) on unix.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        assert_eq!(
+            output.status.signal(),
+            Some(6),
+            "expected SIGABRT (6) from process::abort; got status {:?}",
+            output.status
+        );
+    }
+
+    // The diagnostic must explain the single-thread contract.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("single-threaded"),
+        "abort message should explain the single-thread contract; stderr was:\n{stderr}"
+    );
+}
