@@ -1398,6 +1398,35 @@ mod imp {
     // headless build returns, BEFORE touching the singleton — so headless runs never open a
     // window or audio device.
 
+    /// Pack a (possibly strided) source framebuffer into a tightly packed `w * h` buffer, so the
+    /// raw-pointer read is confined here and the window only ever sees a packed frame.
+    ///
+    /// The per-row copy is clamped to `stride`: a `FrameBuffer` whose `width` exceeds its `stride`
+    /// is malformed, and reading `width` u32s from a row only `stride` wide would run past the
+    /// `stride * height` region into adjacent memory. Clamped-away columns (and the whole buffer
+    /// when `pixels` is null) are left zeroed (black) rather than read out of bounds.
+    ///
+    /// # Safety
+    /// When `pixels` is non-null it must address at least `stride * height` readable `u32`s (the
+    /// frozen `FrameBuffer` contract). `w`, `h`, and `stride` are the packed frame dimensions.
+    unsafe fn pack_frame(pixels: *const u32, w: usize, h: usize, stride: usize) -> Vec<u32> {
+        let mut buf = vec![0u32; w * h];
+        let row = w.min(stride);
+        if !pixels.is_null() {
+            // SAFETY: row `y` starts at `y * stride` and we read `row = min(w, stride) <= stride`
+            // u32s, so the last index touched is `y * stride + row - 1 < (y + 1) * stride <=
+            // stride * height` — always within the caller's guaranteed region. The destination
+            // write of `row <= w` u32s stays within the `w`-wide row at `buf[y * w..]`.
+            unsafe {
+                for y in 0..h {
+                    let src = pixels.add(y * stride);
+                    std::ptr::copy_nonoverlapping(src, buf[y * w..].as_mut_ptr(), row);
+                }
+            }
+        }
+        buf
+    }
+
     pub(super) fn present(pixels: *const u32, width: u32, height: u32, stride: u32) {
         if headless() {
             return;
@@ -1406,19 +1435,10 @@ mod imp {
         if w == 0 || h == 0 {
             return;
         }
-        // Copy the (possibly strided) source into a tightly packed `w * h` buffer up front, so
-        // the raw-pointer read is confined to here and the window only ever sees a packed frame.
-        let mut buf = vec![0u32; w * h];
-        if !pixels.is_null() {
-            // SAFETY: the caller guarantees `pixels` addresses at least `stride * height`
-            // readable `u32`s (the frozen `FrameBuffer` contract); we read `w <= stride` per row.
-            unsafe {
-                for y in 0..h {
-                    let src = pixels.add(y * stride);
-                    std::ptr::copy_nonoverlapping(src, buf[y * w..].as_mut_ptr(), w);
-                }
-            }
-        }
+        // SAFETY: the frozen `FrameBuffer` contract guarantees `pixels` (when non-null) addresses
+        // at least `stride * height` readable `u32`s; `pack_frame` clamps each row read to
+        // `stride`, so an over-wide `width > stride` frame can never read past that region.
+        let buf = unsafe { pack_frame(pixels, w, h, stride) };
         with_state(|st| st.present(&buf, w, h));
     }
 
@@ -1574,5 +1594,47 @@ mod imp {
             return;
         }
         with_state(|st| st.set_title(name));
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::pack_frame;
+
+        // cwage #43: a `FrameBuffer` presenting with `width > stride` is malformed. `pack_frame`
+        // must clamp the per-row read to `stride` so it never touches memory past the
+        // `stride * height` region the source actually backs. We size the source at EXACTLY
+        // `stride * height` u32s (no slack): the pre-fix code read `width` per row and ran off the
+        // end, and would have filled the clamped-away columns with those out-of-bounds reads —
+        // this asserts they are instead left zeroed.
+        #[test]
+        fn present_clamps_overwide_width_to_stride() {
+            let (stride, h, w) = (2usize, 3usize, 5usize); // width (5) > stride (2)
+            let src: Vec<u32> = (1..=(stride * h) as u32).collect(); // [1,2, 3,4, 5,6]
+            let buf = unsafe { pack_frame(src.as_ptr(), w, h, stride) };
+
+            assert_eq!(buf.len(), w * h);
+            for y in 0..h {
+                for x in 0..w {
+                    let want = if x < stride { src[y * stride + x] } else { 0 };
+                    assert_eq!(buf[y * w + x], want, "pixel ({x},{y})");
+                }
+            }
+        }
+
+        // A null source reads nothing and yields a zeroed frame of the requested size.
+        #[test]
+        fn present_null_source_is_zeroed() {
+            let buf = unsafe { pack_frame(std::ptr::null(), 4, 2, 4) };
+            assert_eq!(buf, vec![0u32; 8]);
+        }
+
+        // The normal tightly-packed case (width == stride) is copied verbatim.
+        #[test]
+        fn present_packs_tight_frame_verbatim() {
+            let (w, h) = (3usize, 2usize);
+            let src: Vec<u32> = (10..16).collect();
+            let buf = unsafe { pack_frame(src.as_ptr(), w, h, w) };
+            assert_eq!(buf, src);
+        }
     }
 }
