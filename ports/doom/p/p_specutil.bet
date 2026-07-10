@@ -379,6 +379,11 @@ flex finna hasSpecialData(gt: tag gs.GameState, sec: int) -> bool {
 }
 
 flex finna setSectorSpecialData(gt: tag gs.GameState, sec: int, t: tag think.Thinker) {
+    // secLinks is a fixed SecLinks[MAXSECTORS] slab; guard every caller against an out-of-bounds
+    // index (a crafted savegame's secnum) before it can write past the array.
+    fr sec < 0 || sec >= gs.MAXSECTORS {
+        yeet("setSectorSpecialData: sector index out of bounds, this save is sus")
+    }
     holla g = gt in gs.gsc {
         g.level.secLinks[sec].specialT = t
     } ghosted {

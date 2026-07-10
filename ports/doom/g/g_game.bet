@@ -1169,13 +1169,21 @@ flex finna gDoPlayDemo(gt: tag gs.GameState) {
 // G_ReadDemoTiccmd — decode the next 4-byte demo ticcmd into players[pi].cmd; at the DEMOMARKER
 // (0x80) end the demo. forwardmove/sidemove are signed bytes; angleturn is a byte<<8; buttons a byte.
 flex finna gReadDemoTiccmd(gt: tag gs.GameState, pi: int) {
-    lowkey marker = cap
+    lowkey ended = cap
     holla g = gt in gs.gsc {
-        marker = bstream.rdU8(g.wad.buf, g.shell.demoOfs) == DEMOMARKER
+        // End at the DEMOMARKER, but also when the cursor reaches demoend (ofs+len, the end of the
+        // demo lump): a truncated or unterminated demo has no marker, so demoend is the backstop
+        // that stops the reads below from walking past the lump. Check the bound BEFORE touching
+        // the marker byte so the guard itself can't read out of bounds.
+        fr g.shell.demoOfs >= g.shell.demoend {
+            ended = nocap
+        } naw fr bstream.rdU8(g.wad.buf, g.shell.demoOfs) == DEMOMARKER {
+            ended = nocap
+        }
     } ghosted {
         yeet("gs")
     }
-    fr marker {
+    fr ended {
         gCheckDemoStatus(gt)
         bet
     }
