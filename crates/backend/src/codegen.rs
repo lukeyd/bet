@@ -54,7 +54,7 @@ use inkwell::types::{
 };
 use inkwell::values::{
     ArrayValue, BasicMetadataValueEnum, BasicValueEnum, FunctionValue, GlobalValue, IntValue,
-    PointerValue, VectorValue,
+    PointerValue, StructValue, VectorValue,
 };
 use inkwell::{AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel};
 
@@ -1126,10 +1126,74 @@ impl<'c> Cg<'c> {
                 let signed = self.simd_signed(func, a, b);
                 self.lower_vec_binop(op, l, r, signed)
             }
+            // Aggregate operands reach here for `tag`/`ref` equality: `Tag` lowers to the struct
+            // `{ i32 slot, i64 generation }`, so `tag == ghosted` / `t1 != t2` is a field-wise compare
+            // (before the generation counter widened to u64, a Tag was a scalar `i64` and this went
+            // through the Int arm). Only `==`/`!=` are defined on aggregates.
+            (BasicValueEnum::StructValue(l), BasicValueEnum::StructValue(r)) => {
+                self.lower_agg_eq(op, l, r)
+            }
             _ => Err(BackendError::Lower(
                 "binary op on non-scalar or mismatched operands".into(),
             )),
         }
+    }
+
+    /// Lower `==` / `!=` on two aggregate (struct) operands — the `tag`/`ref` equality case, where
+    /// `Tag` is `{ i32 slot, i64 generation }`. Compares each field and AND-s the results (negated
+    /// for `!=`). Non-equality ops, mismatched struct types, or non-scalar fields stay a lowering
+    /// error, matching the interpreter, which only defines equality on tags.
+    fn lower_agg_eq(
+        &self,
+        op: BinOp,
+        l: StructValue<'c>,
+        r: StructValue<'c>,
+    ) -> Result<BasicValueEnum<'c>, BackendError> {
+        let want_eq = match op {
+            BinOp::Eq => true,
+            BinOp::Ne => false,
+            _ => {
+                return Err(BackendError::Lower(
+                    "only == / != are defined on aggregate (tag) operands".into(),
+                ));
+            }
+        };
+        if l.get_type() != r.get_type() {
+            return Err(BackendError::Lower(
+                "equality on mismatched aggregate operands".into(),
+            ));
+        }
+        let b = &self.builder;
+        let mut all_eq: Option<IntValue<'c>> = None;
+        for i in 0..l.get_type().count_fields() {
+            let lf = b.build_extract_value(l, i, "lf").map_err(lower_err)?;
+            let rf = b.build_extract_value(r, i, "rf").map_err(lower_err)?;
+            let feq = match (lf, rf) {
+                (BasicValueEnum::IntValue(x), BasicValueEnum::IntValue(y)) => b
+                    .build_int_compare(IntPredicate::EQ, x, y, "feq")
+                    .map_err(lower_err)?,
+                (BasicValueEnum::FloatValue(x), BasicValueEnum::FloatValue(y)) => b
+                    .build_float_compare(FloatPredicate::OEQ, x, y, "feq")
+                    .map_err(lower_err)?,
+                _ => {
+                    return Err(BackendError::Lower(
+                        "equality on an aggregate with a non-scalar field".into(),
+                    ));
+                }
+            };
+            all_eq = Some(match all_eq {
+                None => feq,
+                Some(prev) => b.build_and(prev, feq, "aeq").map_err(lower_err)?,
+            });
+        }
+        // A field-less struct compares equal; every real Tag has fields.
+        let all_eq = all_eq.unwrap_or_else(|| self.cx.bool_type().const_int(1, false));
+        let result = if want_eq {
+            all_eq
+        } else {
+            b.build_not(all_eq, "ane").map_err(lower_err)?
+        };
+        Ok(result.into())
     }
 
     /// Element-wise arithmetic/shift on two same-type SIMD vectors. Comparisons and float
