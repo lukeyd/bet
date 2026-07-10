@@ -4140,6 +4140,30 @@ finna lowerIntrinsic(c: LowerCtx, p: P, module: str, method: str, methodIdx: int
         emitAssign(c, result, call2("make_slice[u8]", reg(data), reg(outLen)))
         bet reg(result), "[]u8"
     }
+    fr str.slaps(module, "fs") && str.slaps(method, "drop") {
+        // `fs.drop(path, data)` — write a `[]u8` to a file (create-or-truncate) via bet_fs_write,
+        // yielding the success bool. The write sibling of `fs.peep` (mirror lower_intrinsic fs.drop).
+        lowkey path, pty = lowerExpr(c, p, argValue(p, argsW, 0), "str")
+        lowkey data, dty = lowerExpr(c, p, argValue(p, argsW, 1), "[]u8")
+        fr !str.slaps(dty, "[]u8") {
+            lcFail(c)
+            bet "0i64", "i64"
+        }
+        lowkey pp = emitStrPtr(c, path)
+        lowkey pl = emitStrLen(c, path)
+        lowkey dp = newLocal(c, "rawptr")
+        emitAssign(c, dp, call1("slice_ptr", data))
+        lowkey dl = newLocal(c, "u64")
+        emitAssign(c, dl, call1("slice_len", data))
+        getExtern(c, "extern \"C\" fn bet_fs_write(rawptr, u64, rawptr, u64) -> bool")
+        lowkey wrArgs = vec.new[str]()
+        wrArgs.stack(reg(pp))
+        wrArgs.stack(reg(pl))
+        wrArgs.stack(reg(dp))
+        wrArgs.stack(reg(dl))
+        lowkey ok = emitExternCall(c, "bool", "bet_fs_write", wrArgs)
+        bet reg(ok), "bool"
+    }
     fr str.slaps(module, "fs") && str.slaps(method, "peepText") {
         lowkey path, pty = lowerExpr(c, p, argValue(p, argsW, 0), "str")
         lowkey pp = emitStrPtr(c, path)
@@ -4317,8 +4341,9 @@ finna lowerIntrinsic(c: LowerCtx, p: P, module: str, method: str, methodIdx: int
             lowkey qo, qt = lowerMemSlabSoa(c, p, elem, argValue(p, argsW, 0))
             bet qo, qt
         }
-        lcFail(c)
-        bet "0i64", "i64"
+        // A scalar element is a plain AoS slab (`[]T`) — bet_alloc_zeroed + make_slice.
+        lowkey so, st = lowerMemSlab(c, p, methodIdx)
+        bet so, st
     }
     lcFail(c)
     bet "0i64", "i64"
@@ -4595,6 +4620,56 @@ finna lowerStashMethod(c: LowerCtx, p: P, methodIdx: int, mapOp: str, k: str, v:
     }
     lcFail(c)
     bet "0i64", "i64"
+}
+
+// `mem.slab[T](n)` — a zeroed heap slab of `n` elements returned as a `[]T` slice (mirror
+// lower_intrinsic mem.slab): bytes = n * size_of[T]; bet_alloc_zeroed(bytes, size) -> ptr; wrap
+// as `make_slice[T](ptr, n)`. A struct element sentinels (only scalar slabs lower here).
+finna lowerMemSlab(c: LowerCtx, p: P, methodIdx: int) -> (str, str) {
+    lowkey targsW = findKid(p, methodIdx, "typeargs")
+    fr targsW < 0 || kidCount(p, targsW) != 1 {
+        lcFail(c)
+        bet "0i64", "i64"
+    }
+    lowkey elem = mapTypeNode(c, p, kidAt(p, targsW, 0))
+    fr isStruct(c, elem) {
+        lcFail(c)
+        bet "0i64", "i64"
+    }
+    lowkey argsW = findKid(p, methodIdx, "args")
+    lowkey n, nty = lowerExpr(c, p, argValue(p, argsW, 0), "i64")
+    lowkey nus = coerceInt(c, n, nty, "u64")
+    lowkey esize = newLocal(c, "u64")
+    lowkey eb = sbNew()
+    eb.add("size_of[")
+    eb.add(elem)
+    eb.add("]")
+    emitAssign(c, esize, eb.finish())
+    lowkey bytes = newLocal(c, "u64")
+    lowkey bb = sbNew()
+    bb.add("mul.wrap(")
+    bb.add(nus)
+    bb.add(", ")
+    bb.add(reg(esize))
+    bb.add(")")
+    emitAssign(c, bytes, bb.finish())
+    getExtern(c, "extern \"C\" fn bet_alloc_zeroed(u64, u64) -> rawptr")
+    lowkey azArgs = vec.new[str]()
+    azArgs.stack(reg(bytes))
+    azArgs.stack(reg(esize))
+    lowkey ptr = emitExternCall(c, "rawptr", "bet_alloc_zeroed", azArgs)
+    lowkey sliceTy = cat2("[]", elem)
+    lowkey sl = newLocal(c, sliceTy)
+    lowkey msb = sbNew()
+    msb.add("make_slice[")
+    msb.add(elem)
+    msb.add("](")
+    msb.add(reg(ptr))
+    msb.add(", ")
+    msb.add(nus)
+    msb.add(")")
+    emitAssign(c, sl, msb.finish())
+    bet reg(sl), sliceTy
 }
 
 // `vec.new[T]()` — an empty growable vec (mirror lower_vec_new): size_of[T] + bet_vec_new(size).
@@ -5270,8 +5345,60 @@ finna litFieldValue(p: P, fieldsW: int, fname: str) -> int {
     bet 0 - 1
 }
 
+// The zero value of ANY field-shaped type, for zero-defaulting omitted fields in a `cop T{}` /
+// struct literal (spec §5, mirror lower's `zero_value`). Scalars are their literal zeros; a `tag`
+// is the null tag (`ghosted`); handle-shaped types (fn values, `vec`/`stash`, raw pointers, cribs)
+// are `nullptr`; a slice is the empty `{ null, 0 }` fat value; nested drips and fixed arrays
+// recurse, emitting their aggregate temps into the current block first.
+finna zeroValue(c: LowerCtx, ty: str) -> str {
+    fr isIntTy(ty) { bet cat2("0", ty) }
+    fr isFloatTy(ty) { bet cat2("0", ty) }
+    fr str.slaps(ty, "bool") { bet "false" }
+    fr str.slaps(ty, "str") { bet "\"\"" }
+    fr isTagTy(ty) { bet "ghosted" }
+    fr isFnPtrTy(ty) || isMapTy(ty) || isVecTy(ty) || str.slaps(ty, "rng") || str.slaps(ty, "rawptr") || isCribTy(ty) {
+        bet "nullptr"
+    }
+    fr isSliceTy(ty) {
+        lowkey tmp = newLocal(c, ty)
+        emitAssign(c, tmp, cat3("make_slice[", sliceElem(ty), "](nullptr, 0u64)"))
+        bet reg(tmp)
+    }
+    fr isStruct(c, ty) {
+        lowkey ops = vec.new[str]()
+        lowkey nf = c.fieldNames.gang() as int
+        lowkey i = 0
+        vibin i < nf {
+            fr str.slaps(c.fieldStruct[i], ty) {
+                ops.stack(zeroValue(c, c.fieldTypes[i]))
+            }
+            i = i + 1
+        }
+        lowkey tmp = newLocal(c, ty)
+        emitAssign(c, tmp, cat3("make ", ty, cat3("(", joinComma(ops), ")")))
+        bet reg(tmp)
+    }
+    fr isArrayTy(ty) {
+        lowkey elem = arrayElem(ty)
+        lowkey z = zeroValue(c, elem)
+        lowkey cnt = parseNat(arrayLenStr(ty))
+        lowkey ops = vec.new[str]()
+        lowkey k = 0
+        vibin k < cnt {
+            ops.stack(z)
+            k = k + 1
+        }
+        lowkey tmp = newLocal(c, ty)
+        emitAssign(c, tmp, cat3("array[", elem, cat3("](", joinComma(ops), ")")))
+        bet reg(tmp)
+    }
+    lcFail(c)
+    bet "0i64"
+}
+
 // `Name{ f: v, .. }` cop-init — the struct-literal payload of a `cop`, spelled `Name{0: op, ..}`
 // with fields in DECLARATION order (mirror lower_cop struct arm + text.rs cop_init StructLit).
+// Omitted fields zero-default (spec §5): their aggregate temps precede the `cop`.
 finna copStructInit(c: LowerCtx, p: P, initNode: int, name: str) -> str {
     lowkey fieldsW = findKid(p, initNode, "fields")
     lowkey parts = vec.new[str]()
@@ -5283,7 +5410,7 @@ finna copStructInit(c: LowerCtx, p: P, initNode: int, name: str) -> str {
             lowkey declTy = c.fieldTypes[i]
             lowkey valIdx = litFieldValue(p, fieldsW, declName)
             fr valIdx < 0 {
-                lcFail(c)
+                parts.stack(cat3(itoa(c.fieldIdx[i]), ": ", zeroValue(c, declTy)))
             } naw {
                 lowkey op, oty = lowerExpr(c, p, valIdx, declTy)
                 parts.stack(cat3(itoa(c.fieldIdx[i]), ": ", op))
@@ -6211,6 +6338,21 @@ finna lowerBet(c: LowerCtx, p: P, stmtIdx: int) {
     }
 }
 
+// `panic <op>` terminator — abort the program with a message operand (mirror lower's Panic term).
+// Only emitted if the current block isn't already terminated.
+finna termPanic(c: LowerCtx, op: str) {
+    fr !lcDone(c) {
+        setTerm(c, curId(c), cat2("panic ", op))
+    }
+}
+
+// `yeet <expr>` — panic/abort with a string message (mirror lower_yeet): lower the message operand
+// then terminate the block with `panic <op>`. Used pervasively as DOOM's `ghosted { yeet("gs") }`.
+finna lowerYeet(c: LowerCtx, p: P, stmtIdx: int) {
+    lowkey op, ty = lowerExpr(c, p, kidAt(p, stmtIdx, 0), "")
+    termPanic(c, op)
+}
+
 // `bounce y` — early-return-on-error (mirror lower_bounce): if `y.present`, return zeros for the
 // leading slots plus `y`; else fall through.
 finna lowerBounce(c: LowerCtx, p: P, stmtIdx: int) {
@@ -6613,6 +6755,8 @@ finna lowerStmt(c: LowerCtx, p: P, stmtIdx: int) {
         lowerCribDecl(c, p, stmtIdx)
     } naw fr str.slaps(h, "holla") {
         lowerHolla(c, p, stmtIdx)
+    } naw fr str.slaps(h, "yeet") {
+        lowerYeet(c, p, stmtIdx)
     } naw fr str.slaps(h, "evict-slot") {
         lowerEvictSlot(c, p, stmtIdx)
     } naw fr str.slaps(h, "evict") {
