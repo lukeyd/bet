@@ -68,7 +68,41 @@ pub use rt_abi::{
 // ---------------------------------------------------------------------------
 
 fn layout(size: usize, align: usize) -> Layout {
-    Layout::from_size_align(size.max(1), align.max(1)).expect("invalid (size, align)")
+    // A bad (size, align) — a non-power-of-two align, or a size that overflows when rounded up
+    // to `align` — must not `.expect()`-panic: a Rust unwind across the `extern "C"` boundary
+    // is at best an abort and at worst UB (issue #35). Fail deterministically via `die` (a
+    // plain `process::abort`, no unwinding), mirroring the stub's exhaustion abort. Valid
+    // inputs are unaffected.
+    match Layout::from_size_align(size.max(1), align.max(1)) {
+        Ok(l) => l,
+        Err(_) => die("invalid allocation layout (bad size/align)"),
+    }
+}
+
+/// `alloc::alloc`, but a null return (allocation failure) is a clean [`die`] abort rather than a
+/// null the caller would install into a `Chunk`/slab and later dereference (issue #35). Mirrors
+/// the stub's "exhausted" abort so both runtimes fail the same, deterministic way.
+///
+/// # Safety
+/// Same contract as [`alloc::alloc`]: `l` must have non-zero size (our [`layout`] guarantees it).
+unsafe fn alloc_or_die(l: Layout) -> *mut u8 {
+    let p = unsafe { alloc::alloc(l) };
+    if p.is_null() {
+        die("out of memory (allocation failed)");
+    }
+    p
+}
+
+/// Zero-initialized twin of [`alloc_or_die`] for `bet_alloc_zeroed` / `mem.slab`.
+///
+/// # Safety
+/// Same contract as [`alloc::alloc_zeroed`].
+unsafe fn alloc_zeroed_or_die(l: Layout) -> *mut u8 {
+    let p = unsafe { alloc::alloc_zeroed(l) };
+    if p.is_null() {
+        die("out of memory (allocation failed)");
+    }
+    p
 }
 
 /// Round `addr` up to the next multiple of `align` (a power of two, as the ABI guarantees).
@@ -90,12 +124,12 @@ fn align_up(addr: usize, align: usize) -> usize {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bet_alloc(size: usize, align: usize) -> *mut u8 {
-    unsafe { alloc::alloc(layout(size, align)) }
+    unsafe { alloc_or_die(layout(size, align)) }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bet_alloc_zeroed(size: usize, align: usize) -> *mut u8 {
-    unsafe { alloc::alloc_zeroed(layout(size, align)) }
+    unsafe { alloc_zeroed_or_die(layout(size, align)) }
 }
 
 #[unsafe(no_mangle)]
@@ -180,7 +214,10 @@ struct TypedCrib {
 #[derive(Clone, Copy)]
 struct SlotMeta {
     occupied: bool,
-    generation: u32,
+    /// A `u64` generation counter (issue #34): matches `rt_abi::Tag::generation`, so the
+    /// wrapping bumps at `bet_evict` / `bet_evict_slot` never realistically wrap and a stale
+    /// tag can never alias a reused slot's generation (ABA use-after-free defense).
+    generation: u64,
 }
 
 /// A single pointer-stable region of a bump crib.
@@ -209,7 +246,9 @@ impl BumpCrib {
     fn new(reserve: usize) -> BumpCrib {
         let cap = reserve.max(16);
         let align = 16usize;
-        let base = unsafe { alloc::alloc(layout(cap, align)) };
+        // Null on OOM would install a `Chunk { base: null, .. }` and hand out wild pointers
+        // (issue #35); `alloc_or_die` aborts instead.
+        let base = unsafe { alloc_or_die(layout(cap, align)) };
         BumpCrib {
             chunks: vec![Chunk { base, cap, align }],
             current: 0,
@@ -224,22 +263,36 @@ impl BumpCrib {
         let align = align.max(1);
         loop {
             let chunk = &self.chunks[self.current];
-            let start = chunk.base as usize + self.offset;
-            let aligned = align_up(start, align);
-            if aligned + size <= chunk.base as usize + chunk.cap {
-                self.offset = aligned + size - chunk.base as usize;
+            let base = chunk.base as usize;
+            let aligned = align_up(base + self.offset, align);
+            // The request fits iff `aligned + size` neither overflows `usize` NOR exceeds the
+            // chunk's end (`base + cap`, itself computed with a checked add) — issue #35. An
+            // unchecked `aligned + size` could wrap past the chunk end and hand out a pointer
+            // outside the allocation, so `self.offset` is only ever derived from a bound we
+            // proved fits; overflow / over-capacity falls through to grow-or-reuse.
+            let fits = aligned
+                .checked_add(size)
+                .zip(base.checked_add(chunk.cap))
+                .is_some_and(|(end, limit)| end <= limit);
+            if fits {
+                self.offset = aligned + size - base;
                 return aligned as *mut u8;
             }
 
-            // The active chunk is full. Reuse the next retained chunk if it can hold the
-            // request; otherwise splice in a fresh, big-enough chunk right after it.
+            // The active chunk is full (or can't fit this request). Reuse the next retained
+            // chunk if it can hold the request; otherwise splice in a fresh, big-enough chunk
+            // right after it. The reuse probe uses the same checked-add bound.
             let reuse = self.chunks.get(self.current + 1).is_some_and(|next| {
-                align_up(next.base as usize, align) + size <= next.base as usize + next.cap
+                let nbase = next.base as usize;
+                align_up(nbase, align)
+                    .checked_add(size)
+                    .zip(nbase.checked_add(next.cap))
+                    .is_some_and(|(end, limit)| end <= limit)
             });
             if !reuse {
                 let want = self.next_reserve.max(size.saturating_add(align));
                 let chunk_align = align.max(16);
-                let base = unsafe { alloc::alloc(layout(want, chunk_align)) };
+                let base = unsafe { alloc_or_die(layout(want, chunk_align)) };
                 self.chunks.insert(
                     self.current + 1,
                     Chunk {
@@ -271,10 +324,22 @@ impl BumpCrib {
     }
 }
 
-/// Reborrow a crib handle as `*mut Crib`. Caller guarantees the handle is live and that the
-/// crib is not being touched from another thread (a crib is single-threaded, spec §8 open Q).
+/// Reborrow a crib handle as `&mut Crib`, for the mutating entry points (`cop`, `evict`,
+/// `bump_alloc`). Caller guarantees the handle is live and that the crib is not being touched
+/// from another thread — a crib handle is **single-threaded** and must not cross a `bet_slide`
+/// task boundary (see [`bet_slide`]); the ABI does not synchronize crib access (issue #44).
 unsafe fn crib<'a>(h: CribHandle) -> &'a mut Crib {
     unsafe { &mut *(h.0 as *mut Crib) }
+}
+
+/// Shared reborrow of a crib handle as `&Crib` — the read-only counterpart of [`crib`], for the
+/// entry points that only *read* the crib (`bet_holla_check`, `bet_slot_ptr`). Taking `&`
+/// rather than `&mut` means a resolve asserts no unique access, so two concurrent checked
+/// resolves of the same crib can never form overlapping `&mut`s (issue #44). The single-threaded
+/// contract (no crib handle across a `bet_slide` boundary) still holds and is what makes even a
+/// shared read sound; this only removes the *spurious* `&mut` the resolve never needed.
+unsafe fn crib_ref<'a>(h: CribHandle) -> &'a Crib {
+    unsafe { &*(h.0 as *const Crib) }
 }
 
 #[unsafe(no_mangle)]
@@ -288,7 +353,9 @@ pub unsafe extern "C" fn bet_crib_new(
     let base = if total == 0 {
         std::ptr::null_mut()
     } else {
-        unsafe { alloc::alloc(layout(total, elem_align.max(1))) }
+        // Abort on OOM rather than storing a null slab base that every `holla` would then
+        // guard against (or worse, index off of) — issue #35.
+        unsafe { alloc_or_die(layout(total, elem_align.max(1))) }
     };
     let slots = vec![
         SlotMeta {
@@ -435,7 +502,9 @@ pub unsafe extern "C" fn bet_cop(handle: CribHandle) -> Tag {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bet_holla_check(handle: CribHandle, tag: Tag) -> *mut u8 {
-    let c = unsafe { crib(handle) };
+    // Read-only resolve: a shared borrow (issue #44). The `u64` generation compare below is the
+    // ABA defense (issue #34).
+    let c = unsafe { crib_ref(handle) };
     let CribKind::Typed(t) = &c.kind else {
         return std::ptr::null_mut();
     };
@@ -452,7 +521,8 @@ pub unsafe extern "C" fn bet_holla_check(handle: CribHandle, tag: Tag) -> *mut u
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bet_slot_ptr(handle: CribHandle, slot: u32) -> *mut u8 {
-    let c = unsafe { crib(handle) };
+    // Unchecked resolve is still read-only against the crib metadata: a shared borrow (issue #44).
+    let c = unsafe { crib_ref(handle) };
     let CribKind::Typed(t) = &c.kind else {
         return std::ptr::null_mut();
     };
@@ -857,6 +927,17 @@ struct SendPtr(usize);
 // contract, exactly as with the real scheduler.
 unsafe impl Send for SendPtr {}
 
+/// Spawn a task on a fresh OS thread (no M:N runtime yet).
+///
+/// **Handle threading contract (issue #44):** crib, `stash`, `vec`, and `rng` handles are
+/// **single-threaded**. Their accessors ([`crib`]/[`crib_ref`], `stash_ref`, `vec_ref`,
+/// `rng_ref`) reborrow the raw handle as `&`/`&mut` with *no* internal synchronization, so
+/// resolving the same handle from two threads at once is a data race. A handle must therefore
+/// never be captured by `entry`/`arg` and used inside the spawned task while the parent (or
+/// another task) still uses it. `bet_slide` maps each task to its own thread; only `Send`-safe,
+/// owned data should cross the boundary. Full M:N scheduling with cross-task-safe handles is a
+/// later milestone and out of scope here — this is the documented single-threaded guarantee the
+/// read-only `&`-borrows above rely on.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn bet_slide(entry: extern "C" fn(*mut u8), arg: *mut u8) -> TaskHandle {
     let sp = SendPtr(arg as usize);
