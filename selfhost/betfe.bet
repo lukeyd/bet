@@ -2459,6 +2459,27 @@ finna floatHintOrDefault(hint: str) -> str {
     bet "f64"
 }
 
+// Normalize a float literal's source text to its MIR spelling (mirror text.rs `Const::Float`, which
+// prints the parsed f64 via Rust's `{}`): drop trailing zeros in the fraction, then a lone trailing
+// '.'. e.g. `1.0` -> `1`, `1000.0` -> `1000`, `16.16` -> `16.16`, `0.1` -> `0.1`. Corpus floats are
+// plain decimals (no exponent); non-decimal text is returned unchanged.
+finna normFloat(s: str) -> str {
+    lowkey n = str.len(s)
+    lowkey dot = 0 - 1
+    lowkey i = 0
+    vibin i < n {
+        fr str.at(s, i) == 46 { dot = i }
+        i = i + 1
+    }
+    fr dot < 0 { bet s }
+    lowkey end = n
+    vibin end > dot + 1 && str.at(s, end - 1) == 48 {
+        end = end - 1
+    }
+    fr end == dot + 1 { end = dot }
+    bet str.sub(s, 0, end)
+}
+
 finna isComparisonTag(op: str) -> bool {
     bet str.slaps(op, "eq") || str.slaps(op, "ne") || str.slaps(op, "lt") || str.slaps(op, "le") || str.slaps(op, "gt") || str.slaps(op, "ge")
 }
@@ -2608,6 +2629,179 @@ finna vecElem(t: str) -> str {
 
 finna vecTyStr(elem: str) -> str {
     bet cat3("vec[", elem, "]")
+}
+
+// --- first-class SIMD vectors, spelled `<elem>x<lanes>` in MIR (mirror simd_type_name/text.rs) ---
+// Recognize a SIMD vector type name and return its MIR spelling `<elem>x<lanes>`, or "" if not one.
+// `vec2/vec3/vec4` are f32 aliases; the generic `<elem>x<N>` (scalar numeric elem, lanes 2-4) maps
+// its element to the MIR scalar spelling. Works on surface names (`vec4`, `int` alias) and MIR types.
+finna simdTyStr(nm: str) -> str {
+    fr str.slaps(nm, "vec2") { bet "f32x2" }
+    fr str.slaps(nm, "vec3") { bet "f32x3" }
+    fr str.slaps(nm, "vec4") { bet "f32x4" }
+    lowkey xi = lastX(nm)
+    fr xi <= 0 { bet "" }
+    lowkey elem = str.sub(nm, 0, xi)
+    lowkey rest = str.sub(nm, xi + 1, str.len(nm))
+    fr !isLanes(rest) { bet "" }
+    lowkey me = mapScalar(elem)
+    fr isEmpty(me) { bet "" }
+    fr !(isIntTy(me) || isFloatTy(me)) { bet "" }
+    bet cat3(me, "x", rest)
+}
+
+// Index of the last 'x' (byte 120) in `s`, or -1 if none.
+finna lastX(s: str) -> int {
+    lowkey n = str.len(s)
+    lowkey found = 0 - 1
+    lowkey i = 0
+    vibin i < n {
+        fr str.at(s, i) == 120 { found = i }
+        i = i + 1
+    }
+    bet found
+}
+
+// True if `rest` is a valid SIMD lane-count spelling (a single digit 2, 3, or 4).
+finna isLanes(rest: str) -> bool {
+    bet str.slaps(rest, "2") || str.slaps(rest, "3") || str.slaps(rest, "4")
+}
+
+// True for a MIR SIMD vector type string `<elem>x<lanes>`.
+finna isSimdTy(t: str) -> bool {
+    bet !isEmpty(simdTyStr(t))
+}
+
+// The element type of a MIR SIMD type `<elem>x<lanes>` (the text before the last 'x').
+finna simdElem(t: str) -> str {
+    lowkey xi = lastX(t)
+    bet str.sub(t, 0, xi)
+}
+
+// The lane count of a MIR SIMD type `<elem>x<lanes>` (the single trailing digit).
+finna simdLanes(t: str) -> int {
+    lowkey xi = lastX(t)
+    bet str.at(t, xi + 1) - 48
+}
+
+// The lane index for a SIMD field read `.x/.y/.z/.w` (0..3), or -1 for any other field name.
+finna laneIndex(name: str) -> int {
+    fr str.slaps(name, "x") { bet 0 }
+    fr str.slaps(name, "y") { bet 1 }
+    fr str.slaps(name, "z") { bet 2 }
+    fr str.slaps(name, "w") { bet 3 }
+    bet 0 - 1
+}
+
+// `%t = simd.<op>[<tyTag>](<a>)` into a fresh local of `resTy`; returns (reg, resTy).
+finna emitSimdOp1(c: LowerCtx, op: str, tyTag: str, a: str, resTy: str) -> (str, str) {
+    lowkey tmp = newLocal(c, resTy)
+    lowkey sb = sbNew()
+    sb.add("simd.")
+    sb.add(op)
+    sb.add("[")
+    sb.add(tyTag)
+    sb.add("](")
+    sb.add(a)
+    sb.add(")")
+    emitAssign(c, tmp, sb.finish())
+    bet reg(tmp), resTy
+}
+
+// `%t = simd.<op>[<tyTag>](<a>, <b>)` into a fresh local of `resTy`; returns (reg, resTy).
+finna emitSimdOp2(c: LowerCtx, op: str, tyTag: str, a: str, b: str, resTy: str) -> (str, str) {
+    lowkey tmp = newLocal(c, resTy)
+    lowkey sb = sbNew()
+    sb.add("simd.")
+    sb.add(op)
+    sb.add("[")
+    sb.add(tyTag)
+    sb.add("](")
+    sb.add(a)
+    sb.add(", ")
+    sb.add(b)
+    sb.add(")")
+    emitAssign(c, tmp, sb.finish())
+    bet reg(tmp), resTy
+}
+
+// Dispatch a method on a SIMD vector `recv` of MIR type `vty` (mirror lower_simd_method). The
+// element-wise `+ - * / >> <<` are operators (lower_binary); these are the reductions, min/max/abs,
+// scale, length, and normalize. `elem` is the scalar element type.
+finna lowerSimdMethod(c: LowerCtx, p: P, idx: int, recv: str, vty: str, method: str) -> (str, str) {
+    lowkey elem = simdElem(vty)
+    lowkey argsW = findKid(p, idx, "args")
+    lowkey na = kidCount(p, argsW)
+    fr str.slaps(method, "min") || str.slaps(method, "max") {
+        fr na != 1 {
+            lcFail(c)
+            bet "0i64", "i64"
+        }
+        lowkey w, wt = lowerExpr(c, p, argValue(p, argsW, 0), vty)
+        lowkey mo, mt = emitSimdOp2(c, method, vty, recv, w, vty)
+        bet mo, mt
+    }
+    fr str.slaps(method, "abs") {
+        fr na != 0 {
+            lcFail(c)
+            bet "0i64", "i64"
+        }
+        lowkey mo, mt = emitSimdOp1(c, "abs", vty, recv, vty)
+        bet mo, mt
+    }
+    fr str.slaps(method, "dot") {
+        fr na != 1 {
+            lcFail(c)
+            bet "0i64", "i64"
+        }
+        lowkey w, wt = lowerExpr(c, p, argValue(p, argsW, 0), vty)
+        lowkey mo, mt = emitSimdOp2(c, "dot", elem, recv, w, elem)
+        bet mo, mt
+    }
+    fr str.slaps(method, "sum") {
+        fr na != 0 {
+            lcFail(c)
+            bet "0i64", "i64"
+        }
+        lowkey mo, mt = emitSimdOp1(c, "sum", elem, recv, elem)
+        bet mo, mt
+    }
+    // `v.scale(s)` = `v * splat(s)` — a scalar-broadcast multiply.
+    fr str.slaps(method, "scale") {
+        fr na != 1 {
+            lcFail(c)
+            bet "0i64", "i64"
+        }
+        lowkey s, sty = lowerExpr(c, p, argValue(p, argsW, 0), elem)
+        lowkey splat, spt = emitSimdOp1(c, "splat", vty, s, vty)
+        lowkey tmp = newLocal(c, vty)
+        lowkey sb = sbNew()
+        sb.add("mul.na(")
+        sb.add(recv)
+        sb.add(", ")
+        sb.add(splat)
+        sb.add(")")
+        emitAssign(c, tmp, sb.finish())
+        bet reg(tmp), vty
+    }
+    fr str.slaps(method, "length") {
+        fr na != 0 {
+            lcFail(c)
+            bet "0i64", "i64"
+        }
+        lowkey mo, mt = emitSimdOp1(c, "length", elem, recv, elem)
+        bet mo, mt
+    }
+    fr str.slaps(method, "norm") {
+        fr na != 0 {
+            lcFail(c)
+            bet "0i64", "i64"
+        }
+        lowkey mo, mt = emitSimdOp1(c, "norm", vty, recv, vty)
+        bet mo, mt
+    }
+    lcFail(c)
+    bet "0i64", "i64"
 }
 
 // --- stash (hash map) types, spelled `map[K, V]` in MIR (mirror the vec type helpers) ---
@@ -2779,6 +2973,27 @@ finna zeroOperand(c: LowerCtx, ty: str) -> str {
     fr isIntTy(ty) { bet cat2("0", ty) }
     fr str.slaps(ty, "bool") { bet "false" }
     fr str.slaps(ty, "str") { bet "\"\"" }
+    // A SIMD vector's zero is an all-lanes-zero aggregate (mirror zero_value's TyKind::Simd arm).
+    fr isSimdTy(ty) {
+        lowkey elem = simdElem(ty)
+        lowkey lanes = simdLanes(ty)
+        lowkey z = zeroOperand(c, elem)
+        lowkey ops = vec.new[str]()
+        lowkey i = 0
+        vibin i < lanes {
+            ops.stack(z)
+            i = i + 1
+        }
+        lowkey tmp = newLocal(c, ty)
+        lowkey sb = sbNew()
+        sb.add("simd[")
+        sb.add(elem)
+        sb.add("](")
+        sb.add(joinComma(ops))
+        sb.add(")")
+        emitAssign(c, tmp, sb.finish())
+        bet reg(tmp)
+    }
     lcFail(c)
     bet "0i64"
 }
@@ -3173,6 +3388,9 @@ finna mapTypeNode(c: LowerCtx, p: P, tyNode: int) -> str {
         fr !isEmpty(sub) { bet sub }
         lowkey m = mapScalar(nm)
         fr !isEmpty(m) { bet m }
+        // A first-class SIMD vector type (`vec2/3/4`, `i32x4`, `i64x2`, …) → `<elem>x<lanes>`.
+        lowkey sv = simdTyStr(nm)
+        fr !isEmpty(sv) { bet sv }
         fr str.slaps(nm, "yikes") {
             ensureYikes(c)
             bet "__yikes"
@@ -3507,7 +3725,7 @@ finna lowerExpr(c: LowerCtx, p: P, idx: int, hint: str) -> (str, str) {
     }
     fr str.slaps(h, "float") {
         lowkey ty = floatHintOrDefault(hint)
-        bet cat2(payload, ty), ty
+        bet cat2(normFloat(payload), ty), ty
     }
     fr str.slaps(h, "bool") {
         bet payload, "bool"
@@ -4442,6 +4660,11 @@ finna lowerMethodCall(c: LowerCtx, p: P, idx: int, hint: str) -> (str, str) {
     fr fi < 0 {
         // Not a user method — try a value method on the receiver's type (yikes.tea / vec.*).
         lowkey yop, yty = lowerExpr(c, p, recvE, "")
+        // SIMD value methods (min/max/abs/dot/sum/scale/length/norm) dispatch on the vector type.
+        fr isSimdTy(yty) {
+            lowkey smo, smt = lowerSimdMethod(c, p, idx, yop, yty, methodName)
+            bet smo, smt
+        }
         fr isYikesTy(yty) && str.slaps(methodName, "tea") && isPlace(yop) {
             lowkey to, tt = lowerTea(c, p, idx, yop)
             bet to, tt
@@ -4711,6 +4934,22 @@ finna fieldAccessStr(c: LowerCtx, p: P, idx: int) -> (str, str) {
         }
     }
     lowkey bop, bty = lowerExpr(c, p, kidAt(p, idx, 0), "")
+    // A `<N x elem>` SIMD lane read: `v.x/.y/.z/.w` extract lane 0/1/2/3 as a scalar (mirror
+    // lower_field's TyKind::Simd arm). Lanes are read-only in v1, so this yields a value.
+    fr isSimdTy(bty) {
+        lowkey lane = laneIndex(fname)
+        fr lane < 0 {
+            lcFail(c)
+            bet "0i64", "i64"
+        }
+        fr lane >= simdLanes(bty) {
+            lcFail(c)
+            bet "0i64", "i64"
+        }
+        lowkey selem = simdElem(bty)
+        lowkey lo, lt = emitSimdOp1(c, cat2("lane.", itoa(lane)), selem, bop, selem)
+        bet lo, lt
+    }
     // Auto-deref a `ref Struct` base (as produced by `trust`/`holla`/bump `cop`): `%b.deref.field`.
     lowkey sname = bty
     lowkey base = bop
@@ -4866,6 +5105,40 @@ finna lowerCall(c: LowerCtx, p: P, idx: int) -> (str, str) {
         fr !lcOk(c) {
             bet "0i64", "i64"
         }
+    }
+    // A callee that names a SIMD vector type constructs one (mirror lower_call's simd_type_name arm):
+    // `i32x4(a,b,c,d)` builds it lane-by-lane; `f32x4(x)` broadcasts one scalar to every lane.
+    lowkey svc = simdTyStr(nm)
+    fr !isEmpty(svc) && lookupFn(c, nm) < 0 {
+        lowkey selem = simdElem(svc)
+        lowkey slanes = simdLanes(svc)
+        lowkey cargsW = findKid(p, idx, "args")
+        lowkey cn = kidCount(p, cargsW)
+        fr cn == slanes {
+            lowkey cops = vec.new[str]()
+            lowkey ck = 0
+            vibin ck < cn {
+                lowkey aop, aty = lowerExpr(c, p, argValue(p, cargsW, ck), selem)
+                cops.stack(aop)
+                ck = ck + 1
+            }
+            lowkey tmp = newLocal(c, svc)
+            lowkey sb = sbNew()
+            sb.add("simd[")
+            sb.add(selem)
+            sb.add("](")
+            sb.add(joinComma(cops))
+            sb.add(")")
+            emitAssign(c, tmp, sb.finish())
+            bet reg(tmp), svc
+        }
+        fr cn == 1 {
+            lowkey aop, aty = lowerExpr(c, p, argValue(p, cargsW, 0), selem)
+            lowkey spo, spt = emitSimdOp1(c, "splat", svc, aop, svc)
+            bet spo, spt
+        }
+        lcFail(c)
+        bet "0i64", "i64"
     }
     // A callee that names a `moods` variant (and not a fn) is a value constructor with payload.
     lowkey vi = lookupVariant(c, nm)
@@ -5024,6 +5297,28 @@ finna lowerBinary(c: LowerCtx, p: P, idx: int, hint: str) -> (str, str) {
     lowkey lhint = ""
     fr !isCmp { lhint = hint }
     lowkey lo, lty = lowerExpr(c, p, kidAt(p, idx, 0), lhint)
+    // Element-wise SIMD arith/shift (mirror lower_binary's TyKind::Simd arm). A scalar right operand
+    // (`v >> 16`, `v * s`) is broadcast to a vector so the IR `BinOp` sees two same-type vectors; a
+    // vector right operand passes through. All lane ops use `.na`; comparisons take the scalar path.
+    fr !isCmp && isSimdTy(lty) {
+        lowkey selem = simdElem(lty)
+        lowkey ro2, rty2 = lowerExpr(c, p, kidAt(p, idx, 1), selem)
+        lowkey rop = ro2
+        fr !str.slaps(rty2, lty) {
+            lowkey so, st = emitSimdOp1(c, "splat", lty, ro2, lty)
+            rop = so
+        }
+        lowkey vt = newLocal(c, lty)
+        lowkey vsb = sbNew()
+        vsb.add(opTag)
+        vsb.add(".na(")
+        vsb.add(lo)
+        vsb.add(", ")
+        vsb.add(rop)
+        vsb.add(")")
+        emitAssign(c, vt, vsb.finish())
+        bet reg(vt), lty
+    }
     lowkey ro, rty = lowerExpr(c, p, kidAt(p, idx, 1), lty)
     lowkey mode = arithMode(lty, opTag)
     lowkey resTy = lty
@@ -5069,7 +5364,7 @@ finna constLiteral(c: LowerCtx, p: P, idx: int, hint: str) -> (str, str) {
     }
     fr str.slaps(h, "float") {
         lowkey ty = floatHintOrDefault(hint)
-        bet cat2(payload, ty), ty
+        bet cat2(normFloat(payload), ty), ty
     }
     fr str.slaps(h, "bool") {
         bet payload, "bool"
@@ -5089,7 +5384,7 @@ finna constLiteral(c: LowerCtx, p: P, idx: int, hint: str) -> (str, str) {
         }
         fr str.slaps(ih, "float") {
             lowkey ty = floatHintOrDefault(hint)
-            bet cat3("-", afterFirst(lab(p, inner)), ty), ty
+            bet cat3("-", normFloat(afterFirst(lab(p, inner))), ty), ty
         }
     }
     lcFail(c)
