@@ -1,0 +1,26 @@
+// div_guard.mir — integer div/rem emit safety guards that conditionally branch to `bet_panic`
+// (security issue #36): every div/rem guards a zero divisor, and a SIGNED div/rem additionally
+// guards the `INT_MIN / -1` overflow (a hardware trap / LLVM UB). `sdiv`/`srem` are signed (two
+// guards each); `udiv` is unsigned (the zero guard only). Each guard splits the block, so this
+// also exercises several continuations in one function. Compile-only. (Security #36.)
+
+fn sdiv(%0: i64, %1: i64) -> i64 {
+  let %2: i64
+  bb0:
+    %2 = div.trap(%0, %1)
+    return %2
+}
+
+fn srem(%0: i64, %1: i64) -> i64 {
+  let %2: i64
+  bb0:
+    %2 = rem.trap(%0, %1)
+    return %2
+}
+
+fn udiv(%0: u32, %1: u32) -> u32 {
+  let %2: u32
+  bb0:
+    %2 = div.wrap(%0, %1)
+    return %2
+}
