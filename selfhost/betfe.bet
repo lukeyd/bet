@@ -3512,6 +3512,13 @@ finna lcFail(c: LowerCtx) {
     c.ok.stack(0)
 }
 
+// Clear a prior failure so lowering of the NEXT function starts from an OK state. Used only by the
+// `--emit failall` diagnostic, which lowers every function and records each failure independently.
+finna lcReset(c: LowerCtx) {
+    c.ok.pop()
+    c.ok.stack(1)
+}
+
 // Dedup-add an extern decl line, preserving first-use order (matches lower.rs get_extern).
 finna getExtern(c: LowerCtx, line: str) {
     lowkey found = cap
@@ -7197,6 +7204,66 @@ finna emitFailFromSrc(src: str) -> str {
     bet emitFailFn(p, root)
 }
 
+// Like emitFailFn, but reports EVERY function that fails to lower (one per line) instead of stopping
+// at the first — the gap-surface enumerator that drives large multi-file ports (e.g. the DOOM
+// capstone). Each failure is cleared with lcReset so the next function is checked independently.
+finna emitFailAllFn(p: P, root: int) -> str {
+    lowkey c = lcNew()
+    collectTypeNames(c, p, root)
+    collectTypeDefs(c, p, root)
+    collectCribGlobals(c, p, root)
+    collectConsts(c, p, root)
+    collectExterns(c, p, root)
+    collectFns(c, p, root)
+    lowkey sb = sbNew()
+    fr !lcOk(c) {
+        sb.add("FAIL: collect/prescan (type/const/extern/fn signature)\n")
+        lcReset(c)
+    }
+    lowkey n = kidCount(p, root)
+    lowkey i = 0
+    vibin i < n {
+        lowkey it = kidAt(p, root, i)
+        fr str.slaps(firstWord(lab(p, it)), "func") && !isGenericDecl(p, it) {
+            lowerFunc(c, p, it)
+            fr !lcOk(c) {
+                sb.add(cat2("FAIL fn: ", afterFirst(afterFirst(lab(p, it)))))
+                sb.add("\n")
+                lcReset(c)
+            }
+        }
+        i = i + 1
+    }
+    lowkey qi = 0
+    vibin qi < (c.moQName.gang() as int) {
+        lowerMonoFn(c, p, qi)
+        fr !lcOk(c) {
+            sb.add(cat2("FAIL mono: ", c.moQMangled[qi]))
+            sb.add("\n")
+            lcReset(c)
+        }
+        qi = qi + 1
+    }
+    bet sb.finish()
+}
+
+// Multi-file variant of the failall enumerator (load-graph + resolve/mangle, then list all failures).
+finna emitFailAllFromPath(path: str) -> str {
+    lowkey nodes = vec.new[Node]()
+    lowkey g = modsNew()
+    loadFile(g, nodes, path, 1)
+    fr !modsErrOk(g) { bet cat2("FAIL load: ", g.err[0]) }
+    lowkey p = pFromNodes(nodes)
+    fr (g.stems.gang() as int) == 1 {
+        bet emitFailAllFn(p, g.roots[0])
+    }
+    buildTables(g, nodes)
+    fr !modsErrOk(g) { bet cat2("FAIL tables: ", g.err[0]) }
+    lowkey mergedRoot = resolveProgram(g, p)
+    fr !modsErrOk(g) { bet cat2("FAIL resolve: ", g.err[0]) }
+    bet emitFailAllFn(p, mergedRoot)
+}
+
 // Multi-file variant of the failfn diagnostic: run the full load-graph + resolve/mangle pipeline
 // then report which merged item first fails to lower (or which pipeline stage errored).
 finna emitFailFromPath(path: str) -> str {
@@ -8447,6 +8514,9 @@ finna main() {
         spill.f("{}", emitFailFromSrc(src))
     } naw fr sys.argc() >= 4 && str.slaps(sys.arg(1), "--emit") && str.slaps(sys.arg(2), "failpath") {
         spill.f("{}", emitFailFromPath(sys.arg(3)))
+    } naw fr sys.argc() >= 4 && str.slaps(sys.arg(1), "--emit") && str.slaps(sys.arg(2), "failall") {
+        // Module-aware gap enumerator: list EVERY function that fails to lower (drives large ports).
+        spill.f("{}", emitFailAllFromPath(sys.arg(3)))
     } naw {
         spill.it(emitHelloMir())
     }
