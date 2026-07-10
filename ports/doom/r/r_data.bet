@@ -33,29 +33,46 @@ flex facts MAXTEXTURES: int = 32768
 // `colOfs` is the absolute byte offset of the column's post list in `buf`; `destBase` the
 // absolute byte offset of the target column block in `arena`; posts are topdelta/length/pad +
 // pixels + pad, terminated by topdelta 0xff.
-flex finna drawColumnInCache(buf: []u8, arena: []u8, colOfs: int, destBase: int, originy: int, cacheHeight: int) {
+flex finna drawColumnInCache(buf: []u8, arena: []u8, bufLen: int, colOfs: int, destBase: int, originy: int, cacheHeight: int) {
     lowkey p: int = colOfs
-    vibin (buf[p] as int) != 255 {
-        lowkey topdelta: int = buf[p] as int
-        lowkey length: int = buf[p + 1] as int
-        lowkey source: int = p + 3
-        lowkey position: int = originy + topdelta
-        lowkey count: int = length
-        fr position < 0 {
-            count = count + position
-            position = 0
+    lowkey looping = nocap
+    vibin looping {
+        // sec #42: a crafted patch whose post list runs off the end of its lump (missing 0xff
+        // terminator) would walk `p` past the buffer, copying adjacent WAD bytes into the texture
+        // arena (an info leak). Bound the topdelta/length header + the pixel source by bufLen.
+        fr p >= bufLen {
+            yeet("R_DrawColumnInCache: patch post runs past lump")
         }
-        fr position + count > cacheHeight {
-            count = cacheHeight - position
-        }
-        fr count > 0 {
-            lowkey k: int = 0
-            vibin k < count {
-                arena[destBase + position + k] = buf[source + k]
-                k = k + 1
+        fr (buf[p] as int) == 255 {
+            looping = cap
+        } naw {
+            fr p + 1 >= bufLen {
+                yeet("R_DrawColumnInCache: patch post runs past lump")
             }
+            lowkey topdelta: int = buf[p] as int
+            lowkey length: int = buf[p + 1] as int
+            lowkey source: int = p + 3
+            lowkey position: int = originy + topdelta
+            lowkey count: int = length
+            fr position < 0 {
+                count = count + position
+                position = 0
+            }
+            fr position + count > cacheHeight {
+                count = cacheHeight - position
+            }
+            fr count > 0 {
+                fr source < 0 || source + count > bufLen {
+                    yeet("R_DrawColumnInCache: patch post runs past lump")
+                }
+                lowkey k: int = 0
+                vibin k < count {
+                    arena[destBase + position + k] = buf[source + k]
+                    k = k + 1
+                }
+            }
+            p = p + length + 4
         }
-        p = p + length + 4
     }
 }
 
@@ -198,6 +215,12 @@ flex finna initTextures(gt: tag gs.GameState) {
             }
             lowkey offset: int = bstream.rdI32(g.wad.buf, base + 4 + dirIdx * 4)
             lowkey mtexOfs: int = base + offset
+            // sec #42: `offset` is an attacker-controlled i32 from the TEXTURE lump. mtexOfs+22
+            // spans the maptexture_t header through patchcount (name8/width/height at +0/+12/+14,
+            // patchcount at +20, read here and in passes B/C). Reject an out-of-lump header.
+            fr mtexOfs < 0 || mtexOfs + 22 > g.wad.bufLen {
+                yeet("R_InitTextures: maptexture offset out of range")
+            }
             texMapOfs[ti] = mtexOfs as i32
             lowkey w: int = bstream.rdU16(g.wad.buf, mtexOfs + 12)
             lowkey h: int = bstream.rdU16(g.wad.buf, mtexOfs + 14)
@@ -243,6 +266,11 @@ flex finna initTextures(gt: tag gs.GameState) {
                 lowkey mp: int = mtexOfs + 22 + pj * 10
                 lowkey originx: int = bstream.rdI16(g.wad.buf, mp)
                 lowkey patchIdx: int = bstream.rdU16(g.wad.buf, mp + 4)
+                // sec #42: patchIdx indexes patchlookup (size nummappatches); its result then
+                // indexes g.wad.lumpOfs. Reject an out-of-range patch reference from the lump.
+                fr patchIdx < 0 || patchIdx >= nummappatches {
+                    yeet("R_InitTextures: patch index out of range")
+                }
                 lowkey patchLump: int = patchlookup[patchIdx] as int
                 fr patchLump >= 0 {
                     lowkey patchOfs: int = g.wad.lumpOfs[patchLump] as int
@@ -302,6 +330,10 @@ flex finna initTextures(gt: tag gs.GameState) {
                     lowkey originx: int = bstream.rdI16(g.wad.buf, mp)
                     lowkey originy: int = bstream.rdI16(g.wad.buf, mp + 2)
                     lowkey patchIdx: int = bstream.rdU16(g.wad.buf, mp + 4)
+                    // sec #42: same patchlookup bound as pass B (this is R_GenerateComposite).
+                    fr patchIdx < 0 || patchIdx >= nummappatches {
+                        yeet("R_InitTextures: patch index out of range")
+                    }
                     lowkey patchLump: int = patchlookup[patchIdx] as int
                     fr patchLump >= 0 {
                         lowkey patchOfs: int = g.wad.lumpOfs[patchLump] as int
@@ -320,7 +352,7 @@ flex finna initTextures(gt: tag gs.GameState) {
                                 lowkey cofs: int = bstream.rdU32(g.wad.buf, patchOfs + 8 + (x - x1) * 4)
                                 lowkey colDataOfs: int = patchOfs + cofs
                                 lowkey destBase: int = compBase + (g.render.textureColumnOfs[colStart + x] as int)
-                                drawColumnInCache(g.wad.buf, g.render.texArena, colDataOfs, destBase, originy, texh)
+                                drawColumnInCache(g.wad.buf, g.render.texArena, g.wad.bufLen, colDataOfs, destBase, originy, texh)
                             }
                             x = x + 1
                         }
@@ -397,8 +429,11 @@ flex finna initSpriteLumps(gt: tag gs.GameState) {
                     fr str.slaps(str.sub(lname, 0, 4), sname) {
                         lowkey frame: int = str.at(lname, 4) - 65
                         lowkey rotation: int = str.at(lname, 5) - 48
-                        fr frame < 29 {
-                            fr rotation <= 8 {
+                        // sec #42: frame/rotation index stR/stL (installSpr writes stR[frame],
+                        // stL[frame*8+rot]). The upper bound was checked but not the lower — a
+                        // crafted sprite name (char < 'A'/'0') would drive frame/rotation negative.
+                        fr frame >= 0 && frame < 29 {
+                            fr rotation >= 0 && rotation <= 8 {
                                 fr frame > maxframe {
                                     maxframe = frame
                                 }
@@ -408,8 +443,9 @@ flex finna initSpriteLumps(gt: tag gs.GameState) {
                         fr str.len(lname) >= 8 {
                             lowkey frame2: int = str.at(lname, 6) - 65
                             lowkey rotation2: int = str.at(lname, 7) - 48
-                            fr frame2 < 29 {
-                                fr rotation2 <= 8 {
+                            // sec #42: same lower-bound guard for the second (flipped) frame/rot.
+                            fr frame2 >= 0 && frame2 < 29 {
+                                fr rotation2 >= 0 && rotation2 <= 8 {
                                     fr frame2 > maxframe {
                                         maxframe = frame2
                                     }

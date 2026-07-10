@@ -511,6 +511,7 @@ flex finna drawMaskedColumn(gt: tag gs.GameState, columnOfs: int) {
     lowkey floorc: int = 0
     lowkey ceilc: int = 0
     lowkey srcBuf: int = 0
+    lowkey srcLen: int = 0
     holla g = gt in gs.gsc {
         cf = g.render.colfunc
         spryscale = g.render.spryscale
@@ -518,6 +519,12 @@ flex finna drawMaskedColumn(gt: tag gs.GameState, columnOfs: int) {
         basetm = g.render.dc_texturemid
         dcx = g.render.dc_x as int
         srcBuf = g.render.dc_sourceBuf as int
+        // sec #42: bound the post walk below by the extent of whichever source buffer it reads.
+        fr srcBuf == 1 {
+            srcLen = g.wad.bufLen
+        } naw {
+            srcLen = g.render.texArenaLen
+        }
         floorc = g.render.openings[g.render.mfloorclipOfs as int + dcx] as int
         ceilc = g.render.openings[g.render.mceilingclipOfs as int + dcx] as int
     } ghosted {
@@ -526,15 +533,19 @@ flex finna drawMaskedColumn(gt: tag gs.GameState, columnOfs: int) {
     lowkey p: int = columnOfs
     lowkey looping = nocap
     vibin looping {
+        // sec #42: a crafted patch/composite column whose posts run off the source (missing 0xff
+        // terminator) would walk `p` past the buffer, leaking adjacent bytes. Bound the topdelta
+        // read; the length byte + pixel source are bounded once we know it isn't the terminator.
+        fr p < 0 || p >= srcLen {
+            yeet("R_DrawMaskedColumn: post runs past source")
+        }
         lowkey topdelta: i32 = 0
         lowkey length: i32 = 0
         holla g = gt in gs.gsc {
             fr srcBuf == 1 {
                 topdelta = g.wad.buf[p] as i32
-                length = g.wad.buf[p + 1] as i32
             } naw {
                 topdelta = g.render.texArena[p] as i32
-                length = g.render.texArena[p + 1] as i32
             }
         } ghosted {
             yeet("gs")
@@ -542,6 +553,21 @@ flex finna drawMaskedColumn(gt: tag gs.GameState, columnOfs: int) {
         fr (topdelta as int) == 255 {
             looping = cap
         } naw {
+            fr p + 1 >= srcLen {
+                yeet("R_DrawMaskedColumn: post runs past source")
+            }
+            holla g = gt in gs.gsc {
+                fr srcBuf == 1 {
+                    length = g.wad.buf[p + 1] as i32
+                } naw {
+                    length = g.render.texArena[p + 1] as i32
+                }
+            } ghosted {
+                yeet("gs")
+            }
+            fr p + 3 + (length as int) > srcLen {
+                yeet("R_DrawMaskedColumn: post runs past source")
+            }
             lowkey topscreen: i32 = sprtop + spryscale * topdelta
             lowkey bottomscreen: i32 = topscreen + spryscale * length
             lowkey yl: int = ((topscreen + 65535) >> 16) as int

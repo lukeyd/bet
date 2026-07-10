@@ -464,8 +464,21 @@ flex finna blockLinesIterator(gt: tag gs.GameState, x: int, y: int, func: finna(
         lowkey vc: int = 0
         lowkey lv: int = 0
         holla g = gt in gs.gsc {
+            // sec #42: `list` is a WAD-derived blockmap offset (rebased o-4, so a crafted lump can
+            // drive it negative); reject the negative side before indexing. (The high side beyond
+            // the array remains a #32 trap: the port stores no blockmap-length companion and gs.bet
+            // is out of scope for this change.)
+            fr list < 0 {
+                yeet("P_BlockLinesIterator: blockmap offset out of range")
+            }
             lnum = g.level.blockmap[list] as int
             fr lnum != -1 {
+                // sec #42: lnum is a packed linedef number that indexes lineValid (OOB read here +
+                // OOB write below) and is handed to func (which indexes the line SoA). Bound it by
+                // numlines before any use.
+                fr lnum < 0 || lnum >= g.level.numlines as int {
+                    yeet("P_BlockLinesIterator: linedef index out of range")
+                }
                 vc = g.tick.validcount as int
                 lv = g.level.lineValid[lnum] as int
             }
