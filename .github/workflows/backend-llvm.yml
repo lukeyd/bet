@@ -52,6 +52,11 @@ concurrency:
   group: backend-llvm-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege: this job only builds/tests the LLVM backend — no repo/package/check writes.
+# Default the whole workflow to a read-only GITHUB_TOKEN.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -64,7 +69,7 @@ jobs:
         os: [ubuntu-24.04, macos-14]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       # --- LLVM 18 (llvm-sys 180.x locates it via LLVM_SYS_180_PREFIX) ---
       - name: install LLVM 18 (Linux)
@@ -87,8 +92,8 @@ jobs:
 
       - name: install pinned toolchain
         run: rustup show
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: taiki-e/install-action@c7eb1735f09259a5035e8e5d44b1406b1cddc0fb # v2.83.0
         with:
           tool: nextest
 

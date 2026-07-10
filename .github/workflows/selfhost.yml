@@ -51,6 +51,11 @@ concurrency:
   group: selfhost-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege: this job only compiles + runs the self-hosted frontend — no repo/package/
+# check writes. Default the whole workflow to a read-only GITHUB_TOKEN.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -58,7 +63,7 @@ jobs:
   selfhost:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       # MANDATORY. `cargo xtask selfhost` compiles betfe to a native binary via the LLVM
       # backend; without LLVM present it prints "selfhost skipped: no LLVM/codegen" and exits
@@ -72,7 +77,7 @@ jobs:
 
       - name: install pinned toolchain
         run: rustup show
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       # Builds `driver --features llvm` + `rt-stub` itself, then runs the full pipeline:
       # betfe compile+run, `.mir` byte-equivalence, hello oracle, and the corpus token-diff.
