@@ -2314,6 +2314,31 @@ finna structFieldType(c: LowerCtx, sname: str, fname: str) -> str {
     bet ""
 }
 
+// The number of fields declared in struct `sname` (soa transposes one per-field container).
+finna structFieldCount(c: LowerCtx, sname: str) -> int {
+    lowkey n = c.fieldNames.gang() as int
+    lowkey cnt = 0
+    lowkey i = 0
+    vibin i < n {
+        fr str.slaps(c.fieldStruct[i], sname) { cnt = cnt + 1 }
+        i = i + 1
+    }
+    bet cnt
+}
+
+// The .mir type of the field at declaration position `j` in struct `sname` (or "").
+finna structFieldTypeAt(c: LowerCtx, sname: str, j: int) -> str {
+    lowkey n = c.fieldNames.gang() as int
+    lowkey i = 0
+    vibin i < n {
+        fr str.slaps(c.fieldStruct[i], sname) && c.fieldIdx[i] == j {
+            bet c.fieldTypes[i]
+        }
+        i = i + 1
+    }
+    bet ""
+}
+
 // --- sum (moods) registry: sum types are values spelled by their name; variants resolve globally ---
 finna isSum(c: LowerCtx, name: str) -> bool {
     lowkey n = c.sumNames.gang() as int
@@ -2657,6 +2682,53 @@ finna refTyStr(elem: str) -> str { bet cat2("ref ", elem) }
 finna isRefTy(t: str) -> bool { bet str.slaps(firstWord(t), "ref") }
 
 finna refElem(t: str) -> str { bet afterFirst(t) }
+
+// --- soa (struct-of-arrays) layout wrapper, spelled `soa <container>` (mirror text.rs `soa {}`).
+// The inner container is a fixed array `[E; N]`, a slice `[]E`, or a `vec[E]`; access is
+// per-field only (`arr[i].field`), never a whole element. ---
+finna soaTyStr(inner: str) -> str { bet cat2("soa ", inner) }
+
+finna isSoaTy(t: str) -> bool { bet str.slaps(firstWord(t), "soa") }
+
+finna soaInner(t: str) -> str { bet afterFirst(t) }
+
+// `<base>.field(N)` — a struct-field projection appended to a place string.
+finna fieldProj(base: str, j: int) -> str {
+    lowkey sb = sbNew()
+    sb.add(base)
+    sb.add(".field(")
+    sb.add(itoa(j))
+    sb.add(")")
+    bet sb.finish()
+}
+
+// Parse a non-negative decimal string to an int (fixed-array extents are stored as text).
+finna parseNat(s: str) -> int {
+    lowkey n = str.len(s)
+    lowkey acc = 0
+    lowkey i = 0
+    vibin i < n {
+        lowkey ch = str.at(s, i)
+        fr ch >= 48 && ch <= 57 {
+            acc = acc * 10 + (ch - 48)
+        }
+        i = i + 1
+    }
+    bet acc
+}
+
+// `make_slice[ELEM](ptr, len)` — a fat {ptr,len} view constructor (mirror the MIR text).
+finna makeSliceStr(elem: str, ptr: str, len: str) -> str {
+    lowkey sb = sbNew()
+    sb.add("make_slice[")
+    sb.add(elem)
+    sb.add("](")
+    sb.add(ptr)
+    sb.add(", ")
+    sb.add(len)
+    sb.add(")")
+    bet sb.finish()
+}
 
 // --- tuple types, spelled `(A, B, ..)` (multi-return values) ---
 finna isTupleTy(t: str) -> bool {
@@ -3124,6 +3196,14 @@ finna mapTypeNode(c: LowerCtx, p: P, tyNode: int) -> str {
     fr str.slaps(firstWord(lab(p, tyNode)), "slice") {
         bet sliceTyStr(mapTypeNode(c, p, kidAt(p, tyNode, 0)))
     }
+    // A `T[N]` fixed-array type node is `array N` with the element type as its child.
+    fr str.slaps(firstWord(lab(p, tyNode)), "array") {
+        bet arrayTyStr(mapTypeNode(c, p, kidAt(p, tyNode, 0)), parseNat(afterFirst(lab(p, tyNode))))
+    }
+    // A `soa C` struct-of-arrays type node is `soa` wrapping a container type node.
+    fr str.slaps(firstWord(lab(p, tyNode)), "soa") {
+        bet soaTyStr(mapTypeNode(c, p, kidAt(p, tyNode, 0)))
+    }
     // A `finna(P, ..) -> R` function-pointer type node: `fn(P, ..) -> R` (mirror TyKind::FnPtr).
     fr str.slaps(firstWord(lab(p, tyNode)), "fn-ty") {
         lowkey paramsW = kidAt(p, tyNode, 0)
@@ -3475,7 +3555,7 @@ finna lowerExpr(c: LowerCtx, p: P, idx: int, hint: str) -> (str, str) {
         bet lo, lt
     }
     fr str.slaps(h, "method") {
-        lowkey mo, mt = lowerMethodCall(c, p, idx)
+        lowkey mo, mt = lowerMethodCall(c, p, idx, hint)
         bet mo, mt
     }
     fr str.slaps(h, "cop") {
@@ -3830,8 +3910,169 @@ finna lowerIntrinsic(c: LowerCtx, p: P, module: str, method: str, methodIdx: int
         emitAssign(c, tmp, "call_extern @bet_scratch()")
         bet reg(tmp), "crib void"
     }
+    fr str.slaps(module, "mem") && str.slaps(method, "slab") {
+        // `mem.slab[Drip](n)` — a struct-of-arrays heap slab (one zeroed per-field array bundled
+        // as a `soa []Drip`). A scalar element (AoS slab) is not lowered yet.
+        lowkey targsW = findKid(p, methodIdx, "typeargs")
+        fr targsW < 0 || kidCount(p, targsW) != 1 {
+            lcFail(c)
+            bet "0i64", "i64"
+        }
+        lowkey elem = mapTypeNode(c, p, kidAt(p, targsW, 0))
+        fr isStruct(c, elem) {
+            lowkey qo, qt = lowerMemSlabSoa(c, p, elem, argValue(p, argsW, 0))
+            bet qo, qt
+        }
+        lcFail(c)
+        bet "0i64", "i64"
+    }
     lcFail(c)
     bet "0i64", "i64"
+}
+
+// `mem.slab[Drip](n) -> soa []Drip` — each field gets its own bet_alloc_zeroed(n * size_of[Tj],
+// size_of[Tj]) array wrapped in a fat sub-slice; the k sub-slices are bundled into a `soa []Drip`
+// (mirror lower_mem_slab_soa). Access is `slab[i].field`.
+finna lowerMemSlabSoa(c: LowerCtx, p: P, elem: str, countIdx: int) -> (str, str) {
+    // n, held in a usize local so each field's alloc reuses the same count.
+    lowkey nop, nty = lowerExpr(c, p, countIdx, "i64")
+    lowkey nUs = coerceInt(c, nop, nty, "u64")
+    lowkey nLocal = newLocal(c, "u64")
+    emitAssign(c, nLocal, nUs)
+    lowkey soaTy = soaTyStr(sliceTyStr(elem))
+    lowkey bundle = newLocal(c, soaTy)
+    lowkey nf = structFieldCount(c, elem)
+    lowkey j = 0
+    vibin j < nf {
+        lowkey fty = structFieldTypeAt(c, elem, j)
+        lowkey esize = newLocal(c, "u64")
+        emitAssign(c, esize, cat3("size_of[", fty, "]"))
+        lowkey bytes = newLocal(c, "u64")
+        lowkey mb = sbNew()
+        mb.add("mul.wrap(")
+        mb.add(reg(nLocal))
+        mb.add(", ")
+        mb.add(reg(esize))
+        mb.add(")")
+        emitAssign(c, bytes, mb.finish())
+        getExtern(c, "extern \"C\" fn bet_alloc_zeroed(u64, u64) -> rawptr")
+        lowkey aArgs = vec.new[str]()
+        aArgs.stack(reg(bytes))
+        aArgs.stack(reg(esize))
+        lowkey ptr = emitExternCall(c, "rawptr", "bet_alloc_zeroed", aArgs)
+        emitPlaceAssign(c, fieldProj(reg(bundle), j), makeSliceStr(fty, reg(ptr), reg(nLocal)))
+        j = j + 1
+    }
+    bet reg(bundle), soaTy
+}
+
+// `vec.new[Drip]()` in a `soa vec[Drip]` context — a bundle of k runtime vec handles, one per
+// struct field (all growing in lockstep). Reuses the `bet_vec_*` ABI (mirror lower_soa_vec_new).
+finna lowerSoaVecNew(c: LowerCtx, elem: str) -> (str, str) {
+    lowkey soaTy = soaTyStr(vecTyStr(elem))
+    lowkey bundle = newLocal(c, soaTy)
+    lowkey nf = structFieldCount(c, elem)
+    lowkey j = 0
+    vibin j < nf {
+        lowkey fty = structFieldTypeAt(c, elem, j)
+        lowkey esize = newLocal(c, "u64")
+        emitAssign(c, esize, cat3("size_of[", fty, "]"))
+        lowkey vecJ = vecTyStr(fty)
+        getExtern(c, cat2("extern \"C\" fn bet_vec_new(u64) -> ", vecJ))
+        lowkey args = vec.new[str]()
+        args.stack(reg(esize))
+        lowkey handle = emitExternCall(c, vecJ, "bet_vec_new", args)
+        emitPlaceAssign(c, fieldProj(reg(bundle), j), reg(handle))
+        j = j + 1
+    }
+    bet reg(bundle), soaTy
+}
+
+// Methods on a `soa vec[Drip]`: `stack` (push — scatter each field into its handle) and `gang`
+// (length — from handle 0, all grow in lockstep) (mirror lower_soa_vec_method).
+finna lowerSoaVecMethod(c: LowerCtx, p: P, methodIdx: int, bundleOp: str, elem: str, method: str) -> (str, str) {
+    lowkey nf = structFieldCount(c, elem)
+    lowkey argsW = findKid(p, methodIdx, "args")
+    fr str.slaps(method, "stack") {
+        // Materialize the element, then push each field into its own handle.
+        lowkey val, vty = lowerExpr(c, p, argValue(p, argsW, 0), elem)
+        lowkey el = newLocal(c, elem)
+        emitAssign(c, el, val)
+        lowkey last = 0
+        lowkey j = 0
+        vibin j < nf {
+            lowkey fty = structFieldTypeAt(c, elem, j)
+            lowkey vecJ = vecTyStr(fty)
+            lowkey fptr = emitAddrOf(c, fieldProj(reg(el), j))
+            getExtern(c, vecExternDecl("bet_vec_push", cat3(vecJ, ", ", "rawptr"), "void"))
+            lowkey args = vec.new[str]()
+            args.stack(fieldProj(bundleOp, j))
+            args.stack(reg(fptr))
+            last = emitExternCall(c, "void", "bet_vec_push", args)
+            j = j + 1
+        }
+        bet reg(last), "void"
+    }
+    fr str.slaps(method, "gang") {
+        lowkey f0ty = structFieldTypeAt(c, elem, 0)
+        lowkey vec0 = vecTyStr(f0ty)
+        getExtern(c, vecExternDecl("bet_vec_len", vec0, "u64"))
+        lowkey args = vec.new[str]()
+        args.stack(fieldProj(bundleOp, 0))
+        lowkey r = emitExternCall(c, "u64", "bet_vec_len", args)
+        bet reg(r), "u64"
+    }
+    lcFail(c)
+    bet "0i64", "i64"
+}
+
+// `soa_vec[i].field` — read field `field` of element `i` via bet_vec_get on that field's handle
+// (mirror lower_soa_vec_read). `bundleReg` is the bundle local, `indexIdx` the `index` AST node.
+finna lowerSoaVecRead(c: LowerCtx, p: P, indexIdx: int, bundleReg: str, elem: str, field: str) -> (str, str) {
+    lowkey j = structFieldIndex(c, elem, field)
+    fr j < 0 {
+        lcFail(c)
+        bet "0i64", "i64"
+    }
+    lowkey fty = structFieldType(c, elem, field)
+    lowkey vecJ = vecTyStr(fty)
+    lowkey iop, ity = lowerExpr(c, p, kidAt(p, indexIdx, 1), "u64")
+    lowkey iu = coerceInt(c, iop, ity, "u64")
+    lowkey out = newLocal(c, fty)
+    lowkey ptr = emitAddrOf(c, reg(out))
+    getExtern(c, vecExternDecl("bet_vec_get", cat3(vecJ, ", ", "u64, rawptr"), "bool"))
+    lowkey args = vec.new[str]()
+    args.stack(fieldProj(bundleReg, j))
+    args.stack(iu)
+    args.stack(reg(ptr))
+    lowkey ok = emitExternCall(c, "bool", "bet_vec_get", args)
+    bet reg(out), fty
+}
+
+// `soa_vec[i].field = x` — write field `field` of element `i` via bet_vec_set on that field's
+// handle (mirror lower_soa_vec_write). The value is lowered first (matching evaluation order).
+finna lowerSoaVecWrite(c: LowerCtx, p: P, indexIdx: int, valueIdx: int, bundleReg: str, elem: str, field: str) {
+    lowkey j = structFieldIndex(c, elem, field)
+    fr j < 0 {
+        lcFail(c)
+        bet
+    }
+    lowkey fty = structFieldType(c, elem, field)
+    lowkey vecJ = vecTyStr(fty)
+    lowkey vop, vty = lowerExpr(c, p, valueIdx, fty)
+    lowkey vop2 = vop
+    fr isIntTy(fty) && isIntTy(vty) { vop2 = coerceInt(c, vop, vty, fty) }
+    lowkey slot = newLocal(c, fty)
+    emitAssign(c, slot, vop2)
+    lowkey sptr = emitAddrOf(c, reg(slot))
+    lowkey iop, ity = lowerExpr(c, p, kidAt(p, indexIdx, 1), "u64")
+    lowkey iu = coerceInt(c, iop, ity, "u64")
+    getExtern(c, vecExternDecl("bet_vec_set", cat3(vecJ, ", ", "u64, rawptr"), "bool"))
+    lowkey args = vec.new[str]()
+    args.stack(fieldProj(bundleReg, j))
+    args.stack(iu)
+    args.stack(reg(sptr))
+    lowkey ok = emitExternCall(c, "bool", "bet_vec_set", args)
 }
 
 // Serialize a map key to (ptr, len) operands (mirror serialize_key): a str key uses str_ptr/str_len;
@@ -3963,13 +4204,19 @@ finna lowerStashMethod(c: LowerCtx, p: P, methodIdx: int, mapOp: str, k: str, v:
 }
 
 // `vec.new[T]()` — an empty growable vec (mirror lower_vec_new): size_of[T] + bet_vec_new(size).
-finna lowerVecNew(c: LowerCtx, p: P, methodIdx: int) -> (str, str) {
+finna lowerVecNew(c: LowerCtx, p: P, methodIdx: int, hint: str) -> (str, str) {
     lowkey targsW = findKid(p, methodIdx, "typeargs")
     fr targsW < 0 || kidCount(p, targsW) != 1 {
         lcFail(c)
         bet "0i64", "i64"
     }
     lowkey elem = mapTypeNode(c, p, kidAt(p, targsW, 0))
+    // A `soa vec[Drip]` hint makes this a struct-of-arrays vec: one runtime handle per field.
+    // (Plain `vec[Drip]` is a single-handle vec, so this is hint-driven.)
+    fr isSoaTy(hint) && isVecTy(soaInner(hint)) && str.slaps(vecElem(soaInner(hint)), elem) && isStruct(c, elem) {
+        lowkey qo, qt = lowerSoaVecNew(c, elem)
+        bet qo, qt
+    }
     lowkey vecTy = vecTyStr(elem)
     lowkey esize = newLocal(c, "u64")
     lowkey sb = sbNew()
@@ -4165,7 +4412,7 @@ finna lowerTea(c: LowerCtx, p: P, methodIdx: int, yop: str) -> (str, str) {
 
 // `recv.method(args)` where `recv` is a value — a user receiver method (mirror lower_method's user
 // branch): the receiver becomes the leading argument. Module-name receivers route to intrinsics.
-finna lowerMethodCall(c: LowerCtx, p: P, idx: int) -> (str, str) {
+finna lowerMethodCall(c: LowerCtx, p: P, idx: int, hint: str) -> (str, str) {
     lowkey methodName = afterFirst(lab(p, idx))
     lowkey recvW = findKid(p, idx, "receiver")
     lowkey recvE = kidAt(p, recvW, 0)
@@ -4176,7 +4423,7 @@ finna lowerMethodCall(c: LowerCtx, p: P, idx: int) -> (str, str) {
             fr isModule(rn) {
                 // `vec.new[T]()` needs its type arg, so it bypasses the plain intrinsic dispatch.
                 fr str.slaps(rn, "vec") && str.slaps(methodName, "new") {
-                    lowkey vo, vt = lowerVecNew(c, p, idx)
+                    lowkey vo, vt = lowerVecNew(c, p, idx, hint)
                     bet vo, vt
                 }
                 // `stash.new[K, V]()` needs its type args too, so it bypasses plain intrinsic dispatch.
@@ -4198,6 +4445,12 @@ finna lowerMethodCall(c: LowerCtx, p: P, idx: int) -> (str, str) {
         fr isYikesTy(yty) && str.slaps(methodName, "tea") && isPlace(yop) {
             lowkey to, tt = lowerTea(c, p, idx, yop)
             bet to, tt
+        }
+        // Methods on a `soa vec[Drip]` — `stack` (push) / `gang` (length) route to per-field
+        // handles (must precede the plain-vec check: a soa vec type isn't a vec type).
+        fr isSoaTy(yty) && isVecTy(soaInner(yty)) {
+            lowkey qo, qt = lowerSoaVecMethod(c, p, idx, yop, vecElem(soaInner(yty)), methodName)
+            bet qo, qt
         }
         fr isVecTy(yty) {
             lowkey vo, vt = lowerVecMethod(c, p, idx, yop, vecElem(yty), methodName)
@@ -4444,6 +4697,19 @@ finna lowerTrust(c: LowerCtx, p: P, idx: int) -> (str, str) {
 // addressable struct place (a bare register); returns (`%b.field(i)`, field type).
 finna fieldAccessStr(c: LowerCtx, p: P, idx: int) -> (str, str) {
     lowkey fname = afterFirst(lab(p, idx))
+    // `soa_vec[i].field` reads a field through its per-field runtime handle (a vec element isn't
+    // an addressable place). Peek the container type off a name root without lowering the index.
+    lowkey baseNode = kidAt(p, idx, 0)
+    fr str.slaps(firstWord(lab(p, baseNode)), "index") {
+        lowkey vbase = kidAt(p, baseNode, 0)
+        fr str.slaps(firstWord(lab(p, vbase)), "name") && kidCount(p, vbase) == 0 {
+            lowkey vlid = lookupLocal(c, afterFirst(lab(p, vbase)))
+            fr vlid >= 0 && isSoaTy(c.localTypes[vlid]) && isVecTy(soaInner(c.localTypes[vlid])) {
+                lowkey so, st = lowerSoaVecRead(c, p, baseNode, reg(vlid), vecElem(soaInner(c.localTypes[vlid])), fname)
+                bet so, st
+            }
+        }
+    }
     lowkey bop, bty = lowerExpr(c, p, kidAt(p, idx, 0), "")
     // Auto-deref a `ref Struct` base (as produced by `trust`/`holla`/bump `cop`): `%b.deref.field`.
     lowkey sname = bty
@@ -4452,7 +4718,9 @@ finna fieldAccessStr(c: LowerCtx, p: P, idx: int) -> (str, str) {
         sname = refElem(bty)
         base = cat2(bop, ".deref")
     }
-    fr !isStruct(c, sname) || !isReg(bop) {
+    // The base must be an addressable place — a bare local (`%b.field`) OR an index/field
+    // projection (`%b.index(%i).field`, as an AoS or soa element field access needs).
+    fr !isStruct(c, sname) || !isPlace(bop) {
         lcFail(c)
         bet "0i64", "i64"
     }
@@ -4522,12 +4790,17 @@ finna lowerIndex(c: LowerCtx, p: P, idx: int) -> (str, str) {
         lowkey vo, vt = lowerVecIndex(c, p, idx, bop, vecElem(bty))
         bet vo, vt
     }
-    fr !(isArrayTy(bty) || isSliceTy(bty)) || !isReg(bop) {
+    // Indexing a `soa [E; N]` / `soa []E` yields its element place, spelled exactly like an
+    // array/slice index — a following `.field` projection lands on the per-field array (see
+    // fieldAccessStr). A bare whole-element read (`soa vec` inner, or no field) is unsupported.
+    lowkey effTy = bty
+    fr isSoaTy(bty) { effTy = soaInner(bty) }
+    fr !(isArrayTy(effTy) || isSliceTy(effTy)) || !isPlace(bop) {
         lcFail(c)
         bet "0i64", "i64"
     }
-    lowkey elem = arrayElem(bty)
-    fr isSliceTy(bty) { elem = sliceElem(bty) }
+    lowkey elem = arrayElem(effTy)
+    fr isSliceTy(effTy) { elem = sliceElem(effTy) }
     lowkey iop, ity = lowerExpr(c, p, kidAt(p, idx, 1), "i64")
     lowkey sb = sbNew()
     sb.add(bop)
@@ -4964,7 +5237,7 @@ finna lowerExprStmt(c: LowerCtx, p: P, stmtIdx: int) {
         lowkey dop, dty = lowerCall(c, p, e)
     } naw fr str.slaps(firstWord(lab(p, e)), "method") {
         // A non-spill method statement (e.g. `xs.stack(10)`): lower and discard its result.
-        lowkey mop, mty = lowerMethodCall(c, p, e)
+        lowkey mop, mty = lowerMethodCall(c, p, e, "")
     } naw {
         lcFail(c)
     }
@@ -4986,8 +5259,41 @@ finna lowerVar(c: LowerCtx, p: P, stmtIdx: int) {
         lowkey ty = vty
         fr !isEmpty(declTy) { ty = declTy }
         lowkey l = newLocal(c, ty)
-        emitAssign(c, l, op)
+        // Transposing a plain array into a `soa [E; N]`: its storage is transposed, so a flat
+        // store won't do — scatter element-by-element into the per-field arrays. A soa-typed RHS
+        // (e.g. `mem.slab[Drip]`) is already transposed: a direct copy.
+        fr isSoaTy(ty) && !isSoaTy(vty) {
+            scatterIntoSoa(c, reg(l), op, ty)
+        } naw {
+            emitAssign(c, l, op)
+        }
         bindLocal(c, targets, l)
+    }
+}
+
+// Store an array source into a `soa [E; N]` destination place by scattering each element's fields
+// into the parallel per-field arrays (mirror scatter_into_soa). Only a fixed-size `soa T[N]` dest
+// is supported; the element is a `drip` struct.
+finna scatterIntoSoa(c: LowerCtx, destReg: str, srcOp: str, soaTy: str) {
+    lowkey inner = soaInner(soaTy)
+    fr !isArrayTy(inner) {
+        lcFail(c)
+        bet
+    }
+    lowkey elem = arrayElem(inner)
+    lowkey n = parseNat(arrayLenStr(inner))
+    lowkey nf = structFieldCount(c, elem)
+    lowkey i = 0
+    vibin i < n {
+        lowkey idxStr = cat2(itoa(i), "i64")
+        lowkey j = 0
+        vibin j < nf {
+            lowkey dst = fieldProj(cat3(destReg, ".index(", cat2(idxStr, ")")), j)
+            lowkey src = fieldProj(cat3(srcOp, ".index(", cat2(idxStr, ")")), j)
+            emitPlaceAssign(c, dst, src)
+            j = j + 1
+        }
+        i = i + 1
     }
 }
 
@@ -5046,10 +5352,27 @@ finna lowerAssign(c: LowerCtx, p: P, stmtIdx: int) {
         fr !str.slaps(opTag, "eq") {
             lcFail(c)
         } naw {
-            lowkey place, fty = fieldAccessStr(c, p, kidAt(p, tw, 0))
-            fr lcOk(c) {
-                lowkey val, vty = lowerExpr(c, p, kidAt(p, vw, 0), fty)
-                emitPlaceAssign(c, place, val)
+            lowkey fieldNode = kidAt(p, tw, 0)
+            lowkey fbase = kidAt(p, fieldNode, 0)
+            lowkey handled = cap
+            // `soa_vec[i].field = x`: write a field through its per-field runtime handle (a vec
+            // element isn't an addressable place). The per-field write `soa vec` enables.
+            fr str.slaps(firstWord(lab(p, fbase)), "index") {
+                lowkey vbase = kidAt(p, fbase, 0)
+                fr str.slaps(firstWord(lab(p, vbase)), "name") && kidCount(p, vbase) == 0 {
+                    lowkey vlid = lookupLocal(c, afterFirst(lab(p, vbase)))
+                    fr vlid >= 0 && isSoaTy(c.localTypes[vlid]) && isVecTy(soaInner(c.localTypes[vlid])) {
+                        lowerSoaVecWrite(c, p, fbase, kidAt(p, vw, 0), reg(vlid), vecElem(soaInner(c.localTypes[vlid])), afterFirst(lab(p, fieldNode)))
+                        handled = nocap
+                    }
+                }
+            }
+            fr !handled {
+                lowkey place, fty = fieldAccessStr(c, p, fieldNode)
+                fr lcOk(c) {
+                    lowkey val, vty = lowerExpr(c, p, kidAt(p, vw, 0), fty)
+                    emitPlaceAssign(c, place, val)
+                }
             }
         }
     } naw {
