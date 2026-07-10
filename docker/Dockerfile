@@ -69,11 +69,11 @@ ENV RUSTUP_HOME=/usr/local/rustup \
 # (fail closed) via `sha256sum -c`, then run it with the same flags. RUSTUP_INIT_SHA256 must be the
 # SHA-256 of the rustup-init binary for RUSTUP_VERSION on RUSTUP_ARCH, published at
 #   https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${RUSTUP_ARCH}/rustup-init.sha256
-# TODO(sec #45): pin the real SHA-256 (see URL above) before merge. The all-zero placeholder below
-#   is NOT a real digest; `sha256sum -c` will reject it, so the build fails closed until it is set.
+# NOTE(sec #45): pinned to the official digest for rustup 1.27.1 / x86_64-unknown-linux-gnu.
+#   On a RUSTUP_VERSION/RUSTUP_ARCH bump, re-pin from the .sha256 URL above (build fails closed otherwise).
 ARG RUSTUP_VERSION=1.27.1
 ARG RUSTUP_ARCH=x86_64-unknown-linux-gnu
-ARG RUSTUP_INIT_SHA256=0000000000000000000000000000000000000000000000000000000000000000
+ARG RUSTUP_INIT_SHA256=6aeece6993e902708983b209d04c0d1dbb14ebb405ddb87def578d41f920f56d
 RUN curl -fsSL -o /tmp/rustup-init \
       "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${RUSTUP_ARCH}/rustup-init" \
  && echo "${RUSTUP_INIT_SHA256}  /tmp/rustup-init" | sha256sum -c - \
@@ -91,10 +91,9 @@ RUN curl -fsSL -o /tmp/rustup-init \
 ARG NEXTEST_VERSION=0.9.140
 # #33: the tarball was piped straight from the network into tar with no integrity check. Download
 # it to a file, verify it against a pinned SHA-256 (fail closed) via `sha256sum -c`, then extract.
-# TODO(sec #33): pin the real SHA-256 of https://get.nexte.st/${NEXTEST_VERSION}/linux before merge.
-#   The all-zero placeholder below is NOT a real digest; `sha256sum -c` rejects it, so the build
-#   fails closed until it is set.
-ARG NEXTEST_SHA256=0000000000000000000000000000000000000000000000000000000000000000
+# NOTE(sec #33): pinned to the SHA-256 of https://get.nexte.st/0.9.140/linux.
+#   On a NEXTEST_VERSION bump, re-pin (build fails closed via `sha256sum -c` otherwise).
+ARG NEXTEST_SHA256=4ee9aaa0d0171a985a5d0eb735b87355894c1c455972e9674fb9fdbd1387c9a3
 RUN curl -fsSL -o /tmp/cargo-nextest.tar.gz "https://get.nexte.st/${NEXTEST_VERSION}/linux" \
  && echo "${NEXTEST_SHA256}  /tmp/cargo-nextest.tar.gz" | sha256sum -c - \
  && tar -xzf /tmp/cargo-nextest.tar.gz -C /usr/local/cargo/bin \
