@@ -25,6 +25,12 @@ pull "str"
 pull "../defs/gs" as gs
 pull "../util/bstream" as bstream
 
+// NATIVE-SAFETY cap (sec #41): a forged `numlumps` sizes two i32 directory slabs, so a huge or
+// negative value is a multi-GB / OOM allocation (exploitable in the interpreter too — the alloc
+// happens before any read). Real IWADs and even large megawads are far under this ceiling
+// (doom.wad ~2.3k lumps, doom2.wad ~2.9k); the cap bounds the two slabs to ~0.5 MB.
+flex facts MAXLUMPS: int = 65536
+
 // initWad — W_InitMultipleFiles + W_AddFile specialized to one IWAD/PWAD file:
 //   * fs.peep the whole file into g.wad.buf
 //   * parse the 12-byte wadinfo_t header: magic[4] ("IWAD"/"PWAD"), numlumps i32le@4,
@@ -46,6 +52,22 @@ flex finna initWad(gt: tag gs.GameState, path: str) {
         }
         lowkey numlumps = bstream.rdI32(g.wad.buf, 4)
         lowkey infotableofs = bstream.rdI32(g.wad.buf, 8)
+        // NATIVE-SAFETY (sec #41): both fields are attacker-controlled i32s. Reject a negative or
+        // over-cap numlumps BEFORE it sizes the two slabs (a forged count is a multi-GB OOM), then
+        // bounds-check the directory and every lump extent against the real file length so no
+        // reader later indexes g.wad.buf past EOF (native indexing is an unchecked GEP). fileLen is
+        // the buffer's byte length: str.fromBytesTrust reinterprets the []u8 fat pointer with no
+        // copy, so str.len yields its SliceLen exactly (native — the only path these loaders run).
+        // Comparisons are rearranged to subtractions so the extent adds can never overflow.
+        lowkey fileLen = str.len(str.fromBytesTrust(g.wad.buf))
+        fr numlumps < 0 || numlumps > MAXLUMPS {
+            spill.it("W_AddFile: numlumps is straight sus (negative or over the cap)")
+            yeet("wad-numlumps")
+        }
+        fr infotableofs < 0 || infotableofs > fileLen - numlumps * 16 {
+            spill.it("W_AddFile: lump directory lowkey yeets past EOF")
+            yeet("wad-dir-oob")
+        }
         g.wad.numLumps = numlumps as i32
         g.wad.lumpOfs = mem.slab[i32](numlumps)
         g.wad.lumpLen = mem.slab[i32](numlumps)
@@ -59,6 +81,11 @@ flex finna initWad(gt: tag gs.GameState, path: str) {
             lowkey filepos = bstream.rdI32(g.wad.buf, entry)
             lowkey size = bstream.rdI32(g.wad.buf, entry + 4)
             lowkey name = bstream.name8(g.wad.buf, entry + 8)
+            // reject negative filepos/size, then bound the (overflow-safe) extent to the file
+            fr filepos < 0 || size < 0 || filepos > fileLen - size {
+                spill.it("W_AddFile: lump extent is straight out of bounds")
+                yeet("wad-lump-oob")
+            }
             g.wad.lumpOfs[i] = filepos as i32
             g.wad.lumpLen[i] = size as i32
             g.wad.lumpName.stack(name)

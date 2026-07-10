@@ -22,6 +22,13 @@ pull "../defs/info" as info
 pull "../w/w_wad" as wad
 pull "../util/bstream" as bstream
 
+// NATIVE-SAFETY caps (sec #41): PNAMES/TEXTURE1/TEXTURE2 counts are attacker-controlled i32s that
+// size the patchlookup + per-texture i32 slabs, so a forged/negative value is a multi-GB / OOM
+// allocation. Real WADs are in the hundreds (doom.wad ~350 patches, ~125 textures); these ceilings
+// give wide headroom while bounding each slab to well under 1 MB.
+flex facts MAXPATCHES: int = 16384
+flex facts MAXTEXTURES: int = 32768
+
 // drawColumnInCache (r_data.c) — unpack a patch column's posts into the composite arena block.
 // `colOfs` is the absolute byte offset of the column's post list in `buf`; `destBase` the
 // absolute byte offset of the target column block in `arena`; posts are topdelta/length/pad +
@@ -138,6 +145,9 @@ flex finna initTextures(gt: tag gs.GameState) {
     holla g = gt in gs.gsc {
         // ---- PNAMES: patch-name directory -> patch lump numbers ----
         lowkey nummappatches: int = bstream.rdI32(g.wad.buf, pnamesOfs)
+        fr nummappatches < 0 || nummappatches > MAXPATCHES {
+            yeet("R_InitTextures: PNAMES patch count out of range")
+        }
         lowkey patchlookup = mem.slab[i32](nummappatches)
         lowkey pi: int = 0
         vibin pi < nummappatches {
@@ -152,11 +162,20 @@ flex finna initTextures(gt: tag gs.GameState) {
         }
         // ---- texture counts ----
         lowkey numtex1: int = bstream.rdI32(g.wad.buf, tex1Ofs)
+        fr numtex1 < 0 || numtex1 > MAXTEXTURES {
+            yeet("R_InitTextures: TEXTURE1 count out of range")
+        }
         lowkey numtex2: int = 0
         fr tex2Chk != -1 {
             numtex2 = bstream.rdI32(g.wad.buf, tex2Ofs)
         }
+        fr numtex2 < 0 || numtex2 > MAXTEXTURES {
+            yeet("R_InitTextures: TEXTURE2 count out of range")
+        }
         lowkey numtex: int = numtex1 + numtex2
+        fr numtex > MAXTEXTURES {
+            yeet("R_InitTextures: too many textures")
+        }
         g.render.numTextures = numtex as i32
         g.render.textureWidth = mem.slab[i32](numtex)
         g.render.textureHeight = mem.slab[i32](numtex)
