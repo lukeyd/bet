@@ -2459,25 +2459,25 @@ finna floatHintOrDefault(hint: str) -> str {
     bet "f64"
 }
 
-// Normalize a float literal's source text to its MIR spelling (mirror text.rs `Const::Float`, which
-// prints the parsed f64 via Rust's `{}`): drop trailing zeros in the fraction, then a lone trailing
-// '.'. e.g. `1.0` -> `1`, `1000.0` -> `1000`, `16.16` -> `16.16`, `0.1` -> `0.1`. Corpus floats are
-// plain decimals (no exponent); non-decimal text is returned unchanged.
-finna normFloat(s: str) -> str {
-    lowkey n = str.len(s)
-    lowkey dot = 0 - 1
+// Normalize a float-literal payload to Rust's `{}` Display spelling (how the reference prints a
+// `Const::Float`): a whole float drops its fractional part (`1000.0` -> `1000`, `1.0` -> `1`).
+// Only plain decimals are rewritten; exponent forms are left untouched (no corpus case hits them).
+finna normFloat(payload: str) -> str {
+    lowkey n = str.len(payload)
+    lowkey hasDot = cap
+    lowkey hasExp = cap
     lowkey i = 0
     vibin i < n {
-        fr str.at(s, i) == 46 { dot = i }
+        lowkey ch = str.at(payload, i)
+        fr ch == 46 { hasDot = nocap }
+        fr ch == 101 || ch == 69 { hasExp = nocap }
         i = i + 1
     }
-    fr dot < 0 { bet s }
+    fr hasExp || !hasDot { bet payload }
     lowkey end = n
-    vibin end > dot + 1 && str.at(s, end - 1) == 48 {
-        end = end - 1
-    }
-    fr end == dot + 1 { end = dot }
-    bet str.sub(s, 0, end)
+    vibin end > 0 && str.at(payload, end - 1) == 48 { end = end - 1 }
+    fr end > 0 && str.at(payload, end - 1) == 46 { end = end - 1 }
+    bet str.sub(payload, 0, end)
 }
 
 finna isComparisonTag(op: str) -> bool {
@@ -2922,6 +2922,15 @@ finna makeSliceStr(elem: str, ptr: str, len: str) -> str {
     sb.add(len)
     sb.add(")")
     bet sb.finish()
+}
+
+// --- rng handle, spelled `rng` (a seeded PRNG value from `math.cook`) ---
+finna isRngTy(t: str) -> bool { bet str.slaps(t, "rng") }
+
+// A handle-shaped type whose null value is a `nullptr` (mirror lower.rs's Ghosted handle arms:
+// fn value / vec / stash / rng / rawptr / crib). A `tag` is NOT here — it null-values as `ghosted`.
+finna isHandleTy(t: str) -> bool {
+    bet isFnPtrTy(t) || isVecTy(t) || isMapTy(t) || isRngTy(t) || str.slaps(t, "rawptr") || isCribTy(t)
 }
 
 // --- tuple types, spelled `(A, B, ..)` (multi-return values) ---
@@ -3790,6 +3799,14 @@ finna lowerExpr(c: LowerCtx, p: P, idx: int, hint: str) -> (str, str) {
             lowkey go, gt = emitMakeYikes(c, "false", "\"\"")
             bet go, gt
         }
+        // The null/dead value of a tag or handle-shaped type (issue #72): a `tag` lowers to the
+        // null-tag `ghosted`, a fn/vec/stash/rng/rawptr/crib handle to a null pointer.
+        fr isTagTy(hint) {
+            bet "ghosted", hint
+        }
+        fr isHandleTy(hint) {
+            bet "nullptr", hint
+        }
         lcFail(c)
         bet "0i64", "i64"
     }
@@ -3869,6 +3886,58 @@ finna concatStr(c: LowerCtx, a: str, b: str) -> str {
     mb.add(")")
     emitAssign(c, result, mb.finish())
     bet reg(result)
+}
+
+// Accumulate a little-endian u16 from `buf[off..off+2]` into a fresh u16 local (shared by
+// `bytes.readU16le` / `bytes.readI16le`; mirror lower.rs's readU16le byte-shift loop). On a
+// non-place buffer it sentinels and returns 0; callers must guard on `lcOk` before using it.
+finna bytesReadLe16(c: LowerCtx, p: P, argsW: int) -> int {
+    lowkey buf, bty = lowerExpr(c, p, argValue(p, argsW, 0), "")
+    lowkey off, oty = lowerExpr(c, p, argValue(p, argsW, 1), "i64")
+    fr !isPlace(buf) {
+        lcFail(c)
+        bet 0
+    }
+    lowkey acc = newLocal(c, "u16")
+    emitAssign(c, acc, "0u16")
+    lowkey k = 0
+    vibin k < 2 {
+        lowkey idxL = newLocal(c, "i64")
+        lowkey ib = sbNew()
+        ib.add("add.wrap(")
+        ib.add(off)
+        ib.add(", ")
+        ib.add(itoa(k))
+        ib.add("i64)")
+        emitAssign(c, idxL, ib.finish())
+        lowkey bz = newLocal(c, "u16")
+        lowkey zb = sbNew()
+        zb.add("cast.zext(")
+        zb.add(buf)
+        zb.add(".index(")
+        zb.add(reg(idxL))
+        zb.add(") as u16)")
+        emitAssign(c, bz, zb.finish())
+        lowkey sh = newLocal(c, "u16")
+        lowkey shb = sbNew()
+        shb.add("shl.na(")
+        shb.add(reg(bz))
+        shb.add(", ")
+        shb.add(itoa(8 * k))
+        shb.add("u16)")
+        emitAssign(c, sh, shb.finish())
+        lowkey orr = newLocal(c, "u16")
+        lowkey ob = sbNew()
+        ob.add("bitor.na(")
+        ob.add(reg(acc))
+        ob.add(", ")
+        ob.add(reg(sh))
+        ob.add(")")
+        emitAssign(c, orr, ob.finish())
+        emitAssign(c, acc, reg(orr))
+        k = k + 1
+    }
+    bet acc
 }
 
 // A stdlib module intrinsic call (mirror lower_intrinsic) — the scalar/str subset. Unhandled
@@ -3963,6 +4032,63 @@ finna lowerIntrinsic(c: LowerCtx, p: P, module: str, method: str, methodIdx: int
             k = k + 1
         }
         bet reg(acc), "u32"
+    }
+    // `bytes.readU16le(buf, off)` — a little-endian u16 from `buf[off..off+2]`, zero-extended.
+    fr str.slaps(module, "bytes") && str.slaps(method, "readU16le") {
+        lowkey acc16 = bytesReadLe16(c, p, argsW)
+        fr !lcOk(c) {
+            bet "0i64", "i64"
+        }
+        bet reg(acc16), "u16"
+    }
+    // `bytes.readI16le(buf, off)` — a little-endian i16 from `buf[off..off+2]`, sign-extended to int.
+    fr str.slaps(module, "bytes") && str.slaps(method, "readI16le") {
+        lowkey accI = bytesReadLe16(c, p, argsW)
+        fr !lcOk(c) {
+            bet "0i64", "i64"
+        }
+        // Reinterpret the u16 pattern as i16 (same width => bitcast), then sign-extend to i64.
+        lowkey signed = coerceInt(c, reg(accI), "u16", "i16")
+        lowkey wide = coerceInt(c, signed, "i16", "i64")
+        bet wide, "i64"
+    }
+    fr str.slaps(module, "math") && str.slaps(method, "cook") {
+        lowkey seed, sty = lowerExpr(c, p, argValue(p, argsW, 0), "i64")
+        lowkey seedu = coerceInt(c, seed, sty, "u64")
+        getExtern(c, "extern \"C\" fn bet_rng_new(u64) -> rng")
+        lowkey newArgs = vec.new[str]()
+        newArgs.stack(seedu)
+        lowkey tmp = emitExternCall(c, "rng", "bet_rng_new", newArgs)
+        bet reg(tmp), "rng"
+    }
+    fr str.slaps(module, "sys") && str.slaps(method, "peep") {
+        lowkey outLen = newLocal(c, "u64")
+        emitAssign(c, outLen, "0u64")
+        lowkey outPtr = emitAddrOf(c, reg(outLen))
+        getExtern(c, "extern \"C\" fn bet_read_line(rawptr) -> rawptr")
+        lowkey rdArgs = vec.new[str]()
+        rdArgs.stack(reg(outPtr))
+        lowkey data = emitExternCall(c, "rawptr", "bet_read_line", rdArgs)
+        lowkey result = newLocal(c, "str")
+        emitAssign(c, result, call2("make_str", reg(data), reg(outLen)))
+        bet reg(result), "str"
+    }
+    fr str.slaps(module, "fs") && str.slaps(method, "peep") {
+        lowkey path, pty = lowerExpr(c, p, argValue(p, argsW, 0), "str")
+        lowkey pp = emitStrPtr(c, path)
+        lowkey pl = emitStrLen(c, path)
+        lowkey outLen = newLocal(c, "u64")
+        emitAssign(c, outLen, "0u64")
+        lowkey outPtr = emitAddrOf(c, reg(outLen))
+        getExtern(c, "extern \"C\" fn bet_fs_read(rawptr, u64, rawptr) -> rawptr")
+        lowkey rdArgs = vec.new[str]()
+        rdArgs.stack(reg(pp))
+        rdArgs.stack(reg(pl))
+        rdArgs.stack(reg(outPtr))
+        lowkey data = emitExternCall(c, "rawptr", "bet_fs_read", rdArgs)
+        lowkey result = newLocal(c, "[]u8")
+        emitAssign(c, result, call2("make_slice[u8]", reg(data), reg(outLen)))
+        bet reg(result), "[]u8"
     }
     fr str.slaps(module, "fs") && str.slaps(method, "peepText") {
         lowkey path, pty = lowerExpr(c, p, argValue(p, argsW, 0), "str")
@@ -4464,6 +4590,234 @@ finna vecExternDecl(name: str, paramList: str, ret: str) -> str {
     bet sb.finish()
 }
 
+// `%r = call_indirect <callee>(a, b, ..)` into a fresh temp of `retTy`; returns its id.
+finna emitIndirect(c: LowerCtx, retTy: str, callee: str, args: vec[str]) -> int {
+    lowkey r = newLocal(c, retTy)
+    lowkey sb = sbNew()
+    sb.add("call_indirect ")
+    sb.add(callee)
+    sb.add("(")
+    sb.add(joinComma(args))
+    sb.add(")")
+    emitAssign(c, r, sb.finish())
+    bet r
+}
+
+// The element count of a collection as a `u64` operand (mirror emit_collection_len): a compile-time
+// constant for a fixed array (`nStr`), or a `bet_vec_len` call for a vec.
+finna emitCollectionLen(c: LowerCtx, srcIsVec: bool, srcHandle: str, nStr: str, elem: str) -> str {
+    fr !srcIsVec {
+        bet cat2(nStr, "u64")
+    }
+    lowkey vecTy = vecTyStr(elem)
+    getExtern(c, vecExternDecl("bet_vec_len", vecTy, "u64"))
+    lowkey lenArgs = vec.new[str]()
+    lenArgs.stack(srcHandle)
+    lowkey len = emitExternCall(c, "u64", "bet_vec_len", lenArgs)
+    bet reg(len)
+}
+
+// Read element `ctr` of a collection into a fresh local of type `elem`; returns that local's id
+// (mirror emit_collection_read): an `[i]` array read, or a `bet_vec_get` for a vec.
+finna emitCollectionRead(c: LowerCtx, srcIsVec: bool, srcHandle: str, ctr: int, elem: str) -> int {
+    lowkey el = newLocal(c, elem)
+    fr !srcIsVec {
+        lowkey sb = sbNew()
+        sb.add(srcHandle)
+        sb.add(".index(")
+        sb.add(reg(ctr))
+        sb.add(")")
+        emitAssign(c, el, sb.finish())
+        bet el
+    }
+    lowkey vecTy = vecTyStr(elem)
+    lowkey outPtr = emitAddrOf(c, reg(el))
+    getExtern(c, vecExternDecl("bet_vec_get", cat3(vecTy, ", ", "u64, rawptr"), "bool"))
+    lowkey getArgs = vec.new[str]()
+    getArgs.stack(srcHandle)
+    getArgs.stack(reg(ctr))
+    getArgs.stack(reg(outPtr))
+    lowkey got = emitExternCall(c, "bool", "bet_vec_get", getArgs)
+    bet el
+}
+
+// `xs.glowUp(f)` — map. Allocate a fresh `vec[U]` (U = f's return type), then for each element push
+// `f(x)`. Shared by the array and vec receivers via a (srcIsVec, srcHandle, nStr, elem) descriptor
+// (mirror build_map + open/close_count_loop).
+finna buildMap(c: LowerCtx, p: P, argsW: int, srcIsVec: bool, srcHandle: str, nStr: str, elem: str) -> (str, str) {
+    lowkey fop, fty = lowerExpr(c, p, argValue(p, argsW, 0), "")
+    fr !isFnPtrTy(fty) {
+        lcFail(c)
+        bet "0i64", "i64"
+    }
+    lowkey u = fnPtrRet(fty)
+    fr isEmpty(u) {
+        lcFail(c)
+        bet "0i64", "i64"
+    }
+    lowkey outVecTy = vecTyStr(u)
+    // Spill the finna to a local so the indirect callee carries a known `fn(..)` place type.
+    lowkey callee = newLocal(c, fty)
+    emitAssign(c, callee, fop)
+    // out = bet_vec_new(sizeof(U))
+    lowkey esize = newLocal(c, "u64")
+    lowkey eb = sbNew()
+    eb.add("size_of[")
+    eb.add(u)
+    eb.add("]")
+    emitAssign(c, esize, eb.finish())
+    getExtern(c, vecExternDecl("bet_vec_new", "u64", outVecTy))
+    lowkey newArgs = vec.new[str]()
+    newArgs.stack(reg(esize))
+    lowkey out = emitExternCall(c, outVecTy, "bet_vec_new", newArgs)
+    getExtern(c, vecExternDecl("bet_vec_push", cat3(outVecTy, ", ", "rawptr"), "void"))
+    // open count loop
+    lowkey len = emitCollectionLen(c, srcIsVec, srcHandle, nStr, elem)
+    lowkey ctr = newLocal(c, "u64")
+    emitAssign(c, ctr, "0u64")
+    lowkey pre = curId(c)
+    lowkey header = reserveBlock(c)
+    setGoto(c, pre, header)
+    selectBlock(c, header)
+    lowkey cond = newLocal(c, "bool")
+    lowkey cb = sbNew()
+    cb.add("lt.na(")
+    cb.add(reg(ctr))
+    cb.add(", ")
+    cb.add(len)
+    cb.add(")")
+    emitAssign(c, cond, cb.finish())
+    lowkey headerEnd = curId(c)
+    lowkey bodyBb = newBlock(c)
+    lowkey exit = reserveBlock(c)
+    setBranch(c, headerEnd, reg(cond), bodyBb, exit)
+    selectBlock(c, bodyBb)
+    // body: y = f(x); push its bytes onto out
+    lowkey x = emitCollectionRead(c, srcIsVec, srcHandle, ctr, elem)
+    lowkey callArgs = vec.new[str]()
+    callArgs.stack(reg(x))
+    lowkey y = emitIndirect(c, u, reg(callee), callArgs)
+    lowkey yl = newLocal(c, u)
+    emitAssign(c, yl, reg(y))
+    lowkey yptr = emitAddrOf(c, reg(yl))
+    lowkey pushArgs = vec.new[str]()
+    pushArgs.stack(reg(out))
+    pushArgs.stack(reg(yptr))
+    lowkey pr = emitExternCall(c, "void", "bet_vec_push", pushArgs)
+    // close count loop
+    lowkey isb = sbNew()
+    isb.add("add.wrap(")
+    isb.add(reg(ctr))
+    isb.add(", 1u64)")
+    emitAssign(c, ctr, isb.finish())
+    termGoto(c, header)
+    selectBlock(c, exit)
+    bet reg(out), outVecTy
+}
+
+// `xs.vibeCheck(pred)` — filter. Allocate a fresh `vec[T]`, then for each element where `pred(x)`
+// holds, push `x`. Shared by the array and vec receivers (mirror build_filter + open/close_count_loop).
+finna buildFilter(c: LowerCtx, p: P, argsW: int, srcIsVec: bool, srcHandle: str, nStr: str, elem: str) -> (str, str) {
+    lowkey fop, fty = lowerExpr(c, p, argValue(p, argsW, 0), "")
+    fr !isFnPtrTy(fty) {
+        lcFail(c)
+        bet "0i64", "i64"
+    }
+    fr !str.slaps(fnPtrRet(fty), "bool") {
+        lcFail(c)
+        bet "0i64", "i64"
+    }
+    lowkey outVecTy = vecTyStr(elem)
+    lowkey callee = newLocal(c, fty)
+    emitAssign(c, callee, fop)
+    // out = bet_vec_new(sizeof(T))
+    lowkey esize = newLocal(c, "u64")
+    lowkey eb = sbNew()
+    eb.add("size_of[")
+    eb.add(elem)
+    eb.add("]")
+    emitAssign(c, esize, eb.finish())
+    getExtern(c, vecExternDecl("bet_vec_new", "u64", outVecTy))
+    lowkey newArgs = vec.new[str]()
+    newArgs.stack(reg(esize))
+    lowkey out = emitExternCall(c, outVecTy, "bet_vec_new", newArgs)
+    getExtern(c, vecExternDecl("bet_vec_push", cat3(outVecTy, ", ", "rawptr"), "void"))
+    // open count loop
+    lowkey len = emitCollectionLen(c, srcIsVec, srcHandle, nStr, elem)
+    lowkey ctr = newLocal(c, "u64")
+    emitAssign(c, ctr, "0u64")
+    lowkey pre = curId(c)
+    lowkey header = reserveBlock(c)
+    setGoto(c, pre, header)
+    selectBlock(c, header)
+    lowkey cond = newLocal(c, "bool")
+    lowkey cb = sbNew()
+    cb.add("lt.na(")
+    cb.add(reg(ctr))
+    cb.add(", ")
+    cb.add(len)
+    cb.add(")")
+    emitAssign(c, cond, cb.finish())
+    lowkey headerEnd = curId(c)
+    lowkey bodyBb = newBlock(c)
+    lowkey exit = reserveBlock(c)
+    setBranch(c, headerEnd, reg(cond), bodyBb, exit)
+    selectBlock(c, bodyBb)
+    // body: keep = pred(x); if keep, push x. Falls through to the shared increment block.
+    lowkey x = emitCollectionRead(c, srcIsVec, srcHandle, ctr, elem)
+    lowkey callArgs = vec.new[str]()
+    callArgs.stack(reg(x))
+    lowkey keep = emitIndirect(c, "bool", reg(callee), callArgs)
+    lowkey bodyEnd = curId(c)
+    lowkey pushBb = newBlock(c)
+    lowkey xptr = emitAddrOf(c, reg(x))
+    lowkey pushArgs = vec.new[str]()
+    pushArgs.stack(reg(out))
+    pushArgs.stack(reg(xptr))
+    lowkey pr = emitExternCall(c, "void", "bet_vec_push", pushArgs)
+    lowkey cont = newBlock(c)
+    setGoto(c, pushBb, cont)
+    setBranch(c, bodyEnd, reg(keep), pushBb, cont)
+    selectBlock(c, cont)
+    // close count loop
+    lowkey isb = sbNew()
+    isb.add("add.wrap(")
+    isb.add(reg(ctr))
+    isb.add(", 1u64)")
+    emitAssign(c, ctr, isb.finish())
+    termGoto(c, header)
+    selectBlock(c, exit)
+    bet reg(out), outVecTy
+}
+
+// `arr.<method>(..)` for a fixed-size array receiver (mirror lower_array_method): `gang` is the
+// compile-time length; `vibeCheck`/`glowUp` build a fresh heap `vec`. A non-place receiver (an
+// array-literal temp) is spilled to a slot so the counter loop can index it.
+finna lowerArrayMethod(c: LowerCtx, p: P, methodIdx: int, arrOp: str, arrTy: str, method: str) -> (str, str) {
+    lowkey argsW = findKid(p, methodIdx, "args")
+    lowkey elem = arrayElem(arrTy)
+    lowkey nStr = arrayLenStr(arrTy)
+    fr str.slaps(method, "gang") {
+        bet cat2(nStr, "u64"), "u64"
+    }
+    fr str.slaps(method, "vibeCheck") || str.slaps(method, "glowUp") {
+        lowkey base = arrOp
+        fr !isPlace(arrOp) {
+            lowkey tmp = newLocal(c, arrTy)
+            emitAssign(c, tmp, arrOp)
+            base = reg(tmp)
+        }
+        fr str.slaps(method, "glowUp") {
+            lowkey mo, mt = buildMap(c, p, argsW, cap, base, nStr, elem)
+            bet mo, mt
+        }
+        lowkey fo, ft = buildFilter(c, p, argsW, cap, base, nStr, elem)
+        bet fo, ft
+    }
+    lcFail(c)
+    bet "0i64", "i64"
+}
+
 // Dispatch a method on a `vec[T]` value: stack (push), pop, gang (length) (mirror lower_vec_method).
 finna lowerVecMethod(c: LowerCtx, p: P, methodIdx: int, vecOp: str, elem: str, method: str) -> (str, str) {
     lowkey vecTy = vecTyStr(elem)
@@ -4545,6 +4899,15 @@ finna lowerVecMethod(c: LowerCtx, p: P, methodIdx: int, vecOp: str, elem: str, m
         lowkey result = newLocal(c, "str")
         emitAssign(c, result, call2("make_str", reg(outPtr), reg(len)))
         bet reg(result), "str"
+    }
+    // `v.vibeCheck(pred)` → filter; `v.glowUp(f)` → map. Both build a fresh vec off this receiver.
+    fr str.slaps(method, "vibeCheck") {
+        lowkey fo, ft = buildFilter(c, p, argsW, nocap, vecOp, "", elem)
+        bet fo, ft
+    }
+    fr str.slaps(method, "glowUp") {
+        lowkey mo, mt = buildMap(c, p, argsW, nocap, vecOp, "", elem)
+        bet mo, mt
     }
     lcFail(c)
     bet "0i64", "i64"
@@ -4628,6 +4991,41 @@ finna lowerTea(c: LowerCtx, p: P, methodIdx: int, yop: str) -> (str, str) {
     bet yo, yt
 }
 
+// Dispatch a method on an `rng` handle (`math.cook`): roll (raw 64-bit draw), frac (f64 in
+// [0, 1)), or upTo(n) (unbiased int in [0, n)) (mirror lower_rng_method). The runtime speaks u64;
+// the int-facing sides cross the signed/unsigned boundary via coerceInt.
+finna lowerRngMethod(c: LowerCtx, p: P, methodIdx: int, rngOp: str, method: str) -> (str, str) {
+    lowkey argsW = findKid(p, methodIdx, "args")
+    fr str.slaps(method, "roll") {
+        getExtern(c, "extern \"C\" fn bet_rng_next(rng) -> u64")
+        lowkey rArgs = vec.new[str]()
+        rArgs.stack(rngOp)
+        lowkey raw = emitExternCall(c, "u64", "bet_rng_next", rArgs)
+        lowkey out = coerceInt(c, reg(raw), "u64", "i64")
+        bet out, "i64"
+    }
+    fr str.slaps(method, "frac") {
+        getExtern(c, "extern \"C\" fn bet_rng_frac(rng) -> f64")
+        lowkey fArgs = vec.new[str]()
+        fArgs.stack(rngOp)
+        lowkey res = emitExternCall(c, "f64", "bet_rng_frac", fArgs)
+        bet reg(res), "f64"
+    }
+    fr str.slaps(method, "upTo") {
+        lowkey n, nty = lowerExpr(c, p, argValue(p, argsW, 0), "i64")
+        lowkey nu = coerceInt(c, n, nty, "u64")
+        getExtern(c, "extern \"C\" fn bet_rng_upto(rng, u64) -> u64")
+        lowkey uArgs = vec.new[str]()
+        uArgs.stack(rngOp)
+        uArgs.stack(nu)
+        lowkey raw = emitExternCall(c, "u64", "bet_rng_upto", uArgs)
+        lowkey out = coerceInt(c, reg(raw), "u64", "i64")
+        bet out, "i64"
+    }
+    lcFail(c)
+    bet "0i64", "i64"
+}
+
 // `recv.method(args)` where `recv` is a value — a user receiver method (mirror lower_method's user
 // branch): the receiver becomes the leading argument. Module-name receivers route to intrinsics.
 finna lowerMethodCall(c: LowerCtx, p: P, idx: int, hint: str) -> (str, str) {
@@ -4682,6 +5080,14 @@ finna lowerMethodCall(c: LowerCtx, p: P, idx: int, hint: str) -> (str, str) {
         fr isMapTy(yty) {
             lowkey mo, mt = lowerStashMethod(c, p, idx, yop, mapKey(yty), mapVal(yty), methodName)
             bet mo, mt
+        }
+        fr isRngTy(yty) {
+            lowkey ro, rt = lowerRngMethod(c, p, idx, yop, methodName)
+            bet ro, rt
+        }
+        fr isArrayTy(yty) {
+            lowkey ao, at = lowerArrayMethod(c, p, idx, yop, yty, methodName)
+            bet ao, at
         }
         // A `finna(..)`-typed struct field named like the method — an indirect call through it
         // (mirror lower_fn_field_call): `%r = call_indirect %recv.deref.field(i)(args)`. The base
@@ -5274,14 +5680,21 @@ finna lowerBinary(c: LowerCtx, p: P, idx: int, hint: str) -> (str, str) {
         lowkey so, st = lowerShortCircuit(c, p, idx, opTag)
         bet so, st
     }
-    // `x == ghosted` / `x != ghosted`: for a yikes operand this reads its `present` flag.
+    // `x == ghosted` / `x != ghosted`: for a yikes operand this reads its `present` flag; for a
+    // tag/handle operand it compares against a type-appropriate `ghosted`/`nullptr` (issue #72).
     lowkey lIsGhost = str.slaps(firstWord(lab(p, kidAt(p, idx, 0))), "ghosted")
     lowkey rIsGhost = str.slaps(firstWord(lab(p, kidAt(p, idx, 1))), "ghosted")
     fr (str.slaps(opTag, "eq") || str.slaps(opTag, "ne")) && (lIsGhost || rIsGhost) {
         lowkey otherE = kidAt(p, idx, 1)
         fr rIsGhost { otherE = kidAt(p, idx, 0) }
+        lowkey ghostE = kidAt(p, idx, 1)
+        fr lIsGhost { ghostE = kidAt(p, idx, 0) }
         lowkey oop, oty = lowerExpr(c, p, otherE, "")
-        fr isYikesTy(oty) && isPlace(oop) {
+        fr isYikesTy(oty) {
+            fr !isPlace(oop) {
+                lcFail(c)
+                bet "0i64", "i64"
+            }
             lowkey present = cat2(oop, ".field(0)")
             fr str.slaps(opTag, "ne") {
                 bet present, "bool"
@@ -5290,8 +5703,18 @@ finna lowerBinary(c: LowerCtx, p: P, idx: int, hint: str) -> (str, str) {
             emitAssign(c, t, cat3("not(", present, ")"))
             bet reg(t), "bool"
         }
-        lcFail(c)
-        bet "0i64", "i64"
+        // Non-yikes: `eq.na`/`ne.na` against a `ghosted` typed like the other operand.
+        lowkey gop, gty = lowerExpr(c, p, ghostE, oty)
+        lowkey ct = newLocal(c, "bool")
+        lowkey csb = sbNew()
+        csb.add(opTag)
+        csb.add(".na(")
+        csb.add(oop)
+        csb.add(", ")
+        csb.add(gop)
+        csb.add(")")
+        emitAssign(c, ct, csb.finish())
+        bet reg(ct), "bool"
     }
     lowkey isCmp = isComparisonTag(opTag)
     lowkey lhint = ""
