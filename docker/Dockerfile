@@ -6,6 +6,10 @@
 #
 # The image contains NO project source — the repo is bind-mounted at /work at run time (see
 # compose.yaml), so a code change never means an image rebuild.
+#
+# TODO(sec #45, optional): pin the base image by digest for reproducibility, e.g.
+#   FROM ubuntu:22.04@sha256:<digest from `docker buildx imagetools inspect ubuntu:22.04`>
+# Left unpinned because the digest cannot be determined in this offline environment.
 FROM ubuntu:22.04
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
@@ -24,7 +28,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # 2) LLVM 18 from the official apt.llvm.org repo (jammy). Provides llvm-config-18 and the static
 #    archives that llvm-sys 180 links against, plus clang/lld. Its own layer so tweaking the
 #    app-dependency list above never re-downloads ~half a gigabyte of LLVM.
-RUN curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /usr/share/keyrings/llvm.gpg \
+# #45: the apt.llvm.org signing key is fetched over TLS and then trusted blindly — a compromised
+# mirror or a MITM that can present a valid cert could swap in its own key and sign malicious
+# packages. Fetch the key to a file, dearmor it, and verify its fingerprint against a pinned,
+# out-of-band value (fail closed) before trusting it. LLVM_KEY_FPR is the published fingerprint of
+# the apt.llvm.org archive signing key (key 0x15CF4D18AF4F7421, listed at https://apt.llvm.org/).
+# TODO(sec #45): confirm this fingerprint against https://apt.llvm.org/ before merge, and — for
+#   defence-in-depth / offline builds — additionally vendor the key bytes at
+#   docker/llvm-snapshot.gpg.key and `COPY` them in instead of fetching over the network.
+ARG LLVM_KEY_FPR=6084F3CF814B57C1CF12EFD515CF4D18AF4F7421
+RUN curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm-snapshot.gpg.key \
+ && gpg --dearmor -o /usr/share/keyrings/llvm.gpg /tmp/llvm-snapshot.gpg.key \
+ && got_fpr="$(gpg --show-keys --with-colons /usr/share/keyrings/llvm.gpg \
+        | awk -F: '/^fpr:/ {print $10; exit}')" \
+ && if [[ "$got_fpr" != "$LLVM_KEY_FPR" ]]; then \
+      echo "FATAL: apt.llvm.org key fingerprint mismatch: got '$got_fpr' want '$LLVM_KEY_FPR'" >&2; \
+      exit 1; \
+    fi \
+ && rm -f /tmp/llvm-snapshot.gpg.key \
  && echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main" \
       > /etc/apt/sources.list.d/llvm18.list \
  && apt-get update \
@@ -33,25 +54,51 @@ RUN curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /us
  && rm -rf /var/lib/apt/lists/*
 
 # 3) Rust, pinned to the repo toolchain. Installed under /usr/local so any UID can use it; the
-#    trees are made world-writable so a non-root runtime user (see `user:` in compose.yaml) can
-#    populate the cargo registry cache. RUSTUP_HOME/CARGO_HOME/PATH are baked in as ENV so the
-#    proxies resolve regardless of who runs them.
+#    trees are made world-readable/executable (a+rX, NOT a+w — see #45) so a non-root runtime user
+#    (see `user:` in compose.yaml) can *use* the toolchain without being able to overwrite its
+#    binaries. The runtime cargo registry cache is redirected to the writable bind mount (CARGO_HOME
+#    is overridden at run time in compose.yaml), so /usr/local/cargo itself need not be writable.
+#    RUSTUP_HOME/CARGO_HOME/PATH are baked in as ENV so the proxies resolve regardless of who runs them.
 ARG RUST_VERSION=1.96.1
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     LLVM_SYS_180_PREFIX=/usr/lib/llvm-18 \
     PATH=/usr/local/cargo/bin:/usr/lib/llvm-18/bin:/usr/local/bin:/usr/bin:/bin
-RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path \
+# #45: `curl https://sh.rustup.rs | sh` executes an unverified, network-fetched script. Instead,
+# download the pinned rustup-init binary for this platform, verify it against a pinned SHA-256
+# (fail closed) via `sha256sum -c`, then run it with the same flags. RUSTUP_INIT_SHA256 must be the
+# SHA-256 of the rustup-init binary for RUSTUP_VERSION on RUSTUP_ARCH, published at
+#   https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${RUSTUP_ARCH}/rustup-init.sha256
+# TODO(sec #45): pin the real SHA-256 (see URL above) before merge. The all-zero placeholder below
+#   is NOT a real digest; `sha256sum -c` will reject it, so the build fails closed until it is set.
+ARG RUSTUP_VERSION=1.27.1
+ARG RUSTUP_ARCH=x86_64-unknown-linux-gnu
+ARG RUSTUP_INIT_SHA256=0000000000000000000000000000000000000000000000000000000000000000
+RUN curl -fsSL -o /tmp/rustup-init \
+      "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${RUSTUP_ARCH}/rustup-init" \
+ && echo "${RUSTUP_INIT_SHA256}  /tmp/rustup-init" | sha256sum -c - \
+ && chmod +x /tmp/rustup-init \
+ && /tmp/rustup-init -y --no-modify-path \
       --default-toolchain "${RUST_VERSION}" --profile minimal \
       --component rustfmt --component clippy \
+ && rm -f /tmp/rustup-init \
  && rustc --version && cargo --version \
- && chmod -R a+rwX "$RUSTUP_HOME" "$CARGO_HOME"
+ && chmod -R a+rX "$RUSTUP_HOME" "$CARGO_HOME"
 
 # 4) cargo-nextest (the project's test runner) — the official prebuilt static binary, no compile.
 #    Pinned to a specific version so the image is reproducible (a bare `latest` URL would drift
 #    between rebuilds). Bump NEXTEST_VERSION deliberately.
 ARG NEXTEST_VERSION=0.9.140
-RUN curl -fsSL "https://get.nexte.st/${NEXTEST_VERSION}/linux" | tar -xzf - -C /usr/local/cargo/bin \
+# #33: the tarball was piped straight from the network into tar with no integrity check. Download
+# it to a file, verify it against a pinned SHA-256 (fail closed) via `sha256sum -c`, then extract.
+# TODO(sec #33): pin the real SHA-256 of https://get.nexte.st/${NEXTEST_VERSION}/linux before merge.
+#   The all-zero placeholder below is NOT a real digest; `sha256sum -c` rejects it, so the build
+#   fails closed until it is set.
+ARG NEXTEST_SHA256=0000000000000000000000000000000000000000000000000000000000000000
+RUN curl -fsSL -o /tmp/cargo-nextest.tar.gz "https://get.nexte.st/${NEXTEST_VERSION}/linux" \
+ && echo "${NEXTEST_SHA256}  /tmp/cargo-nextest.tar.gz" | sha256sum -c - \
+ && tar -xzf /tmp/cargo-nextest.tar.gz -C /usr/local/cargo/bin \
+ && rm -f /tmp/cargo-nextest.tar.gz \
  && chmod a+rx /usr/local/cargo/bin/cargo-nextest \
  && cargo-nextest --version
 
