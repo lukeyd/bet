@@ -1,0 +1,5 @@
+{"ts":"2026-07-10T18:05:21Z","agent":"agent","task":"selfhost","event":"in","activity":"planning","note":""}
+{"ts":"2026-07-10T18:15:14Z","agent":"agent","event":"switch","activity":"reviewing","note":""}
+{"ts":"2026-07-10T19:02:59Z","agent":"agent","event":"switch","activity":"writing","note":""}
+{"ts":"2026-07-10T19:13:31Z","agent":"agent","event":"switch","activity":"reviewing","note":""}
+{"ts":"2026-07-10T20:24:01Z","agent":"agent","event":"out","activity":"","note":""}
