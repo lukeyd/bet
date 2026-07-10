@@ -221,12 +221,19 @@ fn emit_dump(input: &Path, kind: &str) -> Result<(), String> {
         Some("bet") | None => {}
         Some(ext) => return Err(format!("`--emit` expects a `.bet` input, got `.{ext}`")),
     }
-    let src =
-        std::fs::read_to_string(input).map_err(|e| format!("reading {}: {e}", input.display()))?;
+    // `mir` dumps a whole *program*: it resolves the entry's `pull` imports across files (like
+    // `build`/`run`) and prints the merged, resolved, mangled `.mir`, so multi-file programs have a
+    // reference dump. `tokens`/`ast` stay single-file — they are pure per-file lexer/parser dumps.
     let dump = match kind {
-        "tokens" => frontend::dump::tokens(&src),
-        "ast" => frontend::dump::ast(&src),
-        "mir" => frontend::dump::mir(&src),
+        "mir" => frontend::dump::mir_program(input),
+        "tokens" | "ast" => {
+            let src = std::fs::read_to_string(input)
+                .map_err(|e| format!("reading {}: {e}", input.display()))?;
+            match kind {
+                "tokens" => frontend::dump::tokens(&src),
+                _ => frontend::dump::ast(&src),
+            }
+        }
         other => {
             return Err(format!(
                 "unknown --emit kind `{other}` (expected `tokens`, `ast`, or `mir`)"

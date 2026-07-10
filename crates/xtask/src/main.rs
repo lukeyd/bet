@@ -1383,16 +1383,11 @@ fn selfhost_run(bin: &Path, root: &Path, tmp: &Path) -> Result<()> {
     let mut bet_files = Vec::new();
     walk_files(&corpus_root, &mut bet_files).context("walking tests/corpus")?;
     bet_files.retain(|p| p.extension().and_then(|e| e.to_str()) == Some("bet"));
-    // The `14-modules/` and `12-doom/` packages use multi-file `pull` + namespace-qualified
-    // syntax (and standalone module fragments) that the single-file self-hosted `betfe` does not
-    // implement yet (it gets taught modules in a later refactor). Exclude them from the betfe
-    // `--emit` differential until then — they stay fully covered by the Rust-side loader/resolve
-    // unit tests and the interp+compiled corpus gates. (`12-doom/` was added after the original
-    // `14-modules` carve-out and pushed direct to `main`, so it slipped past this filter.)
-    for pkg in ["14-modules", "12-doom"] {
-        let dir = corpus_root.join(pkg);
-        bet_files.retain(|p| !p.starts_with(&dir));
-    }
+    // The multi-file `14-modules/` and `12-doom/` packages are now covered: `betfe` learned the
+    // module system (a `pull` import-graph loader + resolve/mangle pass, mirroring the Rust
+    // `loader.rs`/`resolve.rs`), and `--emit mir` on both sides lowers the merged, resolved,
+    // mangled program — so their entries and aux fragments join the differential like any other
+    // corpus program (per-file `tokens`/`ast` parity plus `mir` parity for the supported subset).
     bet_files.sort();
 
     emit_parity(bin, &betfe, &bet_files, &corpus_root, "tokens", "C1 lexer")?;

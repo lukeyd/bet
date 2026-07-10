@@ -833,8 +833,16 @@ finna parseType(p: P) -> int {
         addKid(p, fnNode, retNode)
         bet fnNode
     }
-    // A named type (`int`, `stash[str, i64]`, `Enemy`) or `rawptr`.
+    // A named type (`int`, `stash[str, i64]`, `Enemy`) or `rawptr`. A namespace-qualified type
+    // `geometry.Point` keeps the dotted name as one string (the module resolver splits on the dot);
+    // `rawptr` is never qualified.
     lowkey name = ident(p)
+    fr !str.slaps(name, "rawptr") {
+        fr eat(p, "dot") {
+            lowkey member = ident(p)
+            name = cat3(name, ".", member)
+        }
+    }
     fr str.slaps(name, "rawptr") {
         bet mkNode(p, "rawptr")
     }
@@ -1044,6 +1052,11 @@ finna unaryExpr(p: P) -> int {
     bet n
 }
 
+// Is node `e` a bare `name X` with no generic args (a namespace candidate for `ns.Name{ .. }`)?
+finna isBareNameNode(p: P, e: int) -> bool {
+    bet str.slaps(firstWord(lab(p, e)), "name") && kidCount(p, e) == 0
+}
+
 finna postfixExpr(p: P) -> int {
     lowkey e = primary(p)
     vibin nocap {
@@ -1070,6 +1083,11 @@ finna postfixExpr(p: P) -> int {
                     addTypeargs(p, n, gens)
                     addKid(p, n, argsNode)
                     e = n
+                } naw fr !nsGet(p) && check(p, "lbrace") && isBareNameNode(p, e) {
+                    // A namespace-qualified struct literal `geometry.Point{ .. }`: the base is a bare
+                    // namespace name; keep the dotted head as one string (the resolver splits it).
+                    lowkey ns = afterFirst(lab(p, e))
+                    e = structLitBody(p, cat3(ns, ".", name), gens)
                 } naw {
                     lowkey n = mkNode(p, sp2("field", name))
                     addKid(p, n, e)
@@ -1278,6 +1296,12 @@ finna copExpr(p: P) -> int {
 
 finna copInit(p: P) -> int {
     lowkey name = ident(p)
+    // A namespace-qualified head (`cop state.GameState{..}`) keeps the dotted name as one string.
+    fr check(p, "dot") && str.slaps(peek2Kind(p), "ident") {
+        adv(p)
+        lowkey member = ident(p)
+        name = cat3(name, ".", member)
+    }
     lowkey gens = maybeGenericArgs(p)
     fr check(p, "lbrace") {
         bet structLitBody(p, name, gens)
@@ -1365,8 +1389,16 @@ finna parseStmt(p: P) -> int {
     fr check(p, "sheesh") { bet sheeshStmt(p) }
     fr check(p, "evict") {
         adv(p)
+        // `evict <crib>` frees the whole crib; `evict <tag> in <crib>` frees one slot (evict-slot).
+        lowkey first = parseExpr(p)
+        fr eat(p, "in") {
+            lowkey ns = mkNode(p, "evict-slot")
+            addKid(p, ns, first)
+            addKid(p, ns, parseExpr(p))
+            bet ns
+        }
         lowkey n = mkNode(p, "evict")
-        addKid(p, n, parseExpr(p))
+        addKid(p, n, first)
         bet n
     }
     fr check(p, "slide") {
@@ -1515,6 +1547,12 @@ finna vibeStmt(p: P) -> int {
 
 finna matchArm(p: P) -> int {
     lowkey variant = ident(p)
+    // A namespace-qualified variant pattern (`geometry.Circle(r)`) keeps the dotted head as one
+    // string; the resolver splits it.
+    fr eat(p, "dot") {
+        lowkey member = ident(p)
+        variant = cat3(variant, ".", member)
+    }
     lowkey binds = ""
     fr eat(p, "lparen") {
         binds = ident(p)
@@ -1666,7 +1704,12 @@ finna pullItem(p: P) -> int {
     expect(p, "pull")
     lowkey mod = curText(p)
     adv(p)
-    bet mkNode(p, sp2("pull", mod))
+    lowkey label = sp2("pull", mod)
+    fr eat(p, "as") {
+        lowkey alias = ident(p)
+        label = sp3(label, "as", alias)
+    }
+    bet mkNode(p, label)
 }
 
 finna externDecl(p: P) -> int {
@@ -5363,8 +5406,9 @@ finna fieldAccessStr(c: LowerCtx, p: P, idx: int) -> (str, str) {
         sname = refElem(bty)
         base = cat2(bop, ".deref")
     }
-    // The base must be an addressable place — a bare local (`%b.field`) OR an index/field
-    // projection (`%b.index(%i).field`, as an AoS or soa element field access needs).
+    // The base must be an addressable place — a bare local (`%b.field`) OR a compound projection
+    // (`%b.index(%i).field` / nested `a.b.c`), as AoS/soa element field access and the doom
+    // game-state mutations need; all are valid GEP roots, so accept any place projection.
     fr !isStruct(c, sname) || !isPlace(bop) {
         lcFail(c)
         bet "0i64", "i64"
@@ -6093,6 +6137,21 @@ finna lowerAssign(c: LowerCtx, p: P, stmtIdx: int) {
                 }
             }
         }
+    } naw fr str.slaps(firstWord(lab(p, kidAt(p, tw, 0))), "index") {
+        // `base[i] = expr` — assign through a slice/array element place (`<place>.index(i)`); the
+        // doom game-state writes need it. vec-element writes (a non-place index) are deferred.
+        lowkey idxNode = kidAt(p, tw, 0)
+        lowkey bop, bty = lowerExpr(c, p, kidAt(p, idxNode, 0), "")
+        fr !str.slaps(opTag, "eq") || !(isArrayTy(bty) || isSliceTy(bty)) || !isPlace(bop) {
+            lcFail(c)
+        } naw {
+            lowkey elem = arrayElem(bty)
+            fr isSliceTy(bty) { elem = sliceElem(bty) }
+            lowkey iop, ity = lowerExpr(c, p, kidAt(p, idxNode, 1), "i64")
+            lowkey place = cat2(bop, cat3(".index(", iop, ")"))
+            lowkey val, vty = lowerExpr(c, p, kidAt(p, vw, 0), elem)
+            emitPlaceAssign(c, place, val)
+        }
     } naw {
         lowkey te = kidAt(p, tw, 0)
         lowkey lid = 0 - 1
@@ -6475,6 +6534,19 @@ finna lowerEvict(c: LowerCtx, p: P, stmtIdx: int) {
     }
 }
 
+// `evict <tag> in <crib>` — free one slot (mirror lower_stmt's evict-slot arm -> rt-abi
+// `bet_evict_slot`). The AST is `evict-slot [tag, crib]`; lower the CRIB first (matching the
+// reference's SSA temp order), then the tag, and emit `evictslot <cribOp>, <tagOp>`.
+finna lowerEvictSlot(c: LowerCtx, p: P, stmtIdx: int) {
+    lowkey cribOp, cribTy = lowerExpr(c, p, kidAt(p, stmtIdx, 1), "")
+    fr !isCribTy(cribTy) {
+        lcFail(c)
+    } naw {
+        lowkey tagOp, tagTy = lowerExpr(c, p, kidAt(p, stmtIdx, 0), "")
+        emitStmt(c, cat2("evictslot ", cat3(cribOp, ", ", tagOp)))
+    }
+}
+
 // `slide worker()` — spawn a concurrent task via `bet_slide` (mirror lower_slide). Only a bare
 // call of a known, no-arg named function lowers today: materialize its code pointer `@NAME`, bitcast
 // to `rawptr`, and pass it as both the entry and the (unused) task argument. The `u64` TaskHandle is
@@ -6534,6 +6606,8 @@ finna lowerStmt(c: LowerCtx, p: P, stmtIdx: int) {
         lowerCribDecl(c, p, stmtIdx)
     } naw fr str.slaps(h, "holla") {
         lowerHolla(c, p, stmtIdx)
+    } naw fr str.slaps(h, "evict-slot") {
+        lowerEvictSlot(c, p, stmtIdx)
     } naw fr str.slaps(h, "evict") {
         lowerEvict(c, p, stmtIdx)
     } naw fr str.slaps(h, "slide") {
@@ -7123,6 +7197,1213 @@ finna emitFailFromSrc(src: str) -> str {
     bet emitFailFn(p, root)
 }
 
+// Multi-file variant of the failfn diagnostic: run the full load-graph + resolve/mangle pipeline
+// then report which merged item first fails to lower (or which pipeline stage errored).
+finna emitFailFromPath(path: str) -> str {
+    lowkey nodes = vec.new[Node]()
+    lowkey g = modsNew()
+    loadFile(g, nodes, path, 1)
+    fr !modsErrOk(g) { bet cat2("FAIL load: ", g.err[0]) }
+    lowkey p = pFromNodes(nodes)
+    fr (g.stems.gang() as int) == 1 {
+        bet emitFailFn(p, g.roots[0])
+    }
+    buildTables(g, nodes)
+    fr !modsErrOk(g) { bet cat2("FAIL tables: ", g.err[0]) }
+    lowkey mergedRoot = resolveProgram(g, p)
+    fr !modsErrOk(g) { bet cat2("FAIL resolve: ", g.err[0]) }
+    bet emitFailFn(p, mergedRoot)
+}
+
+// ===========================================================================
+// C4b — the module system: multi-file loader + resolve/mangle pass.
+//
+// Mirror of crates/frontend/src/loader.rs + resolve.rs. betfe parses every `pull`-ed file into
+// ONE shared node arena (indices stay globally unique across files — no cross-arena remap), builds
+// a deterministic post-order module vector (deps first, root last), mangles each NON-root module's
+// top-level decls to `<stem>$<idx>$<name>` (the `$` is illegal in source, so no collisions),
+// rewrites every cross-module reference (`ns.fn(a)` Method -> Call, `ns.CONST` Field -> Name, dotted
+// types / struct-lits / variant heads), enforces `flex`/`hush` visibility, and concatenates the
+// resolved items into one merged `program` node. emitMir then lowers it exactly as a single file —
+// lowering never learns modules exist. A single-module entry (no file imports) skips all of this and
+// lowers directly, so the self-compile fixpoint and every single-file program stay byte-identical.
+// ===========================================================================
+
+// The stdlib module namespaces (mirror is_builtin_module): these `pull`s are intrinsics, not files.
+finna isBuiltinModule(name: str) -> bool {
+    fr str.slaps(name, "spill") || str.slaps(name, "str") || str.slaps(name, "math") { bet nocap }
+    fr str.slaps(name, "mem") || str.slaps(name, "bytes") || str.slaps(name, "fmt") { bet nocap }
+    fr str.slaps(name, "stash") || str.slaps(name, "vec") || str.slaps(name, "yikes") { bet nocap }
+    fr str.slaps(name, "fs") || str.slaps(name, "sys") || str.slaps(name, "gg") { bet nocap }
+    fr str.slaps(name, "squadops") || str.slaps(name, "time") || str.slaps(name, "net") { bet nocap }
+    bet cap
+}
+
+// --- lexical path helpers (betfe has no canonicalize; confinement is lexical, mirror loader.rs) ---
+finna lastSlashIdx(s: str) -> int {
+    lowkey n = str.len(s)
+    lowkey r = 0 - 1
+    lowkey i = 0
+    vibin i < n {
+        fr str.at(s, i) == 47 { r = i }
+        i = i + 1
+    }
+    bet r
+}
+
+finna afterLastSlash(s: str) -> str {
+    lowkey k = lastSlashIdx(s)
+    fr k < 0 { bet s }
+    bet str.sub(s, k + 1, str.len(s))
+}
+
+finna dirOfPath(s: str) -> str {
+    lowkey k = lastSlashIdx(s)
+    fr k < 0 { bet "" }
+    bet str.sub(s, 0, k)
+}
+
+// Strip a trailing ".bet" extension (the file stem, mirror Path::file_stem).
+finna stripBet(s: str) -> str {
+    lowkey n = str.len(s)
+    fr n >= 4 && str.at(s, n - 4) == 46 && str.at(s, n - 3) == 98 && str.at(s, n - 2) == 101 && str.at(s, n - 1) == 116 {
+        bet str.sub(s, 0, n - 4)
+    }
+    bet s
+}
+
+// The mangling stem of a resolved file path: last component minus ".bet" (mirror stem_of on a path).
+finna fileStem(path: str) -> str {
+    bet stripBet(afterLastSlash(path))
+}
+
+// The default namespace of a module string: its last component (mirror stem_of on the module string).
+finna moduleNsName(modstr: str) -> str {
+    bet afterLastSlash(modstr)
+}
+
+finna joinPath(dir: str, file: str) -> str {
+    fr isEmpty(dir) { bet file }
+    bet cat3(dir, "/", file)
+}
+
+// Split a path on '/', keeping empty components (leading/double slashes) so normalize can drop them.
+finna splitSlash(s: str) -> vec[str] {
+    lowkey out = vec.new[str]()
+    lowkey n = str.len(s)
+    lowkey start = 0
+    lowkey i = 0
+    vibin i < n {
+        fr str.at(s, i) == 47 {
+            out.stack(str.sub(s, start, i))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    out.stack(str.sub(s, start, n))
+    bet out
+}
+
+// Lexically normalize a path: resolve `.`, pop a `..` against a preceding segment, and CLAMP a
+// leading `..` (drop it) so no import escapes the confinement root. Mirror loader.rs normalize —
+// the dedup key + `..`-confinement both depend on this matching the reference byte-for-byte.
+finna normalizePath(s: str) -> str {
+    lowkey abs = str.len(s) > 0 && str.at(s, 0) == 47
+    lowkey comps = splitSlash(s)
+    lowkey out = vec.new[str]()
+    lowkey n = comps.gang() as int
+    lowkey i = 0
+    vibin i < n {
+        lowkey c = comps[i]
+        fr isEmpty(c) || str.slaps(c, ".") {
+            // skip empty (leading/double slash) and current-dir segments
+        } naw fr str.slaps(c, "..") {
+            fr (out.gang() as int) > 0 { out.pop() }
+        } naw {
+            out.stack(c)
+        }
+        i = i + 1
+    }
+    lowkey sb = sbNew()
+    fr abs { sb.add("/") }
+    lowkey j = 0
+    lowkey m = out.gang() as int
+    vibin j < m {
+        fr j > 0 { sb.add("/") }
+        sb.add(out[j])
+        j = j + 1
+    }
+    bet sb.finish()
+}
+
+finna indexOfDot(s: str) -> int {
+    lowkey n = str.len(s)
+    lowkey i = 0
+    vibin i < n {
+        fr str.at(s, i) == 46 { bet i }
+        i = i + 1
+    }
+    bet 0 - 1
+}
+
+finna containsStr(v: vec[str], s: str) -> bool {
+    lowkey n = v.gang() as int
+    lowkey i = 0
+    vibin i < n {
+        fr str.slaps(v[i], s) { bet nocap }
+        i = i + 1
+    }
+    bet cap
+}
+
+// --- pull-label extraction (a pull node's label is `pull "MOD" [as ALIAS]`) ---
+finna pullLabelModule(label: str) -> str {
+    bet unquote(firstWord(afterFirst(label)))
+}
+
+finna pullLabelAlias(label: str) -> str {
+    lowkey rest = afterFirst(afterFirst(label))
+    fr str.slaps(firstWord(rest), "as") { bet afterFirst(rest) }
+    bet ""
+}
+
+// --- the module graph + symbol tables + loader bookkeeping (all shared-handle vecs) ---
+drip Mods {
+    stems: vec[str],
+    isRoot: vec[int],
+    roots: vec[int],
+    importMod: vec[int],
+    importName: vec[str],
+    importTarget: vec[int],
+    loadedPath: vec[str],
+    loadedIdx: vec[int],
+    stackPath: vec[str],
+    symMod: vec[int],
+    symName: vec[str],
+    symKind: vec[str],
+    symVis: vec[str],
+    symMangled: vec[str],
+    err: vec[str]
+}
+
+finna modsNew() -> Mods {
+    lowkey e = vec.new[str]()
+    e.stack("")
+    bet Mods{ stems: vec.new[str](), isRoot: vec.new[int](), roots: vec.new[int](), importMod: vec.new[int](), importName: vec.new[str](), importTarget: vec.new[int](), loadedPath: vec.new[str](), loadedIdx: vec.new[int](), stackPath: vec.new[str](), symMod: vec.new[int](), symName: vec.new[str](), symKind: vec.new[str](), symVis: vec.new[str](), symMangled: vec.new[str](), err: e }
+}
+
+finna modsErrOk(g: Mods) -> bool {
+    bet isEmpty(g.err[0])
+}
+
+finna modsSetErr(g: Mods, m: str) {
+    fr isEmpty(g.err[0]) { set1s(g.err, m) }
+}
+
+finna modsLoadedLookup(g: Mods, norm: str) -> int {
+    lowkey n = g.loadedPath.gang() as int
+    lowkey i = 0
+    vibin i < n {
+        fr str.slaps(g.loadedPath[i], norm) { bet g.loadedIdx[i] }
+        i = i + 1
+    }
+    bet 0 - 1
+}
+
+finna importTargetOf(g: Mods, mod: int, ns: str) -> int {
+    lowkey n = g.importMod.gang() as int
+    lowkey i = 0
+    vibin i < n {
+        fr g.importMod[i] == mod && str.slaps(g.importName[i], ns) { bet g.importTarget[i] }
+        i = i + 1
+    }
+    bet 0 - 1
+}
+
+finna putSym(g: Mods, mod: int, name: str, kind: str, vis: str, prefix: str) {
+    g.symMod.stack(mod)
+    g.symName.stack(name)
+    g.symKind.stack(kind)
+    g.symVis.stack(vis)
+    g.symMangled.stack(cat2(prefix, name))
+}
+
+finna symLookup(g: Mods, mod: int, name: str) -> int {
+    lowkey n = g.symMod.gang() as int
+    lowkey i = 0
+    vibin i < n {
+        fr g.symMod[i] == mod && str.slaps(g.symName[i], name) { bet i }
+        i = i + 1
+    }
+    bet 0 - 1
+}
+
+// A top-level decl label is `<kw> <vis> <name...>`.
+finna declVis(label: str) -> str {
+    bet firstWord(afterFirst(label))
+}
+
+finna declName(label: str) -> str {
+    bet afterFirst(afterFirst(label))
+}
+
+// --- the loader (mirror load_graph_with / GraphBuilder::load_file), DFS, post-order, dedup ---
+finna pFromNodes(nodes: vec[Node]) -> P {
+    lowkey pos = vec.new[int]()
+    pos.stack(0)
+    lowkey ns = vec.new[int]()
+    ns.stack(0)
+    bet P{ toks: vec.new[Token](), pos: pos, nodes: nodes, ns: ns }
+}
+
+finna loadFile(g: Mods, nodes: vec[Node], path: str, isRoot: int) -> int {
+    lowkey norm = normalizePath(path)
+    lowkey done = modsLoadedLookup(g, norm)
+    fr done >= 0 { bet done }
+    fr containsStr(g.stackPath, norm) {
+        modsSetErr(g, cat2("import cycle: ", norm))
+        bet 0 - 1
+    }
+    lowkey src = fs.peepText(norm)
+    lowkey pos = vec.new[int]()
+    pos.stack(0)
+    lowkey nsc = vec.new[int]()
+    nsc.stack(0)
+    lowkey p = P{ toks: lex(src), pos: pos, nodes: nodes, ns: nsc }
+    lowkey root = parseProgram(p)
+    g.stackPath.stack(norm)
+    lowkey parentDir = dirOfPath(norm)
+    lowkey impNames = vec.new[str]()
+    lowkey impTargets = vec.new[int]()
+    lowkey ni = kidCount(p, root)
+    lowkey ii = 0
+    vibin ii < ni && modsErrOk(g) {
+        lowkey it = kidAt(p, root, ii)
+        fr str.slaps(firstWord(lab(p, it)), "pull") {
+            loadPull(g, nodes, p, it, parentDir, impNames, impTargets)
+        }
+        ii = ii + 1
+    }
+    g.stackPath.pop()
+    lowkey idx = g.stems.gang() as int
+    g.stems.stack(fileStem(norm))
+    g.isRoot.stack(isRoot)
+    g.roots.stack(root)
+    g.loadedPath.stack(norm)
+    g.loadedIdx.stack(idx)
+    lowkey ki = 0
+    lowkey nimp = impNames.gang() as int
+    vibin ki < nimp {
+        g.importMod.stack(idx)
+        g.importName.stack(impNames[ki])
+        g.importTarget.stack(impTargets[ki])
+        ki = ki + 1
+    }
+    bet idx
+}
+
+finna loadPull(g: Mods, nodes: vec[Node], p: P, pullIdx: int, parentDir: str, impNames: vec[str], impTargets: vec[int]) {
+    lowkey label = lab(p, pullIdx)
+    lowkey modstr = pullLabelModule(label)
+    fr !isBuiltinModule(modstr) {
+        lowkey alias = pullLabelAlias(label)
+        lowkey nsName = alias
+        fr isEmpty(nsName) { nsName = moduleNsName(modstr) }
+        fr isBuiltinModule(nsName) {
+            modsSetErr(g, cat2("namespace shadows builtin module: ", nsName))
+        } naw fr containsStr(impNames, nsName) {
+            modsSetErr(g, cat2("namespace imported twice: ", nsName))
+        } naw fr str.len(modstr) > 0 && str.at(modstr, 0) == 47 {
+            modsSetErr(g, cat2("absolute import: ", modstr))
+        } naw {
+            lowkey targetPath = normalizePath(joinPath(parentDir, cat2(modstr, ".bet")))
+            lowkey target = loadFile(g, nodes, targetPath, 0)
+            fr target >= 0 {
+                impNames.stack(nsName)
+                impTargets.stack(target)
+            }
+        }
+    }
+}
+
+// --- build each module's top-level symbol table (mirror build_table) ---
+finna buildTables(g: Mods, nodes: vec[Node]) {
+    lowkey p = pFromNodes(nodes)
+    lowkey nm = g.stems.gang() as int
+    lowkey mi = 0
+    vibin mi < nm {
+        lowkey prefix = ""
+        fr g.isRoot[mi] == 0 {
+            prefix = cat2(g.stems[mi], cat2("$", cat2(itoa(mi), "$")))
+        }
+        lowkey root = g.roots[mi]
+        lowkey ni = kidCount(p, root)
+        lowkey ii = 0
+        vibin ii < ni {
+            lowkey it = kidAt(p, root, ii)
+            lowkey label = lab(p, it)
+            lowkey h = firstWord(label)
+            fr str.slaps(h, "func") {
+                putSym(g, mi, declName(label), "func", declVis(label), prefix)
+            } naw fr str.slaps(h, "const") {
+                putSym(g, mi, declName(label), "value", declVis(label), prefix)
+            } naw fr str.slaps(h, "crib") {
+                putSym(g, mi, declName(label), "value", declVis(label), prefix)
+            } naw fr str.slaps(h, "drip") {
+                putSym(g, mi, declName(label), "struct", declVis(label), prefix)
+            } naw fr str.slaps(h, "moods") {
+                putSym(g, mi, declName(label), "sum", declVis(label), prefix)
+                buildVariantSyms(g, p, mi, it, declVis(label), prefix)
+            } naw fr str.slaps(h, "var") {
+                buildVarSyms(g, mi, label, prefix)
+            }
+            ii = ii + 1
+        }
+        mi = mi + 1
+    }
+}
+
+finna buildVariantSyms(g: Mods, p: P, mod: int, moodsIdx: int, vis: str, prefix: str) {
+    lowkey n = kidCount(p, moodsIdx)
+    lowkey i = 0
+    vibin i < n {
+        lowkey k = kidAt(p, moodsIdx, i)
+        fr str.slaps(firstWord(lab(p, k)), "variant") {
+            putSym(g, mod, afterFirst(lab(p, k)), "variant", vis, prefix)
+        }
+        i = i + 1
+    }
+}
+
+finna buildVarSyms(g: Mods, mod: int, label: str, prefix: str) {
+    lowkey targets = splitWs(declName(label))
+    lowkey n = targets.gang() as int
+    lowkey i = 0
+    vibin i < n {
+        putSym(g, mod, targets[i], "value", declVis(label), prefix)
+        i = i + 1
+    }
+}
+
+// --- resolve/mangle walk state (mirror the Resolver): local scopes + type params ---
+drip Rz {
+    scopeNames: vec[str],
+    scopeMarks: vec[int],
+    typeParams: vec[str]
+}
+
+finna rzNew() -> Rz {
+    bet Rz{ scopeNames: vec.new[str](), scopeMarks: vec.new[int](), typeParams: vec.new[str]() }
+}
+
+finna rzPushScope(rz: Rz) {
+    rz.scopeMarks.stack(rz.scopeNames.gang() as int)
+}
+
+finna rzPopScope(rz: Rz) {
+    lowkey nm = rz.scopeMarks.gang() as int
+    fr nm > 0 {
+        lowkey mark = rz.scopeMarks[nm - 1]
+        rz.scopeMarks.pop()
+        vibin (rz.scopeNames.gang() as int) > mark { rz.scopeNames.pop() }
+    }
+}
+
+finna rzBind(rz: Rz, name: str) {
+    rz.scopeNames.stack(name)
+}
+
+finna rzIsLocal(rz: Rz, name: str) -> bool {
+    bet containsStr(rz.scopeNames, name)
+}
+
+finna rzSetTypeParams(rz: Rz, gensLabel: str) {
+    vibin (rz.typeParams.gang() as int) > 0 { rz.typeParams.pop() }
+    lowkey names = splitWs(afterFirst(gensLabel))
+    lowkey n = names.gang() as int
+    lowkey i = 0
+    vibin i < n {
+        rz.typeParams.stack(names[i])
+        i = i + 1
+    }
+}
+
+finna rzClearTypeParams(rz: Rz) {
+    vibin (rz.typeParams.gang() as int) > 0 { rz.typeParams.pop() }
+}
+
+finna rzIsTypeParam(rz: Rz, name: str) -> bool {
+    bet containsStr(rz.typeParams, name)
+}
+
+// Mangle a declaration name via this module's own table (root prefix empty -> unchanged).
+finna rzOwnMangle(g: Mods, mod: int, name: str) -> str {
+    lowkey si = symLookup(g, mod, name)
+    fr si >= 0 { bet g.symMangled[si] }
+    bet name
+}
+
+// Resolve `member` as a `flex` export of module `target` (mirror lookup_flex).
+finna rzLookupFlex(g: Mods, target: int, member: str, ns: str) -> str {
+    lowkey si = symLookup(g, target, member)
+    fr si < 0 {
+        modsSetErr(g, cat2(cat2("module ", ns), cat2(" has no exported item ", member)))
+        bet member
+    }
+    fr !str.slaps(g.symVis[si], "flex") {
+        modsSetErr(g, cat2(member, cat2(" is hush in module ", ns)))
+        bet g.symMangled[si]
+    }
+    bet g.symMangled[si]
+}
+
+// Resolve a possibly-qualified / bare name string in name or type position (mirror resolve_named).
+finna rzResolveNamed(g: Mods, p: P, mod: int, rz: Rz, name: str, wantType: bool) -> str {
+    lowkey dot = indexOfDot(name)
+    fr dot >= 0 {
+        lowkey ns = str.sub(name, 0, dot)
+        lowkey member = str.sub(name, dot + 1, str.len(name))
+        lowkey target = importTargetOf(g, mod, ns)
+        fr target < 0 {
+            modsSetErr(g, cat2("unknown module namespace: ", ns))
+            bet name
+        }
+        bet rzLookupFlex(g, target, member, ns)
+    }
+    fr rzIsTypeParam(rz, name) { bet name }
+    lowkey si = symLookup(g, mod, name)
+    fr si >= 0 {
+        lowkey usable = nocap
+        fr wantType {
+            usable = str.slaps(g.symKind[si], "struct") || str.slaps(g.symKind[si], "sum")
+        }
+        fr usable { bet g.symMangled[si] }
+    }
+    bet name
+}
+
+// If `e` is a bare name bound to an imported namespace (not shadowed by a local), its target module.
+finna rzAsNamespace(g: Mods, p: P, mod: int, rz: Rz, e: int) -> int {
+    fr isBareNameNode(p, e) {
+        lowkey nm = afterFirst(lab(p, e))
+        fr !rzIsLocal(rz, nm) {
+            bet importTargetOf(g, mod, nm)
+        }
+    }
+    bet 0 - 1
+}
+
+// --- the copy-with-rewrite walk (mirror Resolver::{ty,expr,stmt,block,item}) ---
+// Everything below builds FRESH nodes in the shared arena (labels are immutable), so no in-place
+// mutation is needed. Declaration names get mangled; references get rewritten; structure is copied.
+
+finna rzAddTypeargs(g: Mods, p: P, mod: int, rz: Rz, parent: int, taW: int) {
+    lowkey nw = mkNode(p, "typeargs")
+    lowkey n = kidCount(p, taW)
+    lowkey i = 0
+    vibin i < n {
+        addKid(p, nw, rzTy(g, p, mod, rz, kidAt(p, taW, i)))
+        i = i + 1
+    }
+    addKid(p, parent, nw)
+}
+
+finna rzTy(g: Mods, p: P, mod: int, rz: Rz, t: int) -> int {
+    lowkey h = firstWord(lab(p, t))
+    fr str.slaps(h, "slice") {
+        lowkey n = mkNode(p, "slice")
+        addKid(p, n, rzTy(g, p, mod, rz, kidAt(p, t, 0)))
+        bet n
+    }
+    fr str.slaps(h, "array") {
+        lowkey n = mkNode(p, lab(p, t))
+        addKid(p, n, rzTy(g, p, mod, rz, kidAt(p, t, 0)))
+        bet n
+    }
+    fr str.slaps(h, "tag") {
+        lowkey n = mkNode(p, "tag")
+        addKid(p, n, rzTy(g, p, mod, rz, kidAt(p, t, 0)))
+        bet n
+    }
+    fr str.slaps(h, "crib-ty") {
+        lowkey n = mkNode(p, "crib-ty")
+        addKid(p, n, rzTy(g, p, mod, rz, kidAt(p, t, 0)))
+        bet n
+    }
+    fr str.slaps(h, "soa") {
+        lowkey n = mkNode(p, "soa")
+        addKid(p, n, rzTy(g, p, mod, rz, kidAt(p, t, 0)))
+        bet n
+    }
+    fr str.slaps(h, "fn-ty") {
+        lowkey n = mkNode(p, "fn-ty")
+        lowkey pw = findKid(p, t, "params")
+        lowkey npw = mkNode(p, "params")
+        lowkey np = kidCount(p, pw)
+        lowkey i = 0
+        vibin i < np {
+            addKid(p, npw, rzTy(g, p, mod, rz, kidAt(p, pw, i)))
+            i = i + 1
+        }
+        addKid(p, n, npw)
+        lowkey rw = findKid(p, t, "ret")
+        lowkey nrw = mkNode(p, "ret")
+        addKid(p, nrw, rzTy(g, p, mod, rz, kidAt(p, rw, 0)))
+        addKid(p, n, nrw)
+        bet n
+    }
+    fr str.slaps(h, "rawptr") {
+        bet mkNode(p, "rawptr")
+    }
+    fr str.slaps(h, "named") {
+        lowkey newNm = rzResolveNamed(g, p, mod, rz, afterFirst(lab(p, t)), nocap)
+        lowkey n = mkNode(p, sp2("named", newNm))
+        lowkey nk = kidCount(p, t)
+        lowkey i = 0
+        vibin i < nk {
+            addKid(p, n, rzTy(g, p, mod, rz, kidAt(p, t, i)))
+            i = i + 1
+        }
+        bet n
+    }
+    bet mkNode(p, lab(p, t))
+}
+
+finna rzArgs(g: Mods, p: P, mod: int, rz: Rz, argsW: int) -> int {
+    lowkey n = mkNode(p, "args")
+    lowkey na = kidCount(p, argsW)
+    lowkey i = 0
+    vibin i < na {
+        lowkey a = kidAt(p, argsW, i)
+        lowkey na2 = mkNode(p, lab(p, a))
+        addKid(p, na2, rzExpr(g, p, mod, rz, kidAt(p, a, 0)))
+        addKid(p, n, na2)
+        i = i + 1
+    }
+    bet n
+}
+
+finna rzExpr(g: Mods, p: P, mod: int, rz: Rz, e: int) -> int {
+    lowkey h = firstWord(lab(p, e))
+    fr str.slaps(h, "name") {
+        lowkey nm = afterFirst(lab(p, e))
+        lowkey newName = nm
+        fr !rzIsLocal(rz, nm) { newName = rzResolveNamed(g, p, mod, rz, nm, cap) }
+        lowkey n = mkNode(p, sp2("name", newName))
+        lowkey ta = findKid(p, e, "typeargs")
+        fr ta >= 0 { rzAddTypeargs(g, p, mod, rz, n, ta) }
+        bet n
+    }
+    fr str.slaps(h, "field") {
+        lowkey fname = afterFirst(lab(p, e))
+        lowkey base = kidAt(p, e, 0)
+        lowkey target = rzAsNamespace(g, p, mod, rz, base)
+        fr target >= 0 {
+            lowkey mangled = rzLookupFlex(g, target, fname, afterFirst(lab(p, base)))
+            lowkey n = mkNode(p, sp2("name", mangled))
+            lowkey ta = findKid(p, e, "typeargs")
+            fr ta >= 0 { rzAddTypeargs(g, p, mod, rz, n, ta) }
+            bet n
+        }
+        lowkey nf = mkNode(p, sp2("field", fname))
+        addKid(p, nf, rzExpr(g, p, mod, rz, base))
+        lowkey ta2 = findKid(p, e, "typeargs")
+        fr ta2 >= 0 { rzAddTypeargs(g, p, mod, rz, nf, ta2) }
+        bet nf
+    }
+    fr str.slaps(h, "method") {
+        bet rzMethod(g, p, mod, rz, e)
+    }
+    fr str.slaps(h, "call") {
+        lowkey calleeW = findKid(p, e, "callee")
+        lowkey n = mkNode(p, "call")
+        lowkey cw = mkNode(p, "callee")
+        addKid(p, cw, rzExpr(g, p, mod, rz, kidAt(p, calleeW, 0)))
+        addKid(p, n, cw)
+        addKid(p, n, rzArgs(g, p, mod, rz, findKid(p, e, "args")))
+        bet n
+    }
+    fr str.slaps(h, "struct") {
+        bet rzStructLit(g, p, mod, rz, e)
+    }
+    fr str.slaps(h, "cop") {
+        bet rzCop(g, p, mod, rz, e)
+    }
+    fr str.slaps(h, "index") {
+        lowkey n = mkNode(p, "index")
+        addKid(p, n, rzExpr(g, p, mod, rz, kidAt(p, e, 0)))
+        addKid(p, n, rzExpr(g, p, mod, rz, kidAt(p, e, 1)))
+        bet n
+    }
+    fr str.slaps(h, "trust") {
+        lowkey n = mkNode(p, "trust")
+        addKid(p, n, rzExpr(g, p, mod, rz, kidAt(p, e, 0)))
+        addKid(p, n, rzExpr(g, p, mod, rz, kidAt(p, e, 1)))
+        bet n
+    }
+    fr str.slaps(h, "unary") {
+        lowkey n = mkNode(p, lab(p, e))
+        addKid(p, n, rzExpr(g, p, mod, rz, kidAt(p, e, 0)))
+        bet n
+    }
+    fr str.slaps(h, "binary") {
+        lowkey n = mkNode(p, lab(p, e))
+        addKid(p, n, rzExpr(g, p, mod, rz, kidAt(p, e, 0)))
+        addKid(p, n, rzExpr(g, p, mod, rz, kidAt(p, e, 1)))
+        bet n
+    }
+    fr str.slaps(h, "cast") {
+        lowkey n = mkNode(p, "cast")
+        addKid(p, n, rzExpr(g, p, mod, rz, kidAt(p, e, 0)))
+        addKid(p, n, rzTy(g, p, mod, rz, kidAt(p, e, 1)))
+        bet n
+    }
+    fr str.slaps(h, "array-lit") {
+        lowkey n = mkNode(p, "array-lit")
+        lowkey nk = kidCount(p, e)
+        lowkey i = 0
+        vibin i < nk {
+            addKid(p, n, rzExpr(g, p, mod, rz, kidAt(p, e, i)))
+            i = i + 1
+        }
+        bet n
+    }
+    bet mkNode(p, lab(p, e))
+}
+
+finna rzMethod(g: Mods, p: P, mod: int, rz: Rz, e: int) -> int {
+    lowkey mname = afterFirst(lab(p, e))
+    lowkey recvW = findKid(p, e, "receiver")
+    lowkey recvE = kidAt(p, recvW, 0)
+    lowkey target = rzAsNamespace(g, p, mod, rz, recvE)
+    fr target >= 0 {
+        // `ns.fn(args)` -> a plain Call to the mangled free function (drop the receiver).
+        lowkey mangled = rzLookupFlex(g, target, mname, afterFirst(lab(p, recvE)))
+        lowkey nameNode = mkNode(p, sp2("name", mangled))
+        lowkey ta = findKid(p, e, "typeargs")
+        fr ta >= 0 { rzAddTypeargs(g, p, mod, rz, nameNode, ta) }
+        lowkey cw = mkNode(p, "callee")
+        addKid(p, cw, nameNode)
+        lowkey n = mkNode(p, "call")
+        addKid(p, n, cw)
+        addKid(p, n, rzArgs(g, p, mod, rz, findKid(p, e, "args")))
+        bet n
+    }
+    lowkey nm = mkNode(p, sp2("method", mname))
+    lowkey rw = mkNode(p, "receiver")
+    addKid(p, rw, rzExpr(g, p, mod, rz, recvE))
+    addKid(p, nm, rw)
+    lowkey ta2 = findKid(p, e, "typeargs")
+    fr ta2 >= 0 { rzAddTypeargs(g, p, mod, rz, nm, ta2) }
+    addKid(p, nm, rzArgs(g, p, mod, rz, findKid(p, e, "args")))
+    bet nm
+}
+
+finna rzStructLit(g: Mods, p: P, mod: int, rz: Rz, e: int) -> int {
+    lowkey newName = rzResolveNamed(g, p, mod, rz, afterFirst(lab(p, e)), nocap)
+    lowkey n = mkNode(p, sp2("struct", newName))
+    lowkey ta = findKid(p, e, "typeargs")
+    fr ta >= 0 { rzAddTypeargs(g, p, mod, rz, n, ta) }
+    lowkey fw = findKid(p, e, "fields")
+    lowkey nfw = mkNode(p, "fields")
+    lowkey nf = kidCount(p, fw)
+    lowkey i = 0
+    vibin i < nf {
+        lowkey fld = kidAt(p, fw, i)
+        lowkey nfld = mkNode(p, lab(p, fld))
+        addKid(p, nfld, rzExpr(g, p, mod, rz, kidAt(p, fld, 0)))
+        addKid(p, nfw, nfld)
+        i = i + 1
+    }
+    addKid(p, n, nfw)
+    bet n
+}
+
+finna rzCop(g: Mods, p: P, mod: int, rz: Rz, e: int) -> int {
+    lowkey n = mkNode(p, "cop")
+    lowkey init = kidAt(p, e, 0)
+    fr str.slaps(firstWord(lab(p, init)), "struct") {
+        addKid(p, n, rzStructLit(g, p, mod, rz, init))
+    } naw {
+        lowkey newV = rzResolveNamed(g, p, mod, rz, afterFirst(lab(p, init)), cap)
+        lowkey vn = mkNode(p, sp2("variant", newV))
+        addKid(p, vn, rzArgs(g, p, mod, rz, findKid(p, init, "args")))
+        addKid(p, n, vn)
+    }
+    lowkey cribW = findKid(p, e, "crib")
+    lowkey ncw = mkNode(p, "crib")
+    addKid(p, ncw, rzExpr(g, p, mod, rz, kidAt(p, cribW, 0)))
+    addKid(p, n, ncw)
+    bet n
+}
+
+finna rzRet(g: Mods, p: P, mod: int, rz: Rz, retW: int) -> int {
+    lowkey n = mkNode(p, lab(p, retW))
+    lowkey nk = kidCount(p, retW)
+    lowkey i = 0
+    vibin i < nk {
+        addKid(p, n, rzTy(g, p, mod, rz, kidAt(p, retW, i)))
+        i = i + 1
+    }
+    bet n
+}
+
+// Copy a decl's optional `type` wrapper then its `value`/`values` wrapper, resolving each.
+finna rzCopyTypeValues(g: Mods, p: P, mod: int, rz: Rz, s: int, n: int, valuesLabel: str) {
+    lowkey tw = findKid(p, s, "type")
+    fr tw >= 0 {
+        lowkey ntw = mkNode(p, "type")
+        addKid(p, ntw, rzTy(g, p, mod, rz, kidAt(p, tw, 0)))
+        addKid(p, n, ntw)
+    }
+    lowkey vw = findKid(p, s, valuesLabel)
+    lowkey nvw = mkNode(p, valuesLabel)
+    lowkey nv = kidCount(p, vw)
+    lowkey i = 0
+    vibin i < nv {
+        addKid(p, nvw, rzExpr(g, p, mod, rz, kidAt(p, vw, i)))
+        i = i + 1
+    }
+    addKid(p, n, nvw)
+}
+
+finna rzBlockNoBinds(g: Mods, p: P, mod: int, rz: Rz, b: int) -> int {
+    bet rzBlockBinds(g, p, mod, rz, b, vec.new[str]())
+}
+
+finna rzBlockBinds(g: Mods, p: P, mod: int, rz: Rz, b: int, binds: vec[str]) -> int {
+    rzPushScope(rz)
+    lowkey nb = binds.gang() as int
+    lowkey bi = 0
+    vibin bi < nb {
+        rzBind(rz, binds[bi])
+        bi = bi + 1
+    }
+    lowkey n = mkNode(p, "block")
+    lowkey ns = kidCount(p, b)
+    lowkey i = 0
+    vibin i < ns {
+        addKid(p, n, rzStmt(g, p, mod, rz, kidAt(p, b, i)))
+        i = i + 1
+    }
+    rzPopScope(rz)
+    bet n
+}
+
+finna rzStmt(g: Mods, p: P, mod: int, rz: Rz, s: int) -> int {
+    lowkey h = firstWord(lab(p, s))
+    fr str.slaps(h, "var") {
+        lowkey n = mkNode(p, lab(p, s))
+        rzCopyTypeValues(g, p, mod, rz, s, n, "values")
+        lowkey targets = splitWs(declName(lab(p, s)))
+        lowkey nt = targets.gang() as int
+        lowkey i = 0
+        vibin i < nt {
+            rzBind(rz, targets[i])
+            i = i + 1
+        }
+        bet n
+    }
+    fr str.slaps(h, "const") {
+        lowkey n = mkNode(p, lab(p, s))
+        rzCopyTypeValues(g, p, mod, rz, s, n, "value")
+        rzBind(rz, declName(lab(p, s)))
+        bet n
+    }
+    fr str.slaps(h, "crib") {
+        lowkey n = mkNode(p, lab(p, s))
+        fr kidCount(p, s) > 0 {
+            addKid(p, n, rzTy(g, p, mod, rz, kidAt(p, s, 0)))
+        }
+        rzBind(rz, declName(lab(p, s)))
+        bet n
+    }
+    fr str.slaps(h, "fr") {
+        bet rzFr(g, p, mod, rz, s)
+    }
+    fr str.slaps(h, "vibin") {
+        lowkey n = mkNode(p, "vibin")
+        addKid(p, n, rzExpr(g, p, mod, rz, kidAt(p, s, 0)))
+        addKid(p, n, rzBlockNoBinds(g, p, mod, rz, kidAt(p, s, 1)))
+        bet n
+    }
+    fr str.slaps(h, "squad") {
+        lowkey n = mkNode(p, lab(p, s))
+        addKid(p, n, rzExpr(g, p, mod, rz, kidAt(p, s, 0)))
+        lowkey binds = vec.new[str]()
+        binds.stack(afterFirst(lab(p, s)))
+        addKid(p, n, rzBlockBinds(g, p, mod, rz, kidAt(p, s, 1), binds))
+        bet n
+    }
+    fr str.slaps(h, "vibe") {
+        bet rzVibe(g, p, mod, rz, s)
+    }
+    fr str.slaps(h, "holla") {
+        bet rzHolla(g, p, mod, rz, s)
+    }
+    fr str.slaps(h, "sheesh") {
+        bet rzSheesh(g, p, mod, rz, s)
+    }
+    fr str.slaps(h, "evict-slot") {
+        lowkey n = mkNode(p, "evict-slot")
+        addKid(p, n, rzExpr(g, p, mod, rz, kidAt(p, s, 0)))
+        addKid(p, n, rzExpr(g, p, mod, rz, kidAt(p, s, 1)))
+        bet n
+    }
+    fr str.slaps(h, "evict") {
+        lowkey n = mkNode(p, "evict")
+        addKid(p, n, rzExpr(g, p, mod, rz, kidAt(p, s, 0)))
+        bet n
+    }
+    fr str.slaps(h, "slide") {
+        lowkey n = mkNode(p, "slide")
+        addKid(p, n, rzExpr(g, p, mod, rz, kidAt(p, s, 0)))
+        bet n
+    }
+    fr str.slaps(h, "bet") {
+        lowkey n = mkNode(p, "bet")
+        lowkey nk = kidCount(p, s)
+        lowkey i = 0
+        vibin i < nk {
+            addKid(p, n, rzExpr(g, p, mod, rz, kidAt(p, s, i)))
+            i = i + 1
+        }
+        bet n
+    }
+    fr str.slaps(h, "bounce") {
+        lowkey n = mkNode(p, "bounce")
+        addKid(p, n, rzExpr(g, p, mod, rz, kidAt(p, s, 0)))
+        bet n
+    }
+    fr str.slaps(h, "yeet") {
+        lowkey n = mkNode(p, "yeet")
+        addKid(p, n, rzExpr(g, p, mod, rz, kidAt(p, s, 0)))
+        bet n
+    }
+    fr str.slaps(h, "dip") {
+        bet mkNode(p, "dip")
+    }
+    fr str.slaps(h, "skip") {
+        bet mkNode(p, "skip")
+    }
+    fr str.slaps(h, "assign") {
+        bet rzAssign(g, p, mod, rz, s)
+    }
+    fr str.slaps(h, "expr-stmt") {
+        lowkey n = mkNode(p, "expr-stmt")
+        addKid(p, n, rzExpr(g, p, mod, rz, kidAt(p, s, 0)))
+        bet n
+    }
+    bet mkNode(p, lab(p, s))
+}
+
+finna rzAssign(g: Mods, p: P, mod: int, rz: Rz, s: int) -> int {
+    lowkey n = mkNode(p, lab(p, s))
+    lowkey tw = findKid(p, s, "targets")
+    lowkey ntw = mkNode(p, "targets")
+    lowkey nt = kidCount(p, tw)
+    lowkey i = 0
+    vibin i < nt {
+        addKid(p, ntw, rzExpr(g, p, mod, rz, kidAt(p, tw, i)))
+        i = i + 1
+    }
+    addKid(p, n, ntw)
+    lowkey vw = findKid(p, s, "values")
+    lowkey nvw = mkNode(p, "values")
+    lowkey nv = kidCount(p, vw)
+    lowkey j = 0
+    vibin j < nv {
+        addKid(p, nvw, rzExpr(g, p, mod, rz, kidAt(p, vw, j)))
+        j = j + 1
+    }
+    addKid(p, n, nvw)
+    bet n
+}
+
+finna rzFr(g: Mods, p: P, mod: int, rz: Rz, s: int) -> int {
+    lowkey n = mkNode(p, "fr")
+    addKid(p, n, rzExpr(g, p, mod, rz, kidAt(p, s, 0)))
+    addKid(p, n, rzBlockNoBinds(g, p, mod, rz, kidAt(p, s, 1)))
+    lowkey nk = kidCount(p, s)
+    lowkey i = 2
+    vibin i < nk {
+        lowkey k = kidAt(p, s, i)
+        fr str.slaps(firstWord(lab(p, k)), "elif") {
+            lowkey ne = mkNode(p, "elif")
+            addKid(p, ne, rzExpr(g, p, mod, rz, kidAt(p, k, 0)))
+            addKid(p, ne, rzBlockNoBinds(g, p, mod, rz, kidAt(p, k, 1)))
+            addKid(p, n, ne)
+        } naw {
+            lowkey nel = mkNode(p, "else")
+            addKid(p, nel, rzBlockNoBinds(g, p, mod, rz, kidAt(p, k, 0)))
+            addKid(p, n, nel)
+        }
+        i = i + 1
+    }
+    bet n
+}
+
+finna rzVibe(g: Mods, p: P, mod: int, rz: Rz, s: int) -> int {
+    lowkey n = mkNode(p, "vibe")
+    addKid(p, n, rzExpr(g, p, mod, rz, kidAt(p, s, 0)))
+    lowkey nk = kidCount(p, s)
+    lowkey i = 1
+    vibin i < nk {
+        lowkey k = kidAt(p, s, i)
+        fr str.slaps(firstWord(lab(p, k)), "default") {
+            lowkey nd = mkNode(p, "default")
+            addKid(p, nd, rzBlockNoBinds(g, p, mod, rz, kidAt(p, k, 0)))
+            addKid(p, n, nd)
+        } naw {
+            addKid(p, n, rzArm(g, p, mod, rz, k))
+        }
+        i = i + 1
+    }
+    bet n
+}
+
+finna rzArm(g: Mods, p: P, mod: int, rz: Rz, k: int) -> int {
+    lowkey rest = afterFirst(lab(p, k))
+    lowkey variant = firstWord(rest)
+    lowkey bindsStr = afterFirst(rest)
+    lowkey newVariant = rzResolveNamed(g, p, mod, rz, variant, cap)
+    lowkey label = sp2("arm", newVariant)
+    fr !isEmpty(bindsStr) {
+        label = sp3("arm", newVariant, bindsStr)
+    }
+    lowkey n = mkNode(p, label)
+    addKid(p, n, rzBlockBinds(g, p, mod, rz, kidAt(p, k, 0), splitWs(bindsStr)))
+    bet n
+}
+
+finna rzHolla(g: Mods, p: P, mod: int, rz: Rz, s: int) -> int {
+    lowkey binding = afterFirst(lab(p, s))
+    lowkey n = mkNode(p, sp2("holla", binding))
+    lowkey tagW = findKid(p, s, "tag")
+    lowkey ntagW = mkNode(p, "tag")
+    addKid(p, ntagW, rzExpr(g, p, mod, rz, kidAt(p, tagW, 0)))
+    addKid(p, n, ntagW)
+    lowkey cribW = findKid(p, s, "crib")
+    lowkey ncribW = mkNode(p, "crib")
+    addKid(p, ncribW, rzExpr(g, p, mod, rz, kidAt(p, cribW, 0)))
+    addKid(p, n, ncribW)
+    lowkey liveW = findKid(p, s, "live")
+    lowkey nliveW = mkNode(p, "live")
+    lowkey binds = vec.new[str]()
+    binds.stack(binding)
+    addKid(p, nliveW, rzBlockBinds(g, p, mod, rz, kidAt(p, liveW, 0), binds))
+    addKid(p, n, nliveW)
+    lowkey ghostW = findKid(p, s, "ghosted")
+    lowkey nghostW = mkNode(p, "ghosted")
+    addKid(p, nghostW, rzBlockNoBinds(g, p, mod, rz, kidAt(p, ghostW, 0)))
+    addKid(p, n, nghostW)
+    bet n
+}
+
+finna rzSheesh(g: Mods, p: P, mod: int, rz: Rz, s: int) -> int {
+    lowkey n = mkNode(p, "sheesh")
+    addKid(p, n, rzBlockNoBinds(g, p, mod, rz, kidAt(p, s, 0)))
+    fr kidCount(p, s) > 1 {
+        lowkey rec = kidAt(p, s, 1)
+        lowkey nrec = mkNode(p, lab(p, rec))
+        lowkey binds = vec.new[str]()
+        binds.stack(afterFirst(lab(p, rec)))
+        addKid(p, nrec, rzBlockBinds(g, p, mod, rz, kidAt(p, rec, 0), binds))
+        addKid(p, n, nrec)
+    }
+    bet n
+}
+
+finna rzItem(g: Mods, p: P, mod: int, rz: Rz, it: int) -> int {
+    lowkey h = firstWord(lab(p, it))
+    fr str.slaps(h, "func") {
+        bet rzFunc(g, p, mod, rz, it)
+    }
+    fr str.slaps(h, "drip") {
+        bet rzDrip(g, p, mod, rz, it)
+    }
+    fr str.slaps(h, "moods") {
+        bet rzMoods(g, p, mod, rz, it)
+    }
+    fr str.slaps(h, "const") {
+        lowkey newName = rzOwnMangle(g, mod, declName(lab(p, it)))
+        lowkey n = mkNode(p, sp3("const", declVis(lab(p, it)), newName))
+        rzCopyTypeValues(g, p, mod, rz, it, n, "value")
+        bet n
+    }
+    fr str.slaps(h, "var") {
+        bet rzVarItem(g, p, mod, rz, it)
+    }
+    fr str.slaps(h, "crib") {
+        lowkey newName = rzOwnMangle(g, mod, declName(lab(p, it)))
+        lowkey n = mkNode(p, sp3("crib", declVis(lab(p, it)), newName))
+        fr kidCount(p, it) > 0 {
+            addKid(p, n, rzTy(g, p, mod, rz, kidAt(p, it, 0)))
+        }
+        bet n
+    }
+    fr str.slaps(h, "extern") {
+        bet rzExtern(g, p, mod, rz, it)
+    }
+    bet mkNode(p, lab(p, it))
+}
+
+finna rzFunc(g: Mods, p: P, mod: int, rz: Rz, it: int) -> int {
+    lowkey newName = rzOwnMangle(g, mod, declName(lab(p, it)))
+    lowkey n = mkNode(p, sp3("func", declVis(lab(p, it)), newName))
+    lowkey gw = findKidWord(p, it, "generics")
+    rzSetTypeParams(rz, lab(p, gw))
+    rzPushScope(rz)
+    lowkey rw = findKidWord(p, it, "receiver")
+    fr rw >= 0 {
+        lowkey nrw = mkNode(p, lab(p, rw))
+        addKid(p, nrw, rzTy(g, p, mod, rz, kidAt(p, rw, 0)))
+        addKid(p, n, nrw)
+        rzBind(rz, afterFirst(lab(p, rw)))
+    }
+    addKid(p, n, mkNode(p, lab(p, gw)))
+    lowkey pw = findKid(p, it, "params")
+    lowkey npw = mkNode(p, "params")
+    lowkey np = kidCount(p, pw)
+    lowkey i = 0
+    vibin i < np {
+        lowkey pm = kidAt(p, pw, i)
+        lowkey npm = mkNode(p, lab(p, pm))
+        addKid(p, npm, rzTy(g, p, mod, rz, kidAt(p, pm, 0)))
+        addKid(p, npw, npm)
+        rzBind(rz, afterFirst(lab(p, pm)))
+        i = i + 1
+    }
+    addKid(p, n, npw)
+    addKid(p, n, rzRet(g, p, mod, rz, findKidWord(p, it, "ret")))
+    addKid(p, n, rzBlockNoBinds(g, p, mod, rz, findKid(p, it, "block")))
+    rzPopScope(rz)
+    rzClearTypeParams(rz)
+    bet n
+}
+
+finna rzDrip(g: Mods, p: P, mod: int, rz: Rz, it: int) -> int {
+    lowkey newName = rzOwnMangle(g, mod, declName(lab(p, it)))
+    lowkey n = mkNode(p, sp3("drip", declVis(lab(p, it)), newName))
+    lowkey gw = findKidWord(p, it, "generics")
+    rzSetTypeParams(rz, lab(p, gw))
+    addKid(p, n, mkNode(p, lab(p, gw)))
+    lowkey nk = kidCount(p, it)
+    lowkey i = 0
+    vibin i < nk {
+        lowkey k = kidAt(p, it, i)
+        fr str.slaps(firstWord(lab(p, k)), "field") {
+            lowkey nfld = mkNode(p, lab(p, k))
+            addKid(p, nfld, rzTy(g, p, mod, rz, kidAt(p, k, 0)))
+            addKid(p, n, nfld)
+        }
+        i = i + 1
+    }
+    rzClearTypeParams(rz)
+    bet n
+}
+
+finna rzMoods(g: Mods, p: P, mod: int, rz: Rz, it: int) -> int {
+    lowkey newName = rzOwnMangle(g, mod, declName(lab(p, it)))
+    lowkey n = mkNode(p, sp3("moods", declVis(lab(p, it)), newName))
+    lowkey gw = findKidWord(p, it, "generics")
+    rzSetTypeParams(rz, lab(p, gw))
+    addKid(p, n, mkNode(p, lab(p, gw)))
+    lowkey nk = kidCount(p, it)
+    lowkey i = 0
+    vibin i < nk {
+        lowkey k = kidAt(p, it, i)
+        fr str.slaps(firstWord(lab(p, k)), "variant") {
+            lowkey vnew = rzOwnMangle(g, mod, afterFirst(lab(p, k)))
+            lowkey nv = mkNode(p, sp2("variant", vnew))
+            lowkey np = kidCount(p, k)
+            lowkey j = 0
+            vibin j < np {
+                addKid(p, nv, rzTy(g, p, mod, rz, kidAt(p, k, j)))
+                j = j + 1
+            }
+            addKid(p, n, nv)
+        }
+        i = i + 1
+    }
+    rzClearTypeParams(rz)
+    bet n
+}
+
+finna rzVarItem(g: Mods, p: P, mod: int, rz: Rz, it: int) -> int {
+    lowkey targets = splitWs(declName(lab(p, it)))
+    lowkey sb = sbNew()
+    lowkey nt = targets.gang() as int
+    lowkey i = 0
+    vibin i < nt {
+        fr i > 0 { sb.add(" ") }
+        sb.add(rzOwnMangle(g, mod, targets[i]))
+        i = i + 1
+    }
+    lowkey n = mkNode(p, sp3("var", declVis(lab(p, it)), sb.finish()))
+    rzCopyTypeValues(g, p, mod, rz, it, n, "values")
+    bet n
+}
+
+finna rzExtern(g: Mods, p: P, mod: int, rz: Rz, it: int) -> int {
+    lowkey n = mkNode(p, lab(p, it))
+    lowkey pw = findKid(p, it, "params")
+    lowkey npw = mkNode(p, "params")
+    lowkey np = kidCount(p, pw)
+    lowkey i = 0
+    vibin i < np {
+        lowkey pm = kidAt(p, pw, i)
+        lowkey npm = mkNode(p, lab(p, pm))
+        addKid(p, npm, rzTy(g, p, mod, rz, kidAt(p, pm, 0)))
+        addKid(p, npw, npm)
+        i = i + 1
+    }
+    addKid(p, n, npw)
+    addKid(p, n, rzRet(g, p, mod, rz, findKidWord(p, it, "ret")))
+    bet n
+}
+
+// Concatenate every module's resolved, non-pull items (post-order) into one merged `program` node.
+finna resolveProgram(g: Mods, p: P) -> int {
+    lowkey mergedRoot = mkNode(p, "program")
+    lowkey nm = g.stems.gang() as int
+    lowkey mi = 0
+    vibin mi < nm && modsErrOk(g) {
+        lowkey rz = rzNew()
+        lowkey root = g.roots[mi]
+        lowkey ni = kidCount(p, root)
+        lowkey ii = 0
+        vibin ii < ni && modsErrOk(g) {
+            lowkey it = kidAt(p, root, ii)
+            fr !str.slaps(firstWord(lab(p, it)), "pull") {
+                addKid(p, mergedRoot, rzItem(g, p, mi, rz, it))
+            }
+            ii = ii + 1
+        }
+        mi = mi + 1
+    }
+    bet mergedRoot
+}
+
+// The module-aware `--emit mir` entry: load the import graph from `path`, resolve/mangle, merge,
+// and lower. A single-module program (no file imports) lowers directly — identical to the
+// pre-modules single-file path, so the self-compile fixpoint stays byte-for-byte stable.
+finna emitMirFromPath(path: str) -> str {
+    lowkey nodes = vec.new[Node]()
+    lowkey g = modsNew()
+    loadFile(g, nodes, path, 1)
+    fr !modsErrOk(g) { bet UNSUPPORTED }
+    lowkey p = pFromNodes(nodes)
+    fr (g.stems.gang() as int) == 1 {
+        bet emitMir(p, g.roots[0])
+    }
+    buildTables(g, nodes)
+    fr !modsErrOk(g) { bet UNSUPPORTED }
+    lowkey mergedRoot = resolveProgram(g, p)
+    fr !modsErrOk(g) { bet UNSUPPORTED }
+    bet emitMir(p, mergedRoot)
+}
+
 // ===========================================================================
 // C0 tracer — the fixed `hello` .mir emission (retires at C4/C5 when real lowering lands).
 // ===========================================================================
@@ -7158,11 +8439,14 @@ finna main() {
         lowkey src = fs.peepText(sys.arg(3))
         spill.f("{}", emitAst(lex(src)))
     } naw fr sys.argc() >= 4 && str.slaps(sys.arg(1), "--emit") && str.slaps(sys.arg(2), "mir") {
-        lowkey src = fs.peepText(sys.arg(3))
-        spill.f("{}", emitMirFromSrc(src))
+        // `--emit mir <entry>` is module-aware: it resolves the entry's `pull` imports across files
+        // and lowers the merged, mangled program (single-file entries take the same path, unchanged).
+        spill.f("{}", emitMirFromPath(sys.arg(3)))
     } naw fr sys.argc() >= 4 && str.slaps(sys.arg(1), "--emit") && str.slaps(sys.arg(2), "failfn") {
         lowkey src = fs.peepText(sys.arg(3))
         spill.f("{}", emitFailFromSrc(src))
+    } naw fr sys.argc() >= 4 && str.slaps(sys.arg(1), "--emit") && str.slaps(sys.arg(2), "failpath") {
+        spill.f("{}", emitFailFromPath(sys.arg(3)))
     } naw {
         spill.it(emitHelloMir())
     }
