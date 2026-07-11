@@ -180,19 +180,30 @@ fn wasm(root: &Path) -> Result<()> {
 
     // Compile the cdylib for wasm. The target IS installed, so a failure here is a real bug.
     let built = std::process::Command::new(&cargo)
-        .args(["build", "-p", "playground", "--target", TARGET, "--release"])
+        .args([
+            "build",
+            "-p",
+            "playground",
+            "--target",
+            TARGET,
+            "--profile",
+            "wasm-release",
+        ])
         .current_dir(root)
         .status()
-        .context("running `cargo build -p playground --target wasm32-unknown-unknown --release`")?;
+        .context(
+            "running `cargo build -p playground --target wasm32-unknown-unknown \
+             --profile wasm-release`",
+        )?;
     if !built.success() {
-        bail!("`cargo build -p playground --target {TARGET} --release` failed");
+        bail!("`cargo build -p playground --target {TARGET} --profile wasm-release` failed");
     }
 
     let out_dir = root.join("dist").join("wasm");
     let wasm_in = root
         .join("target")
         .join(TARGET)
-        .join("release")
+        .join("wasm-release")
         .join("playground.wasm");
 
     // Run wasm-bindgen (`--target web`). If the CLI isn't installed, skip cleanly; if it runs but
@@ -220,16 +231,104 @@ fn wasm(root: &Path) -> Result<()> {
         }
     }
 
-    // Optional size pass: shrink the wasm in place if `wasm-opt` (binaryen) is on PATH. Best-effort.
+    // Size pass + precompression + report. The `wasm-opt` (binaryen) and `brotli` steps are
+    // best-effort: a missing tool prints a visible note and is skipped, never failing the build
+    // (same skip-clean philosophy as the target/CLI checks above). `gzip` is ~universal.
     let bg = out_dir.join("playground_bg.wasm");
-    let _ = std::process::Command::new("wasm-opt")
-        .args(["-Oz", "-o"])
-        .arg(&bg)
-        .arg(&bg)
-        .status();
+    let raw = file_size(&bg);
 
+    // `wasm-opt -Oz` in place — visible about whether it actually ran (the previous version
+    // swallowed both "missing" and "failed", so a no-op looked like success). `--all-features`
+    // is required: rustc emits bulk-memory (`memory.copy`) + sign-ext/etc. by default for wasm,
+    // but `strip = true` drops the `target_features` custom section binaryen would auto-detect
+    // from, so wasm-opt must be told to accept them or it fails validation.
+    let opt = match std::process::Command::new("wasm-opt")
+        .args(["-Oz", "--all-features", "-o"])
+        .arg(&bg)
+        .arg(&bg)
+        .status()
+    {
+        Ok(s) if s.success() => file_size(&bg),
+        Ok(_) => {
+            eprintln!("  warning: `wasm-opt` ran but failed — bundle left un-optimized");
+            raw
+        }
+        Err(_) => {
+            println!(
+                "  note: `wasm-opt` (binaryen) not found — bundle NOT size-optimized.\n  \
+                 install it to shrink further:  brew install binaryen  |  \
+                 apt-get install binaryen  |  cargo install wasm-opt"
+            );
+            raw
+        }
+    };
+
+    // Precompressed copies a static host can serve directly (content-negotiated). Both keep the
+    // original .wasm; gzip is near-universal, brotli is best-effort.
+    let gz = if run_compressor("gzip", &["-9", "-k", "-f"], &bg) {
+        file_size(&append_ext(&bg, "gz"))
+    } else {
+        eprintln!("  warning: `gzip` unavailable — skipped .gz");
+        0
+    };
+    let br = if run_compressor("brotli", &["-f", "-q", "11"], &bg) {
+        file_size(&append_ext(&bg, "br"))
+    } else {
+        println!("  note: `brotli` not found — skipped .br  (install: brew install brotli)");
+        0
+    };
+
+    // Size report — makes the win self-evident. Percentages are total reduction vs the raw wasm.
+    let pct = |n: u64| -> String {
+        match (raw.saturating_sub(n) * 100).checked_div(raw) {
+            Some(p) => format!("-{p}%"),
+            None => "n/a".to_string(),
+        }
+    };
     println!("wasm bundle written to {}", out_dir.display());
+    println!("  playground_bg.wasm");
+    println!("    raw (post-bindgen) : {}", fmt_size(raw));
+    if opt != raw {
+        println!("    wasm-opt -Oz       : {}  {}", fmt_size(opt), pct(opt));
+    }
+    if gz != 0 {
+        println!("    + gzip -9          : {}  {}", fmt_size(gz), pct(gz));
+    }
+    if br != 0 {
+        println!("    + brotli -q 11     : {}  {}", fmt_size(br), pct(br));
+    }
     Ok(())
+}
+
+/// Size of a file in bytes, or 0 if it can't be stat'd.
+fn file_size(p: &Path) -> u64 {
+    std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+}
+
+/// `path` + `.ext` (e.g. `foo.wasm` -> `foo.wasm.gz`) — how gzip/brotli name their output.
+fn append_ext(p: &Path, ext: &str) -> PathBuf {
+    let mut s = p.as_os_str().to_os_string();
+    s.push(".");
+    s.push(ext);
+    PathBuf::from(s)
+}
+
+/// Run a compressor (`gzip`/`brotli`) on `file`, output suppressed. Returns whether it succeeded;
+/// a missing binary (spawn error) or non-zero exit both return false so the caller can skip.
+fn run_compressor(cmd: &str, args: &[&str], file: &Path) -> bool {
+    std::process::Command::new(cmd)
+        .args(args)
+        .arg(file)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// "451.2 KiB (462050 B)" — human size + exact bytes for the size report.
+fn fmt_size(bytes: u64) -> String {
+    format!("{:.1} KiB ({} B)", bytes as f64 / 1024.0, bytes)
 }
 
 // ---------------------------------------------------------------------------
