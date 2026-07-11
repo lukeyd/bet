@@ -23,4 +23,7 @@ interp     = ["frontend", "rt-abi", "gg-backend"]
 fmt        = ["frontend"]
 lsp        = ["frontend"]
 driver     = ["frontend", "backend", "interp", "fmt"]
+# playground: the browser WASM shim (wasm-bindgen over parse + run_to_string). Only the two
+# library edges are internal; `wasm-bindgen` is external and not tracked here.
+playground = ["frontend", "interp"]
 xtask      = []

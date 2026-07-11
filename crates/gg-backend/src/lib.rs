@@ -13,8 +13,9 @@
 //!   hangs off a single process-global singleton created lazily on first use.
 //! * **`desktop` feature OFF (default)** — headless no-ops with ZERO heavy dependencies:
 //!   [`present`]/[`audio`] do nothing, [`poll`] always reports [`event_kind::NONE`], and
-//!   [`ticks`] is a monotonic `Instant`. This is what the default `cargo build` compiles, so
-//!   neither `minifb` nor `cpal` is ever pulled in unless a caller explicitly opts in.
+//!   [`ticks`] is a monotonic `Instant` (a plain monotonic counter on `wasm32`, which has no
+//!   std clock). This is what the default `cargo build` compiles, so neither `minifb` nor `cpal`
+//!   is ever pulled in unless a caller explicitly opts in.
 //!
 //! ## Keycode convention
 //!
@@ -199,12 +200,28 @@ pub fn poll() -> Event {
     imp::poll()
 }
 
-/// A monotonic high-resolution timer, in nanoseconds. Real in both builds (`std::time::Instant`).
+/// A monotonic high-resolution timer, in nanoseconds.
+///
+/// Native (desktop + headless): real wall-clock via `std::time::Instant`. On
+/// `wasm32-unknown-unknown` there is no std clock source — `Instant::now` panics — and the browser
+/// playground is text-output only (`interp::run_to_string` runs to completion; no frame loop), so
+/// the wasm build returns a strictly-increasing, non-panicking counter instead. No new dependency.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn ticks() -> u64 {
     use std::sync::OnceLock;
     use std::time::Instant;
     static START: OnceLock<Instant> = OnceLock::new();
     START.get_or_init(Instant::now).elapsed().as_nanos() as u64
+}
+
+/// See [`ticks`]. wasm has no std clock; return a monotonic counter so timing code that computes
+/// deltas gets a sane, ever-increasing value instead of a panic (~1ms per call; `fetch_add` returns
+/// the previous value, so successive reads strictly increase).
+#[cfg(target_arch = "wasm32")]
+pub fn ticks() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NS: AtomicU64 = AtomicU64::new(0);
+    NS.fetch_add(1_000_000, Ordering::Relaxed)
 }
 
 /// The current window `(width, height)` packed as `w << 32 | h` — the size the framebuffer

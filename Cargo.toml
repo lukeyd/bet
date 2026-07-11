@@ -21,6 +21,11 @@ serde          = { version = "1", features = ["derive"] }
 serde_json     = "1"
 toml           = "0.8"
 
+# --- live now (browser playground shim, crates/playground) ---
+# Resolves to the 0.2.126 already in Cargo.lock (pulled transitively by cpal/minifb/instant/
+# plotters), so adopting it as a direct dep adds no new crate versions.
+wasm-bindgen = "0.2"
+
 # --- seeded but not yet wired into any crate's [dependencies] ---
 # (Cargo only locks/builds deps that a member actually references, so listing
 #  them here is a zero-cost catalog that keeps versions consistent when adopted.)
