@@ -839,3 +839,16 @@ size = 8
 # DOOM binary runs headless demo3 with a demo-sync stream bit-identical to the reference-built one.
 # Also added `betfe --emit failall` (gap enumerator). Full corpus now 81/83 (2 by-design), fixpoint held.
 status = "done"
+
+# ─────────────────────── Browser playground: WASM build of the interpreter ───────────────────────
+# Produce a wasm32 build of the interpreter so the docs site (separate betlang-www repo) can host an
+# interactive playground. Adds crates/playground (a wasm-bindgen shim over frontend::parse +
+# interp::run_to_string), cfg-gates the one wasm blocker (gg-backend ticks() Instant), and a
+# `cargo xtask wasm` build command emitting dist/wasm/. Site integration is a follow-up.
+# Plan: ~/.claude/plans/we-need-to-build-foamy-waterfall.md
+
+[[task]]
+slug = "playground-wasm"
+name = "Browser playground WASM: crates/playground (wasm-bindgen shim) + gg-backend ticks() wasm shim + cargo xtask wasm build -> dist/wasm/"
+size = 3
+status = "doing"

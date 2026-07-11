@@ -1,0 +1,22 @@
+[package]
+name = "playground"
+description = "wasm-bindgen shim exposing the bet interpreter to the browser (wasm32, --target web)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# A browser-loadable cdylib. `wasm-bindgen --target web` post-processes it into a plain ES module
+# loadable with a bare dynamic import() — no bundler/Vite plugin (see `cargo xtask wasm`). On host
+# targets this builds a normal (unused) dynamic lib, which is why `cargo build --workspace` stays
+# green: `#[wasm_bindgen]` compiles off-wasm (the same mechanism that lets crates `cargo test`).
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+frontend     = { path = "../frontend" }
+interp       = { path = "../interp" }
+wasm-bindgen = { workspace = true }
+
+[lints]
+workspace = true

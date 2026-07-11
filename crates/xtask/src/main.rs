@@ -9,6 +9,7 @@
 //!   corpus              execute each program via `bet run` and diff stdout vs .expected
 //!   corpus --compiled   compiled differential column: `bet build` + run each program and
 //!                       assert its stdout == .expected == the interpreter's stdout
+//!   wasm                build the browser playground bundle (dist/wasm/) via wasm-bindgen
 //!   dist                stub (lands with release work)
 //!   bake-frozen-bubble  bake a local Frozen Bubble (GPL-2) share/ checkout into a packed
 //!                       assets.dat + a generated assets_gen.bet index
@@ -67,6 +68,8 @@ usage: cargo xtask <command>
   doom-oracle --setup | --run --demo NAME
                               clone+patch doomgeneric (headless dump platform) / produce a
                               demo sync stream (ports/doom/goldens/<name>.oracle.sync)
+  wasm                        build the browser playground -> dist/wasm/ (needs the wasm32
+                              target + the wasm-bindgen CLI; skipped cleanly without them)
   dist                        (stub — release packaging)";
 
 fn main() -> ExitCode {
@@ -102,6 +105,7 @@ fn main() -> ExitCode {
             );
             return ExitCode::FAILURE;
         }
+        "wasm" => wasm(&workspace_root()),
         "dist" => stub_cmd("dist", "release-artifact packaging for the 6 targets"),
         "" => {
             eprintln!("{USAGE}");
@@ -133,6 +137,98 @@ fn workspace_root() -> PathBuf {
 
 fn stub_cmd(name: &str, what: &str) -> Result<()> {
     println!("xtask {name}: not implemented yet — lands with {what}.");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// wasm — browser playground bundle
+
+/// `cargo xtask wasm` — build the browser playground bundle into `dist/wasm/`.
+///
+/// Mirrors the `corpus --compiled` shell-out idiom: `cargo` and `wasm-bindgen` are invoked as
+/// subprocesses (so xtask keeps `xtask = []` — no workspace dep on `playground`) and the command
+/// SKIPS gracefully (clear note + zero exit) when the `wasm32-unknown-unknown` target or the
+/// `wasm-bindgen` CLI is absent — exactly like the LLVM-missing compiled column. Not part of CI.
+///
+/// Output: `dist/wasm/{playground.js, playground_bg.wasm, *.d.ts}` — a `--target web` ES module
+/// loadable with a bare dynamic `import()` (no bundler). `/dist` is gitignored; hand-copy the
+/// bundle into the docs site's `public/wasm/`.
+fn wasm(root: &Path) -> Result<()> {
+    const TARGET: &str = "wasm32-unknown-unknown";
+    // Keep this in step with the `wasm-bindgen` crate pinned in Cargo.lock: the CLI and the crate
+    // must be the same version or `wasm-bindgen` errors out.
+    const BINDGEN_VERSION: &str = "0.2.126";
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+
+    // Skip cleanly if the wasm target isn't installed (or `rustup` isn't on PATH).
+    let have_target = std::process::Command::new("rustup")
+        .args(["target", "list", "--installed"])
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(|l| l.trim() == TARGET)
+        })
+        .unwrap_or(false);
+    if !have_target {
+        println!(
+            "wasm build skipped: the `{TARGET}` target is not installed.\n  \
+             enable it with:  rustup target add {TARGET}"
+        );
+        return Ok(());
+    }
+
+    // Compile the cdylib for wasm. The target IS installed, so a failure here is a real bug.
+    let built = std::process::Command::new(&cargo)
+        .args(["build", "-p", "playground", "--target", TARGET, "--release"])
+        .current_dir(root)
+        .status()
+        .context("running `cargo build -p playground --target wasm32-unknown-unknown --release`")?;
+    if !built.success() {
+        bail!("`cargo build -p playground --target {TARGET} --release` failed");
+    }
+
+    let out_dir = root.join("dist").join("wasm");
+    let wasm_in = root
+        .join("target")
+        .join(TARGET)
+        .join("release")
+        .join("playground.wasm");
+
+    // Run wasm-bindgen (`--target web`). If the CLI isn't installed, skip cleanly; if it runs but
+    // fails, that's a hard error (almost always a CLI/crate version mismatch).
+    let bindgen = std::process::Command::new("wasm-bindgen")
+        .args(["--target", "web", "--out-name", "playground", "--out-dir"])
+        .arg(&out_dir)
+        .arg(&wasm_in)
+        .current_dir(root)
+        .status();
+    match bindgen {
+        Ok(s) if s.success() => {}
+        Ok(_) => bail!(
+            "`wasm-bindgen` failed — the CLI version must match the `wasm-bindgen` crate in \
+             Cargo.lock ({BINDGEN_VERSION}). Reinstall: \
+             cargo install wasm-bindgen-cli --version {BINDGEN_VERSION}"
+        ),
+        Err(_) => {
+            println!(
+                "wasm build skipped at the bindgen step: the `wasm-bindgen` CLI was not found.\n  \
+                 install it (version MUST match Cargo.lock):  \
+                 cargo install wasm-bindgen-cli --version {BINDGEN_VERSION}"
+            );
+            return Ok(());
+        }
+    }
+
+    // Optional size pass: shrink the wasm in place if `wasm-opt` (binaryen) is on PATH. Best-effort.
+    let bg = out_dir.join("playground_bg.wasm");
+    let _ = std::process::Command::new("wasm-opt")
+        .args(["-Oz", "-o"])
+        .arg(&bg)
+        .arg(&bg)
+        .status();
+
+    println!("wasm bundle written to {}", out_dir.display());
     Ok(())
 }
 
