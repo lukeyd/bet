@@ -851,4 +851,15 @@ status = "done"
 slug = "playground-wasm"
 name = "Browser playground WASM: crates/playground (wasm-bindgen shim) + gg-backend ticks() wasm shim + cargo xtask wasm build -> dist/wasm/"
 size = 3
+# DONE (issue #80 / PR #81). crates/playground exposes run_bet(src)->Result<String,JsError> over
+# frontend::parse + interp::run_to_string; gg-backend ticks() cfg-gated (native Instant / wasm
+# AtomicU64 counter); `cargo xtask wasm` emits dist/wasm/ via wasm-bindgen --target web, skipping
+# cleanly without the target/CLI. wasm-bindgen 0.2.126 was already in Cargo.lock (0 new crates).
+# Verified host-green + a Node ESM smoke test. Site integration in betlang-www is a follow-up.
+status = "done"
+
+[[task]]
+slug = "playground-wasm-optimize"
+name = "Optimize the playground WASM bundle: dedicated [profile.wasm-release] (opt-level z/lto/panic=abort/strip) + real wasm-opt reporting + gzip/brotli precompression + size report in `cargo xtask wasm`"
+size = 2
 status = "doing"

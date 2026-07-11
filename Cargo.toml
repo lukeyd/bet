@@ -52,3 +52,16 @@ unsafe_code = "warn"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# Size-optimized profile for the browser playground wasm (`cargo xtask wasm` builds
+# `-p playground --profile wasm-release`). DEDICATED on purpose: it is inert unless explicitly
+# selected, so the undefined `[profile.release]` that native `cargo build --release` / the
+# release-npm.yml `bet` binary rely on stays at cargo's defaults. `panic = "abort"` applies only
+# here — `run_bet` still returns `Result` for handled compile/runtime errors.
+[profile.wasm-release]
+inherits      = "release"
+opt-level     = "z"      # optimize for size
+lto           = true     # cross-crate inlining + dead-code elimination (drops the unused frontend::lower path)
+codegen-units = 1        # maximal optimization
+panic         = "abort"  # remove unwinding / landing-pad machinery (large wasm win)
+strip         = true     # drop symbols + debug info
