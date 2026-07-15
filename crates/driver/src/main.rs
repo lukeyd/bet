@@ -14,7 +14,7 @@ const USAGE: &str = "\
 bet — the bet compiler driver
 
 USAGE:
-    bet build [--release] <input.bet|input.mir> [-o <output>]
+    bet build [--release] [--overflow-checks on|off] <input.bet|input.mir> [-o <output>]
     bet build [--release] --emit asm <input.bet> [-o <output.s>]
     bet build --emit <tokens|ast|mir> <input.bet>
     bet run   <input.bet>
@@ -25,6 +25,11 @@ Requires a codegen-enabled build (`--features llvm`); without it, `build` report
 generator is present. `--release` (alias `-O2`) runs the LLVM `default<O2>` optimization pipeline
 — inlining, SROA, and the loop/SLP vectorizers — so abstractions become zero-cost and `soa` loops
 auto-vectorize; the default is unoptimized `-O0` (fastest to build).
+
+Signed `+`/`-`/`*` trap on overflow at `-O0` and wrap under `--release` (Rust's debug/release
+split); `--overflow-checks on|off` pins it regardless of opt level — e.g. `--overflow-checks off`
+for a fast `-O0` build that still wraps like C (needed by faithful ports whose fixed-point math
+relies on 2's-complement wraparound). Div-by-zero / `INT_MIN / -1` / shift guards stay on always.
 
 `build --emit asm` writes the target assembly (`.s`) instead of linking — honoring `--release`, so
 `--release --emit asm` shows the optimized (vectorized) code. `build --emit <tokens|ast|mir>`
@@ -124,6 +129,9 @@ fn build(args: &[String]) -> Result<(), String> {
     let mut runtime = link::Runtime::Stub;
     let mut emit: Option<String> = None;
     let mut opt = backend::OptLevel::O0;
+    // `None` = derive from `opt` (Rust rule: trap at -O0, wrap at --release); `--overflow-checks`
+    // pins it explicitly.
+    let mut overflow_checks: Option<bool> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -146,6 +154,14 @@ fn build(args: &[String]) -> Result<(), String> {
             }
             "--release" | "-O2" => opt = backend::OptLevel::O2,
             "-O0" => opt = backend::OptLevel::O0,
+            "--overflow-checks" => {
+                i += 1;
+                overflow_checks = match args.get(i).map(String::as_str) {
+                    Some("on") => Some(true),
+                    Some("off") => Some(false),
+                    _ => return Err("`--overflow-checks` needs `on` or `off`".into()),
+                };
+            }
             flag if flag.starts_with('-') => return Err(format!("unknown flag `{flag}`")),
             path => {
                 if input.is_some() {
@@ -157,6 +173,8 @@ fn build(args: &[String]) -> Result<(), String> {
         i += 1;
     }
     let input = input.ok_or("`bet build` needs an input file")?;
+    // Rust's rule: overflow traps at -O0 (catch bugs), wraps under --release (match hardware/C).
+    let overflow_checks = overflow_checks.unwrap_or(opt == backend::OptLevel::O0);
 
     // `--emit=<kind>` short-circuits the native link. `tokens`/`ast`/`mir` print a canonical
     // textual dump of a frontend intermediate (for differential-testing the self-hosted frontend)
@@ -169,6 +187,7 @@ fn build(args: &[String]) -> Result<(), String> {
             let opts = backend::EmitOptions {
                 entry: Some("main".into()),
                 opt,
+                overflow_checks,
                 emit: backend::EmitKind::Assembly,
                 ..Default::default()
             };
@@ -185,6 +204,7 @@ fn build(args: &[String]) -> Result<(), String> {
     let opts = backend::EmitOptions {
         entry: Some("main".into()),
         opt,
+        overflow_checks,
         ..Default::default()
     };
     let object = compile_object(&input, &opts)?;

@@ -5,9 +5,9 @@
 //! slice of what `midir` actually defines:
 //!
 //! * **Arithmetic / bitwise / comparison** [`Rvalue::BinOp`]s over integers and floats,
-//!   plus [`Rvalue::UnOp`] (`neg`/`not`/`bitnot`). Overflow [`ArithMode`] is currently
-//!   lowered as plain wrapping arithmetic (release semantics); trap-on-overflow
-//!   instrumentation is deferred.
+//!   plus [`Rvalue::UnOp`] (`neg`/`not`/`bitnot`). Signed `+`/`-`/`*` in [`ArithMode::Trap`]
+//!   trap on overflow at `-O0` and wrap under `--release`, mirroring Rust's debug/release
+//!   split (gated by [`EmitOptions::overflow_checks`]); `Wrap`/`Na` always wrap.
 //! * **Casts** ([`Rvalue::Cast`]): int zext/sext/trunc, int<->float, float resize, bitcast.
 //! * **Aggregates via places**: `struct` (`drip`) values, with `Field`/`Deref` place
 //!   projections for both reads and writes (GEP + load/store).
@@ -161,6 +161,7 @@ pub fn compile(module: &Module, opts: &EmitOptions) -> Result<Vec<u8>, BackendEr
         m: module,
         llm,
         builder,
+        overflow_checks: opts.overflow_checks,
         td,
         tm,
         funcs: Vec::new(),
@@ -182,6 +183,10 @@ struct Cg<'c> {
     m: &'c Module,
     llm: LlvmModule<'c>,
     builder: Builder<'c>,
+    /// Whether `ArithMode::Trap` (signed `+`/`-`/`*`) actually traps on overflow. `true` at
+    /// `-O0` (debug), `false` under `--release` — see [`EmitOptions::overflow_checks`]. When
+    /// `false`, `Trap` ops lower as plain wrapping arithmetic, exactly like `Wrap`.
+    overflow_checks: bool,
     /// The target data layout — the source of truth for type sizes/alignments.
     td: TargetData,
     /// The target machine, used to emit the final object.
@@ -1449,11 +1454,14 @@ impl<'c> Cg<'c> {
         mode: ArithMode,
     ) -> Result<BasicValueEnum<'c>, BackendError> {
         let b = &self.builder;
-        // `Trap` arith mode (signed arithmetic) traps on overflow via the checked intrinsics;
-        // `Wrap`/`Na` stay plain wrapping arithmetic. Div/rem always guard the zero-divisor
-        // (and signed `INT_MIN / -1`) UB, and shifts always mask the amount — the safety guards
-        // are unconditional, matching the interpreter (issues #32, #36).
-        let trap = mode == ArithMode::Trap;
+        // `Trap` arith mode (signed arithmetic) traps on overflow via the checked intrinsics —
+        // but only when `overflow_checks` is on (`-O0`); under `--release` it wraps, matching
+        // Rust's debug/release split (see `EmitOptions::overflow_checks`). `Wrap`/`Na` always
+        // stay plain wrapping arithmetic. Div/rem always guard the zero-divisor (and signed
+        // `INT_MIN / -1`) UB, and shifts always mask the amount — those safety guards are
+        // unconditional (they prevent UB/hardware traps, not wrap), matching the interpreter
+        // and Rust release (issues #32, #36).
+        let trap = mode == ArithMode::Trap && self.overflow_checks;
         let v: BasicValueEnum = match op {
             BinOp::Add if trap => {
                 let name = if signed {

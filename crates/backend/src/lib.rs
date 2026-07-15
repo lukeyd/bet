@@ -24,6 +24,13 @@ pub struct EmitOptions {
     pub entry: Option<String>,
     /// Optimization level.
     pub opt: OptLevel,
+    /// Whether signed `+`/`-`/`*` trap on overflow (`ArithMode::Trap`). Mirrors Rust: `true`
+    /// at `-O0` (debug — catch overflow bugs), `false` under `--release` (wrap, matching the
+    /// hardware and C `int` semantics that faithful ports like DOOM's fixed-point math rely on).
+    /// The driver resolves the default from [`OptLevel`] and lets `--overflow-checks on|off`
+    /// override it. Div-by-zero / `INT_MIN / -1` / shift-amount guards stay unconditional (they
+    /// prevent UB, not wrap) — same as Rust.
+    pub overflow_checks: bool,
     /// What kind of artifact to emit — native object code (the default) or textual assembly.
     pub emit: EmitKind,
 }
@@ -34,6 +41,8 @@ impl Default for EmitOptions {
             target: None,
             entry: None,
             opt: OptLevel::O0,
+            // Default is the `-O0` (debug) behavior: trap on signed overflow.
+            overflow_checks: true,
             emit: EmitKind::Object,
         }
     }
