@@ -349,6 +349,16 @@ impl BumpCrib {
         self.offset = 0;
     }
 
+    /// Bytes handed out since the last [`reset`](Self::reset) — a usage gauge for
+    /// `mem.receipts()`. Full chunks before the active one contribute their whole capacity
+    /// (advancing past a chunk means it couldn't fit the next request); the active chunk
+    /// contributes its live bump offset. Zero right after a reset, so a per-frame arena that
+    /// resets each frame reads back to zero every frame.
+    fn used(&self) -> usize {
+        let prior: usize = self.chunks[..self.current].iter().map(|c| c.cap).sum();
+        prior + self.offset
+    }
+
     /// Free every chunk's backing memory.
     fn destroy(&mut self) {
         for c in self.chunks.drain(..) {
@@ -518,6 +528,21 @@ pub unsafe extern "C" fn bet_scratch_reset() {
             unsafe { bet_evict(h) };
         }
     });
+}
+
+/// `mem.receipts()` — bytes currently allocated in this thread's scratch arena (0 if scratch
+/// was never touched, or was just reset). A cheap allocation gauge that makes the per-frame
+/// bump arena observable: it climbs as a frame allocates and returns to 0 after the frame-end
+/// reset, so the arena's cycle is measurable without any heap bookkeeping.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_mem_receipts() -> usize {
+    SCRATCH.with(|s| match *s.borrow() {
+        Some(h) => match &unsafe { crib_ref(h) }.kind {
+            CribKind::Bump(b) => b.used(),
+            CribKind::Typed(_) => 0,
+        },
+        None => 0,
+    })
 }
 
 // ---------------------------------------------------------------------------

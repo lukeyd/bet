@@ -4862,6 +4862,23 @@ impl LowerCtx {
                     .assign(Place::local(tmp), Rvalue::Call(Callee::Extern(ext), vec![]));
                 Ok((Operand::Copy(Place::local(tmp)), crib_ty))
             }
+            // `mem.receipts()` — bytes currently live in this thread's per-frame scratch arena.
+            // Climbs as a frame allocates into `mem.scratch()` and drops back to 0 after the
+            // frame-end reset (see `gg.flush`), so a game loop can watch the arena cycle. Returns
+            // an `int`.
+            ("mem", "receipts") => {
+                if !args.is_empty() {
+                    return Err("`mem.receipts` takes no arguments".into());
+                }
+                let usize_t = self.m.t_int(IntWidth::W64, false);
+                let i64t = self.m.t_i64();
+                let ext = self.get_extern("bet_mem_receipts", vec![], vec![usize_t]);
+                let tmp = self.new_local(usize_t);
+                self.fb()
+                    .assign(Place::local(tmp), Rvalue::Call(Callee::Extern(ext), vec![]));
+                let v = self.coerce_int(Operand::Copy(Place::local(tmp)), usize_t, i64t);
+                Ok((v, i64t))
+            }
             // `gg.blit(pixels, w, h)` — present a framebuffer. Build a `FrameBuffer` in a stack
             // slot (`pixels` = the array's base pointer, `stride` = `width`) and hand its address
             // to `bet_gg_present`. Used as a void statement.
@@ -5131,13 +5148,20 @@ impl LowerCtx {
                 self.emit_extern_call(ext, &[], vec![x, y, w, h, c])
             }
             // `gg.flush()` — present the composited canvas and pump input. Void statement.
+            // The present *is* the frame boundary, so it also reclaims this thread's per-frame
+            // scratch arena (`mem.scratch()`): allocations made during the frame are auto-evicted
+            // in O(1) here, exactly as the spec's per-frame-arena contract promises. A no-op if
+            // scratch was never touched (the reset short-circuits on an uninitialized scratch).
             ("gg", "flush") => {
                 if !args.is_empty() {
                     return Err("`gg.flush` takes no arguments".into());
                 }
-                let ext = self.get_extern("bet_gg_flush", vec![], vec![]);
-                self.emit_extern_call(ext, &[], vec![])
+                let flush = self.get_extern("bet_gg_flush", vec![], vec![]);
+                self.emit_extern_call(flush, &[], vec![])?;
+                let reset = self.get_extern("bet_scratch_reset", vec![], vec![]);
+                self.emit_extern_call(reset, &[], vec![])
             }
+            // `gg.receipts` lives under `mem`; see the `("mem", "receipts")` arm below.
             // `gg.sound(buf, byteOff, byteLen, channels, rate) -> int` — register a PCM sound from a
             // byte view of `buf`; returns its 1-based id.
             ("gg", "sound") => {

@@ -142,6 +142,41 @@ fn bump_crib_and_scratch() {
     }
 }
 
+/// `mem.receipts()` is the per-frame arena's usage gauge: it climbs as scratch is allocated into
+/// and returns to zero after `bet_scratch_reset` — the frame-arena cycle the `fireworks` port
+/// demonstrates (fill each frame, reclaim in O(1) at the frame boundary, never grow).
+#[test]
+fn mem_receipts_tracks_scratch_and_resets() {
+    unsafe {
+        // Untouched scratch reads zero (no arena yet).
+        assert_eq!(bet_mem_receipts(), 0, "receipts start at zero");
+
+        let s = bet_scratch();
+        assert_eq!(
+            bet_mem_receipts(),
+            0,
+            "a fresh scratch has nothing allocated"
+        );
+
+        // Allocating into scratch climbs the gauge...
+        let _a = bet_bump_alloc(s, 64, 8);
+        let after_first = bet_mem_receipts();
+        assert!(
+            after_first >= 64,
+            "receipts reflect the bytes handed out ({after_first})"
+        );
+        let _b = bet_bump_alloc(s, 128, 8);
+        assert!(
+            bet_mem_receipts() >= after_first + 128,
+            "receipts keep climbing as the frame allocates"
+        );
+
+        // ...and the frame-end reset returns it to zero (the per-frame cycle).
+        bet_scratch_reset();
+        assert_eq!(bet_mem_receipts(), 0, "reset reclaims the whole arena");
+    }
+}
+
 #[test]
 fn alloc_realloc_free() {
     unsafe {
