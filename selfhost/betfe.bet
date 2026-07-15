@@ -2587,7 +2587,7 @@ finna mapScalar(nm: str) -> str {
     fr str.slaps(nm, "uint") { bet "u64" }
     fr str.slaps(nm, "float") { bet "f64" }
     fr isIntTy(nm) || isFloatTy(nm) { bet nm }
-    fr str.slaps(nm, "bool") || str.slaps(nm, "str") || str.slaps(nm, "rawptr") { bet nm }
+    fr str.slaps(nm, "bool") || str.slaps(nm, "str") || str.slaps(nm, "rawptr") || str.slaps(nm, "rng") { bet nm }
     fr str.slaps(nm, "void") || str.slaps(nm, "nada") { bet "void" }
     bet ""
 }
@@ -4345,7 +4345,17 @@ finna lowerIntrinsic(c: LowerCtx, p: P, module: str, method: str, methodIdx: int
         lowkey so, st = lowerMemSlab(c, p, methodIdx)
         bet so, st
     }
-    // --- gg platform module (graphics/audio/input): the 12 intrinsics the DOOM port needs ---
+    // `mem.receipts()` -> int — bytes live in this thread's per-frame scratch arena (mirror
+    // lower.rs mem.receipts); climbs as a frame allocates, 0 after the frame-end reset.
+    fr str.slaps(module, "mem") && str.slaps(method, "receipts") {
+        getExtern(c, "extern \"C\" fn bet_mem_receipts() -> u64")
+        lowkey rcArgs = vec.new[str]()
+        lowkey raw = emitExternCall(c, "u64", "bet_mem_receipts", rcArgs)
+        lowkey v = coerceInt(c, reg(raw), "u64", "i64")
+        bet v, "i64"
+    }
+    // --- gg platform module (graphics/audio/input): the DOOM framebuffer intrinsics plus the
+    //     sprite-compositor set (frame/sprite/spriteSub/rect/tex/flush) the Frozen Bubble port needs ---
     // `gg.ticks()` -> int — monotonic nanosecond timer, presented as int (mirror lower.rs gg.ticks).
     fr str.slaps(module, "gg") && str.slaps(method, "ticks") {
         getExtern(c, "extern \"C\" fn bet_gg_ticks() -> u64")
@@ -4546,6 +4556,119 @@ finna lowerIntrinsic(c: LowerCtx, p: P, module: str, method: str, methodIdx: int
         lowkey id = emitExternCall(c, "u32", "bet_gg_sound", sndArgs)
         lowkey out = coerceInt(c, reg(id), "u32", "i64")
         bet out, "i64"
+    }
+    // `gg.frame(w, h, color)` — begin a frame: (re)size the canvas and clear to `color`. Void.
+    fr str.slaps(module, "gg") && str.slaps(method, "frame") {
+        lowkey w0, wt0 = lowerExpr(c, p, argValue(p, argsW, 0), "u32")
+        lowkey wc = coerceInt(c, w0, wt0, "u32")
+        lowkey h0, ht0 = lowerExpr(c, p, argValue(p, argsW, 1), "u32")
+        lowkey hc = coerceInt(c, h0, ht0, "u32")
+        lowkey col0, colt0 = lowerExpr(c, p, argValue(p, argsW, 2), "u32")
+        lowkey colc = coerceInt(c, col0, colt0, "u32")
+        getExtern(c, "extern \"C\" fn bet_gg_frame(u32, u32, u32) -> void")
+        lowkey frArgs = vec.new[str]()
+        frArgs.stack(wc)
+        frArgs.stack(hc)
+        frArgs.stack(colc)
+        lowkey r = emitExternCall(c, "void", "bet_gg_frame", frArgs)
+        bet reg(r), "void"
+    }
+    // `gg.sprite(tex, x, y)` — src-over blit of texture `tex` at `(x, y)`. Void.
+    fr str.slaps(module, "gg") && str.slaps(method, "sprite") {
+        lowkey t0, tt0 = lowerExpr(c, p, argValue(p, argsW, 0), "u32")
+        lowkey tc = coerceInt(c, t0, tt0, "u32")
+        lowkey x0, xt0 = lowerExpr(c, p, argValue(p, argsW, 1), "i32")
+        lowkey xc = coerceInt(c, x0, xt0, "i32")
+        lowkey y0, yt0 = lowerExpr(c, p, argValue(p, argsW, 2), "i32")
+        lowkey yc = coerceInt(c, y0, yt0, "i32")
+        getExtern(c, "extern \"C\" fn bet_gg_sprite(u32, i32, i32) -> void")
+        lowkey spArgs = vec.new[str]()
+        spArgs.stack(tc)
+        spArgs.stack(xc)
+        spArgs.stack(yc)
+        lowkey r = emitExternCall(c, "void", "bet_gg_sprite", spArgs)
+        bet reg(r), "void"
+    }
+    // `gg.spriteSub(tex, sx, sy, sw, sh, dx, dy)` — src-over blit of a source sub-rectangle. Void.
+    fr str.slaps(module, "gg") && str.slaps(method, "spriteSub") {
+        lowkey t0, tt0 = lowerExpr(c, p, argValue(p, argsW, 0), "u32")
+        lowkey tc = coerceInt(c, t0, tt0, "u32")
+        lowkey sx0, sxt0 = lowerExpr(c, p, argValue(p, argsW, 1), "i32")
+        lowkey sxc = coerceInt(c, sx0, sxt0, "i32")
+        lowkey sy0, syt0 = lowerExpr(c, p, argValue(p, argsW, 2), "i32")
+        lowkey syc = coerceInt(c, sy0, syt0, "i32")
+        lowkey sw0, swt0 = lowerExpr(c, p, argValue(p, argsW, 3), "u32")
+        lowkey swc = coerceInt(c, sw0, swt0, "u32")
+        lowkey sh0, sht0 = lowerExpr(c, p, argValue(p, argsW, 4), "u32")
+        lowkey shc = coerceInt(c, sh0, sht0, "u32")
+        lowkey dx0, dxt0 = lowerExpr(c, p, argValue(p, argsW, 5), "i32")
+        lowkey dxc = coerceInt(c, dx0, dxt0, "i32")
+        lowkey dy0, dyt0 = lowerExpr(c, p, argValue(p, argsW, 6), "i32")
+        lowkey dyc = coerceInt(c, dy0, dyt0, "i32")
+        getExtern(c, "extern \"C\" fn bet_gg_sprite_sub(u32, i32, i32, u32, u32, i32, i32) -> void")
+        lowkey ssArgs = vec.new[str]()
+        ssArgs.stack(tc)
+        ssArgs.stack(sxc)
+        ssArgs.stack(syc)
+        ssArgs.stack(swc)
+        ssArgs.stack(shc)
+        ssArgs.stack(dxc)
+        ssArgs.stack(dyc)
+        lowkey r = emitExternCall(c, "void", "bet_gg_sprite_sub", ssArgs)
+        bet reg(r), "void"
+    }
+    // `gg.rect(x, y, w, h, color)` — src-over fill with `color` (`0xAARRGGBB`). Void.
+    fr str.slaps(module, "gg") && str.slaps(method, "rect") {
+        lowkey x0, xt0 = lowerExpr(c, p, argValue(p, argsW, 0), "i32")
+        lowkey xc = coerceInt(c, x0, xt0, "i32")
+        lowkey y0, yt0 = lowerExpr(c, p, argValue(p, argsW, 1), "i32")
+        lowkey yc = coerceInt(c, y0, yt0, "i32")
+        lowkey w0, wt0 = lowerExpr(c, p, argValue(p, argsW, 2), "u32")
+        lowkey wc = coerceInt(c, w0, wt0, "u32")
+        lowkey h0, ht0 = lowerExpr(c, p, argValue(p, argsW, 3), "u32")
+        lowkey hc = coerceInt(c, h0, ht0, "u32")
+        lowkey col0, colt0 = lowerExpr(c, p, argValue(p, argsW, 4), "u32")
+        lowkey colc = coerceInt(c, col0, colt0, "u32")
+        getExtern(c, "extern \"C\" fn bet_gg_rect(i32, i32, u32, u32, u32) -> void")
+        lowkey rtArgs = vec.new[str]()
+        rtArgs.stack(xc)
+        rtArgs.stack(yc)
+        rtArgs.stack(wc)
+        rtArgs.stack(hc)
+        rtArgs.stack(colc)
+        lowkey r = emitExternCall(c, "void", "bet_gg_rect", rtArgs)
+        bet reg(r), "void"
+    }
+    // `gg.tex(buf, byteOff, w, h)` -> int — upload a `w * h` texture from a byte view of `buf`;
+    // returns its 1-based id (mirror lower.rs gg.tex; the byte pointer via ggBufferBytePtr).
+    fr str.slaps(module, "gg") && str.slaps(method, "tex") {
+        lowkey ptr = ggBufferBytePtr(c, p, argValue(p, argsW, 0), argValue(p, argsW, 1))
+        fr !lcOk(c) {
+            bet "0i64", "i64"
+        }
+        lowkey w0, wt0 = lowerExpr(c, p, argValue(p, argsW, 2), "u32")
+        lowkey wc = coerceInt(c, w0, wt0, "u32")
+        lowkey h0, ht0 = lowerExpr(c, p, argValue(p, argsW, 3), "u32")
+        lowkey hc = coerceInt(c, h0, ht0, "u32")
+        getExtern(c, "extern \"C\" fn bet_gg_tex(rawptr, u32, u32) -> u32")
+        lowkey txArgs = vec.new[str]()
+        txArgs.stack(ptr)
+        txArgs.stack(wc)
+        txArgs.stack(hc)
+        lowkey id = emitExternCall(c, "u32", "bet_gg_tex", txArgs)
+        lowkey out = coerceInt(c, reg(id), "u32", "i64")
+        bet out, "i64"
+    }
+    // `gg.flush()` — present the composited canvas; the present is the frame boundary, so it also
+    // resets the per-frame scratch arena (mirror lower.rs gg.flush: bet_gg_flush then bet_scratch_reset).
+    fr str.slaps(module, "gg") && str.slaps(method, "flush") {
+        getExtern(c, "extern \"C\" fn bet_gg_flush() -> void")
+        lowkey flArgs = vec.new[str]()
+        lowkey flushR = emitExternCall(c, "void", "bet_gg_flush", flArgs)
+        getExtern(c, "extern \"C\" fn bet_scratch_reset() -> void")
+        lowkey rsArgs = vec.new[str]()
+        lowkey r = emitExternCall(c, "void", "bet_scratch_reset", rsArgs)
+        bet reg(r), "void"
     }
     lcFail(c)
     bet "0i64", "i64"
