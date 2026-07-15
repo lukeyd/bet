@@ -1375,6 +1375,13 @@ impl<'p> Interp<'p> {
                         let id = self.new_arena(false);
                         return Ok(vec![Value::Crib(id)]);
                     }
+                    // `mem.receipts()` — scratch-usage gauge. The tree-walker stores arena values
+                    // as reference-counted Rust objects, not a byte-addressed bump region, so it
+                    // has no meaningful offset to report and returns 0. The gauge is exercised on
+                    // the native `runtime`, where scratch is a real bump arena.
+                    "mem" if method == "receipts" => {
+                        return Ok(vec![Value::Int(0)]);
+                    }
                     // `mem.slab[T](n)` — a zero-initialized buffer of `n` elements. Scalars
                     // erase to `Value::Int(0)` (matching `bet_alloc_zeroed`); a `drip` element
                     // (the `soa []Drip` case) zeroes each field, so `slab[i].field` reads a real

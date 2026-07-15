@@ -1,0 +1,117 @@
+// fireworks.bet — the first bet port to exercise the per-frame scratch arena end to end.
+//
+// Every frame a handful of overlapping firework bursts are BLOOMED into `mem.scratch()`: each
+// burst expands into a *variable* number of Spark structs copped into the frame arena, drawn
+// with `gg.rect`, then the whole cloud is reclaimed in O(1) by `gg.flush()` — which now resets
+// scratch at the frame boundary (the spec's "auto-evicted at frame end", finally wired). No
+// per-spark bookkeeping, no fixed MAXSPARKS ceiling, no GC: allocate freely, reclaim for free.
+//
+// `mem.receipts()` reports the live scratch bytes, so the printed trace shows the arena filling
+// each frame (a number that varies with the spark count) and dropping back to 0 after flush —
+// the frame-arena cycle, measured, not just asserted.
+//
+// Build + run:
+//   ports/fireworks/run.sh                 # windowed — watch the fireworks
+//   BET_GG_HEADLESS=1 /tmp/fireworks       # headless — prints the scratch trace, self-terminates
+pull "spill"
+pull "gg"
+pull "mem"
+
+flex facts W: int = 640
+flex facts H: int = 480
+flex facts PERIOD: int = 16      // a new burst launches every PERIOD frames
+flex facts NBURSTS: int = 6      // blend up to this many overlapping recent bursts
+flex facts MAXAGE: int = 64      // a burst's sparks fade out over this many frames
+flex facts MAXFRAMES: int = 300  // self-terminate cap (also a headless safety bound)
+
+drip Spark {
+    flex x: int
+    flex y: int
+    flex color: u32
+}
+
+// Deterministic burst center from its launch epoch (no RNG intrinsic needed; the arithmetic
+// stays well inside i64 for the small epochs this demo reaches, so no overflow trap).
+finna burstX(epoch: int) -> int {
+    lowkey m = epoch * 97
+    bet 70 + (m - (m / 500) * 500)       // (epoch*97) mod 500, shifted into 70..570
+}
+finna burstY(epoch: int) -> int {
+    lowkey m = epoch * 53
+    bet 90 + (m - (m / 180) * 180)       // 90..270
+}
+
+// A 6-color palette indexed by launch epoch (0x00RRGGBB; per-spark alpha is added at draw time).
+finna hueRGB(epoch: int) -> u32 {
+    lowkey h = epoch - (epoch / 6) * 6
+    fr h == 0 { bet 0xFF4050 }
+    fr h == 1 { bet 0xFFA040 }
+    fr h == 2 { bet 0xF8F040 }
+    fr h == 3 { bet 0x50FF70 }
+    fr h == 4 { bet 0x50B0FF }
+    bet 0xC060FF
+}
+
+finna main() {
+    lowkey frame = 0
+    lowkey running = nocap
+    lowkey last = gg.ticks()
+    vibin running {
+        // Window close ends the loop (headless never sends QUIT; the frame cap ends it instead).
+        lowkey kind, code = gg.poll()
+        fr kind == 4 { running = cap }
+
+        gg.frame(W, H, 0x00000A)             // begin frame: (re)size canvas + clear to near-black
+
+        // ---- bloom every active burst into the per-frame scratch arena ----
+        lowkey sparks = 0
+        lowkey bursts = 0
+        lowkey b = 0
+        vibin b < NBURSTS {
+            lowkey epoch = (frame / PERIOD - b) * PERIOD    // the b-th most recent launch epoch
+            fr epoch >= 0 {
+                lowkey t = frame - epoch                    // this burst's age, in frames
+                fr t < MAXAGE {
+                    bursts = bursts + 1
+                    lowkey cx = burstX(epoch)
+                    lowkey cy = burstY(epoch)
+                    lowkey rgb = hueRGB(epoch)
+                    lowkey a = 240 - t * 4                  // fade with age
+                    fr a < 0 { a = 0 }
+                    fr a > 0 {
+                        lowkey count = 14 + t               // VARIABLE: more sparks as it expands
+                        lowkey k = 0
+                        vibin k < count {
+                            lowkey spread = k - count / 2
+                            lowkey px = cx + spread * t / 5
+                            lowkey py = cy - (6 + (k - (k / 7) * 7)) * t / 3 + (t * t) / 10
+                            lowkey au = a as u32
+                            lowkey p = cop Spark{ x: px, y: py, color: (au << 24) | rgb } in mem.scratch()
+                            gg.rect(p.x, p.y, 2, 2, p.color)   // read the spark back from scratch, draw it
+                            sparks = sparks + 1
+                            k = k + 1
+                        }
+                    }
+                }
+            }
+            b = b + 1
+        }
+
+        // ---- the measurement: scratch holds this frame's whole cloud, then flush reclaims it ----
+        lowkey usedBefore = mem.receipts()
+        gg.flush()                           // present  +  O(1) scratch reset (the frame boundary)
+        lowkey usedAfter = mem.receipts()
+        spill.f("frame {} | bursts {} | sparks {} | scratch {} B  -> flush ->  {} B\n",
+                frame as int, bursts as int, sparks as int, usedBefore as int, usedAfter as int)
+
+        frame = frame + 1
+        fr frame >= MAXFRAMES { running = cap }
+
+        // pace to ~60fps (16.6ms/frame) so the window is watchable (gg.ticks is nanoseconds)
+        lowkey target = last + 16600000
+        vibin gg.ticks() < target {
+        }
+        last = gg.ticks()
+    }
+    spill.it(frame)                          // total frames run
+}

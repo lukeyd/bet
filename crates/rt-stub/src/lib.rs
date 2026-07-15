@@ -290,6 +290,14 @@ pub unsafe extern "C" fn bet_scratch_reset() {
     });
 }
 
+/// `mem.receipts()` — scratch-usage gauge. The stub keeps no bump-offset bookkeeping (its
+/// arenas don't grow), so it reports 0; the real `runtime` returns live scratch bytes. Present
+/// here only to keep the ABI symbol set identical between the two runtimes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bet_mem_receipts() -> usize {
+    0
+}
+
 // ---------------------------------------------------------------------------
 // Tags / holla.
 // ---------------------------------------------------------------------------
