@@ -1229,8 +1229,8 @@ fn run_compiled_program(
                 run.status.signal() == Some(6) || run.status.code() == Some(134)
             };
             #[cfg(not(unix))]
-            let trapped = run.status.code() == Some(0xC000_0409_u32 as i32)
-                || run.status.code() == Some(3);
+            let trapped =
+                run.status.code() == Some(0xC000_0409_u32 as i32) || run.status.code() == Some(3);
             if !trapped {
                 return Err(format!(
                     "  FAIL {stem} — expected a runtime trap (abort) but the program exited \
