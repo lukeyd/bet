@@ -43,28 +43,39 @@ fn emit_release_asm(kernel_rel: &str, out_name: &str) -> String {
     asm
 }
 
-/// Count AArch64 NEON vector instructions in an assembly listing — the fixed-width lane suffixes
-/// (`.4s`/`.2d`/`.16b`) plus the vector load/store mnemonics (`ld1`/`st1`) the loop vectorizer
-/// emits. Zero means the loop stayed scalar.
-fn count_neon_ops(asm: &str) -> usize {
-    asm.lines()
-        .filter(|l| {
-            l.contains(".4s")
-                || l.contains(".2d")
-                || l.contains(".16b")
-                || l.contains("ld1")
-                || l.contains("st1")
-        })
-        .count()
+/// Count vector instructions in an assembly listing for the host arch (the backend emits the
+/// host triple). Zero means the loop stayed scalar.
+///
+/// - AArch64: NEON's fixed-width lane suffixes (`.4s`/`.2d`/`.16b`) plus the vector load/store
+///   mnemonics (`ld1`/`st1`) the loop vectorizer emits.
+/// - x86-64: any use of an SSE/AVX vector register (`xmm`/`ymm`/`zmm`). The kernels are integer
+///   (`[]u32`), so scalar code never touches these registers — their presence means the
+///   vectorizer ran.
+fn count_vector_ops(asm: &str) -> usize {
+    if cfg!(target_arch = "x86_64") {
+        asm.lines()
+            .filter(|l| l.contains("xmm") || l.contains("ymm") || l.contains("zmm"))
+            .count()
+    } else {
+        asm.lines()
+            .filter(|l| {
+                l.contains(".4s")
+                    || l.contains(".2d")
+                    || l.contains(".16b")
+                    || l.contains("ld1")
+                    || l.contains("st1")
+            })
+            .count()
+    }
 }
 
 #[test]
 fn soa_is_zero_cost_vs_hand_written_aos() {
-    let soa = count_neon_ops(&emit_release_asm(
+    let soa = count_vector_ops(&emit_release_asm(
         "tests/bench/soa_kernel.bet",
         "bet_zerocost_soa.s",
     ));
-    let aos = count_neon_ops(&emit_release_asm(
+    let aos = count_vector_ops(&emit_release_asm(
         "tests/bench/aos_kernel.bet",
         "bet_zerocost_aos.s",
     ));
@@ -72,17 +83,17 @@ fn soa_is_zero_cost_vs_hand_written_aos() {
     // Both must actually vectorize (guards against the optimizer silently regressing to scalar).
     assert!(
         soa > 0,
-        "soa_kernel did not vectorize at --release (0 NEON ops) — the -O2 pipeline is not running"
+        "soa_kernel did not vectorize at --release (0 vector ops) — the -O2 pipeline is not running"
     );
     assert!(
         aos > 0,
-        "aos_kernel did not vectorize at --release (0 NEON ops)"
+        "aos_kernel did not vectorize at --release (0 vector ops)"
     );
 
     // The zero-cost claim: the `soa` abstraction emits the *same* vector code as hand-written
     // parallel arrays. A difference would mean the abstraction costs something.
     assert_eq!(
         soa, aos,
-        "`soa` is not zero-cost: soa_kernel has {soa} NEON ops but hand-written aos_kernel has {aos}"
+        "`soa` is not zero-cost: soa_kernel has {soa} vector ops but hand-written aos_kernel has {aos}"
     );
 }
