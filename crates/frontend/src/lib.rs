@@ -5,9 +5,9 @@
 //! - [`parse`] — lex + parse arbitrary `bet` source to a full [`ast::Program`] covering the
 //!   frozen surface grammar (`spec/grammar.ebnf` v0.1.1). This is the contract the interpreter
 //!   consumes.
-//! - [`compile`] — the Step-2 tracer-bullet pipeline: parse, then lower the `spill.it("…")`
-//!   subset to a validated `midir` module (used by the `driver`'s LLVM path). Lowering of the
-//!   wider grammar to `midir` is still to come; `parse` already accepts it.
+//! - [`compile`] — the full pipeline: parse, resolve, then lower to a validated `midir`
+//!   module (used by the `driver`'s LLVM path). Lowering covers the whole frozen grammar —
+//!   it is what compiles the DOOM port and the self-hosted frontend (`selfhost/betfe.bet`).
 
 pub mod ast;
 pub mod dump;
