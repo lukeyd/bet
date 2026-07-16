@@ -1218,19 +1218,24 @@ fn run_compiled_program(
         }
         CompiledMode::Trap => {
             // This program's defined behaviour is to fault: a bounds/overflow guard calls
-            // `bet_panic`, which `abort()`s — SIGABRT (signal 6), reported as exit 134. A clean
+            // `bet_panic`, which `abort()`s. On unix that's SIGABRT (signal 6), reported as
+            // exit 134; on Windows `std::process::abort` fast-fails with
+            // STATUS_STACK_BUFFER_OVERRUN (0xC0000409), and a CRT `abort()` reports 3. A clean
             // exit means the guard did NOT fire (e.g. the soa bounds check silently regressed) —
             // a hard failure, which is the whole point of gating it here.
-            use std::os::unix::process::ExitStatusExt;
-            let trapped = run.status.signal() == Some(6) || run.status.code() == Some(134);
+            #[cfg(unix)]
+            let trapped = {
+                use std::os::unix::process::ExitStatusExt;
+                run.status.signal() == Some(6) || run.status.code() == Some(134)
+            };
+            #[cfg(not(unix))]
+            let trapped =
+                run.status.code() == Some(0xC000_0409_u32 as i32) || run.status.code() == Some(3);
             if !trapped {
                 return Err(format!(
-                    "  FAIL {stem} — expected a runtime trap (SIGABRT / exit 134) but the \
-                     program exited {}; a safety guard that should have fired did not",
-                    run.status
-                        .code()
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| format!("via signal {:?}", run.status.signal())),
+                    "  FAIL {stem} — expected a runtime trap (abort) but the program exited \
+                     {}; a safety guard that should have fired did not",
+                    run.status,
                 ));
             }
         }
