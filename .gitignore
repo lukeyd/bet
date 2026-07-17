@@ -3,9 +3,11 @@
 **/*.rs.bk
 *.pdb
 
-# Compiled `ports/` demo binaries (built at the repo root via `bet build ... -o <name>`)
+# Compiled binaries built at the repo root via `bet build ... -o <name>`:
+# `ports/` demos, plus the self-hosted frontend built from `selfhost/betfe.bet`.
 /pong
 /oregon
+/betfe
 
 # Local pinned-LLVM install used by `cargo xtask setup-llvm`
 /.llvm
