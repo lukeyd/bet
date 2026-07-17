@@ -28,16 +28,21 @@ that fails to lower — the gap enumerator used to drive large multi-file ports.
 Prereqs: the pinned Rust toolchain (automatic) + **LLVM 18** (the backend's codegen), needed only to
 *build*:
 
-| Platform | install | env to export |
-|---|---|---|
-| macOS (Homebrew) | `brew install llvm@18 zstd` | `LLVM_SYS_180_PREFIX=/opt/homebrew/opt/llvm@18`  `LIBRARY_PATH=/opt/homebrew/lib` |
-| Debian/Ubuntu | `apt install llvm-18-dev` | `LLVM_SYS_180_PREFIX=/usr/lib/llvm-18` |
+| Platform | install |
+|---|---|
+| macOS (Homebrew) | `brew install llvm@18 zstd` |
+| Debian/Ubuntu | `apt install llvm-18-dev` |
 
 ```sh
-export LLVM_SYS_180_PREFIX=/opt/homebrew/opt/llvm@18     # your LLVM 18 prefix
-export LIBRARY_PATH=/opt/homebrew/lib                    # macOS: where libzstd lives
+cargo xtask setup-llvm                    # confirms LLVM 18 is present, or says how to install it
+eval "$(cargo xtask setup-llvm | sed -n 's/^  export /export /p')"   # put it in this shell
 scripts/betself --setup
 ```
+
+There is no path to copy: `setup-llvm` **finds** your install (`$LLVM_SYS_180_PREFIX`, a
+`llvm-config` on PATH, Homebrew, or the usual system paths) and prints the exports for *your*
+machine — the `eval` just applies them to the current shell, which is what `betself` needs. If
+LLVM lives somewhere unusual, `export LLVM_SYS_180_PREFIX=/path/to/llvm-18` overrides the probe.
 
 That builds `target/release/bet` (the Rust backend) and `./betfe` (the self-hosted frontend).
 By hand it's just:

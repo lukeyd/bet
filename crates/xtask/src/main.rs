@@ -792,9 +792,17 @@ fn setup_llvm() -> Result<()> {
                  To use it in a bare cargo invocation:\n  export {}=\"{}\"{}",
                 llvm::PREFIX_VAR,
                 l.prefix.display(),
+                // `${LIBRARY_PATH:+:$LIBRARY_PATH}` rather than `:$LIBRARY_PATH`: when the
+                // variable is unset the naive form leaves a trailing colon, and an empty element
+                // in a search path means "the current directory" to the linker.
                 l.library_path
                     .as_ref()
-                    .map(|p| format!("\n  export LIBRARY_PATH=\"{}:$LIBRARY_PATH\"", p.display()))
+                    .map(|p| {
+                        format!(
+                            "\n  export LIBRARY_PATH=\"{}${{LIBRARY_PATH:+:$LIBRARY_PATH}}\"",
+                            p.display()
+                        )
+                    })
                     .unwrap_or_default(),
             );
             Ok(())

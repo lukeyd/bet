@@ -191,3 +191,68 @@ pub fn not_found_message() -> String {
          llvm-config on PATH, brew --prefix llvm@{MAJOR}, and the well-known system paths."
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `llvm-sys` version locked in Cargo.lock, as its major component (e.g. `180`).
+    fn locked_llvm_sys_major() -> String {
+        let lock = std::fs::read_to_string(crate::workspace_root().join("Cargo.lock"))
+            .expect("Cargo.lock is readable");
+        let doc: toml::Value = lock.parse().expect("Cargo.lock is valid TOML");
+        let version = doc["package"]
+            .as_array()
+            .expect("[[package]] array")
+            .iter()
+            .find(|p| p.get("name").and_then(toml::Value::as_str) == Some("llvm-sys"))
+            .and_then(|p| p.get("version"))
+            .and_then(toml::Value::as_str)
+            .expect("llvm-sys is in Cargo.lock (backend's `llvm` feature depends on it)")
+            .to_string();
+        version
+            .split('.')
+            .next()
+            .expect("a version has a major component")
+            .to_string()
+    }
+
+    /// `PREFIX_VAR` must match what the *locked* `llvm-sys` actually reads.
+    ///
+    /// `llvm-sys` derives its prefix variable from its own crate version: `llvm-sys 180.x` reads
+    /// `LLVM_SYS_180_PREFIX`, `181.x` reads `LLVM_SYS_181_PREFIX`. So the name is not a free
+    /// choice — it is a fact about a dependency, and it silently rots when that dependency is
+    /// bumped.
+    ///
+    /// This is not a hypothetical: `setup-llvm` shipped `LLVM_SYS_181_PREFIX` (an LLVM *release*
+    /// number, 18.1) where `llvm-sys 180.0.0` wanted `LLVM_SYS_180_PREFIX`. Nothing caught it,
+    /// because exporting a variable nobody reads fails silently — discovery looks implemented
+    /// while never working. That typo is the reason this whole module exists, so pin it against
+    /// the real source of truth rather than against a copy of the same guess.
+    #[test]
+    fn prefix_var_matches_the_locked_llvm_sys_version() {
+        let major = locked_llvm_sys_major();
+        assert_eq!(
+            PREFIX_VAR,
+            format!("LLVM_SYS_{major}_PREFIX"),
+            "llvm-sys {major}.x reads LLVM_SYS_{major}_PREFIX, but PREFIX_VAR is {PREFIX_VAR:?}. \
+             If llvm-sys was bumped, update PREFIX_VAR (and MAJOR) in this module — every \
+             `cargo xtask run`/`setup-llvm` path exports that name, and a wrong one is ignored \
+             silently rather than erroring."
+        );
+    }
+
+    /// `MAJOR` (the LLVM release we tell people to install) must agree with the locked `llvm-sys`
+    /// too: `llvm-sys 180.x` targets LLVM 18. Without this, `setup-llvm` could cheerfully tell a
+    /// contributor to `brew install llvm@18` while the build wants a different LLVM entirely.
+    #[test]
+    fn major_matches_the_locked_llvm_sys_version() {
+        let major = locked_llvm_sys_major();
+        assert!(
+            major.starts_with(MAJOR),
+            "llvm-sys {major}.x targets LLVM {}, but MAJOR is {MAJOR:?} — the install guidance \
+             and the version check in `probe` would both be wrong.",
+            &major[..2]
+        );
+    }
+}
