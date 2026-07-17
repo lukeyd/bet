@@ -10,9 +10,9 @@ pointers into that history, not live documents.
 
 The compiler pipeline is complete and self-hosted: `selfhost/betfe.bet` re-emits its own
 MIR byte-identically (Milestone 8 fixpoint), and `ports/doom` plays real DOOM with
-byte-exact sim parity. Current work is port-driven hardening (Frozen Bubble, the M:N
-scheduler, corpus parity) coordinated through the `midir`/`rt-abi` contract crates
-and the golden corpus.
+byte-exact sim parity. Current work is port-driven hardening (the M:N scheduler, corpus
+parity; Frozen Bubble, which needs a local GPL-2 asset bake) coordinated through the
+`midir`/`rt-abi` contract crates and the golden corpus.
 
 ## Time tracking: retired — do NOT log time
 
