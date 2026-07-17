@@ -351,6 +351,159 @@ pub fn title(name: &str) {
     imp::title(name);
 }
 
+/// A fixed-timestep accumulator: decouples a fixed-rate simulation from a variable-rate present
+/// (cwage #97). DOOM wants its sim at exactly 35Hz regardless of how fast frames actually land.
+///
+/// Feed it [`ticks`] and it tells you how many sim steps to run:
+///
+/// ```
+/// # use gg_backend::FixedTimestep;
+/// let mut ts = FixedTimestep::new(35); // DOOM's tic rate
+/// let mut now = 0u64;
+/// ts.advance(now); // the first call only establishes the baseline
+///
+/// let mut tics = 0u64;
+/// for _ in 0..60 {
+///     now += 16_666_667; // a ~60Hz frame
+///     tics += u64::from(ts.advance(now));
+/// }
+/// assert_eq!(tics, 35); // 35 sim steps per second of 60Hz frames, exactly
+/// ```
+///
+/// The step count is clamped (see [`FixedTimestep::MAX_CATCH_UP`]) so a long stall — a breakpoint,
+/// a WAD load, the machine sleeping — cannot hand back thousands of steps and spiral the game
+/// into a death loop trying to catch up.
+#[derive(Debug, Clone)]
+pub struct FixedTimestep {
+    step_ns: u64,
+    accum_ns: u64,
+    last_ns: Option<u64>,
+}
+
+impl FixedTimestep {
+    /// The most steps a single [`Self::advance`] will ever return. Past this, time is DROPPED:
+    /// a game that cannot keep up must run slow, not freeze.
+    pub const MAX_CATCH_UP: u32 = 8;
+
+    /// A timestep of `hz` steps per second. `hz == 0` is treated as 1 to avoid a zero step.
+    pub fn new(hz: u32) -> FixedTimestep {
+        FixedTimestep {
+            step_ns: 1_000_000_000 / u64::from(hz.max(1)),
+            accum_ns: 0,
+            last_ns: None,
+        }
+    }
+
+    /// Advance to `now_ns` (from [`ticks`]) and return how many fixed steps to run — 0 when the
+    /// frame landed early. The remainder carries, so the rate has no long-term drift.
+    ///
+    /// A `now_ns` that goes backwards contributes no time rather than wrapping.
+    pub fn advance(&mut self, now_ns: u64) -> u32 {
+        let last = self.last_ns.replace(now_ns);
+        // The first call establishes the baseline; it must not bank all of process uptime.
+        let Some(last) = last else {
+            return 0;
+        };
+        self.accum_ns += now_ns.saturating_sub(last);
+        let steps = (self.accum_ns / self.step_ns).min(u64::from(Self::MAX_CATCH_UP)) as u32;
+        if steps == Self::MAX_CATCH_UP {
+            // Fell too far behind: drop the backlog instead of spiralling.
+            self.accum_ns = 0;
+        } else {
+            self.accum_ns -= u64::from(steps) * self.step_ns;
+        }
+        steps
+    }
+
+    /// How far into the next step we are, `0.0..1.0` — the blend factor for interpolating a
+    /// render between two sim states.
+    pub fn alpha(&self) -> f32 {
+        self.accum_ns as f32 / self.step_ns as f32
+    }
+}
+
+#[cfg(test)]
+mod timestep_tests {
+    use super::FixedTimestep;
+
+    /// The whole point: a fixed sim rate that does not drift, no matter how the frames land.
+    /// 35Hz sim under 60Hz frames must produce exactly 35 steps per second, forever.
+    #[test]
+    fn fixed_rate_does_not_drift_over_time() {
+        let mut ts = FixedTimestep::new(35);
+        let mut now = 0u64;
+        ts.advance(now);
+        let mut tics = 0u64;
+        for second in 1..=10u64 {
+            for _ in 0..60 {
+                now += 16_666_667;
+                tics += u64::from(ts.advance(now));
+            }
+            // The remainder carries, so error never accumulates.
+            assert_eq!(tics, 35 * second, "drifted by second {second}");
+        }
+    }
+
+    /// A frame that lands early runs no steps at all — that is what decouples present from sim.
+    #[test]
+    fn early_frames_run_no_steps() {
+        let mut ts = FixedTimestep::new(10); // 100ms steps
+        ts.advance(1_000);
+        assert_eq!(ts.advance(1_000 + 50_000_000), 0); // 50ms in: too early
+        assert_eq!(ts.advance(1_000 + 99_000_000), 0); // 99ms: still too early
+        assert_eq!(ts.advance(1_000 + 100_000_000), 1); // 100ms: exactly one
+    }
+
+    /// A long stall must NOT hand back a thousand steps to catch up — that is the classic
+    /// spiral of death, where catching up costs more time than it recovers.
+    #[test]
+    fn a_long_stall_is_clamped_and_the_backlog_dropped() {
+        let mut ts = FixedTimestep::new(35);
+        ts.advance(0);
+        // Ten seconds of stall (a breakpoint, a WAD load, the lid closing).
+        let steps = ts.advance(10_000_000_000);
+        assert_eq!(steps, FixedTimestep::MAX_CATCH_UP);
+        // And the backlog is DROPPED, not banked: the next normal frame is normal again.
+        assert_eq!(ts.advance(10_000_000_000 + 28_571_428), 1);
+    }
+
+    /// A clock that goes backwards must contribute no time rather than wrap into a huge delta.
+    #[test]
+    fn a_backwards_clock_contributes_nothing() {
+        let mut ts = FixedTimestep::new(60);
+        ts.advance(1_000_000_000);
+        assert_eq!(ts.advance(500_000_000), 0);
+        // ...and the timestep recovers from the new baseline.
+        assert_eq!(ts.advance(500_000_000 + 16_666_667), 1);
+    }
+
+    /// The first `advance` must not bank all of process uptime as a backlog.
+    #[test]
+    fn the_first_advance_banks_nothing() {
+        let mut ts = FixedTimestep::new(35);
+        assert_eq!(ts.advance(60_000_000_000), 0, "banked process uptime");
+        assert_eq!(ts.advance(60_000_000_000), 0);
+    }
+
+    /// `alpha` is the render blend factor: how far into the current step we are.
+    #[test]
+    fn alpha_reports_progress_into_the_step() {
+        let mut ts = FixedTimestep::new(10); // 100ms steps
+        ts.advance(0);
+        assert!(ts.alpha().abs() < 1e-6);
+        ts.advance(50_000_000); // half a step in
+        assert!((ts.alpha() - 0.5).abs() < 1e-3, "alpha = {}", ts.alpha());
+    }
+
+    /// A zero rate must not divide by zero.
+    #[test]
+    fn zero_hz_is_clamped_not_divided_by() {
+        let mut ts = FixedTimestep::new(0);
+        ts.advance(0);
+        assert_eq!(ts.advance(1_000_000_000), 1);
+    }
+}
+
 // ===========================================================================
 // The mixer core — compiled in BOTH builds, so the default `cargo nextest run --workspace`
 // gate exercises it. Nothing here knows about `cpal`: the real-time side is expressed as the
@@ -433,6 +586,11 @@ mod alloc_probe {
 /// * the only channel between them is a wait-free SPSC ring of [`MixCmd`]s;
 /// * the voice pool is PRE-ALLOCATED ([`MAX_VOICES`] slots), so starting a voice writes into
 ///   an existing slot rather than growing a `Vec`.
+///
+/// Compiled when it is used (`desktop`) or tested (`test`) — so the DEFAULT `cargo nextest
+/// run --workspace` gate exercises every line of it, while the default non-test build stays
+/// the zero-dependency headless no-op it has always been.
+#[cfg(any(feature = "desktop", test))]
 mod mixer {
     use std::sync::Arc;
 
@@ -1175,6 +1333,346 @@ mod mixer {
 }
 
 // ===========================================================================
+// The present core — like `mixer`, compiled in BOTH builds so the default test gate covers it.
+// Nothing here knows about `minifb`: it turns a logical frame into window pixels, and that is
+// all. The `desktop` build hands the result to `update_with_buffer`.
+// ===========================================================================
+
+/// Framebuffer staging and the aspect-fit scaler.
+///
+/// ## Why this shape (cwage #97)
+///
+/// `present_scaled` used to do `vec![0u32; win_w * win_h]` EVERY FRAME. At DOOM's `GG_SCALE=4`
+/// (1280x800) that is 4.1MB malloc'd, zeroed, and freed per frame — ~245MB/s of churn at 60Hz —
+/// and the zeroing was wasted, because the scale loop overwrites everything except the letterbox
+/// bars. `present`/`show` each allocated a second full-frame staging buffer on top of it.
+///
+/// So the buffers are hoisted into [`Present`] and reused. They are resized only when the window
+/// dimensions actually change, and the letterbox bars are painted once per LAYOUT change rather
+/// than re-zeroed per frame — the bars are never written by the scale loop, so once black they
+/// stay black.
+/// Compiled when used (`desktop`) or tested (`test`), like [`mixer`].
+#[cfg(any(feature = "desktop", test))]
+mod compose {
+    /// The reusable present buffer plus the window-to-logical mapping the mouse needs.
+    pub(crate) struct Present {
+        /// The window-sized scratch handed to `update_with_buffer`. Reused across frames.
+        buf: Vec<u32>,
+        /// The layout the letterbox bars were last painted for: `(win_w, win_h, scale, off_x,
+        /// off_y)`. While this is unchanged, the bars are already black and need no repaint.
+        laid_out: Option<(usize, usize, usize, i32, i32)>,
+        /// The integer upscale factor and letterbox offsets of the last compose, used to map
+        /// window pixels back to logical-canvas coordinates for the mouse.
+        pub(crate) scale: usize,
+        pub(crate) off_x: i32,
+        pub(crate) off_y: i32,
+        /// How many times a present-path buffer actually had to GROW. This is the `GG_STATS`
+        /// "allocs/frame" gauge, and in steady state it must stay flat — that is the whole point
+        /// of cwage #97. It counts capacity growth only: a `resize` that shrinks reuses the
+        /// existing allocation.
+        pub(crate) growths: u64,
+    }
+
+    impl Present {
+        pub(crate) const fn new() -> Present {
+            Present {
+                buf: Vec::new(),
+                laid_out: None,
+                scale: 1,
+                off_x: 0,
+                off_y: 0,
+                growths: 0,
+            }
+        }
+
+        /// The composed window-sized frame from the last [`Self::compose`].
+        pub(crate) fn buf(&self) -> &[u32] {
+            &self.buf
+        }
+
+        /// Grow `v` to exactly `need` elements, counting only real capacity growth.
+        fn fit(&mut self, need: usize) {
+            if self.buf.len() == need {
+                return;
+            }
+            if need > self.buf.capacity() {
+                self.growths += 1;
+            }
+            self.buf.resize(need, 0);
+        }
+
+        /// Aspect-fit `src` (a tightly packed `cw * ch` logical frame) into a `win_w * win_h`
+        /// window buffer by integer nearest-neighbor upscale, centered with black letterbox bars.
+        ///
+        /// Allocation-free once the window size settles — see
+        /// `present_reuses_its_buffer_across_frames`, which measures exactly that.
+        pub(crate) fn compose(
+            &mut self,
+            src: &[u32],
+            cw: usize,
+            ch: usize,
+            win_w: usize,
+            win_h: usize,
+        ) {
+            if cw == 0 || ch == 0 || win_w == 0 || win_h == 0 || src.len() < cw * ch {
+                return;
+            }
+            let scale = (win_w / cw).min(win_h / ch).max(1);
+            let out_w = cw * scale;
+            let out_h = ch * scale;
+            let off_x = (win_w as i32 - out_w as i32) / 2;
+            let off_y = (win_h as i32 - out_h as i32) / 2;
+            let layout = (win_w, win_h, scale, off_x, off_y);
+
+            self.fit(win_w * win_h);
+            if self.laid_out != Some(layout) {
+                // Paint the letterbox black ONCE per layout. The scale loop below never touches
+                // the bars, so they stay black until the layout changes again. This replaces a
+                // full-window zeroing per frame.
+                self.buf.fill(0);
+                self.laid_out = Some(layout);
+            }
+            self.scale = scale;
+            self.off_x = off_x;
+            self.off_y = off_y;
+
+            for y in 0..out_h {
+                let py = off_y + y as i32;
+                if py < 0 || py >= win_h as i32 {
+                    continue;
+                }
+                let sy = y / scale;
+                let row = (py as usize) * win_w;
+                for x in 0..out_w {
+                    let px_out = off_x + x as i32;
+                    if px_out < 0 || px_out >= win_w as i32 {
+                        continue;
+                    }
+                    self.buf[row + px_out as usize] = src[sy * cw + x / scale];
+                }
+            }
+        }
+    }
+
+    /// Pack a (possibly strided) source framebuffer into `dst` as a tightly packed `w * h` buffer,
+    /// so the raw-pointer read is confined here and the window only ever sees a packed frame.
+    ///
+    /// `dst` is a CALLER-OWNED buffer reused across frames (cwage #97): this used to return a
+    /// fresh `Vec` every present. It is resized only when the frame dimensions change.
+    ///
+    /// The per-row copy is clamped to `stride`: a `FrameBuffer` whose `width` exceeds its `stride`
+    /// is malformed, and reading `width` u32s from a row only `stride` wide would run past the
+    /// `stride * height` region into adjacent memory. Clamped-away columns (and the whole buffer
+    /// when `pixels` is null) are left zeroed (black) rather than read out of bounds.
+    ///
+    /// # Safety
+    /// When `pixels` is non-null it must address at least `stride * height` readable `u32`s (the
+    /// frozen `FrameBuffer` contract). `w`, `h`, and `stride` are the packed frame dimensions.
+    pub(crate) unsafe fn pack_frame_into(
+        dst: &mut Vec<u32>,
+        pixels: *const u32,
+        w: usize,
+        h: usize,
+        stride: usize,
+    ) {
+        // Reused buffers hold the PREVIOUS frame, so the zero-fill the old `vec![0u32; w * h]`
+        // gave for free must now be explicit — the clamped-away columns of an over-wide frame,
+        // and a null source, are both contractually black.
+        dst.clear();
+        dst.resize(w * h, 0);
+        let row = w.min(stride);
+        if !pixels.is_null() {
+            // SAFETY: row `y` starts at `y * stride` and we read `row = min(w, stride) <= stride`
+            // u32s, so the last index touched is `y * stride + row - 1 < (y + 1) * stride <=
+            // stride * height` — always within the caller's guaranteed region. The destination
+            // write of `row <= w` u32s stays within the `w`-wide row at `dst[y * w..]`.
+            unsafe {
+                for y in 0..h {
+                    let src = pixels.add(y * stride);
+                    std::ptr::copy_nonoverlapping(src, dst[y * w..].as_mut_ptr(), row);
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Compose a solid `cw * ch` canvas of `color` into a `win_w * win_h` window.
+        fn composed(p: &mut Present, color: u32, cw: usize, ch: usize, ww: usize, wh: usize) {
+            let src = vec![color; cw * ch];
+            p.compose(&src, cw, ch, ww, wh);
+        }
+
+        /// THE cwage #97 regression test, measured against the real allocator: the first frame
+        /// at a given window size may allocate; every frame after it must not. This is the
+        /// 4MB/frame malloc that nothing in the tree could observe.
+        #[test]
+        fn present_reuses_its_buffer_across_frames() {
+            let mut p = Present::new();
+            let src = vec![0x00FF_0000u32; 320 * 200];
+
+            // Frame 1 sizes the buffer.
+            p.compose(&src, 320, 200, 1280, 800);
+            let after_first = p.growths;
+            assert_eq!(
+                after_first, 1,
+                "the first frame should allocate exactly once"
+            );
+
+            // Frames 2..=60 must be free.
+            let ops = crate::alloc_probe::count_allocator_ops(|| {
+                for _ in 0..59 {
+                    p.compose(&src, 320, 200, 1280, 800);
+                }
+            });
+            assert_eq!(
+                ops, 0,
+                "59 steady-state frames performed {ops} allocator ops"
+            );
+            assert_eq!(
+                p.growths, after_first,
+                "the present buffer grew mid-steady-state"
+            );
+        }
+
+        /// The letterbox bars must be black — and must STAY black across frames now that they are
+        /// painted once per layout instead of re-zeroed every frame.
+        #[test]
+        fn letterbox_bars_are_black_and_stay_black() {
+            let mut p = Present::new();
+            // A 2x2 canvas in a 10x4 window: scale 2, out 4x4, so 3px bars left and right.
+            for _ in 0..3 {
+                composed(&mut p, 0x00FF_0000, 2, 2, 10, 4);
+            }
+            assert_eq!((p.scale, p.off_x, p.off_y), (2, 3, 0));
+            for y in 0..4 {
+                for x in 0..10 {
+                    let got = p.buf()[y * 10 + x];
+                    let want = if (3..7).contains(&x) { 0x00FF_0000 } else { 0 };
+                    assert_eq!(got, want, "pixel ({x},{y})");
+                }
+            }
+        }
+
+        /// A layout change must repaint the bars: stale pixels from the previous layout would
+        /// otherwise survive in the reused buffer. This is the bug the per-frame zeroing hid.
+        #[test]
+        fn layout_change_repaints_the_letterbox() {
+            let mut p = Present::new();
+            // Wide window: vertical bars.
+            composed(&mut p, 0x0000_FF00, 2, 2, 10, 4);
+            // Now a square window at the same size: scale 2, out 4x4 centered, bars all round.
+            composed(&mut p, 0x0000_FF00, 2, 2, 8, 5);
+            assert_eq!((p.scale, p.off_x, p.off_y), (2, 2, 0));
+            for y in 0..5 {
+                for x in 0..8 {
+                    let want = if (2..6).contains(&x) && y < 4 {
+                        0x0000_FF00
+                    } else {
+                        0
+                    };
+                    assert_eq!(p.buf()[y * 8 + x], want, "stale pixel at ({x},{y})");
+                }
+            }
+        }
+
+        /// Integer nearest-neighbor upscale: each source pixel becomes a `scale * scale` block.
+        #[test]
+        fn compose_upscales_nearest_neighbor() {
+            let mut p = Present::new();
+            let src = [1u32, 2, 3, 4]; // 2x2
+            p.compose(&src, 2, 2, 4, 4); // scale 2, no letterbox
+            assert_eq!(p.buf(), &[1, 1, 2, 2, 1, 1, 2, 2, 3, 3, 4, 4, 3, 3, 4, 4]);
+        }
+
+        /// A window smaller than the canvas can't upscale: scale clamps to 1 and the frame is
+        /// cropped, not read out of bounds.
+        #[test]
+        fn window_smaller_than_canvas_crops_at_scale_one() {
+            let mut p = Present::new();
+            let src: Vec<u32> = (0..16).collect(); // 4x4
+            p.compose(&src, 4, 4, 2, 2);
+            assert_eq!(p.scale, 1);
+            assert_eq!(p.buf().len(), 4);
+        }
+
+        /// Degenerate dimensions are a no-op rather than a panic or an out-of-bounds read.
+        #[test]
+        fn compose_rejects_degenerate_input() {
+            let mut p = Present::new();
+            p.compose(&[], 0, 0, 8, 8);
+            p.compose(&[1, 2], 4, 4, 8, 8); // src too short for 4x4
+            p.compose(&[1], 1, 1, 0, 0);
+            assert!(p.buf().is_empty());
+        }
+
+        // cwage #43: a `FrameBuffer` presenting with `width > stride` is malformed. `pack_frame`
+        // must clamp the per-row read to `stride` so it never touches memory past the
+        // `stride * height` region the source actually backs. We size the source at EXACTLY
+        // `stride * height` u32s (no slack): the pre-fix code read `width` per row and ran off the
+        // end, and would have filled the clamped-away columns with those out-of-bounds reads —
+        // this asserts they are instead left zeroed.
+        #[test]
+        fn present_clamps_overwide_width_to_stride() {
+            let (stride, h, w) = (2usize, 3usize, 5usize); // width (5) > stride (2)
+            let src: Vec<u32> = (1..=(stride * h) as u32).collect(); // [1,2, 3,4, 5,6]
+            let mut buf = Vec::new();
+            unsafe { pack_frame_into(&mut buf, src.as_ptr(), w, h, stride) };
+
+            assert_eq!(buf.len(), w * h);
+            for y in 0..h {
+                for x in 0..w {
+                    let want = if x < stride { src[y * stride + x] } else { 0 };
+                    assert_eq!(buf[y * w + x], want, "pixel ({x},{y})");
+                }
+            }
+        }
+
+        // A null source reads nothing and yields a zeroed frame of the requested size.
+        #[test]
+        fn present_null_source_is_zeroed() {
+            let mut buf = Vec::new();
+            unsafe { pack_frame_into(&mut buf, std::ptr::null(), 4, 2, 4) };
+            assert_eq!(buf, vec![0u32; 8]);
+        }
+
+        // The normal tightly-packed case (width == stride) is copied verbatim.
+        #[test]
+        fn present_packs_tight_frame_verbatim() {
+            let (w, h) = (3usize, 2usize);
+            let src: Vec<u32> = (10..16).collect();
+            let mut buf = Vec::new();
+            unsafe { pack_frame_into(&mut buf, src.as_ptr(), w, h, w) };
+            assert_eq!(buf, src);
+        }
+
+        /// The staging buffer is reused too, and reuse must not leak the previous frame into the
+        /// clamped-away columns — a hazard the old fresh-`vec![0; _]` per call could not have.
+        #[test]
+        fn reused_staging_buffer_does_not_leak_the_previous_frame() {
+            let mut buf = Vec::new();
+            // A full-width frame first...
+            let full: Vec<u32> = vec![0xDEAD_BEEF; 4 * 2];
+            unsafe { pack_frame_into(&mut buf, full.as_ptr(), 4, 2, 4) };
+            // ...then an over-wide one whose clamped columns must be black, not 0xDEADBEEF.
+            let narrow: Vec<u32> = vec![7; 2 * 2];
+            unsafe { pack_frame_into(&mut buf, narrow.as_ptr(), 4, 2, 2) };
+            assert_eq!(buf, vec![7, 7, 0, 0, 7, 7, 0, 0]);
+
+            // And reuse at a settled size allocates nothing.
+            let ops = crate::alloc_probe::count_allocator_ops(|| {
+                for _ in 0..32 {
+                    unsafe { pack_frame_into(&mut buf, narrow.as_ptr(), 4, 2, 2) };
+                }
+            });
+            assert_eq!(ops, 0, "staging reuse performed {ops} allocator ops");
+        }
+    }
+}
+
+// ===========================================================================
 // Headless implementation (default: `desktop` OFF). Zero heavy dependencies.
 // ===========================================================================
 
@@ -1257,7 +1755,7 @@ mod imp {
 
 #[cfg(feature = "desktop")]
 mod imp {
-    use super::{Event, NONE_EVENT, event_kind, key, mixer};
+    use super::{Event, NONE_EVENT, compose, event_kind, key, mixer};
     use std::collections::VecDeque;
     use std::sync::{Mutex, OnceLock};
 
@@ -1450,11 +1948,13 @@ mod imp {
         canvas_h: u32,
         /// Uploaded textures (premultiplied), indexed by `id - 1`.
         textures: Vec<Texture>,
-        /// The integer upscale factor and letterbox offsets recorded at the last `flush`, used to
-        /// map window pixels back to logical-canvas coordinates for the mouse.
-        scale: u32,
-        off_x: i32,
-        off_y: i32,
+        /// The reusable window-sized present buffer and the window->logical mapping recorded at
+        /// the last flush/show. Persistent: the scaler used to `vec![0u32; win_w * win_h]` every
+        /// single frame (cwage #97).
+        present: compose::Present,
+        /// The reusable staging buffer `present`/`show` pack their caller's framebuffer into —
+        /// the second full-frame allocation that used to happen per frame.
+        staging: Vec<u32>,
         /// The last known mouse position, in logical-canvas coordinates.
         mouse_x: i32,
         mouse_y: i32,
@@ -1512,9 +2012,8 @@ mod imp {
                 canvas_w: 0,
                 canvas_h: 0,
                 textures: Vec::new(),
-                scale: 1,
-                off_x: 0,
-                off_y: 0,
+                present: compose::Present::new(),
+                staging: Vec::new(),
                 mouse_x: 0,
                 mouse_y: 0,
                 last_win_mouse: None,
@@ -1532,20 +2031,7 @@ mod imp {
         /// the first call, then synthesize input events from the new key state.
         fn present(&mut self, buf: &[u32], w: usize, h: usize) {
             let title = self.title.clone();
-            let window = self.window.get_or_insert_with(|| {
-                // `X1` maps the framebuffer 1:1 to the window (no upscaling), so the program can
-                // drive true dynamic resolution by sizing the framebuffer to `size()`. `resize`
-                // lets the user maximize; `Stretch` only covers the single transient frame after
-                // a resize, before the program reallocates its framebuffer to the new size.
-                let opts = minifb::WindowOptions {
-                    resize: true,
-                    scale: minifb::Scale::X1,
-                    scale_mode: minifb::ScaleMode::Stretch,
-                    ..minifb::WindowOptions::default()
-                };
-                minifb::Window::new(&title, w, h, opts)
-                    .expect("gg: failed to open the minifb window")
-            });
+            let window = self.window.get_or_insert_with(|| open_window(&title, w, h));
             // `update_with_buffer` wants exactly `w * h` pixels; `present()` guarantees `buf`
             // is that long.
             let _ = window.update_with_buffer(buf, w, h);
@@ -1658,9 +2144,9 @@ mod imp {
             // Mouse: track the cursor in logical-canvas coords, and synthesize MOUSE_DOWN/UP
             // edges for the two buttons (code 0 = left, 1 = right). Position via `gg.mouse()`.
             if let Some((mx, my)) = window.get_mouse_pos(minifb::MouseMode::Clamp) {
-                let scale = self.scale.max(1) as i32;
-                let lx = (mx as i32 - self.off_x) / scale;
-                let ly = (my as i32 - self.off_y) / scale;
+                let scale = self.present.scale.max(1) as i32;
+                let lx = (mx as i32 - self.present.off_x) / scale;
+                let ly = (my as i32 - self.present.off_y) / scale;
                 let max_x = (self.canvas_w as i32 - 1).max(0);
                 let max_y = (self.canvas_h as i32 - 1).max(0);
                 self.mouse_x = lx.clamp(0, max_x);
@@ -1929,12 +2415,6 @@ mod imp {
             // 1. Ensure the window (default ~2x the frame), read its live size, end that borrow.
             let title = self.title.clone();
             let window = self.window.get_or_insert_with(|| {
-                let opts = minifb::WindowOptions {
-                    resize: true,
-                    scale: minifb::Scale::X1,
-                    scale_mode: minifb::ScaleMode::Stretch,
-                    ..minifb::WindowOptions::default()
-                };
                 // Default: ~2x the logical frame. With `GG_FULLSQUARE` set (the DOOM launcher
                 // exports it) open the largest square that fits the main display instead — a ~6%
                 // margin keeps it clear of the menu bar/dock — so the aspect-fit compositor shows
@@ -1949,42 +2429,22 @@ mod imp {
                 } else {
                     (cw * 2, ch * 2)
                 };
-                minifb::Window::new(&title, open_w, open_h, opts)
-                    .expect("gg: failed to open the minifb window")
+                open_window(&title, open_w, open_h)
             });
             let (win_w, win_h) = window.get_size();
-            // 2. Integer aspect-fit scale + centered offsets; nearest-neighbor upscale into `present`.
-            let scale = (win_w / cw).min(win_h / ch).max(1);
-            let out_w = cw * scale;
-            let out_h = ch * scale;
-            let off_x = (win_w as i32 - out_w as i32) / 2;
-            let off_y = (win_h as i32 - out_h as i32) / 2;
-            let mut present = vec![0u32; win_w * win_h];
-            for y in 0..out_h {
-                let py = off_y + y as i32;
-                if py < 0 || py >= win_h as i32 {
-                    continue;
-                }
-                let sy = y / scale;
-                let row = (py as usize) * win_w;
-                for x in 0..out_w {
-                    let px_out = off_x + x as i32;
-                    if px_out < 0 || px_out >= win_w as i32 {
-                        continue;
-                    }
-                    present[row + px_out as usize] = src[sy * cw + x / scale];
-                }
+            // 2. Aspect-fit into the PERSISTENT present buffer — no per-frame allocation, and no
+            //    per-frame zeroing of a window the scale loop is about to overwrite (cwage #97).
+            //    Split the borrow: `compose` writes `present`, `update_with_buffer` reads it and
+            //    writes `window` — distinct fields of `self`.
+            let GgState {
+                window, present, ..
+            } = self;
+            present.compose(src, cw, ch, win_w, win_h);
+            // 3. Hand the composed buffer to the window.
+            if let Some(window) = window.as_mut() {
+                let _ = window.update_with_buffer(present.buf(), win_w, win_h);
             }
-            // 3. Re-borrow the window and present the upscaled buffer.
-            let _ = self
-                .window
-                .as_mut()
-                .unwrap()
-                .update_with_buffer(&present, win_w, win_h);
-            // 4. Record the mapping for the mouse, then pump input.
-            self.scale = scale as u32;
-            self.off_x = off_x;
-            self.off_y = off_y;
+            // 4. Pump input; the window->logical mapping the mouse needs lives in `self.present`.
             self.pump_input();
         }
 
@@ -2092,6 +2552,52 @@ mod imp {
                 None => 0,
             }
         }
+    }
+
+    /// The minimum wall-clock interval between presents, from `GG_FPS` (cwage #97).
+    ///
+    /// minifb does throttle by default — but to its own 4ms (250 FPS) floor, so a game loop that
+    /// just calls `present` in a tight loop burns a core rendering four frames nobody will ever
+    /// see for every one they will. There was no frame budget anywhere in the platform layer,
+    /// which is also *why* the 4MB-per-frame allocation went unnoticed: nothing measured it.
+    ///
+    /// `GG_FPS` unset ⇒ 60. `GG_FPS=0` ⇒ uncapped (the old behavior, for benchmarking). Read once
+    /// at first window open.
+    fn frame_interval() -> Option<std::time::Duration> {
+        static INTERVAL: OnceLock<Option<std::time::Duration>> = OnceLock::new();
+        *INTERVAL.get_or_init(|| {
+            let fps = std::env::var("GG_FPS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .unwrap_or(60);
+            match fps {
+                0 => None,
+                fps => Some(std::time::Duration::from_micros(1_000_000 / u64::from(fps))),
+            }
+        })
+    }
+
+    /// Open the one window, with the options and the frame limiter every present path wants.
+    ///
+    /// `X1` maps the framebuffer 1:1 to the window (no upscaling), so a program can drive true
+    /// dynamic resolution by sizing its framebuffer to `size()`. `resize` lets the user maximize;
+    /// `Stretch` only covers the single transient frame after a resize, before the program
+    /// reallocates its framebuffer to the new size.
+    fn open_window(title: &str, w: usize, h: usize) -> minifb::Window {
+        let opts = minifb::WindowOptions {
+            resize: true,
+            scale: minifb::Scale::X1,
+            scale_mode: minifb::ScaleMode::Stretch,
+            ..minifb::WindowOptions::default()
+        };
+        let mut window =
+            minifb::Window::new(title, w, h, opts).expect("gg: failed to open the minifb window");
+        // `limit_update_rate` is marked deprecated in minifb 0.26 in favour of `set_fps_target` —
+        // which does not exist in 0.27, the version we pin. So this remains the only way to set
+        // the cap, deprecation and all, until minifb ships the replacement.
+        #[allow(deprecated)]
+        window.limit_update_rate(frame_interval());
+        window
     }
 
     /// The `BET_GG_HEADLESS` switch: when the env var is set to anything but `""`/`"0"`, this
@@ -2210,35 +2716,6 @@ mod imp {
     // headless build returns, BEFORE touching the singleton — so headless runs never open a
     // window or audio device.
 
-    /// Pack a (possibly strided) source framebuffer into a tightly packed `w * h` buffer, so the
-    /// raw-pointer read is confined here and the window only ever sees a packed frame.
-    ///
-    /// The per-row copy is clamped to `stride`: a `FrameBuffer` whose `width` exceeds its `stride`
-    /// is malformed, and reading `width` u32s from a row only `stride` wide would run past the
-    /// `stride * height` region into adjacent memory. Clamped-away columns (and the whole buffer
-    /// when `pixels` is null) are left zeroed (black) rather than read out of bounds.
-    ///
-    /// # Safety
-    /// When `pixels` is non-null it must address at least `stride * height` readable `u32`s (the
-    /// frozen `FrameBuffer` contract). `w`, `h`, and `stride` are the packed frame dimensions.
-    unsafe fn pack_frame(pixels: *const u32, w: usize, h: usize, stride: usize) -> Vec<u32> {
-        let mut buf = vec![0u32; w * h];
-        let row = w.min(stride);
-        if !pixels.is_null() {
-            // SAFETY: row `y` starts at `y * stride` and we read `row = min(w, stride) <= stride`
-            // u32s, so the last index touched is `y * stride + row - 1 < (y + 1) * stride <=
-            // stride * height` — always within the caller's guaranteed region. The destination
-            // write of `row <= w` u32s stays within the `w`-wide row at `buf[y * w..]`.
-            unsafe {
-                for y in 0..h {
-                    let src = pixels.add(y * stride);
-                    std::ptr::copy_nonoverlapping(src, buf[y * w..].as_mut_ptr(), row);
-                }
-            }
-        }
-        buf
-    }
-
     pub(super) fn present(pixels: *const u32, width: u32, height: u32, stride: u32) {
         if headless() {
             return;
@@ -2247,11 +2724,19 @@ mod imp {
         if w == 0 || h == 0 {
             return;
         }
-        // SAFETY: the frozen `FrameBuffer` contract guarantees `pixels` (when non-null) addresses
-        // at least `stride * height` readable `u32`s; `pack_frame` clamps each row read to
-        // `stride`, so an over-wide `width > stride` frame can never read past that region.
-        let buf = unsafe { pack_frame(pixels, w, h, stride) };
-        with_state(|st| st.present(&buf, w, h));
+        with_state(|st| {
+            // Pack into the PERSISTENT staging buffer rather than a fresh `Vec` per frame
+            // (cwage #97), then move it out to split the borrow and put it straight back.
+            //
+            // SAFETY: the frozen `FrameBuffer` contract guarantees `pixels` (when non-null)
+            // addresses at least `stride * height` readable `u32`s; `pack_frame_into` clamps each
+            // row read to `stride`, so an over-wide `width > stride` frame can never read past
+            // that region.
+            unsafe { compose::pack_frame_into(&mut st.staging, pixels, w, h, stride) };
+            let staging = std::mem::take(&mut st.staging);
+            st.present(&staging, w, h);
+            st.staging = staging;
+        });
     }
 
     pub(super) fn audio(samples: &[i16]) {
@@ -2376,15 +2861,18 @@ mod imp {
         if pixels.is_null() || w == 0 || h == 0 {
             return;
         }
-        // Copy the tightly packed source up front (stride == w), mirroring `present`, so the
-        // raw-pointer read is confined to here.
-        let mut buf = vec![0u32; w * h];
-        // SAFETY: the caller guarantees `pixels` addresses `w * h` readable `u32`s (the
-        // `bet_gg_show` contract).
-        unsafe {
-            std::ptr::copy_nonoverlapping(pixels, buf.as_mut_ptr(), w * h);
-        }
-        with_state(|st| st.show(&buf, w, h));
+        with_state(|st| {
+            // Copy the tightly packed source (stride == w) into the persistent staging buffer,
+            // mirroring `present`, so the raw-pointer read is confined to here — and so DOOM,
+            // which presents through `show`, stops allocating a full frame every tic (cwage #97).
+            //
+            // SAFETY: the caller guarantees `pixels` addresses `w * h` readable `u32`s (the
+            // `bet_gg_show` contract), which is `pack_frame_into`'s requirement at stride == w.
+            unsafe { compose::pack_frame_into(&mut st.staging, pixels, w, h, w) };
+            let staging = std::mem::take(&mut st.staging);
+            st.show(&staging, w, h);
+            st.staging = staging;
+        });
     }
 
     pub(super) fn audio_spec() -> u64 {
@@ -2406,47 +2894,5 @@ mod imp {
             return;
         }
         with_state(|st| st.set_title(name));
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::pack_frame;
-
-        // cwage #43: a `FrameBuffer` presenting with `width > stride` is malformed. `pack_frame`
-        // must clamp the per-row read to `stride` so it never touches memory past the
-        // `stride * height` region the source actually backs. We size the source at EXACTLY
-        // `stride * height` u32s (no slack): the pre-fix code read `width` per row and ran off the
-        // end, and would have filled the clamped-away columns with those out-of-bounds reads —
-        // this asserts they are instead left zeroed.
-        #[test]
-        fn present_clamps_overwide_width_to_stride() {
-            let (stride, h, w) = (2usize, 3usize, 5usize); // width (5) > stride (2)
-            let src: Vec<u32> = (1..=(stride * h) as u32).collect(); // [1,2, 3,4, 5,6]
-            let buf = unsafe { pack_frame(src.as_ptr(), w, h, stride) };
-
-            assert_eq!(buf.len(), w * h);
-            for y in 0..h {
-                for x in 0..w {
-                    let want = if x < stride { src[y * stride + x] } else { 0 };
-                    assert_eq!(buf[y * w + x], want, "pixel ({x},{y})");
-                }
-            }
-        }
-
-        // A null source reads nothing and yields a zeroed frame of the requested size.
-        #[test]
-        fn present_null_source_is_zeroed() {
-            let buf = unsafe { pack_frame(std::ptr::null(), 4, 2, 4) };
-            assert_eq!(buf, vec![0u32; 8]);
-        }
-
-        // The normal tightly-packed case (width == stride) is copied verbatim.
-        #[test]
-        fn present_packs_tight_frame_verbatim() {
-            let (w, h) = (3usize, 2usize);
-            let src: Vec<u32> = (10..16).collect();
-            let buf = unsafe { pack_frame(src.as_ptr(), w, h, w) };
-            assert_eq!(buf, src);
-        }
     }
 }
