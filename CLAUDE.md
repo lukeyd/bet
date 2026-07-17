@@ -1,9 +1,14 @@
 # CLAUDE.md — working rules for the `bet` repo
 
 `bet` is a compiled, statically-typed language with slang-keyword vocabulary and an
-arena/`tag`/`holla` memory model, implemented in Rust over an LLVM backend. Design
-docs: `language-spec.md`, `bootstrap-plan.md`, `plan-amendment-01/02/03.md`. The
-compiler pipeline is complete and self-hosted: `selfhost/betfe.bet` re-emits its own
+arena/`tag`/`holla` memory model, implemented in Rust over an LLVM backend. The
+normative reference is `language-spec.md`, with the frozen contracts in `spec/`
+(`grammar.ebnf`, `midir.md`, `runtime-abi.md`, `semantics.md`). The original
+bootstrap plan and its amendments finished and were deleted; `git log` has them,
+and comments citing `bootstrap-plan.md §N` / `plan-amendment-0N §N` are provenance
+pointers into that history, not live documents.
+
+The compiler pipeline is complete and self-hosted: `selfhost/betfe.bet` re-emits its own
 MIR byte-identically (Milestone 8 fixpoint), and `ports/doom` plays real DOOM with
 byte-exact sim parity. Current work is port-driven hardening (Frozen Bubble, the M:N
 scheduler, corpus parity) coordinated through the `midir`/`rt-abi` contract crates
