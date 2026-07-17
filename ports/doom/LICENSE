@@ -1,0 +1,102 @@
+ports/doom — licensing and provenance
+=====================================
+
+This directory is a hand-translation of id Software's DOOM into the `bet`
+language. It is a derivative work of id's released DOOM source and is
+distributed under the GNU General Public License, version 2. The full license
+text is in the file COPYING next to this notice.
+
+    DOOM
+    Copyright (C) 1993-1996 id Software, Inc.
+    Copyright (C) ZeniMax Media Inc.
+
+    The `bet` translation
+    Copyright (C) 2026 Luke Baggett
+
+    This program is free software; you can redistribute it and/or modify it
+    under the terms of the GNU General Public License as published by the Free
+    Software Foundation; version 2 of the License.
+
+    This program is distributed in the hope that it will be useful, but
+    WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+    or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+    for more details.
+
+    You should have received a copy of the GNU General Public License along
+    with this program; if not, see the file COPYING in this directory.
+
+
+Provenance
+----------
+
+The upstream is id Software's `linuxdoom-1.10` source, released by John Carmack
+on 1997-12-23. That original 1997 release was published under the "DOOM Source
+Code License", a non-commercial-use license. id subsequently relicensed the
+same source under the GNU General Public License, version 2. The GPL-2
+relicensing — not the 1997 license — is what permits this port to exist and be
+redistributed here.
+
+Two artifacts of that history look like contradictions and are not:
+
+  1. The per-file headers in the `linuxdoom-1.10` C sources still read "only
+     under the terms of the DOOM Source Code License as published by id
+     Software". id never rewrote those headers when they relicensed. The
+     operative grant is the LICENSE.TXT shipped alongside them, which is the
+     GPL-2 text, and the README.TXT, which closes with "Copyright (c) ZeniMax
+     Media Inc. / Licensed under the GNU General Public License 2.0." The stale
+     headers do not narrow that grant.
+
+  2. Consequently the GPL-2 headers on the `.bet` files in this directory are
+     *not* transcriptions of the C originals' headers. They are the standard
+     GPL-2 notice, applied to reflect the license the code is actually under.
+
+`COPYING` is a byte-identical copy of the `LICENSE.TXT` that id ships with the
+DOOM source. It is the older Free Software Foundation revision of GPL-2 (the
+"59 Temple Place" address, and "Library" rather than "Lesser" General Public
+License). Its operative terms are identical to the current gnu.org revision;
+only the FSF's mailing address and that rename differ. It is reproduced as id
+shipped it rather than swapped for the newer revision.
+
+The grant is version 2 specifically. id and ZeniMax state "the GNU General
+Public License 2.0" with no "or (at your option) any later version" clause, so
+the notices here do not claim one.
+
+
+Copyright attribution within this directory
+-------------------------------------------
+
+Every `.bet` file here is part of one GPL-2 combined work and carries the GPL-2
+notice. The copyright lines differ by file, deliberately:
+
+  * Files translated from id's C sources carry both id Software's copyright and
+    the translator's. Most of this directory is in this category — including the
+    `defs/` modules, which are translations of id's headers under new names
+    (`defs/player.bet` from `d_player.h`; `defs/think.bet` from `p_mobj.h`,
+    `d_think.h` and `p_pspr.h`; `defs/fixed.bet` from `m_fixed.c`; and so on).
+
+  * Files that are this port's own original work carry only the translator's
+    copyright. These are the `tools/` test harnesses and the music subsystem
+    (`s/opl.bet`, `s/mus.bet`, `s/genmidi.bet`, `s/wad.bet`) — an OPL2 FM
+    synthesizer, a DMX MUS sequencer, a GENMIDI bank parser, and a standalone
+    WAD directory walk. `linuxdoom-1.10` contains none of these: Linux DOOM had
+    no music and shelled out to an external `sndserv` for audio. They are GPL-2
+    because they are part of this combined work, not because they derive from
+    id's code.
+
+Attributing id's copyright to files id did not write would be a false copyright
+statement, which is why this split exists rather than a blanket header.
+
+
+Game data
+---------
+
+No copyrighted WAD data is committed to this repository, and none of it is
+covered by the GPL. The GPL-2 release covers id's *source code* only; the DOOM
+game assets remain proprietary to id/ZeniMax and are not redistributable.
+
+Run this port against the shareware `doom1.wad` (freely redistributable, and
+the source of the DEMO1/2/3 lumps used as the correctness oracle), against a
+commercial IWAD you own, or against Freedoom (BSD-licensed).
+
+See ../../LICENSING.md for how this GPL-2 directory relates to the Apache-2.0
+`bet` language and toolchain that surround it.
