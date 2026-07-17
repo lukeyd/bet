@@ -1,8 +1,7 @@
 # Frozen Bubble — `bet` port
 
 A port of [Frozen Bubble](https://github.com/kthakore/frozen-bubble) (GPL-2) to the `bet`
-language, running on the extended `gg` game platform (sprite compositor + audio mixer + mouse;
-see `plan-amendment-03.md`).
+language, running on the extended `gg` game platform (sprite compositor + audio mixer + mouse).
 
 ## Assets are NOT committed (GPL-2)
 
@@ -23,14 +22,17 @@ and emits a packed little-endian `FBD1` file (header + entry table + string tabl
 plus `assets_gen.bet` mapping asset names → entry indices. The game reads `assets.dat` at runtime
 with `fs.peep` and uploads textures/sounds via `gg.tex`/`gg.sound`.
 
-## Build & run (macOS)
+## Build & run
+
+Bake the assets first (above) — there is no way around it, and `cargo xtask run frozen-bubble`
+will tell you so rather than failing obscurely if `assets.dat` is missing. Then:
 
 ```sh
-export LLVM_SYS_180_PREFIX=/opt/homebrew/opt/llvm@18
-export LIBRARY_PATH="/opt/homebrew/lib:$LIBRARY_PATH"
-cargo build -p driver  --features llvm
-cargo build -p runtime --features gg-desktop
-target/debug/bet build ports/frozen-bubble/frozen-bubble.bet --runtime real -o fb && ./fb   # native
+cargo xtask run frozen-bubble     # builds the compiler + runtime + port, then runs it
+
 # or interpreter:
 cargo run -p driver --features "llvm,gg-desktop" -- run ports/frozen-bubble/frozen-bubble.bet
 ```
+
+`cargo xtask run` discovers LLVM 18 itself — nothing to export (`cargo xtask setup-llvm` reports
+what it found). The interpreter path needs LLVM in the environment the normal way.
