@@ -1,3 +1,20 @@
+// DOOM ported to bet — derived from id Software's linuxdoom-1.10.
+//
+// Copyright (C) 1993-1996 id Software, Inc.
+// Copyright (C) 2026 Luke Baggett
+//
+// This program is free software; you can redistribute it and/or modify it
+// under the terms of the GNU General Public License as published by the Free
+// Software Foundation; version 2 of the License.
+//
+// This program is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+// more details.
+//
+// You should have received a copy of the GNU General Public License along with
+// this program; if not, see the file COPYING in ports/doom.
+
 // p/p_sight.bet — line-of-sight / visibility checks using the REJECT table + a BSP descent
 // (linuxdoom-1.10 p_sight.c). Signature FROZEN in ports/doom/p-sigs.md ("p/p_map": checkSight).
 //

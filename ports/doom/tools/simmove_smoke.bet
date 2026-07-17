@@ -1,3 +1,19 @@
+// DOOM ported to bet — original work, part of the GPL-2 combined work.
+//
+// Copyright (C) 2026 Luke Baggett
+//
+// This program is free software; you can redistribute it and/or modify it
+// under the terms of the GNU General Public License as published by the Free
+// Software Foundation; version 2 of the License.
+//
+// This program is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+// more details.
+//
+// You should have received a copy of the GNU General Public License along with
+// this program; if not, see the file COPYING in ports/doom.
+
 // tools/simmove_smoke.bet — the P2.2 SIM-MOVE proof (p/p_inter + p/p_map). Cops a GameState,
 // fills the generated tables, wires NO-OP action/special stubs, then wires the 4 movement hooks
 // to the REAL p_map versions (tryMove/slideMove/checkPosition/aimLineAttack) so the collision

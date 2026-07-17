@@ -1,3 +1,20 @@
+// DOOM ported to bet — derived from id Software's linuxdoom-1.10.
+//
+// Copyright (C) 1993-1996 id Software, Inc.
+// Copyright (C) 2026 Luke Baggett
+//
+// This program is free software; you can redistribute it and/or modify it
+// under the terms of the GNU General Public License as published by the Free
+// Software Foundation; version 2 of the License.
+//
+// This program is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+// more details.
+//
+// You should have received a copy of the GNU General Public License along with
+// this program; if not, see the file COPYING in ports/doom.
+
 // util/m_cheat.bet — the cheat-sequence matcher (m_cheat.c). st_stuff (P2.9) owns the actual
 // cheat tables; this provides the SCRAMBLE obfuscation and the per-key matcher. A cheat is a
 // mutable []u8 sequence of SCRAMBLE'd bytes terminated by 0xff, with 0/1 param markers. The
