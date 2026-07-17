@@ -88,7 +88,20 @@ env:
 
 jobs:
   sim-parity:
-    runs-on: ubuntu-24.04
+    # aarch64, NOT the usual x86_64 ubuntu-24.04, and that is a finding rather than a
+    # preference: on ubuntu-24.04/x86_64 `bet build ports/doom/doom.bet` dies in ~22s with
+    # SIGSEGV (exit 139, core dumped). Measured on both arches from the same commit:
+    #
+    #   ubuntu-24.04     (x86_64)   default 16 MB stack -> 139     unlimited stack -> 139
+    #   ubuntu-24.04-arm (aarch64)  default 16 MB stack ->   0     unlimited stack ->   0
+    #
+    # So it is not a stack overflow (an unlimited stack changes nothing) and not OOM (7.9 GB
+    # total / 3.4 GB free, and it dies in 22s, and OOM would be SIGKILL/137) — it is an
+    # x86_64-specific bug in the compiler. The whole project was built on macOS/arm64, so the
+    # port had never been compiled for x86_64 until this workflow tried; see the follow-up issue.
+    # Running here gates sim regressions TODAY on the arch that works; flip this to a matrix over
+    # both arches once x86_64 compiles, and it doubles as an arch-parity gate.
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
