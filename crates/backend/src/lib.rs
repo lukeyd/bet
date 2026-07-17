@@ -7,9 +7,9 @@
 //! lives in the [`codegen`] module, compiled only under `--features llvm`; without it,
 //! [`compile_to_object`] returns [`BackendError::NoCodegen`].
 //!
-//! Step 2 (tracer bullet) scope: enough of the IR to thread `spill.it("hi")` — externs,
-//! string-literal data pointers/lengths, direct calls, and a synthesized C `main` entry —
-//! through to a linked, running binary. Broader lowering lands with the backend fan-out.
+//! Scope: the full `midir` surface, through to a linked, running binary. This is the code
+//! generator behind the DOOM port and the self-hosting fixpoint; see `tests/corpus/` for
+//! the programs it is gated against (`cargo xtask corpus --compiled`).
 
 #[cfg(feature = "llvm")]
 mod codegen;
