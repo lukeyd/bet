@@ -1,3 +1,20 @@
+// DOOM ported to bet — derived from id Software's linuxdoom-1.10.
+//
+// Copyright (C) 1993-1996 id Software, Inc.
+// Copyright (C) 2026 Luke Baggett
+//
+// This program is free software; you can redistribute it and/or modify it
+// under the terms of the GNU General Public License as published by the Free
+// Software Foundation; version 2 of the License.
+//
+// This program is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+// more details.
+//
+// You should have received a copy of the GNU General Public License along with
+// this program; if not, see the file COPYING in ports/doom.
+
 // w/w_wad.bet — WAD header, directory, and lump I/O (linuxdoom-1.10 w_wad.c).
 //
 // No-purgeable-cache model: the whole IWAD is fs.peep'd once into `g.wad.buf` (a []u8), and

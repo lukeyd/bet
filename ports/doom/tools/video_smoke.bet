@@ -1,3 +1,19 @@
+// DOOM ported to bet — original work, part of the GPL-2 combined work.
+//
+// Copyright (C) 2026 Luke Baggett
+//
+// This program is free software; you can redistribute it and/or modify it
+// under the terms of the GNU General Public License as published by the Free
+// Software Foundation; version 2 of the License.
+//
+// This program is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+// more details.
+//
+// You should have received a copy of the GNU General Public License along with
+// this program; if not, see the file COPYING in ports/doom.
+
 // tools/video_smoke.bet — the P1.2 WAD+VIDEO+SYSTEM proof. Cops a GameState, gsInit, loads
 // the shareware IWAD, sets palette 0, draws TITLEPIC (a 320×200 patch) into scr0 via
 // v_video.drawPatch, presents once (i_video.finishUpdate → gg.show), and crc32's the 8-bit

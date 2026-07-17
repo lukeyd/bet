@@ -1,3 +1,19 @@
+// DOOM ported to bet — original work, part of the GPL-2 combined work.
+//
+// Copyright (C) 2026 Luke Baggett
+//
+// This program is free software; you can redistribute it and/or modify it
+// under the terms of the GNU General Public License as published by the Free
+// Software Foundation; version 2 of the License.
+//
+// This program is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+// FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+// more details.
+//
+// You should have received a copy of the GNU General Public License along with
+// this program; if not, see the file COPYING in ports/doom.
+
 // tools/simcore_smoke.bet — the P2.1 SIM-CORE proof. Cops a GameState, fills the generated data
 // tables, wires NO-OP stubs into all 74 g.actions.a* and the 7 g.hooks.*, wires the mobj thinker
 // dispatch (g.hooks.mobjThink -> p_mobj.mobjThinker), then:
