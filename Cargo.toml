@@ -41,10 +41,18 @@ insta     = "1"     # frontend (dev-dep, snapshot tests)
 # NOTE: unsafe_code is deliberately NOT forbidden — rt-abi/rt-stub/runtime/backend
 # need `unsafe` (extern "C", FFI, raw slabs) in Step 1+. Kept at warn.
 unsafe_code = "warn"
-# `unused_crate_dependencies` is intentionally OFF in Step 0: the stub crates wire
-# their real dependency EDGES (so graph-check is meaningful) but the empty lib.rs
-# files don't reference them yet, which would trip this lint under `-D warnings`.
-# Re-enable in Step 1 once crates actually use their deps.
+# Catches per-crate dependency rot: a dep declared in a crate's [dependencies]
+# that its source never references. This does NOT police the
+# [workspace.dependencies] catalog above — an entry no member references is
+# invisible to it, so prune those by hand.
+#
+# BLOCKED on exactly one crate: `backend` declares the allowlisted `backend ->
+# rt-abi` edge but only names `rt_abi` in comments (codegen.rs hardcodes the
+# 16-byte `rt_abi::Tag` layout instead of importing it), so this lint fires there
+# and `-D warnings` turns it into a CI error. The fix is one line — `use rt_abi
+# as _;` in crates/backend/src/lib.rs (as crates/lsp/src/lib.rs now does for its
+# own reserved edge) — or, better, have codegen.rs import the `Tag` type it is
+# currently duplicating by hand. Uncomment this in the same change.
 # unused_crate_dependencies = "warn"
 
 [workspace.lints.clippy]
