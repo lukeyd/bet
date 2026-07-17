@@ -11,8 +11,8 @@
 // the frame-arena cycle, measured, not just asserted.
 //
 // Build + run:
-//   ports/fireworks/run.sh                 # windowed — watch the fireworks
-//   BET_GG_HEADLESS=1 /tmp/fireworks       # headless — prints the scratch trace, self-terminates
+//   cargo xtask run fireworks                    # windowed — watch the fireworks
+//   BET_GG_HEADLESS=1 cargo xtask run fireworks  # headless — prints the scratch trace, self-terminates
 pull "spill"
 pull "gg"
 pull "mem"
