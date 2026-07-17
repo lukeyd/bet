@@ -9,8 +9,14 @@
 //! ## Two builds from one source
 //!
 //! * **`desktop` feature ON** — a real window (`minifb`), a real audio output stream
-//!   (`cpal`) draining a shared sample ring, and a synthesized input-event queue. All of it
-//!   hangs off a single process-global singleton created lazily on first use.
+//!   (`cpal`) draining a wait-free SPSC sample ring, and a synthesized input-event queue. All
+//!   of it hangs off a single process-global singleton created lazily on first use.
+//!
+//! ## Threads
+//!
+//! There are exactly TWO: the game thread, which owns the singleton and every allocation, and
+//! the `cpal` audio callback, which is REAL-TIME and shares no state with it — only the two
+//! wait-free SPSC rings reach across. Nothing in the callback locks or allocates; see [`mixer`].
 //! * **`desktop` feature OFF (default)** — headless no-ops with ZERO heavy dependencies:
 //!   [`present`]/[`audio`] do nothing, [`poll`] always reports [`event_kind::NONE`], and
 //!   [`ticks`] is a monotonic `Instant` (a plain monotonic counter on `wasm32`, which has no
@@ -32,9 +38,10 @@
 //! (the first gg call) and lets CI run a compiled gg game to completion.
 
 // The desktop singleton stores a `minifb::Window` and a `cpal::Stream`, neither of which is
-// `Send`. We keep them in a process-global `Mutex` and force `Send` on the wrapper: `gg` is a
-// single-threaded platform layer — the game loop presents, polls, and pushes audio from one
-// thread — so the invariant holds. This is the one place the crate needs `unsafe`.
+// `Send`. We keep them in a process-global `Mutex` and force `Send` on the wrapper: every `gg`
+// entry point runs on the one game-loop thread, so the singleton is only ever touched from
+// there. (The audio callback is a second thread, but it shares nothing with the singleton — see
+// the `unsafe impl Send` for the real argument.) This is the one place the crate needs `unsafe`.
 #![allow(unsafe_code)]
 
 use rt_abi::{Event, event_kind};
@@ -233,8 +240,8 @@ pub fn size() -> u64 {
 
 // ---------------------------------------------------------------------------
 // gg compositor / mixer / mouse (amendment §SP0.4 raise). All share the singleton the four
-// original primitives use; the audio mixer lives behind its OWN mutex so the cpal callback
-// never touches the outer GG lock (the existing no-deadlock invariant).
+// original primitives use; the audio mixer is owned outright by the cpal callback and reached
+// only through a wait-free command ring, so the real-time thread takes no lock at all.
 // ---------------------------------------------------------------------------
 
 /// Upload an RGBA8 texture (`w * h` pixels, 4 bytes `R,G,B,A` each) and return its 1-based id
@@ -345,6 +352,829 @@ pub fn title(name: &str) {
 }
 
 // ===========================================================================
+// The mixer core — compiled in BOTH builds, so the default `cargo nextest run --workspace`
+// gate exercises it. Nothing here knows about `cpal`: the real-time side is expressed as the
+// two `PcmSource`/`CmdSource` traits, which the `desktop` build satisfies with lock-free
+// `rtrb` SPSC consumers and the tests satisfy with plain slices/`VecDeque`s.
+// ===========================================================================
+
+/// A counting global allocator, installed ONLY in this crate's own test binary.
+///
+/// The claims this crate makes — "the audio callback never allocates", "the present path is
+/// zero-allocation per frame" — are exactly the kind that rot into a false line in a Markdown
+/// table. So they are measured, against the real allocator, rather than asserted.
+///
+/// Both `alloc` AND `dealloc` are counted: a `free()` on the real-time thread misses the
+/// deadline just as surely as a `malloc`, and it is the subtler hazard (an `Arc` whose refcount
+/// happens to hit zero inside the callback). See [`mixer::Mixer::apply`].
+#[cfg(test)]
+mod alloc_probe {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Allocator operations performed by THIS thread. `const`-initialized and `Drop`-free,
+        /// so touching it from inside the allocator cannot recurse through TLS destructors.
+        static OPS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn bump() {
+        // `try_with`: during thread teardown the TLS may be gone — never panic in the allocator.
+        let _ = OPS.try_with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) struct Counting;
+
+    // SAFETY: every method forwards verbatim to `System`, which is a correct `GlobalAlloc`; the
+    // only addition is a thread-local counter bump that allocates nothing itself.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            bump();
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            bump();
+            unsafe { System.alloc_zeroed(layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            bump();
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            bump();
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOC: Counting = Counting;
+
+    /// Run `f` and report how many allocator operations it performed on this thread. Per-thread
+    /// (not global) so it stays exact whether the harness runs tests threaded or process-per-test.
+    pub(crate) fn count_allocator_ops(f: impl FnOnce()) -> usize {
+        let before = OPS.with(Cell::get);
+        f();
+        OPS.with(Cell::get) - before
+    }
+}
+
+/// The lock-free voice mixer shared by the `desktop` audio callback and the unit tests.
+///
+/// ## Why this shape (cwage #96)
+///
+/// The audio callback is a REAL-TIME thread: it must never block and never allocate. The
+/// previous design had it take two `Mutex`es that the game thread also held while doing a
+/// `Vec<i16>` resample — textbook priority inversion, and an audible click whenever a sound
+/// registered mid-frame. So:
+///
+/// * the game thread OWNS the sound registry ([`SoundRegistry`]) and does every allocation
+///   (registration, resampling) itself, before handing anything over;
+/// * the callback OWNS the [`Mixer`] outright — no sharing, therefore no lock;
+/// * the only channel between them is a wait-free SPSC ring of [`MixCmd`]s;
+/// * the voice pool is PRE-ALLOCATED ([`MAX_VOICES`] slots), so starting a voice writes into
+///   an existing slot rather than growing a `Vec`.
+mod mixer {
+    use std::sync::Arc;
+
+    /// The pre-allocated voice pool size. Fixed so `play` never grows a `Vec` (the old
+    /// `voices: Vec<Voice>` also grew without bound — every `play` leaked a slot forever).
+    /// Beyond this, the oldest slot is stolen, which is what every real game mixer does.
+    pub(crate) const MAX_VOICES: usize = 64;
+
+    /// Voice ids pack `generation` and `slot` so a `stop`/`tune` racing a stolen slot is a
+    /// no-op instead of retuning whatever voice recycled it. 25 generation bits keeps
+    /// `generation * MAX_VOICES + slot + 1` inside `u32` (max id `0x8000_0000`).
+    const VOICE_GEN_MASK: u32 = 0x01FF_FFFF;
+
+    /// Pack a `(slot, generation)` into the public 1-based voice id (`0` = invalid).
+    pub(crate) fn voice_id(slot: usize, generation: u32) -> u32 {
+        ((generation & VOICE_GEN_MASK) * MAX_VOICES as u32) + slot as u32 + 1
+    }
+
+    /// Unpack a public voice id back into `(slot, generation)`; `0` (and only `0`) is invalid.
+    pub(crate) fn decode_voice(id: u32) -> Option<(usize, u32)> {
+        let i = id.checked_sub(1)?;
+        Some((i as usize % MAX_VOICES, i / MAX_VOICES as u32))
+    }
+
+    /// A message from the game thread to the audio callback. Every variant is plain data or an
+    /// already-built `Arc` — applying one never allocates and never blocks.
+    pub(crate) enum MixCmd {
+        /// Start (or steal) `slot` with an ALREADY-RESAMPLED buffer. The game thread resampled
+        /// it; the callback only reads it.
+        Play {
+            slot: usize,
+            generation: u32,
+            pcm: Arc<Vec<i16>>,
+            vol_q8: u32,
+            looping: bool,
+        },
+        Stop {
+            slot: usize,
+            generation: u32,
+        },
+        Tune {
+            slot: usize,
+            generation: u32,
+            vol_q8: u32,
+            pan_q8: u32,
+        },
+    }
+
+    /// A pre-allocated voice slot. `pcm` is a REFERENCE to registry-owned audio, never an owned
+    /// buffer — see [`Mixer::apply`] for why that matters in a real-time callback.
+    pub(crate) struct Voice {
+        pcm: Option<Arc<Vec<i16>>>,
+        /// The generation this slot was last started at; a command for any other generation is
+        /// stale and ignored.
+        generation: u32,
+        pos: usize,
+        vol_q8: u32,
+        /// Stereo pan: `0` = full left, `128` = center, `255` = full right (see [`Mixer::mix_sample`]).
+        pan_q8: u32,
+        looping: bool,
+        active: bool,
+    }
+
+    impl Voice {
+        const fn idle() -> Voice {
+            Voice {
+                pcm: None,
+                generation: 0,
+                pos: 0,
+                vol_q8: 0,
+                pan_q8: 128,
+                looping: false,
+                active: false,
+            }
+        }
+    }
+
+    /// The interleaved raw-[`crate::audio`] sample stream the callback drains 1:1. Abstracted so
+    /// the mixer core compiles (and is tested) without `rtrb`.
+    pub(crate) trait PcmSource {
+        /// The next queued sample, or `0` when the stream has run dry (silence, not a stall).
+        fn next_sample(&mut self) -> i16;
+    }
+
+    /// The [`MixCmd`] stream the callback drains at the top of each block.
+    pub(crate) trait CmdSource {
+        fn next_cmd(&mut self) -> Option<MixCmd>;
+    }
+
+    /// A `PcmSource` over a plain slice — the test stand-in for the `rtrb` consumer.
+    #[cfg(test)]
+    pub(crate) struct SlicePcm<'a>(pub &'a [i16], pub usize);
+    #[cfg(test)]
+    impl PcmSource for SlicePcm<'_> {
+        fn next_sample(&mut self) -> i16 {
+            let s = self.0.get(self.1).copied().unwrap_or(0);
+            self.1 += 1;
+            s
+        }
+    }
+
+    /// Silence — the `PcmSource` for tests that only care about voices.
+    #[cfg(test)]
+    pub(crate) struct Silence;
+    #[cfg(test)]
+    impl PcmSource for Silence {
+        fn next_sample(&mut self) -> i16 {
+            0
+        }
+    }
+
+    /// A `CmdSource` over a `Vec`, used by tests; `None` once drained.
+    #[cfg(test)]
+    pub(crate) struct VecCmds(pub std::collections::VecDeque<MixCmd>);
+    #[cfg(test)]
+    impl CmdSource for VecCmds {
+        fn next_cmd(&mut self) -> Option<MixCmd> {
+            self.0.pop_front()
+        }
+    }
+
+    /// No commands at all.
+    #[cfg(test)]
+    pub(crate) struct NoCmds;
+    #[cfg(test)]
+    impl CmdSource for NoCmds {
+        fn next_cmd(&mut self) -> Option<MixCmd> {
+            None
+        }
+    }
+
+    /// The voice mixer, owned OUTRIGHT by the audio callback (never shared, never locked).
+    pub(crate) struct Mixer {
+        voices: [Voice; MAX_VOICES],
+        device_channels: u16,
+    }
+
+    impl Mixer {
+        pub(crate) fn new(device_channels: u16) -> Mixer {
+            const IDLE: Voice = Voice::idle();
+            Mixer {
+                voices: [IDLE; MAX_VOICES],
+                device_channels,
+            }
+        }
+
+        /// Apply one command. Allocation-free by construction:
+        ///
+        /// * `Play` stores an `Arc` CLONE; the drop of the slot's previous `Arc` can only
+        ///   decrement a refcount, never free, because [`SoundRegistry`] holds a strong
+        ///   reference to every resampled buffer for the life of the process. That invariant is
+        ///   what keeps `free()` out of the real-time thread — do not "tidy" the registry into
+        ///   dropping entries.
+        /// * `Stop`/`Tune` only touch scalars.
+        ///
+        /// Stale commands (a `stop`/`tune` for a slot that has since been stolen) are ignored.
+        pub(crate) fn apply(&mut self, cmd: MixCmd) {
+            match cmd {
+                MixCmd::Play {
+                    slot,
+                    generation,
+                    pcm,
+                    vol_q8,
+                    looping,
+                } => {
+                    let Some(v) = self.voices.get_mut(slot) else {
+                        return;
+                    };
+                    // A `Play` always wins its slot — that IS the steal.
+                    v.pcm = Some(pcm);
+                    v.generation = generation;
+                    v.pos = 0;
+                    v.vol_q8 = vol_q8;
+                    v.pan_q8 = 128; // center — `tune` moves it
+                    v.looping = looping;
+                    v.active = true;
+                }
+                MixCmd::Stop { slot, generation } => {
+                    if let Some(v) = self.voices.get_mut(slot)
+                        && v.generation == generation
+                    {
+                        v.active = false;
+                    }
+                }
+                MixCmd::Tune {
+                    slot,
+                    generation,
+                    vol_q8,
+                    pan_q8,
+                } => {
+                    if let Some(v) = self.voices.get_mut(slot)
+                        && v.generation == generation
+                    {
+                        v.vol_q8 = vol_q8;
+                        v.pan_q8 = pan_q8.min(255);
+                    }
+                }
+            }
+        }
+
+        /// Drain every pending command. Bounded by the ring's capacity, and each `apply` is O(1)
+        /// — so the callback's worst case stays a fixed, small amount of work.
+        pub(crate) fn drain(&mut self, cmds: &mut impl CmdSource) {
+            while let Some(cmd) = cmds.next_cmd() {
+                self.apply(cmd);
+            }
+        }
+
+        /// Produce one output sample for channel `chan` (the slot's index within its interleaved
+        /// frame): the raw ring (kept 1:1 and unpanned for `gg.audio` / Pong) plus every active
+        /// voice, summed and clipped to `i16`. Advances each voice's `pos`; a one-shot voice
+        /// deactivates at its end, a looping voice wraps.
+        ///
+        /// Per-voice stereo pan (linear law): with `vol = vol_q8` and `pan = pan_q8` (0 = full
+        /// left, 128 = center, 255 = full right),
+        ///   * even channels (left)  get gain `vol * (255 - pan) / 255`,
+        ///   * odd  channels (right) get gain `vol * pan / 255`,
+        ///   * a mono device applies the plain unpanned `vol`.
+        ///
+        /// Center is therefore ~half gain per side (127/255 and 128/255), the standard linear
+        /// halving that keeps a hard-panned voice at unity on its side.
+        pub(crate) fn mix_sample(&mut self, pcm: &mut impl PcmSource, chan: usize) -> i16 {
+            let mut acc = i32::from(pcm.next_sample());
+            let mono = self.device_channels <= 1;
+            for v in self.voices.iter_mut() {
+                if !v.active {
+                    continue;
+                }
+                let res = match v.pcm.as_ref() {
+                    Some(r) if !r.is_empty() => r,
+                    _ => {
+                        v.active = false;
+                        continue;
+                    }
+                };
+                let vol = v.vol_q8 as i32;
+                let gain = if mono {
+                    vol
+                } else if chan.is_multiple_of(2) {
+                    vol * (255 - v.pan_q8 as i32) / 255
+                } else {
+                    vol * v.pan_q8 as i32 / 255
+                };
+                acc += (i32::from(res[v.pos]) * gain) >> 8;
+                v.pos += 1;
+                if v.pos >= res.len() {
+                    if v.looping {
+                        v.pos = 0;
+                    } else {
+                        v.active = false;
+                    }
+                }
+            }
+            acc.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
+        }
+
+        /// The whole real-time callback body, in one allocation-free, lock-free call: drain the
+        /// command ring, then mix `data.len()` sample slots. Shared by the I16 and F32 stream
+        /// formats (and driven directly by the tests).
+        pub(crate) fn fill(
+            &mut self,
+            data: &mut [i16],
+            pcm: &mut impl PcmSource,
+            cmds: &mut impl CmdSource,
+            channels: usize,
+        ) {
+            self.drain(cmds);
+            for (i, s) in data.iter_mut().enumerate() {
+                *s = self.mix_sample(pcm, i % channels);
+            }
+        }
+
+        /// Whether `slot` is currently sounding — test/instrumentation only.
+        #[cfg(test)]
+        pub(crate) fn is_active(&self, slot: usize) -> bool {
+            self.voices[slot].active
+        }
+    }
+
+    /// A registered PCM sound, owned by the GAME thread. `pcm` is the raw interleaved `i16` at
+    /// its native `channels`/`rate`; `resampled` is a lazily-built copy interleaved at the DEVICE
+    /// channels/rate, so the mixer advances a voice's `pos` by one per output sample slot
+    /// (matching the raw ring's 1:1 drain).
+    struct Sound {
+        pcm: Vec<i16>,
+        channels: u32,
+        rate: u32,
+        resampled: Option<Arc<Vec<i16>>>,
+    }
+
+    /// The game-thread-owned sound registry and voice-slot allocator. Every allocation in the
+    /// audio path happens HERE, on the game thread — the callback only ever receives finished
+    /// `Arc`s. Entries are never removed, which is precisely what guarantees the callback's
+    /// `Arc` drops can't free (see [`Mixer::apply`]).
+    pub(crate) struct SoundRegistry {
+        sounds: Vec<Sound>,
+        /// Per-slot generation counter, bumped on every (re)use so stale ids can be rejected.
+        generations: [u32; MAX_VOICES],
+        /// Round-robin cursor: voices are stolen oldest-first once the pool wraps.
+        next_slot: usize,
+    }
+
+    impl SoundRegistry {
+        pub(crate) fn new() -> SoundRegistry {
+            SoundRegistry {
+                sounds: Vec::new(),
+                generations: [0; MAX_VOICES],
+                next_slot: 0,
+            }
+        }
+
+        /// Register interleaved little-endian `i16` PCM; returns its 1-based id.
+        pub(crate) fn register(&mut self, pcm: &[u8], channels: u32, rate: u32) -> u32 {
+            let samples: Vec<i16> = pcm
+                .chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            self.sounds.push(Sound {
+                pcm: samples,
+                channels: channels.max(1),
+                rate: if rate == 0 { 44_100 } else { rate },
+                resampled: None,
+            });
+            self.sounds.len() as u32
+        }
+
+        /// The device-format buffer for `sound` (1-based), resampling it ON THE GAME THREAD the
+        /// first time. `None` for an unknown id.
+        pub(crate) fn prepare(
+            &mut self,
+            sound: u32,
+            dev_ch: u32,
+            dev_rate: u32,
+        ) -> Option<Arc<Vec<i16>>> {
+            let idx = (sound.checked_sub(1)?) as usize;
+            let s = self.sounds.get_mut(idx)?;
+            if s.resampled.is_none() {
+                let dst_rate = if dev_rate == 0 { s.rate } else { dev_rate };
+                let res = resample(&s.pcm, s.channels, s.rate, dev_ch, dst_rate);
+                s.resampled = Some(Arc::new(res));
+            }
+            s.resampled.clone()
+        }
+
+        /// Claim the next voice slot round-robin, bumping its generation. Returns
+        /// `(slot, generation)`; the caller turns that into a public id with [`voice_id`].
+        pub(crate) fn alloc_voice(&mut self) -> (usize, u32) {
+            let slot = self.next_slot;
+            self.next_slot = (self.next_slot + 1) % MAX_VOICES;
+            self.generations[slot] = self.generations[slot].wrapping_add(1) & VOICE_GEN_MASK;
+            (slot, self.generations[slot])
+        }
+
+        #[cfg(test)]
+        pub(crate) fn len(&self) -> usize {
+            self.sounds.len()
+        }
+    }
+
+    /// Resample `pcm` (interleaved `src_ch` channels at `src_rate` Hz) to interleaved `dst_ch`
+    /// channels at `dst_rate` Hz, nearest-neighbor. The result is interleaved at the DEVICE channel
+    /// count so the mixer advances a voice's `pos` by one per output sample slot. Channel mapping:
+    /// mono -> duplicate, multi -> mono average, else copy shared channels.
+    ///
+    /// This allocates — which is exactly why it runs on the game thread, in `play`, once per
+    /// sound, and never in the callback.
+    pub(crate) fn resample(
+        pcm: &[i16],
+        src_ch: u32,
+        src_rate: u32,
+        dst_ch: u32,
+        dst_rate: u32,
+    ) -> Vec<i16> {
+        let src_ch = src_ch.max(1) as usize;
+        let dst_ch = dst_ch.max(1) as usize;
+        let src_rate = src_rate.max(1) as u64;
+        let dst_rate = dst_rate.max(1) as u64;
+        let src_frames = pcm.len() / src_ch;
+        if src_frames == 0 {
+            return Vec::new();
+        }
+        let dst_frames = (src_frames as u64 * dst_rate / src_rate) as usize;
+        let mut out = Vec::with_capacity(dst_frames * dst_ch);
+        for f in 0..dst_frames {
+            let sf = ((f as u64 * src_rate / dst_rate) as usize).min(src_frames - 1);
+            let base = sf * src_ch;
+            if dst_ch == src_ch {
+                out.extend_from_slice(&pcm[base..base + src_ch]);
+            } else if src_ch == 1 {
+                let s = pcm[base];
+                for _ in 0..dst_ch {
+                    out.push(s);
+                }
+            } else if dst_ch == 1 {
+                let mut acc = 0i32;
+                for c in 0..src_ch {
+                    acc += i32::from(pcm[base + c]);
+                }
+                out.push((acc / src_ch as i32) as i16);
+            } else {
+                for c in 0..dst_ch {
+                    out.push(if c < src_ch { pcm[base + c] } else { 0 });
+                }
+            }
+        }
+        out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn cmds(v: Vec<MixCmd>) -> VecCmds {
+            VecCmds(v.into())
+        }
+
+        /// A registered sound resamples once, on the game thread, and hands the callback a
+        /// ready-to-read `Arc`. Two `prepare`s of the same sound must return the SAME buffer —
+        /// that sharing is what makes the callback's `Arc` drop a refcount decrement and never a
+        /// `free()` (cwage #96).
+        #[test]
+        fn registry_resamples_once_and_shares_the_buffer() {
+            let mut reg = SoundRegistry::new();
+            // 4 mono frames of 0x0101-ish LE i16.
+            let id = reg.register(&[1, 0, 2, 0, 3, 0, 4, 0], 1, 8_000);
+            assert_eq!(id, 1);
+            assert_eq!(reg.len(), 1);
+
+            let a = reg.prepare(id, 2, 8_000).expect("prepared");
+            let b = reg.prepare(id, 2, 8_000).expect("prepared again");
+            // Same allocation, not a re-resample.
+            assert!(Arc::ptr_eq(&a, &b));
+            // Mono -> stereo duplicate at the same rate: 4 frames * 2 channels.
+            assert_eq!(*a, vec![1, 1, 2, 2, 3, 3, 4, 4]);
+            // The registry keeps its own strong ref forever — the invariant the callback relies on.
+            assert_eq!(Arc::strong_count(&a), 3); // registry + a + b
+            assert!(reg.prepare(0, 2, 8_000).is_none());
+            assert!(reg.prepare(99, 2, 8_000).is_none());
+        }
+
+        /// The voice pool is fixed-size and round-robin. Slot reuse must bump the generation so
+        /// the recycled id differs — otherwise a late `stop` would kill an unrelated voice.
+        #[test]
+        fn voice_ids_roundtrip_and_bump_generation_on_reuse() {
+            let mut reg = SoundRegistry::new();
+            let mut first = Vec::new();
+            for _ in 0..MAX_VOICES {
+                let (slot, generation) = reg.alloc_voice();
+                first.push(voice_id(slot, generation));
+            }
+            // Every id in one lap round the pool is distinct...
+            let mut sorted = first.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(sorted.len(), MAX_VOICES);
+            // ...and every id decodes back to what produced it.
+            for (i, &id) in first.iter().enumerate() {
+                assert_eq!(decode_voice(id), Some((i, 1)));
+            }
+            // The next lap reuses slot 0 but at generation 2 — a different id.
+            let (slot, generation) = reg.alloc_voice();
+            assert_eq!((slot, generation), (0, 2));
+            assert_ne!(voice_id(slot, generation), first[0]);
+            // `0` is the reserved invalid id, and only `0`.
+            assert_eq!(decode_voice(0), None);
+            assert!(decode_voice(1).is_some());
+        }
+
+        /// A `stop` aimed at a slot that has since been stolen must be ignored, not applied to
+        /// whatever voice now owns the slot.
+        #[test]
+        fn stale_stop_does_not_kill_the_voice_that_stole_the_slot() {
+            let mut mix = Mixer::new(2);
+            let pcm = Arc::new(vec![100i16; 64]);
+            // Generation 1 takes slot 0, then generation 2 steals it.
+            for generation in [1, 2] {
+                mix.apply(MixCmd::Play {
+                    slot: 0,
+                    generation,
+                    pcm: Arc::clone(&pcm),
+                    vol_q8: 256,
+                    looping: false,
+                });
+            }
+            // The old owner's stop must not touch the new one.
+            mix.apply(MixCmd::Stop {
+                slot: 0,
+                generation: 1,
+            });
+            assert!(mix.is_active(0), "stale stop killed the stealing voice");
+            // The current owner's stop must.
+            mix.apply(MixCmd::Stop {
+                slot: 0,
+                generation: 2,
+            });
+            assert!(!mix.is_active(0));
+        }
+
+        /// The command ring is the ONLY way into the mixer, so a `Play` arriving mid-block must
+        /// be picked up by `fill`'s drain and be audible in that same block.
+        #[test]
+        fn fill_drains_commands_then_mixes_the_voice() {
+            let mut mix = Mixer::new(1); // mono: unpanned, gain == vol
+            let pcm = Arc::new(vec![1000i16, 2000, 3000, 4000]);
+            let mut q = cmds(vec![MixCmd::Play {
+                slot: 3,
+                generation: 1,
+                pcm,
+                vol_q8: 256, // unity
+                looping: false,
+            }]);
+            let mut out = [0i16; 4];
+            mix.fill(&mut out, &mut Silence, &mut q, 1);
+            assert_eq!(out, [1000, 2000, 3000, 4000]);
+            // A 4-sample one-shot is finished; the next block is silence and the slot is free.
+            let mut out2 = [0i16; 4];
+            mix.fill(&mut out2, &mut Silence, &mut NoCmds, 1);
+            assert_eq!(out2, [0, 0, 0, 0]);
+            assert!(!mix.is_active(3));
+        }
+
+        /// The raw `gg.audio` ring stays 1:1 and unpanned (Pong / DOOM music depend on it), and
+        /// sums with voices rather than replacing them.
+        #[test]
+        fn raw_ring_passes_through_and_sums_with_voices() {
+            let mut mix = Mixer::new(1);
+            let raw = [10i16, 20, 30, 40];
+            let mut src = SlicePcm(&raw, 0);
+            let mut out = [0i16; 4];
+            // No voices: straight passthrough.
+            mix.fill(&mut out, &mut src, &mut NoCmds, 1);
+            assert_eq!(out, raw);
+            // A dry ring reads as silence, not a stall.
+            let mut out2 = [0i16; 2];
+            mix.fill(&mut out2, &mut src, &mut NoCmds, 1);
+            assert_eq!(out2, [0, 0]);
+            // With a voice: the two sum.
+            let mut src = SlicePcm(&raw, 0);
+            let mut q = cmds(vec![MixCmd::Play {
+                slot: 0,
+                generation: 1,
+                pcm: Arc::new(vec![5i16; 4]),
+                vol_q8: 256,
+                looping: false,
+            }]);
+            let mut out3 = [0i16; 4];
+            mix.fill(&mut out3, &mut src, &mut q, 1);
+            assert_eq!(out3, [15, 25, 35, 45]);
+        }
+
+        /// The linear pan law, at the three points that matter. Center is ~half gain per side.
+        #[test]
+        fn pan_law_splits_stereo_channels() {
+            let pcm = Arc::new(vec![1000i16; 16]);
+            let play = |pan_q8: u32| MixCmd::Tune {
+                slot: 0,
+                generation: 1,
+                vol_q8: 256,
+                pan_q8,
+            };
+            // Center's slight left/right asymmetry (496 vs 500) is the pan law's integer
+            // 127/255-vs-128/255 split, not a bug: 128 is the only exact center an odd-width
+            // 0..=255 range can't have.
+            for (pan, want_l, want_r) in [(0u32, 1000i16, 0i16), (255, 0, 1000), (128, 496, 500)] {
+                let mut mix = Mixer::new(2);
+                mix.apply(MixCmd::Play {
+                    slot: 0,
+                    generation: 1,
+                    pcm: Arc::clone(&pcm),
+                    vol_q8: 256,
+                    looping: true,
+                });
+                mix.apply(play(pan));
+                let mut out = [0i16; 2];
+                mix.fill(&mut out, &mut Silence, &mut NoCmds, 2);
+                assert_eq!(out, [want_l, want_r], "pan {pan}");
+            }
+        }
+
+        /// A looping voice wraps forever; a one-shot stops exactly at its end.
+        #[test]
+        fn looping_voice_wraps_and_one_shot_ends() {
+            let pcm = Arc::new(vec![1i16, 2]);
+            for looping in [true, false] {
+                let mut mix = Mixer::new(1);
+                mix.apply(MixCmd::Play {
+                    slot: 0,
+                    generation: 1,
+                    pcm: Arc::clone(&pcm),
+                    vol_q8: 256,
+                    looping,
+                });
+                let mut out = [0i16; 6];
+                mix.fill(&mut out, &mut Silence, &mut NoCmds, 1);
+                if looping {
+                    assert_eq!(out, [1, 2, 1, 2, 1, 2]);
+                    assert!(mix.is_active(0));
+                } else {
+                    assert_eq!(out, [1, 2, 0, 0, 0, 0]);
+                    assert!(!mix.is_active(0));
+                }
+            }
+        }
+
+        /// An empty sound must deactivate its voice instead of indexing an empty buffer.
+        #[test]
+        fn empty_sound_deactivates_rather_than_panicking() {
+            let mut mix = Mixer::new(2);
+            mix.apply(MixCmd::Play {
+                slot: 0,
+                generation: 1,
+                pcm: Arc::new(Vec::new()),
+                vol_q8: 256,
+                looping: true,
+            });
+            let mut out = [0i16; 4];
+            mix.fill(&mut out, &mut Silence, &mut NoCmds, 2);
+            assert_eq!(out, [0; 4]);
+            assert!(!mix.is_active(0));
+        }
+
+        /// Summing voices clip to `i16` rather than wrapping (a wrap is a loud, ugly click).
+        #[test]
+        fn mixed_voices_clip_instead_of_wrapping() {
+            let mut mix = Mixer::new(1);
+            for slot in 0..8 {
+                mix.apply(MixCmd::Play {
+                    slot,
+                    generation: 1,
+                    pcm: Arc::new(vec![i16::MAX; 4]),
+                    vol_q8: 256,
+                    looping: true,
+                });
+            }
+            let mut out = [0i16; 4];
+            mix.fill(&mut out, &mut Silence, &mut NoCmds, 1);
+            assert_eq!(out, [i16::MAX; 4]);
+        }
+
+        /// THE cwage #96 regression test, and the one that is measured rather than asserted: a
+        /// real counting global allocator watches `Mixer::fill` — the entire body of the cpal
+        /// callback — and it must perform ZERO allocator operations, including frees.
+        ///
+        /// The interesting case is the third block: it carries a `Play` that STEALS a live slot,
+        /// which drops that slot's `Arc<Vec<i16>>`. That drop is a `free()` on the real-time
+        /// thread unless the registry still holds a strong reference. This test is what stops
+        /// someone "cleaning up" the registry and silently reintroducing the click.
+        #[test]
+        fn callback_body_performs_no_allocator_operations() {
+            let mut mix = Mixer::new(2);
+            let pcm = Arc::new(vec![500i16; 8192]);
+            let mut block = vec![0i16; 1024];
+
+            // Fill the voice pool first, so later steals have a live Arc to displace.
+            for slot in 0..MAX_VOICES {
+                mix.apply(MixCmd::Play {
+                    slot,
+                    generation: 1,
+                    pcm: Arc::clone(&pcm),
+                    vol_q8: 200,
+                    looping: true,
+                });
+            }
+
+            // 1. Steady state: no commands, 64 voices, 1024 sample slots.
+            let ops = crate::alloc_probe::count_allocator_ops(|| {
+                mix.fill(&mut block, &mut Silence, &mut NoCmds, 2);
+            });
+            assert_eq!(ops, 0, "steady-state mix performed {ops} allocator ops");
+
+            // 2. With the raw `gg.audio` ring also feeding it.
+            let raw = vec![7i16; 1024];
+            let ops = crate::alloc_probe::count_allocator_ops(|| {
+                let mut src = SlicePcm(&raw, 0);
+                mix.fill(&mut block, &mut src, &mut NoCmds, 2);
+            });
+            assert_eq!(
+                ops, 0,
+                "mix with a live raw ring performed {ops} allocator ops"
+            );
+
+            // 3. The hard case: commands arriving mid-block, including a slot steal whose
+            //    displaced `Arc` must NOT be the last reference.
+            let mut q = cmds(vec![
+                MixCmd::Play {
+                    slot: 0,
+                    generation: 2,
+                    pcm: Arc::clone(&pcm),
+                    vol_q8: 256,
+                    looping: false,
+                },
+                MixCmd::Tune {
+                    slot: 1,
+                    generation: 1,
+                    vol_q8: 128,
+                    pan_q8: 20,
+                },
+                MixCmd::Stop {
+                    slot: 2,
+                    generation: 1,
+                },
+            ]);
+            let ops = crate::alloc_probe::count_allocator_ops(|| {
+                mix.fill(&mut block, &mut Silence, &mut q, 2);
+            });
+            assert_eq!(ops, 0, "command drain performed {ops} allocator ops");
+        }
+
+        /// The probe itself must be able to see an allocation — otherwise the test above would
+        /// pass just as happily if the counter were broken.
+        #[test]
+        fn alloc_probe_actually_counts() {
+            let ops = crate::alloc_probe::count_allocator_ops(|| {
+                let v: Vec<i16> = Vec::with_capacity(1024);
+                std::hint::black_box(&v);
+            });
+            assert!(
+                ops > 0,
+                "the allocation probe counted nothing; it is broken"
+            );
+        }
+
+        #[test]
+        fn resample_rate_and_channel_conversions() {
+            // Mono 8k -> stereo 16k: 2x the frames, each duplicated across channels.
+            let out = resample(&[1, 2], 1, 8_000, 2, 16_000);
+            assert_eq!(out, vec![1, 1, 1, 1, 2, 2, 2, 2]);
+            // Stereo -> mono averages the pair.
+            assert_eq!(
+                resample(&[10, 20, 30, 40], 2, 8_000, 1, 8_000),
+                vec![15, 35]
+            );
+            // Downsampling halves the frame count.
+            assert_eq!(resample(&[1, 2, 3, 4], 1, 16_000, 1, 8_000), vec![1, 3]);
+            // Degenerate inputs don't divide by zero or panic.
+            assert!(resample(&[], 1, 8_000, 2, 8_000).is_empty());
+            assert!(resample(&[1, 2], 0, 0, 0, 0).len() <= 2);
+        }
+    }
+}
+
+// ===========================================================================
 // Headless implementation (default: `desktop` OFF). Zero heavy dependencies.
 // ===========================================================================
 
@@ -427,15 +1257,19 @@ mod imp {
 
 #[cfg(feature = "desktop")]
 mod imp {
-    use super::{Event, NONE_EVENT, event_kind, key};
+    use super::{Event, NONE_EVENT, event_kind, key, mixer};
     use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Mutex, OnceLock};
 
     /// The default window title, used until a game sets its own via [`title`]. Kept generic (not
     /// per-game) so a gg program that never calls `gg.title` doesn't inherit another game's name.
     const WINDOW_TITLE: &str = "bet";
     /// Cap the audio ring so a program that outruns the audio callback can't grow it forever.
+    /// ~10s of 48kHz stereo — far more headroom than any port uses.
     const RING_CAP: usize = 1 << 20;
+    /// Cap the mixer command ring. Commands are tiny and the callback drains the whole ring every
+    /// block (~10ms), so this is orders of magnitude more than a frame can ever produce.
+    const CMD_CAP: usize = 256;
 
     /// `minifb::Key` → keycode pairs used to diff the down-key set each frame. `Escape` is a
     /// normal key here (KEY_DOWN/KEY_UP code 27); QUIT is emitted only for window close.
@@ -581,46 +1415,24 @@ mod imp {
         px: Vec<u32>,
     }
 
-    /// A registered PCM sound. `pcm` is the raw interleaved `i16` at its native `channels`/`rate`;
-    /// `resampled` is a lazily-built copy interleaved at the DEVICE channels/rate, so the mixer
-    /// advances a voice's `pos` by one per output sample slot (matching the raw ring's 1:1 drain).
-    struct Sound {
-        pcm: Vec<i16>,
-        channels: u32,
-        rate: u32,
-        resampled: Option<Vec<i16>>,
-    }
-
-    /// A playing voice: a cursor into `sounds[sound].resampled` plus its gain, stereo pan, and
-    /// loop flag. `vol_q8`/`pan_q8` are live-updatable via `tune` (the mixer reads them per
-    /// sample), with the linear pan law documented on [`mix_sample`].
-    struct Voice {
-        sound: usize,
-        pos: usize,
-        vol_q8: u32,
-        /// Stereo pan: `0` = full left, `128` = center, `255` = full right. `play` starts every
-        /// voice at 128.
-        pan_q8: u32,
-        looping: bool,
-        active: bool,
-    }
-
-    /// The voice mixer. Lives behind its OWN `Arc<Mutex<Mixer>>` (see `GgState::mixer`); the cpal
-    /// callback locks only this, never the outer GG mutex.
-    struct Mixer {
-        sounds: Vec<Sound>,
-        voices: Vec<Voice>,
-        device_rate: u32,
-        device_channels: u16,
-    }
-
     /// The process-global platform state. Created lazily on first [`present`]/[`audio`].
     struct GgState {
         /// The window, created on the first `present` (its size comes from that first frame).
         window: Option<minifb::Window>,
-        /// Samples awaiting playback; shared with the `cpal` callback (which only ever locks
-        /// THIS mutex, never the outer `GG` one, so the two can't deadlock).
-        ring: Arc<Mutex<VecDeque<i16>>>,
+        /// The producing end of the wait-free SPSC sample ring drained by the audio callback.
+        /// `None` until the stream opens (or forever, if no device). The game thread is the only
+        /// producer and the callback the only consumer — hence SPSC, hence no lock (cwage #96).
+        pcm_tx: Option<rtrb::Producer<i16>>,
+        /// The producing end of the wait-free SPSC command ring: how `play`/`stop`/`tune` reach
+        /// the callback-owned mixer without either side taking a lock.
+        cmd_tx: Option<rtrb::Producer<mixer::MixCmd>>,
+        /// The game-thread-owned sound registry. Holds every resampled buffer alive for the life
+        /// of the process, which is what keeps `free()` out of the audio callback.
+        sounds: mixer::SoundRegistry,
+        /// The device's output format, cached here because the `Mixer` itself now lives inside
+        /// the callback and the game thread cannot read it.
+        device_rate: u32,
+        device_channels: u16,
         /// The live output stream. Kept alive to keep audio playing; dropped ⇒ silence. `None`
         /// until the first `audio` call (or if no output device could be opened).
         stream: Option<cpal::Stream>,
@@ -666,22 +1478,31 @@ mod imp {
         /// The window title: `WINDOW_TITLE` until a game sets its own via `set_title`, then applied
         /// live and used as the title when the window is (re)created.
         title: String,
-        /// The voice mixer, behind its OWN mutex (NOT the outer GG one) so the cpal callback can
-        /// lock it without ever touching GG — preserving the no-deadlock invariant.
-        mixer: Arc<Mutex<Mixer>>,
     }
 
-    // SAFETY: `minifb::Window` and `cpal::Stream` are `!Send`, but `gg` is a single-threaded
-    // platform layer — every call funnels through the one game-loop thread — so the singleton
-    // is only ever touched from that thread. The `Send` claim is what lets us hold the state
-    // in a `static Mutex`; the single-thread discipline is what makes it sound.
+    // SAFETY: `minifb::Window` and `cpal::Stream` are `!Send`, but every field of `GgState` is
+    // reached ONLY from the game-loop thread — every `gg` entry point funnels through
+    // `with_state`, and nothing else holds a reference to any of them. The `Send` claim is what
+    // lets us keep the state in a `static Mutex`; that game-thread-only discipline is what makes
+    // it sound.
+    //
+    // The audio callback is a SECOND thread, and a real-time one — it is not covered by, and
+    // must not be argued from, the discipline above (an earlier revision of this comment claimed
+    // a "single-thread" invariant the code did not have; see cwage #96). What actually makes the
+    // callback safe is that it shares NO state with `GgState`: it owns its `Mixer` outright and
+    // reaches the game thread only through the two wait-free SPSC rings, whose `Consumer` halves
+    // it owns. There is nothing here for it to race, and nothing for it to lock.
     unsafe impl Send for GgState {}
 
     impl GgState {
         fn new() -> Self {
             GgState {
                 window: None,
-                ring: Arc::new(Mutex::new(VecDeque::new())),
+                pcm_tx: None,
+                cmd_tx: None,
+                sounds: mixer::SoundRegistry::new(),
+                device_rate: 0,
+                device_channels: 0,
                 stream: None,
                 audio_started: false,
                 events: VecDeque::new(),
@@ -704,12 +1525,6 @@ mod imp {
                 relative_mouse: false,
                 cursor_hidden: false,
                 title: WINDOW_TITLE.to_string(),
-                mixer: Arc::new(Mutex::new(Mixer {
-                    sounds: Vec::new(),
-                    voices: Vec::new(),
-                    device_rate: 0,
-                    device_channels: 0,
-                })),
             }
         }
 
@@ -881,20 +1696,31 @@ mod imp {
             }
         }
 
-        /// Push samples onto the ring, opening the output stream on first use. Old samples are
-        /// dropped rather than exceeding [`RING_CAP`].
+        /// Push samples onto the wait-free sample ring, opening the output stream on first use.
+        ///
+        /// Overflow policy CHANGED with the lock-free rewrite (cwage #96): the old
+        /// `Mutex<VecDeque>` dropped the OLDEST sample to stay under [`RING_CAP`]; an SPSC
+        /// producer cannot pop, so a full ring now drops the NEWEST samples instead. Both are
+        /// lossy, and a full ring means the game is ~10s of audio ahead of the device — a
+        /// condition `pending()` exists to let ports avoid, and which no port hits. That is a
+        /// cheap price for taking the lock out of the real-time thread.
         fn push_audio(&mut self, samples: &[i16]) {
             self.ensure_stream();
-            // No stream (no device) ⇒ nothing to feed; skip.
-            if self.stream.is_none() {
-                return;
-            }
-            let mut ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(tx) = self.pcm_tx.as_mut() else {
+                return; // No stream (no device) ⇒ nothing to feed; skip.
+            };
             for &s in samples {
-                if ring.len() >= RING_CAP {
-                    ring.pop_front();
+                if tx.push(s).is_err() {
+                    break; // Ring full: drop the rest of this block rather than block.
                 }
-                ring.push_back(s);
+            }
+        }
+
+        /// Send one command to the callback-owned mixer. Never blocks: a full ring drops the
+        /// command (an inaudible missed one-shot beats a stalled game thread).
+        fn send_cmd(&mut self, cmd: mixer::MixCmd) {
+            if let Some(tx) = self.cmd_tx.as_mut() {
+                let _ = tx.push(cmd);
             }
         }
 
@@ -905,7 +1731,13 @@ mod imp {
                 return;
             }
             self.audio_started = true;
-            self.stream = build_stream(Arc::clone(&self.ring), Arc::clone(&self.mixer));
+            if let Some(open) = build_stream() {
+                self.stream = Some(open.stream);
+                self.pcm_tx = Some(open.pcm_tx);
+                self.cmd_tx = Some(open.cmd_tx);
+                self.device_rate = open.device_rate;
+                self.device_channels = open.device_channels;
+            }
         }
 
         /// Upload an RGBA8 texture (premultiplying each pixel) and return its 1-based id.
@@ -1156,79 +1988,57 @@ mod imp {
             self.pump_input();
         }
 
-        /// Register a PCM sound (interleaved little-endian `i16`) with the mixer; returns its
-        /// 1-based id.
+        /// Register a PCM sound (interleaved little-endian `i16`) with the game-thread registry;
+        /// returns its 1-based id. Allocates — on the game thread, where that is fine.
         fn sound(&mut self, pcm: &[u8], channels: u32, rate: u32) -> u32 {
-            let samples: Vec<i16> = pcm
-                .chunks_exact(2)
-                .map(|c| i16::from_le_bytes([c[0], c[1]]))
-                .collect();
-            let channels = channels.max(1);
-            let rate = if rate == 0 { 44_100 } else { rate };
-            let mut mixer = self.mixer.lock().unwrap_or_else(|e| e.into_inner());
-            mixer.sounds.push(Sound {
-                pcm: samples,
-                channels,
-                rate,
-                resampled: None,
-            });
-            mixer.sounds.len() as u32
+            self.sounds.register(pcm, channels, rate)
         }
 
-        /// Start a voice playing `sound`, resampling it to the device format once. Returns the
-        /// 1-based voice id, or `0` if there is no audio device or the sound id is invalid.
+        /// Start a voice playing `sound`. Everything expensive — the one-time resample to the
+        /// device format — happens HERE, on the game thread; the callback receives only a
+        /// finished `Arc` through the command ring. Returns the voice id, or `0` if there is no
+        /// audio device or the sound id is invalid.
         fn play(&mut self, sound: u32, loop_: u32, vol_q8: u32) -> u32 {
             self.ensure_stream();
             if self.stream.is_none() {
                 return 0;
             }
-            let mut mixer = self.mixer.lock().unwrap_or_else(|e| e.into_inner());
-            if sound == 0 || sound as usize > mixer.sounds.len() {
+            let (dev_ch, dev_rate) = (u32::from(self.device_channels), self.device_rate);
+            let Some(pcm) = self.sounds.prepare(sound, dev_ch, dev_rate) else {
                 return 0;
-            }
-            let idx = (sound - 1) as usize;
-            if mixer.sounds[idx].resampled.is_none() {
-                let dst_ch = mixer.device_channels as u32;
-                let dst_rate = mixer.device_rate;
-                let s = &mixer.sounds[idx];
-                let dst_rate = if dst_rate == 0 { s.rate } else { dst_rate };
-                let res = resample(&s.pcm, s.channels, s.rate, dst_ch, dst_rate);
-                mixer.sounds[idx].resampled = Some(res);
-            }
-            mixer.voices.push(Voice {
-                sound: idx,
-                pos: 0,
+            };
+            let (slot, generation) = self.sounds.alloc_voice();
+            self.send_cmd(mixer::MixCmd::Play {
+                slot,
+                generation,
+                pcm,
                 vol_q8,
-                pan_q8: 128, // center — `tune` moves it
                 looping: loop_ != 0,
-                active: true,
             });
-            mixer.voices.len() as u32
+            mixer::voice_id(slot, generation)
         }
 
-        /// Stop the voice `voice` (1-based); unknown or finished ids are ignored.
+        /// Stop the voice `voice`; unknown, finished, or already-stolen ids are ignored.
         fn stop(&mut self, voice: u32) {
-            if voice == 0 {
+            let Some((slot, generation)) = mixer::decode_voice(voice) else {
                 return;
-            }
-            let mut mixer = self.mixer.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(v) = mixer.voices.get_mut((voice - 1) as usize) {
-                v.active = false;
-            }
+            };
+            self.send_cmd(mixer::MixCmd::Stop { slot, generation });
         }
 
-        /// Live-update voice `voice`'s volume and stereo pan (see [`Voice::pan_q8`] and the pan
-        /// law on [`mix_sample`]). Unknown or finished ids are ignored, so retuning a voice that
-        /// already ended is safe.
+        /// Live-update voice `voice`'s volume and stereo pan (see the pan law on
+        /// [`mixer::Mixer::mix_sample`]). Unknown, finished, or already-stolen ids are ignored,
+        /// so retuning a voice that already ended is safe.
         fn tune(&mut self, voice: u32, vol_q8: u32, pan_q8: u32) {
-            if voice == 0 {
+            let Some((slot, generation)) = mixer::decode_voice(voice) else {
                 return;
-            }
-            let mut mixer = self.mixer.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(v) = mixer.voices.get_mut((voice - 1) as usize) {
-                v.vol_q8 = vol_q8;
-                v.pan_q8 = pan_q8.min(255);
-            }
+            };
+            self.send_cmd(mixer::MixCmd::Tune {
+                slot,
+                generation,
+                vol_q8,
+                pan_q8,
+            });
         }
 
         /// The mouse position in logical-canvas coordinates, packed `x << 32 | y`.
@@ -1267,19 +2077,20 @@ mod imp {
         /// any samples; no usable device ⇒ the fixed headless default.
         fn audio_spec(&mut self) -> u64 {
             self.ensure_stream();
-            if self.stream.is_some() {
-                let m = self.mixer.lock().unwrap_or_else(|e| e.into_inner());
-                if m.device_rate != 0 && m.device_channels != 0 {
-                    return super::pack_size(m.device_rate, u32::from(m.device_channels));
-                }
+            if self.stream.is_some() && self.device_rate != 0 && self.device_channels != 0 {
+                return super::pack_size(self.device_rate, u32::from(self.device_channels));
             }
             super::pack_size(super::DEFAULT_AUDIO_RATE, super::DEFAULT_AUDIO_CHANNELS)
         }
 
         /// Interleaved `i16` samples currently queued in the raw `audio` ring (submitted but not
-        /// yet consumed by the device callback) — the streaming backpressure signal.
+        /// yet consumed by the device callback) — the streaming backpressure signal. Read from
+        /// the producer's free-slot count, so it stays lock-free too.
         fn pending(&self) -> u64 {
-            self.ring.lock().unwrap_or_else(|e| e.into_inner()).len() as u64
+            match self.pcm_tx.as_ref() {
+                Some(tx) => (RING_CAP - tx.slots()) as u64,
+                None => 0,
+            }
         }
     }
 
@@ -1295,7 +2106,7 @@ mod imp {
     }
 
     /// The process-global singleton. `Mutex<GgState>: Sync` holds because we force `GgState:
-    /// Send`; the single-thread discipline (see the `unsafe impl`) makes that sound.
+    /// Send`; the game-thread-only discipline (see the `unsafe impl`) makes that sound.
     static GG: OnceLock<Mutex<GgState>> = OnceLock::new();
 
     fn with_state<R>(f: impl FnOnce(&mut GgState) -> R) -> R {
@@ -1304,161 +2115,95 @@ mod imp {
         f(&mut guard)
     }
 
-    /// Open the default output device and start a stream whose callback drains `ring`. Returns
-    /// `None` (silently) if no device/config/stream could be set up — audio is best-effort.
-    fn build_stream(
-        ring: Arc<Mutex<VecDeque<i16>>>,
-        mixer: Arc<Mutex<Mixer>>,
-    ) -> Option<cpal::Stream> {
+    /// An `rtrb` consumer of raw `gg.audio` samples, drained 1:1 by the callback.
+    impl mixer::PcmSource for rtrb::Consumer<i16> {
+        #[inline]
+        fn next_sample(&mut self) -> i16 {
+            // A dry ring is silence, not an error: `gg.audio` streaming games (Pong, DOOM's
+            // music) legitimately run the ring empty between submissions.
+            self.pop().unwrap_or(0)
+        }
+    }
+
+    /// An `rtrb` consumer of mixer commands.
+    impl mixer::CmdSource for rtrb::Consumer<mixer::MixCmd> {
+        #[inline]
+        fn next_cmd(&mut self) -> Option<mixer::MixCmd> {
+            self.pop().ok()
+        }
+    }
+
+    /// Everything `ensure_stream` needs back from a successful device open: the stream to keep
+    /// alive, the two producer ends, and the device format the game thread must resample to.
+    struct OpenStream {
+        stream: cpal::Stream,
+        pcm_tx: rtrb::Producer<i16>,
+        cmd_tx: rtrb::Producer<mixer::MixCmd>,
+        device_rate: u32,
+        device_channels: u16,
+    }
+
+    /// Open the default output device and start a stream.
+    ///
+    /// The callback closure MOVES its `Mixer` and both ring `Consumer`s in, so at steady state it
+    /// touches nothing any other thread can see: no `Arc`, no `Mutex`, no allocation, no
+    /// unbounded work — just `Mixer::fill` (cwage #96). Returns `None` (silently) if no
+    /// device/config/stream could be set up — audio is best-effort.
+    fn build_stream() -> Option<OpenStream> {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
         let device = cpal::default_host().default_output_device()?;
         let supported = device.default_output_config().ok()?;
         let sample_format = supported.sample_format();
         let config: cpal::StreamConfig = supported.into();
-        // Record the device format so `play` resamples each sound to it exactly once.
-        {
-            let mut m = mixer.lock().unwrap_or_else(|e| e.into_inner());
-            m.device_rate = config.sample_rate.0;
-            m.device_channels = config.channels;
-        }
+        let (device_rate, device_channels) = (config.sample_rate.0, config.channels);
         let err_fn = |_err| { /* best-effort audio: ignore stream errors */ };
         // Interleaved-slot → channel index for the pan law: cpal hands whole frames, so slot `i`
         // is channel `i % channels`.
         let channels = usize::from(config.channels).max(1);
 
+        let (pcm_tx, mut pcm_rx) = rtrb::RingBuffer::<i16>::new(RING_CAP);
+        let (cmd_tx, mut cmd_rx) = rtrb::RingBuffer::<mixer::MixCmd>::new(CMD_CAP);
+        let mut mix = mixer::Mixer::new(device_channels);
+
         let stream = match sample_format {
-            cpal::SampleFormat::I16 => {
-                let ring = Arc::clone(&ring);
-                let mixer = Arc::clone(&mixer);
-                device
-                    .build_output_stream(
-                        &config,
-                        move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
-                            let mut ring = ring.lock().unwrap_or_else(|e| e.into_inner());
-                            let mut mixer = mixer.lock().unwrap_or_else(|e| e.into_inner());
-                            for (i, s) in data.iter_mut().enumerate() {
-                                *s = mix_sample(&mut ring, &mut mixer, i % channels);
-                            }
-                        },
-                        err_fn,
-                        None,
-                    )
-                    .ok()?
-            }
-            cpal::SampleFormat::F32 => {
-                let ring = Arc::clone(&ring);
-                let mixer = Arc::clone(&mixer);
-                device
-                    .build_output_stream(
-                        &config,
-                        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                            let mut ring = ring.lock().unwrap_or_else(|e| e.into_inner());
-                            let mut mixer = mixer.lock().unwrap_or_else(|e| e.into_inner());
-                            for (i, s) in data.iter_mut().enumerate() {
-                                let v = mix_sample(&mut ring, &mut mixer, i % channels);
-                                *s = f32::from(v) / 32768.0;
-                            }
-                        },
-                        err_fn,
-                        None,
-                    )
-                    .ok()?
-            }
+            cpal::SampleFormat::I16 => device
+                .build_output_stream(
+                    &config,
+                    move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                        mix.fill(data, &mut pcm_rx, &mut cmd_rx, channels);
+                    },
+                    err_fn,
+                    None,
+                )
+                .ok()?,
+            cpal::SampleFormat::F32 => device
+                .build_output_stream(
+                    &config,
+                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                        // Mix into `i16` (the mixer's native format) one slot at a time and
+                        // convert in place — no scratch buffer, so still zero-allocation.
+                        mix.drain(&mut cmd_rx);
+                        for (i, s) in data.iter_mut().enumerate() {
+                            let v = mix.mix_sample(&mut pcm_rx, i % channels);
+                            *s = f32::from(v) / 32768.0;
+                        }
+                    },
+                    err_fn,
+                    None,
+                )
+                .ok()?,
             // Some other native format — skip audio rather than guess.
             _ => return None,
         };
         stream.play().ok()?;
-        Some(stream)
-    }
-
-    /// Resample `pcm` (interleaved `src_ch` channels at `src_rate` Hz) to interleaved `dst_ch`
-    /// channels at `dst_rate` Hz, nearest-neighbor. The result is interleaved at the DEVICE channel
-    /// count so the mixer advances a voice's `pos` by one per output sample slot. Channel mapping:
-    /// mono -> duplicate, multi -> mono average, else copy shared channels.
-    fn resample(pcm: &[i16], src_ch: u32, src_rate: u32, dst_ch: u32, dst_rate: u32) -> Vec<i16> {
-        let src_ch = src_ch.max(1) as usize;
-        let dst_ch = dst_ch.max(1) as usize;
-        let src_rate = src_rate.max(1) as u64;
-        let dst_rate = dst_rate.max(1) as u64;
-        let src_frames = pcm.len() / src_ch;
-        if src_frames == 0 {
-            return Vec::new();
-        }
-        let dst_frames = (src_frames as u64 * dst_rate / src_rate) as usize;
-        let mut out = Vec::with_capacity(dst_frames * dst_ch);
-        for f in 0..dst_frames {
-            let sf = ((f as u64 * src_rate / dst_rate) as usize).min(src_frames - 1);
-            let base = sf * src_ch;
-            if dst_ch == src_ch {
-                out.extend_from_slice(&pcm[base..base + src_ch]);
-            } else if src_ch == 1 {
-                let s = pcm[base];
-                for _ in 0..dst_ch {
-                    out.push(s);
-                }
-            } else if dst_ch == 1 {
-                let mut acc = 0i32;
-                for c in 0..src_ch {
-                    acc += i32::from(pcm[base + c]);
-                }
-                out.push((acc / src_ch as i32) as i16);
-            } else {
-                for c in 0..dst_ch {
-                    out.push(if c < src_ch { pcm[base + c] } else { 0 });
-                }
-            }
-        }
-        out
-    }
-
-    /// Produce one output sample for channel `chan` (the slot's index within its interleaved
-    /// frame): the raw ring (kept 1:1 and unpanned for `gg.audio` / Pong) plus every active
-    /// mixer voice, summed and clipped to `i16`. Advances each voice's `pos`; a one-shot voice
-    /// deactivates at its end, a looping voice wraps.
-    ///
-    /// Per-voice stereo pan (linear law): with `vol = vol_q8` and `pan = pan_q8` (0 = full left,
-    /// 128 = center, 255 = full right),
-    ///   * even channels (left)  get gain `vol * (255 - pan) / 255`,
-    ///   * odd  channels (right) get gain `vol * pan / 255`,
-    ///   * a mono device applies the plain unpanned `vol`.
-    ///
-    /// Center is therefore ~half gain per side (127/255 and 128/255), the standard linear
-    /// halving that keeps a hard-panned voice at unity on its side.
-    fn mix_sample(ring: &mut VecDeque<i16>, mixer: &mut Mixer, chan: usize) -> i16 {
-        let mut acc = i32::from(ring.pop_front().unwrap_or(0));
-        let mono = mixer.device_channels <= 1;
-        let Mixer { sounds, voices, .. } = mixer;
-        for v in voices.iter_mut() {
-            if !v.active {
-                continue;
-            }
-            let res = match sounds[v.sound].resampled.as_ref() {
-                Some(r) if !r.is_empty() => r,
-                _ => {
-                    v.active = false;
-                    continue;
-                }
-            };
-            let vol = v.vol_q8 as i32;
-            let gain = if mono {
-                vol
-            } else if chan.is_multiple_of(2) {
-                vol * (255 - v.pan_q8 as i32) / 255
-            } else {
-                vol * v.pan_q8 as i32 / 255
-            };
-            acc += (i32::from(res[v.pos]) * gain) >> 8;
-            v.pos += 1;
-            if v.pos >= res.len() {
-                if v.looping {
-                    v.pos = 0;
-                } else {
-                    v.active = false;
-                }
-            }
-        }
-        acc.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
+        Some(OpenStream {
+            stream,
+            pcm_tx,
+            cmd_tx,
+            device_rate,
+            device_channels,
+        })
     }
 
     // Every wrapper below short-circuits under `BET_GG_HEADLESS` to the same value the default
