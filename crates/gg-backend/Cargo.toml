@@ -6,17 +6,25 @@ version.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# minifb (window/framebuffer present + input) and cpal (audio output) are pulled in ONLY when
-# the `desktop` feature is on. The default build compiles the crate to headless no-ops with no
-# heavy transitive dependencies — the whole point of gating them behind `dep:` optional deps.
+# minifb (window/framebuffer present + input), cpal (audio output), and rtrb (the lock-free SPSC
+# rings that carry samples/commands to the cpal callback) are pulled in ONLY when the `desktop`
+# feature is on. The default build compiles the crate to headless no-ops with no heavy transitive
+# dependencies — the whole point of gating them behind `dep:` optional deps.
+#
+# NB: `rtrb` is declared with a plain version rather than via the root `[workspace.dependencies]`
+# catalog only because that file was owned by a concurrent change; it should move to the catalog.
+# It is a 1-file, zero-dependency, MIT-licensed SPSC ring by the `rodio`/audio community — chosen
+# over hand-rolling the atomics because a wait-free ring is exactly the code you do not want to
+# write yourself, and over `ringbuf` because it is smaller and has no allocator machinery.
 [dependencies]
 rt-abi = { path = "../rt-abi" }
 minifb = { version = "0.27", optional = true }
 cpal   = { version = "0.15", optional = true }
+rtrb   = { version = "0.3", optional = true }
 
 [features]
 # Turn on the real desktop backend (window + audio + input). OFF by default.
-desktop = ["dep:minifb", "dep:cpal"]
+desktop = ["dep:minifb", "dep:cpal", "dep:rtrb"]
 
 [lints]
 workspace = true

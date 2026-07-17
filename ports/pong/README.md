@@ -7,29 +7,29 @@ program to exercise **`gg`**, `bet`'s platform layer (its SDL-equivalent) — re
 
 ## Run it
 
-`gg`'s windowed backend (minifb + cpal) is gated behind an off-by-default cargo feature, so
-the default build stays dependency-free. Both build paths open the same window.
+```sh
+cargo xtask run pong
+```
+
+That builds the compiler (`driver --features llvm`) and the windowed runtime
+(`runtime --features gg-desktop`), compiles the game, and runs it. LLVM 18 is discovered
+automatically — nothing to export. Pong needs no assets, which is why it's the first port to
+reach for.
+
+`gg`'s windowed backend (minifb + cpal) is gated behind an off-by-default cargo feature, so the
+default build stays dependency-free. The interpreter opens the same window, for quick iteration:
 
 ```sh
-# one-time env for the LLVM codegen path (this machine)
-export LLVM_SYS_180_PREFIX=/opt/homebrew/opt/llvm@18
-export LIBRARY_PATH="/opt/homebrew/lib:$LIBRARY_PATH"
-
-# --- native (the real deliverable) ---
-cargo build -p driver  --features llvm          # the bet compiler
-cargo build -p runtime --features gg-desktop     # the windowed runtime (libruntime.a)
-target/debug/bet build ports/pong/pong.bet --runtime real -o pong
-./pong
-
-# --- interpreter (same window, quick iteration) ---
 cargo run -p driver --features "llvm,gg-desktop" -- run ports/pong/pong.bet
 ```
 
 A **resizable** window opens (default 960×640). It runs at **true dynamic resolution**: each
-frame the program asks `gg.size()` for the live window size and reallocates its framebuffer to
-match 1:1, so the field **fills the whole window** and gains real detail as you enlarge or
-maximize it. Paddle/ball/speed are derived from the current size, so the whole board scales with
-the window.
+frame the program asks `gg.size()` for the live window size, and **whenever that size changes**
+it reallocates its framebuffer to match 1:1 — so the field **fills the whole window** and gains
+real detail as you enlarge or maximize it. Paddle/ball/speed are derived from the current size,
+so the whole board scales with the window.
+
+The window presents at 60 FPS; `GG_FPS` overrides the cap (`GG_FPS=0` to uncap).
 
 ## Source layout
 
@@ -86,7 +86,10 @@ program must learn the drawable size), amending that decision:
   make the two paths diverge. Game state is value-threaded through a small `Game` struct (which
   stores the ball **direction ±1**, not a velocity, so speed auto-scales with resolution) and
   updated by the pure `step()` function; per-frame geometry flows through a `Dims` struct.
-- **Frame pacing** is a busy-wait on `gg.ticks()` to ~16.6 ms/frame (≈60 fps).
+- **Frame pacing** is a busy-wait on `gg.ticks()` to ~16.6 ms/frame (≈60 fps). Since cwage #97
+  `gg` itself also sleeps to a 60 FPS floor inside the present call, so the busy-wait usually
+  finds its budget already spent and spins for close to nothing. A port written today should
+  lean on `gg`'s cap (and `GG_FPS`) rather than spin.
 
 ## Fidelity / platform notes
 
