@@ -1,0 +1,190 @@
+name: doom-parity
+
+# Makes the DOOM simulation-parity claim CI-enforced (issue #99).
+#
+# README.md and ports/doom/README.md claim byte-exact simulation parity with id's engine. Until
+# this workflow, that claim was backed by a table typed into Markdown on 2026-07-07 and NOTHING
+# else: `grep -rin doom .github/workflows/` returned zero hits, so a sim regression was
+# undetectable by automation. The port's verification tooling existed and is good, but it was
+# manual and double-gated (a non-default `doom` xtask feature + a WAD that CI cannot legally
+# ship).
+#
+# WHAT THIS GATE IS. A REGRESSION gate, not an oracle. It asserts that the port's per-tic
+# simulation fingerprint for a fixed (WAD, demo) pair is exactly what it was when the golden was
+# recorded — so any change to the frontend, backend, runtime, or the port's own .bet source that
+# perturbs the simulation fails the build. It does NOT re-derive parity against id's engine: the
+# doomgeneric differential oracle (`cargo xtask doom-oracle`) cannot run here, because its inputs
+# — ports/doom/goldens/oracle.patch and *.oracle.sync — are gitignored id-GPL-derived artifacts
+# and its paths are hardcoded to the author's machine (crates/xtask/src/doom.rs). The oracle
+# remains the definitive check and remains manual; this gate is what protects the claim BETWEEN
+# those manual runs. See the PR for issue #99.
+#
+# WHY FREEDOOM. The parity table was measured against the shareware doom1.wad, which is
+# copyrighted id/ZeniMax data that CI must not redistribute (.gitignore bans *.wad repo-wide).
+# freedoom1.wad is BSD-3-clause (Freedoom project, COPYING.txt in the release), pinned by
+# version + verified by SHA-256 below. Different WAD => different maps => the committed
+# doom1.wad-based goldens do NOT apply; hence this gate's own golden, recorded against Freedoom.
+#
+# Path-filtered to the port plus every crate whose output the port is built from. Keep the
+# pull_request and push lists in sync by hand — GitHub Actions does not reliably support YAML
+# anchors, so the two lists are duplicated on purpose.
+on:
+  workflow_dispatch: {}
+  pull_request:
+    paths:
+      - "ports/doom/**"
+      - "crates/frontend/**"
+      - "crates/backend/**"
+      - "crates/runtime/**"
+      - "crates/driver/**"
+      - "crates/midir/**"
+      - "crates/rt-abi/**"
+      - "crates/xtask/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/doom-parity.yml"
+  push:
+    branches: [main]
+    # Duplicate of the pull_request paths above (no YAML anchors in GH Actions).
+    paths:
+      - "ports/doom/**"
+      - "crates/frontend/**"
+      - "crates/backend/**"
+      - "crates/runtime/**"
+      - "crates/driver/**"
+      - "crates/midir/**"
+      - "crates/rt-abi/**"
+      - "crates/xtask/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/doom-parity.yml"
+
+concurrency:
+  group: doom-parity-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: this job builds the port and diffs fingerprints — no repo/package/check
+# writes. Default the whole workflow to a read-only GITHUB_TOKEN.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Freedoom pin. FREEDOOM_ZIP_SHA256 is the value published in the project's PGP-SIGNED
+  # freedoom-0.13.0-CHECKSUM file; FREEDOOM1_WAD_SHA256 is the wad extracted from that verified
+  # zip. Both are checked below, so a tampered mirror or a silently re-cut release fails closed
+  # rather than quietly changing what "parity" means. To bump: change all three together and
+  # re-record the golden (see the record step's comment).
+  FREEDOOM_VERSION: "0.13.0"
+  FREEDOOM_ZIP_SHA256: "3f9b264f3e3ce503b4fb7f6bdcb1f419d93c7b546f4df3e874dd878db9688f59"
+  FREEDOOM1_WAD_SHA256: "7323bcc168c5a45ff10749b339960e98314740a734c30d4b9f3337001f9e703d"
+  # The demo + tic cap the golden was recorded with. -maxframes bounds the stream (the full demo1
+  # is ~7.8k lines / 1 MB); 600 tics keeps the golden ~99 KB while still covering the ENTIRE
+  # P_SetupLevel spawn block (373 SETUP lines: every sector/line count and every spawned mobj's
+  # type/x/y/angle) plus 600 tics of live simulation. The capped stream is a byte-exact PREFIX of
+  # the uncapped one, verified when the golden was recorded.
+  DOOM_DEMO: demo1
+  DOOM_MAXFRAMES: "600"
+
+jobs:
+  sim-parity:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      # MANDATORY. The port is compiled to a native binary through the LLVM backend; there is no
+      # interpreter path for it (the interpreter clones an array per element read — WAD-scale
+      # intractable). Same LLVM 18 install as backend-llvm.yml / selfhost.yml.
+      # libzstd-dev: LLVM 18's static libs link against zstd. clang: the link driver.
+      - name: install LLVM 18
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm-18-dev libpolly-18-dev libzstd-dev clang
+          echo "LLVM_SYS_180_PREFIX=/usr/lib/llvm-18" >> "$GITHUB_ENV"
+
+      - name: install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: doom-parity
+
+      # Pinned release URL + SHA-256 on BOTH the archive and the extracted wad. `set -euo
+      # pipefail` + an explicit `sha256sum -c` means a hash mismatch fails the job; there is no
+      # path where this step proceeds with unverified game data.
+      - name: fetch freedoom1.wad (BSD-3-clause, pinned + checksummed)
+        run: |
+          set -euo pipefail
+          url="https://github.com/freedoom/freedoom/releases/download/v${FREEDOOM_VERSION}/freedoom-${FREEDOOM_VERSION}.zip"
+          echo "==> $url"
+          curl -fsSL --retry 3 --retry-delay 2 -o /tmp/freedoom.zip "$url"
+          echo "${FREEDOOM_ZIP_SHA256}  /tmp/freedoom.zip" | sha256sum -c -
+          unzip -q -o -j /tmp/freedoom.zip "freedoom-${FREEDOOM_VERSION}/freedoom1.wad" -d /tmp
+          echo "${FREEDOOM1_WAD_SHA256}  /tmp/freedoom1.wad" | sha256sum -c -
+          ls -la /tmp/freedoom1.wad
+
+      # `runtime` (not rt-stub): the port needs the real cribs/generational allocator. Built
+      # WITHOUT `gg-desktop`, so the default headless runtime is used — BET_GG_HEADLESS=1 below
+      # needs no window, no X11, no audio device.
+      - name: build the compiler (driver --features llvm) + the real runtime
+        run: |
+          cargo build -p driver --features llvm --locked
+          cargo build -p runtime --locked
+
+      - name: compile the DOOM port -> native binary
+        run: target/debug/bet build ports/doom/doom.bet --runtime real -o /tmp/doom
+
+      # WAD-FREE sim goldens. These two tools are the only smoke tools that load no WAD and
+      # hardcode no absolute path, so they are the only ones runnable in CI (the other 13 hardcode
+      # /Users/<author>/... — see the PR for issue #99). simcore drives the thinker list + mobj
+      # state machine; simmove drives P_XYMovement/P_ZMovement. Cheap, and they fail independently
+      # of the WAD fetch above.
+      - name: oracle-independent sim goldens (WAD-free)
+        run: |
+          set -euo pipefail
+          for tool in simcore simmove; do
+            target/debug/bet build "ports/doom/tools/${tool}_smoke.bet" --runtime real -o "/tmp/${tool}_smoke"
+            BET_GG_HEADLESS=1 "/tmp/${tool}_smoke" > "/tmp/${tool}.out"
+            diff -u "ports/doom/goldens/${tool}.golden" "/tmp/${tool}.out"
+            echo "  OK ${tool}.golden"
+          done
+
+      # Play the demo headless and emit the per-tic fingerprint stream. Deterministic: demo-lump
+      # playback is a fixed input tape, and re-running produced a byte-identical stream (verified
+      # when the golden was recorded).
+      #
+      # To RE-RECORD the golden after an intentional sim change, run this same command and strip
+      # the framebuffer-crc field (which --sim-only ignores and the golden therefore omits):
+      #   sed -E 's/ C=[0-9a-f]+$//' /tmp/ours.sync > ports/doom/goldens/freedoom1-demo1.sim.golden
+      - name: record the port's sim fingerprint (headless demo playback)
+        run: |
+          set -euo pipefail
+          BET_GG_HEADLESS=1 /tmp/doom -iwad /tmp/freedoom1.wad \
+            -timedemo "$DOOM_DEMO" -maxframes "$DOOM_MAXFRAMES" -sync /tmp/ours.sync
+          echo "recorded $(grep -c '^T=' /tmp/ours.sync) tics, $(grep -c '^SETUP' /tmp/ours.sync) SETUP lines"
+          # Fail loudly rather than diffing an empty file into a passing "match".
+          test -s /tmp/ours.sync
+
+      # THE GATE. --sim-only ignores the framebuffer crc (C=) so this fails on SIMULATION
+      # divergence only — renderer/platform pixel differences are out of scope here and the
+      # golden omits the field entirely. doom-verify reports the first divergent line with
+      # context, a per-field diff, and triage (SETUP -> map loader, else -> sim); it exits
+      # non-zero on any divergence.
+      #
+      # `--features doom`: every doom-* xtask command is behind that non-default feature, which
+      # keeps the port out of the default workspace build gate (crates/xtask/src/main.rs).
+      - name: doom-verify --sim-only (fresh stream vs committed golden)
+        run: |
+          cargo run -q -p xtask --features doom -- doom-verify \
+            --ours /tmp/ours.sync \
+            --theirs ports/doom/goldens/freedoom1-demo1.sim.golden \
+            --sim-only
+
+      # On failure the fresh stream is the thing you need to triage or (after an intentional sim
+      # change) to re-record from. `if: failure()` so a green run uploads nothing.
+      - name: upload the divergent stream
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: doom-sync-stream
+          path: /tmp/ours.sync
+          retention-days: 7
