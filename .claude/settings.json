@@ -1,16 +1,3 @@
 {
-  "$comment": "Committed workspace rule for the bet project. The PostToolUse hook appends one timestamped heartbeat after every tool call (see scripts/timelog-hook.sh and timelog/README.md). It is the mechanical backstop for the time-tracking system; the semantic spans in scripts/timelog.sh are the primary source.",
-  "hooks": {
-    "PostToolUse": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "sh \"$CLAUDE_PROJECT_DIR/scripts/timelog-hook.sh\""
-          }
-        ]
-      }
-    ]
-  }
+  "$comment": "Committed workspace settings for the bet project. The PostToolUse timelog heartbeat hook was removed when agent time-tracking was retired: timelog/ is now a closed historical record (see timelog/README.md). Please don't re-add a hook that writes to the working tree on every tool call — it never left `git status` clean."
 }

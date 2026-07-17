@@ -55,7 +55,8 @@
 .vscode/
 
 # NOTE: Cargo.lock is intentionally COMMITTED (the workspace ships the `bet` binary;
-#       CI builds with --locked). timelog/ is intentionally COMMITTED (durable effort log).
+#       CI builds with --locked). timelog/ stays COMMITTED as a CLOSED historical
+#       record of the bootstrap effort — retired, not written to any more (#93).
 
 # Docker build env cargo cache (docker/compose.yaml CARGO_HOME)
 /.docker-cache/

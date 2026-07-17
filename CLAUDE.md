@@ -12,36 +12,21 @@ The compiler pipeline is complete and self-hosted: `selfhost/betfe.bet` re-emits
 MIR byte-identically (Milestone 8 fixpoint), and `ports/doom` plays real DOOM with
 byte-exact sim parity. Current work is port-driven hardening (Frozen Bubble, the M:N
 scheduler, corpus parity) coordinated through the `midir`/`rt-abi` contract crates
-and the golden corpus. See `timelog/tasks.toml` for live per-workstream status.
+and the golden corpus.
 
-## Time tracking (MANDATORY)
+## Time tracking: retired — do NOT log time
 
-Every agent — root and subagents — must log its active time. This measures real build
-effort across the whole project and feeds a velocity-based ETA (`cargo xtask timelog eta`).
+Agent time-tracking is **over**. `timelog/` is a closed historical record of the
+bootstrap effort (see `timelog/README.md`); nothing new gets written to it.
 
-1. **Clock in** when you start working:
-   ```sh
-   scripts/timelog.sh in <activity> --task <slug>
-   ```
-   It prints a logfile path — **remember it for this session.**
-2. **Switch** whenever your activity changes:
-   ```sh
-   scripts/timelog.sh switch <activity> --file <that path>
-   ```
-3. **Clock out** when you pause or finish:
-   ```sh
-   scripts/timelog.sh out --file <that path>
-   ```
+- Do **not** run `scripts/timelog.sh in/switch/out`, and do not add timelog entries
+  to your commits. There is no `PostToolUse` heartbeat hook any more — don't re-add one.
+- Do **not** add `chore(timelog)` clock-punching commits. 12% of this repo's history
+  is already that, and it buys nothing.
+- `timelog/tasks.toml` is likewise frozen. Track live work in GitHub issues.
 
-- **Activities** (fixed enum): `planning writing testing reviewing debugging docs research ci other`.
-- **`--task`** must match a `slug` in `timelog/tasks.toml` (add a task there if you're starting new work).
-- **Use your own logfile.** Each agent gets its own UUID-named file from `in`; never
-  write to another agent's file. Parallel agents are safe because files never overlap.
-- A `PostToolUse` hook (`.claude/settings.json`) records heartbeats automatically as a
-  backstop, but it can't label your *activity* — so still clock in/switch/out.
-
-See `timelog/README.md` for the schema and how durations are computed (idle gaps > 5 min
-are not counted).
+The read-side tooling (`cargo xtask timelog report` / `eta`, `scripts/timelog.sh`)
+still works against the historical data if you're curious what the build cost.
 
 ## Repo conventions
 
