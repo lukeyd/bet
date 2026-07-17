@@ -1,0 +1,116 @@
+name: miri
+
+# Undefined-behaviour detection for the memory model (issue #99).
+#
+# `runtime` (the real cribs / generational tag+holla allocator) and `rt-stub` (the bootstrap
+# malloc-backed ABI) carry ~200 `unsafe` blocks between them and are the part of the project
+# where a bug is a silent use-after-free rather than a compile error. Both are PURE RUST with no
+# C FFI underneath, so miri can actually interpret them end to end — unlike `backend` (LLVM FFI)
+# or `driver` (links native objects), which miri cannot run and which are deliberately absent
+# from the crate list below. `midir` is included because it is a contract crate: cheap to check
+# and its `.mir` round-trip is pure computation.
+#
+# This job is the FIRST UB / generative check in the repo; before it, 282 example-based `#[test]`s
+# gated the memory model without anything ever asking whether the unsafe code upheld its
+# contracts. Writing the missing `# Safety` docs is deliberately deferred (issue #99): miri
+# reports what the code actually upholds, so the contracts get written from evidence, not blind.
+#
+# Path-filtered to the crates it interprets plus the workspace build config. Keep the
+# pull_request and push lists in sync by hand — GitHub Actions does not reliably support YAML
+# anchors, so the two lists are duplicated on purpose.
+on:
+  workflow_dispatch: {}
+  pull_request:
+    paths:
+      - "crates/runtime/**"
+      - "crates/rt-stub/**"
+      - "crates/midir/**"
+      - "crates/rt-abi/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/miri.yml"
+  push:
+    branches: [main]
+    # Duplicate of the pull_request paths above (no YAML anchors in GH Actions).
+    paths:
+      - "crates/runtime/**"
+      - "crates/rt-stub/**"
+      - "crates/midir/**"
+      - "crates/rt-abi/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/miri.yml"
+
+concurrency:
+  group: miri-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: this job only interprets the workspace's own tests — no repo/package/check
+# writes. Default the whole workflow to a read-only GITHUB_TOKEN.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  miri:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      # miri ships only on nightly, while rust-toolchain.toml pins stable 1.96.1. Installing a
+      # SECOND toolchain leaves that pin untouched: every other job still gets 1.96.1 from
+      # `rustup show`, and only the explicit `+nightly-...` invocations below use nightly.
+      #
+      # The nightly is DATE-PINNED to match the repo's pinning convention (SHA-pinned actions,
+      # LLVM 18, the doomgeneric oracle SHA, the docker base digest): a floating `nightly` would
+      # let an upstream miri or rustc change turn this gate red on a day nobody touched the
+      # runtime. To bump: pick a date whose `miri` component exists (check
+      # https://rust-lang.github.io/rustup-components-history/), then update BOTH lines below.
+      - name: install pinned nightly + miri
+        run: |
+          rustup toolchain install nightly-2026-07-16 --profile minimal --component miri
+          rustup run nightly-2026-07-16 cargo miri --version
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: miri
+
+      # Builds miri's sysroot (a std interpreted from source). Slow on a cold cache; cached above.
+      - name: cargo miri setup
+        run: cargo +nightly-2026-07-16 miri setup
+
+      # Interpret the memory model. Two MIRIFLAGS, each earned by an observed failure rather than
+      # copied from a template — see the PR for issue #99 for the captured output:
+      #
+      #   -Zmiri-disable-isolation
+      #     miri sandboxes filesystem access by default. `midir`'s
+      #     `mir_fixtures_validate_and_round_trip` walks tests/mir with `fs::read_dir`, and
+      #     rt-stub's `fs_read_round_trips_a_file` exercises the fs ABI by design. Without this
+      #     they fail as "unsupported operation: `opendir` not available when isolation is
+      #     enabled" — a sandbox limitation, NOT undefined behaviour.
+      #
+      #   -Zmiri-ignore-leaks
+      #     miri's leak check flags `bet_str_concat` (rt-stub/src/lib.rs:361) and `bet_str_upper`
+      #     (:374). Both leak DELIBERATELY and say so in the source: "Leak the buffer: `str`
+      #     values are immutable and freed at program exit (the stub does not track string
+      #     lifetimes — the real runtime's allocator context will)." A leak is not UB, and this
+      #     one is the documented design of a bootstrap stub. UB detection is unaffected: this
+      #     flag disables ONLY the end-of-run leak report, never the aliasing/validity checks
+      #     that are the point of this job.
+      #
+      # NOT disabled: Stacked Borrows and the provenance/validity checks — the actual UB gate.
+      #
+      # `--skip cross_thread_handle_use_aborts`: that test asserts the single-thread contract by
+      # RE-EXECING ITS OWN TEST BINARY as a child process and observing SIGABRT
+      # (crates/runtime/tests/abi.rs:506). miri cannot spawn processes ("unsupported operation:
+      # can't call foreign function `posix_spawnattr_init`"), so it is unrunnable here by
+      # construction — not skipped to hide a result. It keeps its full coverage under the normal
+      # `cargo nextest` run in ci.yml.
+      - name: miri (runtime, rt-stub, midir)
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-ignore-leaks
+        run: |
+          cargo +nightly-2026-07-16 miri test -p runtime -p rt-stub -p midir \
+            -- --skip cross_thread_handle_use_aborts
