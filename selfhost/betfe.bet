@@ -5941,7 +5941,7 @@ finna fieldAccessStr(c: LowerCtx, p: P, idx: int) -> (str, str) {
             lowkey swi = 0
             vibin swi < swn {
                 lowkey swlane = laneIndex(str.sub(fname, swi, swi + 1))
-                lowkey swo, swt = emitSimdOp1(cat2("lane.", itoa(swlane)), swelem, bop, swelem)
+                lowkey swo, swt = emitSimdOp1(c, cat2("lane.", itoa(swlane)), swelem, bop, swelem)
                 swops.stack(swo)
                 swi = swi + 1
             }
