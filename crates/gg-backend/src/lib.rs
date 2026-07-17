@@ -1332,6 +1332,586 @@ mod mixer {
     }
 }
 
+/// The frame-time instrument behind `GG_STATS=1`.
+///
+/// ## Why this exists (cwage #98)
+///
+/// This project ships a language whose pitch is "no tracing GC in the hot path" and had, in its
+/// platform layer, no instrument that could observe the hot path: no FPS counter, no frame-time
+/// histogram, no allocation counter, no profiling hook. That gap is precisely what let the audio
+/// (#96) and per-frame-allocation (#97) bugs through — nothing measured them, so nobody noticed.
+///
+/// So: p50/p99 frame time (percentiles, not a mean — a mean hides exactly the hitches you care
+/// about) and the present path's allocations-per-frame, reported once a second. Percentiles are
+/// computed from a fixed-size ring on the stack, so the instrument does not itself allocate.
+#[cfg(any(feature = "desktop", test))]
+mod stats {
+    /// Frame times retained for the percentile window — ~4s at 60 FPS.
+    const SAMPLES: usize = 256;
+
+    /// One second's worth of frames, summarized.
+    #[derive(Debug, PartialEq)]
+    pub(crate) struct Report {
+        pub fps: f32,
+        pub p50_ms: f32,
+        pub p99_ms: f32,
+        /// Present-path buffer allocations per frame over the window. The whole point of #97 is
+        /// that this reads 0.
+        pub allocs_per_frame: f32,
+    }
+
+    pub(crate) struct FrameStats {
+        /// Frame intervals in microseconds; a ring, oldest overwritten.
+        ring: [u32; SAMPLES],
+        next: usize,
+        filled: usize,
+        last_ns: Option<u64>,
+        window_start_ns: u64,
+        frames_this_window: u64,
+        growths_at_window_start: u64,
+    }
+
+    impl FrameStats {
+        pub(crate) const fn new() -> FrameStats {
+            FrameStats {
+                ring: [0; SAMPLES],
+                next: 0,
+                filled: 0,
+                last_ns: None,
+                window_start_ns: 0,
+                frames_this_window: 0,
+                growths_at_window_start: 0,
+            }
+        }
+
+        /// Record a presented frame. Returns a [`Report`] once per second, otherwise `None`.
+        pub(crate) fn record(&mut self, now_ns: u64, growths: u64) -> Option<Report> {
+            let Some(last) = self.last_ns.replace(now_ns) else {
+                // First frame: start the window, measure nothing.
+                self.window_start_ns = now_ns;
+                self.growths_at_window_start = growths;
+                return None;
+            };
+            let dt = now_ns.saturating_sub(last);
+            self.ring[self.next] = (dt / 1_000) as u32;
+            self.next = (self.next + 1) % SAMPLES;
+            self.filled = (self.filled + 1).min(SAMPLES);
+            self.frames_this_window += 1;
+
+            let elapsed = now_ns.saturating_sub(self.window_start_ns);
+            if elapsed < 1_000_000_000 {
+                return None;
+            }
+            let report = Report {
+                fps: self.frames_this_window as f32 * 1e9 / elapsed as f32,
+                p50_ms: self.percentile_ms(50),
+                p99_ms: self.percentile_ms(99),
+                allocs_per_frame: growths.saturating_sub(self.growths_at_window_start) as f32
+                    / self.frames_this_window as f32,
+            };
+            self.window_start_ns = now_ns;
+            self.frames_this_window = 0;
+            self.growths_at_window_start = growths;
+            Some(report)
+        }
+
+        /// The `p`th percentile frame time, in ms. Sorts a fixed stack copy — no allocation, and
+        /// it only runs once a second anyway.
+        fn percentile_ms(&self, p: usize) -> f32 {
+            if self.filled == 0 {
+                return 0.0;
+            }
+            let mut buf = [0u32; SAMPLES];
+            buf[..self.filled].copy_from_slice(&self.ring[..self.filled]);
+            let slice = &mut buf[..self.filled];
+            slice.sort_unstable();
+            let idx = (self.filled * p / 100).min(self.filled - 1);
+            slice[idx] as f32 / 1_000.0
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A steady 60 FPS second reports ~60 FPS, ~16.7ms at both percentiles, and — the claim
+        /// that matters — 0 allocations per frame.
+        #[test]
+        fn a_steady_second_reports_sane_numbers() {
+            let mut s = FrameStats::new();
+            let mut now = 0u64;
+            assert!(
+                s.record(now, 1).is_none(),
+                "the first frame reports nothing"
+            );
+            let mut report = None;
+            for _ in 0..60 {
+                now += 16_666_667;
+                if let Some(r) = s.record(now, 1) {
+                    report = Some(r);
+                }
+            }
+            let r = report.expect("a report after one second");
+            assert!((r.fps - 60.0).abs() < 1.0, "fps = {}", r.fps);
+            assert!((r.p50_ms - 16.67).abs() < 0.1, "p50 = {}", r.p50_ms);
+            assert!((r.p99_ms - 16.67).abs() < 0.1, "p99 = {}", r.p99_ms);
+            assert_eq!(r.allocs_per_frame, 0.0, "steady state allocated");
+        }
+
+        /// p99 must expose a hitch that a mean would bury. 99 good frames and one 100ms stall:
+        /// the mean stays ~11ms (looks fine), p99 tells the truth.
+        #[test]
+        fn p99_exposes_a_hitch_a_mean_would_hide() {
+            let mut s = FrameStats::new();
+            let mut now = 0u64;
+            s.record(now, 0);
+            let mut report = None;
+            for i in 0..100 {
+                now += if i == 50 { 100_000_000 } else { 10_000_000 };
+                if let Some(r) = s.record(now, 0) {
+                    report = Some(r);
+                }
+            }
+            let r = report.expect("a report");
+            assert!((r.p50_ms - 10.0).abs() < 0.5, "p50 = {}", r.p50_ms);
+            assert!(r.p99_ms > 50.0, "p99 = {} — the hitch was hidden", r.p99_ms);
+        }
+
+        /// The gauge must actually count allocations when they happen — otherwise "0 allocs/frame"
+        /// proves nothing.
+        #[test]
+        fn allocations_are_reported_when_they_occur() {
+            let mut s = FrameStats::new();
+            let mut now = 0u64;
+            let mut growths = 0u64;
+            s.record(now, growths);
+            let mut report = None;
+            for _ in 0..60 {
+                now += 16_666_667;
+                growths += 2; // a pathological two-allocations-per-frame present path
+                if let Some(r) = s.record(now, growths) {
+                    report = Some(r);
+                }
+            }
+            let r = report.expect("a report");
+            assert!(
+                (r.allocs_per_frame - 2.0).abs() < 0.01,
+                "allocs/frame = {}",
+                r.allocs_per_frame
+            );
+        }
+
+        /// Reporting must not allocate — the instrument runs in the frame loop.
+        #[test]
+        fn the_instrument_allocates_nothing() {
+            let mut s = FrameStats::new();
+            let mut now = 0u64;
+            s.record(now, 0);
+            let ops = crate::alloc_probe::count_allocator_ops(|| {
+                for _ in 0..600 {
+                    now += 16_666_667;
+                    std::hint::black_box(s.record(now, 0));
+                }
+            });
+            assert_eq!(ops, 0, "the frame instrument performed {ops} allocator ops");
+        }
+
+        /// A backwards clock must not panic or produce a garbage percentile.
+        #[test]
+        fn a_backwards_clock_is_survivable() {
+            let mut s = FrameStats::new();
+            s.record(1_000_000_000, 0);
+            assert!(s.record(0, 0).is_none());
+        }
+    }
+}
+
+/// Keyboard edge synthesis.
+///
+/// ## Why this shape (cwage #98)
+///
+/// The old pump allocated a `Vec<u32>`, scanned the whole key table with `is_key_down`, and
+/// SYNTHESIZED edges by diffing against the previous frame. That is polling wearing an event
+/// API's clothes, and it drops input: a key pressed AND released between two pumps is down at
+/// neither, so no edge is ever detected and the tap vanishes. `Vec::contains` made it O(n²) per
+/// frame on top.
+///
+/// Note that minifb's `get_keys_pressed`/`get_keys_released` do NOT fix this — both are frame
+/// diffs over the same two arrays (`keys[i] && !keys_prev[i]`), so a tap inside one frame is
+/// invisible to them too. The only real event stream minifb exposes is `set_input_callback`'s
+/// `set_key_state`, which every backend calls straight from its platform key handler. So:
+///
+/// * pass 1 replays the RAW transition stream in arrival order — this is what catches the tap;
+/// * pass 2 reconciles against the authoritative down-state, self-healing anything pass 1 missed
+///   (a dropped event, or focus loss leaving a key stuck down);
+/// * the down-set is a fixed `[bool; KEY_COUNT]` bitset — no allocation, O(1) lookup.
+#[cfg(any(feature = "desktop", test))]
+mod input {
+    use super::{Event, event_kind, key};
+    use std::collections::VecDeque;
+
+    /// Dense key index -> the stable `gg` keycode it reports.
+    ///
+    /// The `desktop` build's `KEY_TABLE` maps `minifb::Key` onto these SAME indices and MUST stay
+    /// in this exact order; `key_table_matches_key_codes` is the test that holds the two together.
+    pub(crate) const KEY_CODES: [u32; 75] = [
+        key::A,
+        key::B,
+        key::C,
+        key::D,
+        key::E,
+        key::F,
+        key::G,
+        key::H,
+        key::I,
+        key::J,
+        key::K,
+        key::L,
+        key::M,
+        key::N,
+        key::O,
+        key::P,
+        key::Q,
+        key::R,
+        key::S,
+        key::T,
+        key::U,
+        key::V,
+        key::W,
+        key::X,
+        key::Y,
+        key::Z, //
+        key::D0,
+        key::D1,
+        key::D2,
+        key::D3,
+        key::D4,
+        key::D5,
+        key::D6,
+        key::D7,
+        key::D8,
+        key::D9,
+        key::SPACE,
+        key::ENTER,
+        key::ESC,
+        key::BACKSPACE,
+        key::TAB, //
+        key::APOSTROPHE,
+        key::COMMA,
+        key::MINUS,
+        key::PERIOD,
+        key::SLASH,
+        key::SEMICOLON,
+        key::EQUALS,
+        key::LBRACKET,
+        key::BACKSLASH,
+        key::RBRACKET,
+        key::BACKTICK, //
+        key::UP,
+        key::DOWN,
+        key::LEFT,
+        key::RIGHT, //
+        key::LCTRL,
+        key::RCTRL,
+        key::LSHIFT,
+        key::RSHIFT,
+        key::LALT,
+        key::RALT,
+        key::PAUSE, //
+        key::F1,
+        key::F2,
+        key::F3,
+        key::F4,
+        key::F5,
+        key::F6,
+        key::F7,
+        key::F8,
+        key::F9,
+        key::F10,
+        key::F11,
+        key::F12,
+    ];
+
+    /// How many keys `gg` reports. The down-set is exactly this many bools.
+    pub(crate) const KEY_COUNT: usize = KEY_CODES.len();
+
+    /// What a windowing backend can tell us about the keyboard: a stream of raw transitions, and
+    /// the authoritative current state. Abstracted so the pump is tested without a window.
+    pub(crate) trait KeySource {
+        /// The next raw `(dense index, is_down)` transition since the last pump, in ARRIVAL
+        /// order, or `None` when drained.
+        fn next_transition(&mut self) -> Option<(usize, bool)>;
+        /// Whether the key is physically down right now, per the platform.
+        fn is_down(&self, idx: usize) -> bool;
+    }
+
+    /// The down-key bitset and its edge synthesis.
+    pub(crate) struct Keyboard {
+        down: [bool; KEY_COUNT],
+    }
+
+    impl Keyboard {
+        pub(crate) const fn new() -> Keyboard {
+            Keyboard {
+                down: [false; KEY_COUNT],
+            }
+        }
+
+        /// Apply one transition, emitting an edge ONLY on a real change.
+        ///
+        /// That guard does double duty: it dedups OS key-repeat (macOS re-sends `keyDown` while a
+        /// key is held, which would otherwise flood KEY_DOWNs and break the contract the old
+        /// frame-diff happened to provide), and it makes the reconcile pass a no-op whenever the
+        /// event stream was already correct.
+        pub(crate) fn edge(&mut self, idx: usize, state: bool, out: &mut VecDeque<Event>) {
+            if idx >= KEY_COUNT || self.down[idx] == state {
+                return;
+            }
+            self.down[idx] = state;
+            out.push_back(Event {
+                kind: if state {
+                    event_kind::KEY_DOWN
+                } else {
+                    event_kind::KEY_UP
+                },
+                code: KEY_CODES[idx],
+                x: 0,
+                y: 0,
+            });
+        }
+
+        /// Synthesize this pump's key events. Allocation-free; O(transitions + KEY_COUNT).
+        pub(crate) fn pump(&mut self, src: &mut impl KeySource, out: &mut VecDeque<Event>) {
+            // 1. Replay every raw transition in arrival order. A press+release inside one frame
+            //    arrives as two transitions and produces KEY_DOWN then KEY_UP — the tap the old
+            //    polling pump silently dropped.
+            while let Some((idx, state)) = src.next_transition() {
+                self.edge(idx, state, out);
+            }
+            // 2. Reconcile against the platform's authoritative state. A no-op in the normal case
+            //    (pass 1 already agrees), but it self-heals a dropped event or a key left stuck
+            //    down by a focus change — the failure mode a pure event stream would have.
+            for idx in 0..KEY_COUNT {
+                self.edge(idx, src.is_down(idx), out);
+            }
+        }
+
+        #[cfg(test)]
+        pub(crate) fn is_down(&self, idx: usize) -> bool {
+            self.down[idx]
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A scripted key source: a transition stream plus an authoritative down-state.
+        struct FakeKeys {
+            transitions: VecDeque<(usize, bool)>,
+            down: [bool; KEY_COUNT],
+        }
+
+        impl FakeKeys {
+            fn new() -> FakeKeys {
+                FakeKeys {
+                    transitions: VecDeque::new(),
+                    down: [false; KEY_COUNT],
+                }
+            }
+            /// Press and RELEASE within the same frame — the dropped-tap case.
+            fn tap(&mut self, idx: usize) {
+                self.transitions.push_back((idx, true));
+                self.transitions.push_back((idx, false));
+                self.down[idx] = false; // physically up again by the time we pump
+            }
+            /// Press and hold across the pump.
+            fn hold(&mut self, idx: usize) {
+                self.transitions.push_back((idx, true));
+                self.down[idx] = true;
+            }
+            fn release(&mut self, idx: usize) {
+                self.transitions.push_back((idx, false));
+                self.down[idx] = false;
+            }
+        }
+
+        impl KeySource for FakeKeys {
+            fn next_transition(&mut self) -> Option<(usize, bool)> {
+                self.transitions.pop_front()
+            }
+            fn is_down(&self, idx: usize) -> bool {
+                self.down[idx]
+            }
+        }
+
+        fn kinds(q: &VecDeque<Event>) -> Vec<(u32, u32)> {
+            q.iter().map(|e| (e.kind, e.code)).collect()
+        }
+
+        /// THE cwage #98 regression test: a key pressed AND released between two pumps must
+        /// still produce KEY_DOWN then KEY_UP, in that order.
+        ///
+        /// This is the weapon-switch tap that used to vanish. The old pump saw `is_key_down ==
+        /// false` at both frames and emitted nothing at all.
+        #[test]
+        fn a_tap_inside_one_frame_still_reports_both_edges() {
+            let mut kb = Keyboard::new();
+            let mut src = FakeKeys::new();
+            let mut out = VecDeque::new();
+
+            let w = 22; // dense index of 'W'
+            assert_eq!(KEY_CODES[w], key::W);
+            src.tap(w);
+            kb.pump(&mut src, &mut out);
+
+            assert_eq!(
+                kinds(&out),
+                vec![(event_kind::KEY_DOWN, key::W), (event_kind::KEY_UP, key::W)],
+                "a press+release inside one frame was dropped"
+            );
+            assert!(!kb.is_down(w));
+        }
+
+        /// The reason the fix needs the event STREAM: with only the polled down-state (what the
+        /// old pump had, and what minifb's get_keys_pressed/get_keys_released are built on), the
+        /// very same tap is invisible. This test pins the bug's mechanism, so nobody "simplifies"
+        /// the pump back to polling.
+        #[test]
+        fn polling_alone_cannot_see_the_tap() {
+            let mut kb = Keyboard::new();
+            let mut src = FakeKeys::new();
+            let mut out = VecDeque::new();
+
+            src.tap(22);
+            src.transitions.clear(); // simulate a pure poller: state only, no event stream
+            kb.pump(&mut src, &mut out);
+
+            assert!(
+                out.is_empty(),
+                "polling saw the tap; the premise of this test is wrong"
+            );
+        }
+
+        /// Several taps in one frame all survive, in order.
+        #[test]
+        fn multiple_taps_in_one_frame_all_survive_in_order() {
+            let mut kb = Keyboard::new();
+            let mut src = FakeKeys::new();
+            let mut out = VecDeque::new();
+
+            src.tap(27); // '1'
+            src.tap(28); // '2'
+            src.tap(29); // '3'
+            kb.pump(&mut src, &mut out);
+
+            assert_eq!(
+                kinds(&out),
+                vec![
+                    (event_kind::KEY_DOWN, key::D1),
+                    (event_kind::KEY_UP, key::D1),
+                    (event_kind::KEY_DOWN, key::D2),
+                    (event_kind::KEY_UP, key::D2),
+                    (event_kind::KEY_DOWN, key::D3),
+                    (event_kind::KEY_UP, key::D3),
+                ]
+            );
+        }
+
+        /// A held key reports exactly one KEY_DOWN, then one KEY_UP when it goes — no repeats,
+        /// even though macOS re-sends `keyDown` while the key is held.
+        #[test]
+        fn a_held_key_reports_one_edge_each_way_despite_os_repeat() {
+            let mut kb = Keyboard::new();
+            let mut src = FakeKeys::new();
+            let mut out = VecDeque::new();
+
+            src.hold(22);
+            kb.pump(&mut src, &mut out);
+            assert_eq!(kinds(&out), vec![(event_kind::KEY_DOWN, key::W)]);
+            out.clear();
+
+            // Frames 2 and 3: still held, with OS key-repeat re-asserting `down`.
+            for _ in 0..2 {
+                src.transitions.push_back((22, true)); // an OS repeat
+                kb.pump(&mut src, &mut out);
+                assert!(out.is_empty(), "key repeat leaked a duplicate KEY_DOWN");
+            }
+
+            src.release(22);
+            kb.pump(&mut src, &mut out);
+            assert_eq!(kinds(&out), vec![(event_kind::KEY_UP, key::W)]);
+        }
+
+        /// If the event stream drops a transition (a lost callback, or focus loss leaving a key
+        /// stuck), the reconcile pass must repair the state rather than wedge it forever.
+        #[test]
+        fn reconcile_repairs_a_dropped_transition() {
+            let mut kb = Keyboard::new();
+            let mut src = FakeKeys::new();
+            let mut out = VecDeque::new();
+
+            src.hold(22);
+            kb.pump(&mut src, &mut out);
+            out.clear();
+            assert!(kb.is_down(22));
+
+            // The window loses focus: the key is physically up, but no transition ever arrived.
+            src.down[22] = false;
+            kb.pump(&mut src, &mut out);
+            assert_eq!(
+                kinds(&out),
+                vec![(event_kind::KEY_UP, key::W)],
+                "a stuck key was not reconciled"
+            );
+            assert!(!kb.is_down(22));
+        }
+
+        /// The pump runs every frame, so it must not allocate — the old one built a `Vec` per
+        /// pump and linear-scanned it.
+        #[test]
+        fn the_pump_allocates_nothing() {
+            let mut kb = Keyboard::new();
+            let mut src = FakeKeys::new();
+            let mut out = VecDeque::with_capacity(256);
+
+            // Warm the queue's allocation, then measure steady state.
+            src.hold(0);
+            kb.pump(&mut src, &mut out);
+            out.clear();
+
+            let ops = crate::alloc_probe::count_allocator_ops(|| {
+                for _ in 0..100 {
+                    kb.pump(&mut src, &mut out);
+                }
+            });
+            assert_eq!(ops, 0, "the input pump performed {ops} allocator ops");
+        }
+
+        /// Out-of-range indices are ignored rather than panicking.
+        #[test]
+        fn an_out_of_range_index_is_ignored() {
+            let mut kb = Keyboard::new();
+            let mut out = VecDeque::new();
+            kb.edge(KEY_COUNT, true, &mut out);
+            kb.edge(9999, true, &mut out);
+            assert!(out.is_empty());
+        }
+
+        /// The keycodes are a frozen contract the ports depend on by value.
+        #[test]
+        fn keycodes_are_unique_and_stable() {
+            let mut seen = KEY_CODES.to_vec();
+            seen.sort_unstable();
+            seen.dedup();
+            assert_eq!(seen.len(), KEY_COUNT, "duplicate keycode in KEY_CODES");
+            assert_eq!(KEY_CODES[22], b'W' as u32);
+            assert_eq!(KEY_CODES[52], 256); // UP
+            assert_eq!(KEY_CODES[63], 280); // F1
+        }
+    }
+}
+
 // ===========================================================================
 // The present core — like `mixer`, compiled in BOTH builds so the default test gate covers it.
 // Nothing here knows about `minifb`: it turns a logical frame into window pixels, and that is
@@ -1470,11 +2050,17 @@ mod compose {
     /// frozen `FrameBuffer` contract). `w`, `h`, and `stride` are the packed frame dimensions.
     pub(crate) unsafe fn pack_frame_into(
         dst: &mut Vec<u32>,
+        growths: &mut u64,
         pixels: *const u32,
         w: usize,
         h: usize,
         stride: usize,
     ) {
+        // Count real capacity growth, so the `GG_STATS` allocs/frame gauge covers the staging
+        // buffer and not just the window buffer.
+        if w * h > dst.capacity() {
+            *growths += 1;
+        }
         // Reused buffers hold the PREVIOUS frame, so the zero-fill the old `vec![0u32; w * h]`
         // gave for free must now be explicit — the clamped-away columns of an over-wide frame,
         // and a null source, are both contractually black.
@@ -1619,7 +2205,7 @@ mod compose {
             let (stride, h, w) = (2usize, 3usize, 5usize); // width (5) > stride (2)
             let src: Vec<u32> = (1..=(stride * h) as u32).collect(); // [1,2, 3,4, 5,6]
             let mut buf = Vec::new();
-            unsafe { pack_frame_into(&mut buf, src.as_ptr(), w, h, stride) };
+            unsafe { pack_frame_into(&mut buf, &mut 0, src.as_ptr(), w, h, stride) };
 
             assert_eq!(buf.len(), w * h);
             for y in 0..h {
@@ -1634,7 +2220,7 @@ mod compose {
         #[test]
         fn present_null_source_is_zeroed() {
             let mut buf = Vec::new();
-            unsafe { pack_frame_into(&mut buf, std::ptr::null(), 4, 2, 4) };
+            unsafe { pack_frame_into(&mut buf, &mut 0, std::ptr::null(), 4, 2, 4) };
             assert_eq!(buf, vec![0u32; 8]);
         }
 
@@ -1644,7 +2230,7 @@ mod compose {
             let (w, h) = (3usize, 2usize);
             let src: Vec<u32> = (10..16).collect();
             let mut buf = Vec::new();
-            unsafe { pack_frame_into(&mut buf, src.as_ptr(), w, h, w) };
+            unsafe { pack_frame_into(&mut buf, &mut 0, src.as_ptr(), w, h, w) };
             assert_eq!(buf, src);
         }
 
@@ -1655,16 +2241,16 @@ mod compose {
             let mut buf = Vec::new();
             // A full-width frame first...
             let full: Vec<u32> = vec![0xDEAD_BEEF; 4 * 2];
-            unsafe { pack_frame_into(&mut buf, full.as_ptr(), 4, 2, 4) };
+            unsafe { pack_frame_into(&mut buf, &mut 0, full.as_ptr(), 4, 2, 4) };
             // ...then an over-wide one whose clamped columns must be black, not 0xDEADBEEF.
             let narrow: Vec<u32> = vec![7; 2 * 2];
-            unsafe { pack_frame_into(&mut buf, narrow.as_ptr(), 4, 2, 2) };
+            unsafe { pack_frame_into(&mut buf, &mut 0, narrow.as_ptr(), 4, 2, 2) };
             assert_eq!(buf, vec![7, 7, 0, 0, 7, 7, 0, 0]);
 
             // And reuse at a settled size allocates nothing.
             let ops = crate::alloc_probe::count_allocator_ops(|| {
                 for _ in 0..32 {
-                    unsafe { pack_frame_into(&mut buf, narrow.as_ptr(), 4, 2, 2) };
+                    unsafe { pack_frame_into(&mut buf, &mut 0, narrow.as_ptr(), 4, 2, 2) };
                 }
             });
             assert_eq!(ops, 0, "staging reuse performed {ops} allocator ops");
@@ -1755,9 +2341,9 @@ mod imp {
 
 #[cfg(feature = "desktop")]
 mod imp {
-    use super::{Event, NONE_EVENT, compose, event_kind, key, mixer};
+    use super::{Event, NONE_EVENT, compose, event_kind, input, mixer, stats};
     use std::collections::VecDeque;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
 
     /// The default window title, used until a game sets its own via [`title`]. Kept generic (not
     /// per-game) so a gg program that never calls `gg.title` doesn't inherit another game's name.
@@ -1769,85 +2355,154 @@ mod imp {
     /// block (~10ms), so this is orders of magnitude more than a frame can ever produce.
     const CMD_CAP: usize = 256;
 
-    /// `minifb::Key` → keycode pairs used to diff the down-key set each frame. `Escape` is a
-    /// normal key here (KEY_DOWN/KEY_UP code 27); QUIT is emitted only for window close.
-    const KEY_TABLE: &[(minifb::Key, u32)] = &[
-        (minifb::Key::A, key::A),
-        (minifb::Key::B, key::B),
-        (minifb::Key::C, key::C),
-        (minifb::Key::D, key::D),
-        (minifb::Key::E, key::E),
-        (minifb::Key::F, key::F),
-        (minifb::Key::G, key::G),
-        (minifb::Key::H, key::H),
-        (minifb::Key::I, key::I),
-        (minifb::Key::J, key::J),
-        (minifb::Key::K, key::K),
-        (minifb::Key::L, key::L),
-        (minifb::Key::M, key::M),
-        (minifb::Key::N, key::N),
-        (minifb::Key::O, key::O),
-        (minifb::Key::P, key::P),
-        (minifb::Key::Q, key::Q),
-        (minifb::Key::R, key::R),
-        (minifb::Key::S, key::S),
-        (minifb::Key::T, key::T),
-        (minifb::Key::U, key::U),
-        (minifb::Key::V, key::V),
-        (minifb::Key::W, key::W),
-        (minifb::Key::X, key::X),
-        (minifb::Key::Y, key::Y),
-        (minifb::Key::Z, key::Z),
-        (minifb::Key::Key0, key::D0),
-        (minifb::Key::Key1, key::D1),
-        (minifb::Key::Key2, key::D2),
-        (minifb::Key::Key3, key::D3),
-        (minifb::Key::Key4, key::D4),
-        (minifb::Key::Key5, key::D5),
-        (minifb::Key::Key6, key::D6),
-        (minifb::Key::Key7, key::D7),
-        (minifb::Key::Key8, key::D8),
-        (minifb::Key::Key9, key::D9),
-        (minifb::Key::Space, key::SPACE),
-        (minifb::Key::Enter, key::ENTER),
-        (minifb::Key::Escape, key::ESC),
-        (minifb::Key::Backspace, key::BACKSPACE),
-        (minifb::Key::Tab, key::TAB),
-        (minifb::Key::Apostrophe, key::APOSTROPHE),
-        (minifb::Key::Comma, key::COMMA),
-        (minifb::Key::Minus, key::MINUS),
-        (minifb::Key::Period, key::PERIOD),
-        (minifb::Key::Slash, key::SLASH),
-        (minifb::Key::Semicolon, key::SEMICOLON),
-        (minifb::Key::Equal, key::EQUALS),
-        (minifb::Key::LeftBracket, key::LBRACKET),
-        (minifb::Key::Backslash, key::BACKSLASH),
-        (minifb::Key::RightBracket, key::RBRACKET),
-        (minifb::Key::Backquote, key::BACKTICK),
-        (minifb::Key::Up, key::UP),
-        (minifb::Key::Down, key::DOWN),
-        (minifb::Key::Left, key::LEFT),
-        (minifb::Key::Right, key::RIGHT),
-        (minifb::Key::LeftCtrl, key::LCTRL),
-        (minifb::Key::RightCtrl, key::RCTRL),
-        (minifb::Key::LeftShift, key::LSHIFT),
-        (minifb::Key::RightShift, key::RSHIFT),
-        (minifb::Key::LeftAlt, key::LALT),
-        (minifb::Key::RightAlt, key::RALT),
-        (minifb::Key::Pause, key::PAUSE),
-        (minifb::Key::F1, key::F1),
-        (minifb::Key::F2, key::F2),
-        (minifb::Key::F3, key::F3),
-        (minifb::Key::F4, key::F4),
-        (minifb::Key::F5, key::F5),
-        (minifb::Key::F6, key::F6),
-        (minifb::Key::F7, key::F7),
-        (minifb::Key::F8, key::F8),
-        (minifb::Key::F9, key::F9),
-        (minifb::Key::F10, key::F10),
-        (minifb::Key::F11, key::F11),
-        (minifb::Key::F12, key::F12),
+    /// `minifb::Key` in DENSE-INDEX order: `KEY_TABLE[i]` is the minifb key whose `gg` keycode is
+    /// `input::KEY_CODES[i]`. The two tables must stay in lockstep — `key_table_matches_key_codes`
+    /// is the test that enforces it. `Escape` is a normal key here (KEY_DOWN/KEY_UP code 27);
+    /// QUIT is emitted only for window close.
+    const KEY_TABLE: [minifb::Key; input::KEY_COUNT] = [
+        minifb::Key::A,
+        minifb::Key::B,
+        minifb::Key::C,
+        minifb::Key::D,
+        minifb::Key::E,
+        minifb::Key::F,
+        minifb::Key::G,
+        minifb::Key::H,
+        minifb::Key::I,
+        minifb::Key::J,
+        minifb::Key::K,
+        minifb::Key::L,
+        minifb::Key::M,
+        minifb::Key::N,
+        minifb::Key::O,
+        minifb::Key::P,
+        minifb::Key::Q,
+        minifb::Key::R,
+        minifb::Key::S,
+        minifb::Key::T,
+        minifb::Key::U,
+        minifb::Key::V,
+        minifb::Key::W,
+        minifb::Key::X,
+        minifb::Key::Y,
+        minifb::Key::Z,
+        minifb::Key::Key0,
+        minifb::Key::Key1,
+        minifb::Key::Key2,
+        minifb::Key::Key3,
+        minifb::Key::Key4,
+        minifb::Key::Key5,
+        minifb::Key::Key6,
+        minifb::Key::Key7,
+        minifb::Key::Key8,
+        minifb::Key::Key9,
+        minifb::Key::Space,
+        minifb::Key::Enter,
+        minifb::Key::Escape,
+        minifb::Key::Backspace,
+        minifb::Key::Tab,
+        minifb::Key::Apostrophe,
+        minifb::Key::Comma,
+        minifb::Key::Minus,
+        minifb::Key::Period,
+        minifb::Key::Slash,
+        minifb::Key::Semicolon,
+        minifb::Key::Equal,
+        minifb::Key::LeftBracket,
+        minifb::Key::Backslash,
+        minifb::Key::RightBracket,
+        minifb::Key::Backquote,
+        minifb::Key::Up,
+        minifb::Key::Down,
+        minifb::Key::Left,
+        minifb::Key::Right,
+        minifb::Key::LeftCtrl,
+        minifb::Key::RightCtrl,
+        minifb::Key::LeftShift,
+        minifb::Key::RightShift,
+        minifb::Key::LeftAlt,
+        minifb::Key::RightAlt,
+        minifb::Key::Pause,
+        minifb::Key::F1,
+        minifb::Key::F2,
+        minifb::Key::F3,
+        minifb::Key::F4,
+        minifb::Key::F5,
+        minifb::Key::F6,
+        minifb::Key::F7,
+        minifb::Key::F8,
+        minifb::Key::F9,
+        minifb::Key::F10,
+        minifb::Key::F11,
+        minifb::Key::F12,
     ];
+
+    /// Cap the raw key-transition queue. A game that never pumps input (a long load) must not
+    /// grow it forever; past this, the oldest transitions are dropped and the reconcile pass in
+    /// `Keyboard::pump` repairs the resulting state.
+    const RAW_KEY_CAP: usize = 1024;
+
+    /// `minifb::Key` -> dense key index, built once by scanning [`KEY_TABLE`]. `minifb` indexes
+    /// its own key array by `Key as usize` over 512 slots, so a flat LUT is exact and O(1) —
+    /// replacing the old linear scan of the whole table per key per frame.
+    fn key_index(k: minifb::Key) -> Option<usize> {
+        static LUT: OnceLock<[u8; 512]> = OnceLock::new();
+        let lut = LUT.get_or_init(|| {
+            let mut lut = [u8::MAX; 512];
+            for (idx, &mk) in KEY_TABLE.iter().enumerate() {
+                lut[mk as usize] = idx as u8;
+            }
+            lut
+        });
+        match lut.get(k as usize).copied() {
+            Some(u8::MAX) | None => None,
+            Some(idx) => Some(usize::from(idx)),
+        }
+    }
+
+    /// The minifb input callback: the ONLY real key-event stream minifb exposes (cwage #98).
+    /// `set_key_state` is called straight from each platform's key handler on every physical
+    /// transition, so a press+release inside one frame arrives as two events rather than
+    /// vanishing into a frame diff.
+    ///
+    /// It runs on the game thread, from inside `update_with_buffer`, so the mutex here is
+    /// uncontended and nowhere near the audio callback.
+    struct KeyTap(Arc<Mutex<VecDeque<(usize, bool)>>>);
+
+    impl minifb::InputCallback for KeyTap {
+        fn add_char(&mut self, _uni_char: u32) {
+            // gg reports keycodes, not text; `gg.poll` has no character event.
+        }
+
+        fn set_key_state(&mut self, k: minifb::Key, state: bool) {
+            if let Some(idx) = key_index(k) {
+                let mut q = self.0.lock().unwrap_or_else(|e| e.into_inner());
+                if q.len() < RAW_KEY_CAP {
+                    q.push_back((idx, state));
+                }
+            }
+        }
+    }
+
+    /// The live window as an [`input::KeySource`]: raw transitions from [`KeyTap`], authoritative
+    /// state from minifb's key array.
+    struct WinKeys<'a> {
+        window: &'a minifb::Window,
+        raw: &'a Mutex<VecDeque<(usize, bool)>>,
+    }
+
+    impl input::KeySource for WinKeys<'_> {
+        fn next_transition(&mut self) -> Option<(usize, bool)> {
+            self.raw
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop_front()
+        }
+
+        fn is_down(&self, idx: usize) -> bool {
+            self.window.is_key_down(KEY_TABLE[idx])
+        }
+    }
 
     /// CoreGraphics relative-mouse support (macOS only). Warping the cursor back to window-center
     /// near an edge is how a position-difference mouse delta avoids clamping to zero at the screen
@@ -1938,8 +2593,12 @@ mod imp {
         audio_started: bool,
         /// The synthesized input-event queue drained by [`poll`].
         events: VecDeque<Event>,
-        /// Keycodes that were down at the previous `present`, for edge detection.
-        down: Vec<u32>,
+        /// The down-key bitset and edge synthesizer (cwage #98). Replaces a `Vec<u32>` that was
+        /// allocated and linear-scanned every single pump.
+        keyboard: input::Keyboard,
+        /// Raw key transitions pushed by [`KeyTap`] from inside `update_with_buffer`, drained by
+        /// `pump_input`. Shared with the callback the window owns, hence the `Arc`.
+        raw_keys: Arc<Mutex<VecDeque<(usize, bool)>>>,
         /// Set once a QUIT has been enqueued, so we don't flood the queue every frame.
         quit_sent: bool,
         /// The composited logical canvas (`canvas_w * canvas_h` XRGB pixels), rebuilt by `frame`.
@@ -1978,6 +2637,8 @@ mod imp {
         /// The window title: `WINDOW_TITLE` until a game sets its own via `set_title`, then applied
         /// live and used as the title when the window is (re)created.
         title: String,
+        /// The `GG_STATS=1` frame instrument. Inert (never even read) when stats are off.
+        stats: stats::FrameStats,
     }
 
     // SAFETY: `minifb::Window` and `cpal::Stream` are `!Send`, but every field of `GgState` is
@@ -2006,7 +2667,8 @@ mod imp {
                 stream: None,
                 audio_started: false,
                 events: VecDeque::new(),
-                down: Vec::new(),
+                keyboard: input::Keyboard::new(),
+                raw_keys: Arc::new(Mutex::new(VecDeque::new())),
                 quit_sent: false,
                 canvas: Vec::new(),
                 canvas_w: 0,
@@ -2024,6 +2686,33 @@ mod imp {
                 relative_mouse: false,
                 cursor_hidden: false,
                 title: WINDOW_TITLE.to_string(),
+                stats: stats::FrameStats::new(),
+            }
+        }
+
+        /// Record a presented frame for `GG_STATS=1` and, once a second, report.
+        ///
+        /// Reports to BOTH stderr (greppable, survives the window closing) and the title bar
+        /// (visible while you play, and free — no font rasterizer needed for a text overlay).
+        /// A no-op, minus one env check, when stats are off.
+        fn note_frame(&mut self) {
+            if !stats_on() {
+                return;
+            }
+            let growths = self.present.growths;
+            let Some(r) = self.stats.record(super::ticks(), growths) else {
+                return;
+            };
+            eprintln!(
+                "gg stats: {:6.1} fps | frame p50 {:5.2} ms p99 {:5.2} ms | present allocs/frame {:.3}",
+                r.fps, r.p50_ms, r.p99_ms, r.allocs_per_frame
+            );
+            if let Some(w) = self.window.as_mut() {
+                // The game's own title, plus the numbers. Rebuilt once a second, not per frame.
+                w.set_title(&format!(
+                    "{} — {:.0} fps | p50 {:.1}ms p99 {:.1}ms | {:.2} allocs/frame",
+                    self.title, r.fps, r.p50_ms, r.p99_ms, r.allocs_per_frame
+                ));
             }
         }
 
@@ -2031,10 +2720,14 @@ mod imp {
         /// the first call, then synthesize input events from the new key state.
         fn present(&mut self, buf: &[u32], w: usize, h: usize) {
             let title = self.title.clone();
-            let window = self.window.get_or_insert_with(|| open_window(&title, w, h));
+            let raw_keys = Arc::clone(&self.raw_keys);
+            let window = self
+                .window
+                .get_or_insert_with(|| open_window(&title, w, h, &raw_keys));
             // `update_with_buffer` wants exactly `w * h` pixels; `present()` guarantees `buf`
             // is that long.
             let _ = window.update_with_buffer(buf, w, h);
+            self.note_frame();
             self.pump_input();
         }
 
@@ -2068,31 +2761,13 @@ mod imp {
                 self.quit_sent = true;
             }
 
-            let mut now_down: Vec<u32> = Vec::new();
-            for &(mk, code) in KEY_TABLE {
-                if window.is_key_down(mk) {
-                    now_down.push(code);
-                    if !self.down.contains(&code) {
-                        self.events.push_back(Event {
-                            kind: event_kind::KEY_DOWN,
-                            code,
-                            x: 0,
-                            y: 0,
-                        });
-                    }
-                }
-            }
-            for &code in &self.down {
-                if !now_down.contains(&code) {
-                    self.events.push_back(Event {
-                        kind: event_kind::KEY_UP,
-                        code,
-                        x: 0,
-                        y: 0,
-                    });
-                }
-            }
-            self.down = now_down;
+            // Keys: replay the raw transition stream, then reconcile against the live state.
+            // See `input::Keyboard::pump` — this is what stops a fast tap from vanishing.
+            let mut src = WinKeys {
+                window,
+                raw: &self.raw_keys,
+            };
+            self.keyboard.pump(&mut src, &mut self.events);
 
             // Relative mouse: accumulate raw window-pixel deltas between pumps, drained by
             // `mouse_delta()`. minifb exposes only absolute positions (no pointer lock). On macOS,
@@ -2414,6 +3089,7 @@ mod imp {
         fn present_scaled(&mut self, src: &[u32], cw: usize, ch: usize) {
             // 1. Ensure the window (default ~2x the frame), read its live size, end that borrow.
             let title = self.title.clone();
+            let raw_keys = Arc::clone(&self.raw_keys);
             let window = self.window.get_or_insert_with(|| {
                 // Default: ~2x the logical frame. With `GG_FULLSQUARE` set (the DOOM launcher
                 // exports it) open the largest square that fits the main display instead — a ~6%
@@ -2429,7 +3105,7 @@ mod imp {
                 } else {
                     (cw * 2, ch * 2)
                 };
-                open_window(&title, open_w, open_h)
+                open_window(&title, open_w, open_h, &raw_keys)
             });
             let (win_w, win_h) = window.get_size();
             // 2. Aspect-fit into the PERSISTENT present buffer — no per-frame allocation, and no
@@ -2444,6 +3120,7 @@ mod imp {
             if let Some(window) = window.as_mut() {
                 let _ = window.update_with_buffer(present.buf(), win_w, win_h);
             }
+            self.note_frame();
             // 4. Pump input; the window->logical mapping the mouse needs lives in `self.present`.
             self.pump_input();
         }
@@ -2583,7 +3260,12 @@ mod imp {
     /// dynamic resolution by sizing its framebuffer to `size()`. `resize` lets the user maximize;
     /// `Stretch` only covers the single transient frame after a resize, before the program
     /// reallocates its framebuffer to the new size.
-    fn open_window(title: &str, w: usize, h: usize) -> minifb::Window {
+    fn open_window(
+        title: &str,
+        w: usize,
+        h: usize,
+        raw_keys: &Arc<Mutex<VecDeque<(usize, bool)>>>,
+    ) -> minifb::Window {
         let opts = minifb::WindowOptions {
             resize: true,
             scale: minifb::Scale::X1,
@@ -2597,7 +3279,17 @@ mod imp {
         // the cap, deprecation and all, until minifb ships the replacement.
         #[allow(deprecated)]
         window.limit_update_rate(frame_interval());
+        // Subscribe to the REAL key-event stream. Without this the pump is back to frame-diffed
+        // polling and fast taps disappear again (cwage #98).
+        window.set_input_callback(Box::new(KeyTap(Arc::clone(raw_keys))));
         window
+    }
+
+    /// The `GG_STATS` switch: set to anything but `""`/`"0"` to print a frame-time and
+    /// allocation report once a second (cwage #98). Read once, at the first frame.
+    fn stats_on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("GG_STATS").is_ok_and(|v| !v.is_empty() && v != "0"))
     }
 
     /// The `BET_GG_HEADLESS` switch: when the env var is set to anything but `""`/`"0"`, this
@@ -2732,7 +3424,16 @@ mod imp {
             // addresses at least `stride * height` readable `u32`s; `pack_frame_into` clamps each
             // row read to `stride`, so an over-wide `width > stride` frame can never read past
             // that region.
-            unsafe { compose::pack_frame_into(&mut st.staging, pixels, w, h, stride) };
+            unsafe {
+                compose::pack_frame_into(
+                    &mut st.staging,
+                    &mut st.present.growths,
+                    pixels,
+                    w,
+                    h,
+                    stride,
+                )
+            };
             let staging = std::mem::take(&mut st.staging);
             st.present(&staging, w, h);
             st.staging = staging;
@@ -2868,7 +3569,9 @@ mod imp {
             //
             // SAFETY: the caller guarantees `pixels` addresses `w * h` readable `u32`s (the
             // `bet_gg_show` contract), which is `pack_frame_into`'s requirement at stride == w.
-            unsafe { compose::pack_frame_into(&mut st.staging, pixels, w, h, w) };
+            unsafe {
+                compose::pack_frame_into(&mut st.staging, &mut st.present.growths, pixels, w, h, w)
+            };
             let staging = std::mem::take(&mut st.staging);
             st.show(&staging, w, h);
             st.staging = staging;
@@ -2894,5 +3597,42 @@ mod imp {
             return;
         }
         with_state(|st| st.set_title(name));
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// `KEY_TABLE` (minifb keys) and `input::KEY_CODES` (gg keycodes) are two parallel tables
+        /// that MUST stay in the same dense-index order — the pump maps between them by index,
+        /// and the ports depend on the keycodes by value. A reorder of either would silently
+        /// remap every key in every game. This is the test that makes that impossible.
+        #[test]
+        fn key_table_matches_key_codes() {
+            assert_eq!(KEY_TABLE.len(), input::KEY_COUNT);
+            // Round-trip every minifb key through the LUT back to its dense index.
+            for (idx, &mk) in KEY_TABLE.iter().enumerate() {
+                assert_eq!(key_index(mk), Some(idx), "{mk:?} did not map back to {idx}");
+            }
+            // Spot-check the mapping the ports actually rely on.
+            let code = |k| key_index(k).map(|i| input::KEY_CODES[i]);
+            assert_eq!(code(minifb::Key::W), Some(87));
+            assert_eq!(code(minifb::Key::Escape), Some(27));
+            assert_eq!(code(minifb::Key::Up), Some(256));
+            assert_eq!(code(minifb::Key::F1), Some(280));
+            // A key gg does not report has no index (and must not panic).
+            assert_eq!(key_index(minifb::Key::NumPad5), None);
+            assert_eq!(key_index(minifb::Key::Unknown), None);
+        }
+
+        /// `GG_FPS` must resolve to a stable, non-zero interval (a zero would spin).
+        #[test]
+        fn frame_interval_is_stable_and_nonzero() {
+            let a = frame_interval();
+            assert_eq!(a, frame_interval(), "frame_interval is not stable");
+            if let Some(d) = a {
+                assert!(d.as_micros() > 0, "a zero frame interval would spin");
+            }
+        }
     }
 }
