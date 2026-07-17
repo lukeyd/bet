@@ -3634,5 +3634,107 @@ mod imp {
                 assert!(d.as_micros() > 0, "a zero frame interval would spin");
             }
         }
+
+        /// The mixer's own tests drive the FAKE `PcmSource`/`CmdSource`, so they never touch the
+        /// `rtrb` rings that carry the real thing. This exercises the actual wiring in the actual
+        /// topology: producer on one thread, consumer on another, exactly as the game thread and
+        /// the cpal callback are arranged.
+        ///
+        /// Deterministic by construction — the assertions are on CONTENT and ORDER, never on
+        /// timing, so it cannot go flaky on a loaded machine.
+        #[test]
+        fn spsc_sample_ring_is_lossless_and_ordered_across_threads() {
+            const N: i16 = 8_000;
+            let (mut tx, mut rx) = rtrb::RingBuffer::<i16>::new(1024);
+
+            // The "callback": pop until it has N samples, using the same PcmSource impl the real
+            // stream does.
+            let consumer = std::thread::spawn(move || {
+                use mixer::PcmSource;
+                let mut got = Vec::with_capacity(N as usize);
+                while got.len() < N as usize {
+                    // `next_sample` reads 0 on an empty ring (silence, not a stall) — so pop
+                    // directly here to distinguish "not yet written" from a real value.
+                    match rx.pop() {
+                        Ok(s) => got.push(s),
+                        Err(_) => std::hint::spin_loop(),
+                    }
+                }
+                // The trait impl is the thing the stream actually calls; prove it drains too.
+                assert_eq!(rx.next_sample(), 0, "a dry ring must read as silence");
+                got
+            });
+
+            // The "game thread": push 1..=N, retrying on a full ring.
+            for s in 1..=N {
+                while tx.push(s).is_err() {
+                    std::hint::spin_loop();
+                }
+            }
+
+            let got = consumer.join().expect("consumer thread panicked");
+            assert_eq!(got.len(), N as usize);
+            // Lossless AND in order — the two properties the raw `gg.audio` stream depends on.
+            assert!(
+                got.iter().copied().eq(1..=N),
+                "the sample ring lost or reordered data across the thread boundary"
+            );
+        }
+
+        /// The same, for the command ring: every `Play` must arrive intact, with its `Arc`
+        /// payload, and be applied by the mixer on the consumer side.
+        #[test]
+        fn spsc_command_ring_delivers_plays_to_a_mixer_on_another_thread() {
+            use std::sync::Arc;
+            const PLAYS: usize = 500;
+            let (mut tx, mut rx) = rtrb::RingBuffer::<mixer::MixCmd>::new(CMD_CAP);
+            // The registry's strong ref — the invariant that keeps `free()` off the RT thread.
+            let pcm = Arc::new(vec![1234i16; 16]);
+            let keepalive = Arc::clone(&pcm);
+
+            let consumer = std::thread::spawn(move || {
+                let mut mix = mixer::Mixer::new(1);
+                let mut applied = 0usize;
+                let mut block = [0i16; 4];
+                while applied < PLAYS {
+                    let before = applied;
+                    // Drain whatever has arrived, then mix — the real callback's exact shape.
+                    while let Ok(cmd) = rx.pop() {
+                        mix.apply(cmd);
+                        applied += 1;
+                    }
+                    mix.fill(&mut block, &mut mixer::Silence, &mut mixer::NoCmds, 1);
+                    if applied == before {
+                        std::hint::spin_loop();
+                    }
+                }
+                applied
+            });
+
+            for i in 0..PLAYS {
+                let mut cmd = mixer::MixCmd::Play {
+                    slot: i % mixer::MAX_VOICES,
+                    generation: (i / mixer::MAX_VOICES) as u32 + 1,
+                    pcm: Arc::clone(&pcm),
+                    vol_q8: 256,
+                    looping: true,
+                };
+                // Retry on a full ring rather than dropping, so the count is exact.
+                while let Err(rtrb::PushError::Full(back)) = tx.push(cmd) {
+                    cmd = back;
+                    std::hint::spin_loop();
+                }
+            }
+
+            assert_eq!(consumer.join().expect("consumer panicked"), PLAYS);
+            // Every Arc the consumer took has been dropped with the mixer; ours must survive —
+            // if the consumer's drops had been the last, they would have been frees on the RT
+            // thread (see `Mixer::apply`).
+            assert_eq!(
+                Arc::strong_count(&keepalive),
+                2,
+                "the registry ref was lost"
+            );
+        }
     }
 }
