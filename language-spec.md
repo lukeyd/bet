@@ -485,8 +485,9 @@ finna loadSave(path: str) -> (SaveData, yikes) {
 ## 12. Open Questions
 
 Most of these were resolved by implementation through Milestones 3–6; the five on the
-critical path were ratified early in `plan-amendment-02.md` (SP0). **RESOLVED** items are
-frozen for v1; the short remaining list is what the Milestone-7 freeze still tracks.
+critical path were ratified early, in the bootstrap plan's SP0 amendment (that plan
+finished and was deleted — `git log` has it). **RESOLVED** items are frozen for v1; the
+short remaining list is what the Milestone-7 freeze still tracks.
 
 > **Milestone-7 freeze — RATIFIED (stage-1 self-hosting).** Every critical-path question below
 > is **RESOLVED**, and each remaining *Open* item is explicitly deferred past the v1 freeze

@@ -1,33 +1,54 @@
-# Time & velocity tracking
+# Time & velocity tracking — CLOSED historical record
 
-This directory records **active build effort** on `bet` — planning, writing, testing,
-etc. — across every agent that ever works on the repo, and drives a velocity-based
-ETA. It is committed so the totals are durable and aggregate across machines and
-sessions.
+**This system is retired. Do not log time. Nothing new gets written here.**
 
-## Why it never conflicts
+During the bootstrap, every agent working on `bet` logged its active effort —
+planning, writing, testing, etc. — and that fed a velocity-based ETA. The data
+is kept: **714h 47m of active effort across 210 event files**, covering the run
+from the empty skeleton to a self-hosting fixpoint and real DOOM. It is a decent
+answer to "what did this actually cost", and it is worth keeping for that alone.
 
-Every writer touches **only its own file**, named with a UUID (span logs) or a
-session id (hook logs). No two writers share a file, so:
+It is no longer worth its price. The write side cost the repo a `PostToolUse` hook
+that appended a heartbeat after **every tool call** (so `git status` was never
+clean) and 47 of 387 commits — 12% of the history — that were pure `chore(timelog)`
+clock-punching. Meanwhile `cargo xtask timelog eta`, the report all of that fed,
+sat broken for 11 days behind a duplicate-key parse error in `tasks.toml` that
+nobody noticed, because nothing in CI ever ran the parser. Every agent kept
+dutifully logging into a report that could not be computed. That settled it.
 
-- parallel agents never overwrite each other,
-- no locks or coordination are needed,
-- committed logs never merge-conflict (the filenames differ).
+Retired in #93. Track live work in GitHub issues instead.
 
-The reader (`cargo xtask timelog report`) is read-only.
+## What's still here
+
+The **read side** works, against the frozen data:
+
+```sh
+cargo xtask timelog report          # per-activity + per-task active totals, grand total
+cargo xtask timelog eta             # velocity + ETA, as of the freeze
+cargo xtask timelog report --json   # machine-readable
+```
+
+`scripts/timelog.sh` and `scripts/timelog-hook.sh` remain on disk but should not
+be run. The `PostToolUse` hook that invoked the latter is gone from
+`.claude/settings.json` — please don't re-add it.
 
 ## Files
 
 ```
 timelog/
 ├── README.md          # this file
-├── tasks.toml         # work breakdown: slug, name, size(points), status — drives ETA
-└── events/            # append-only logs (git-tracked)
+├── tasks.toml         # work breakdown: slug, name, size(points), status — frozen
+└── events/            # append-only logs, frozen
     ├── <UTC>__<task-slug>__<uuid>.jsonl   # SPAN log — one per agent-session (semantic)
     └── <YYYYMMDD>__auto-<session_id>.jsonl# HOOK log — mechanical heartbeats (per session/day)
 ```
 
+Every writer touched only its own UUID- or session-named file, so no two writers
+ever shared a file and the committed logs never merge-conflicted.
+
 ## Event schema (JSONL, one object per line)
+
+Retained so the archived data stays readable.
 
 Span events (written by `scripts/timelog.sh`):
 
@@ -51,25 +72,4 @@ Within one span file, sort events by `ts`; each `in`/`switch` opens a span for i
 activity that ends at the next event's `ts` (or at `out`). **Any gap longer than the
 idle cap (default 5 min) is clamped to zero**, so idle/waiting time is not counted —
 totals reflect real effort, not wall-clock. A span left open (no `out`) is closed at
-the last heartbeat of the same session from the hook log.
-
-## Commands
-
-```sh
-# clock in / switch activity / clock out (fast, no build needed):
-scripts/timelog.sh in writing --task step0-skeleton --note "cargo manifests"   # prints the logfile path
-scripts/timelog.sh switch testing --file <path printed above>
-scripts/timelog.sh out --file <path>
-
-# analyze (needs the workspace built):
-cargo xtask timelog report          # per-activity + per-task active totals, grand total
-cargo xtask timelog eta             # velocity + estimated time to completion
-cargo xtask timelog report --json   # machine-readable
-```
-
-## The rule
-
-Every agent (root and subagents) must clock in when it starts, switch when the
-activity changes, and clock out when it pauses/finishes — see the "Time tracking"
-section of the repo-root `CLAUDE.md`. The PostToolUse hook in `.claude/settings.json`
-is the automatic backstop.
+the last heartbeat of the same session from the hook log; 23 spans ended that way.
