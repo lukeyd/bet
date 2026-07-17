@@ -10,8 +10,11 @@ exclude  = ["std", "tests", "selfhost", "ports"]
 [workspace.package]
 edition = "2024"
 version = "0.0.0"
-license = "Apache-2.0"        # placeholder — confirm before first release
+license = "Apache-2.0"
 publish = false
+# NOTE: no `rust-version` here on purpose — see clippy.toml. Inheriting it would
+# require `rust-version.workspace = true` in all 13 member manifests; adding it
+# here alone is inert and would only create a second copy to drift.
 
 [workspace.dependencies]
 # --- live now (used by xtask) ---
@@ -26,17 +29,14 @@ toml           = "0.8"
 # plotters), so adopting it as a direct dep adds no new crate versions.
 wasm-bindgen = "0.2"
 
-# --- seeded but not yet wired into any crate's [dependencies] ---
-# (Cargo only locks/builds deps that a member actually references, so listing
-#  them here is a zero-cost catalog that keeps versions consistent when adopted.)
+# --- live now (compiler crates) ---
+# inkwell is optional and OFF by default: backend gates it behind its `llvm`
+# feature, so the default workspace build needs no LLVM install.
 inkwell   = { version = "0.5", default-features = false, features = ["llvm18-0"] }
-thiserror = "2"
-logos     = "0.14"
-chumsky   = "0.9"
-tower-lsp = "0.20"
-criterion = "0.5"
-insta     = "1"
-libc      = "0.2"
+thiserror = "2"     # backend, midir
+logos     = "0.14"  # frontend (lexer; the parser is hand-written recursive descent)
+criterion = "0.5"   # driver (dev-dep, bench harness)
+insta     = "1"     # frontend (dev-dep, snapshot tests)
 
 # Lint policy inherited by every crate via `[lints] workspace = true`.
 # Levels live here; CI runs clippy with `-D warnings`, so any of these is a hard error there.
@@ -44,10 +44,18 @@ libc      = "0.2"
 # NOTE: unsafe_code is deliberately NOT forbidden — rt-abi/rt-stub/runtime/backend
 # need `unsafe` (extern "C", FFI, raw slabs) in Step 1+. Kept at warn.
 unsafe_code = "warn"
-# `unused_crate_dependencies` is intentionally OFF in Step 0: the stub crates wire
-# their real dependency EDGES (so graph-check is meaningful) but the empty lib.rs
-# files don't reference them yet, which would trip this lint under `-D warnings`.
-# Re-enable in Step 1 once crates actually use their deps.
+# Catches per-crate dependency rot: a dep declared in a crate's [dependencies]
+# that its source never references. This does NOT police the
+# [workspace.dependencies] catalog above — an entry no member references is
+# invisible to it, so prune those by hand.
+#
+# BLOCKED on exactly one crate: `backend` declares the allowlisted `backend ->
+# rt-abi` edge but only names `rt_abi` in comments (codegen.rs hardcodes the
+# 16-byte `rt_abi::Tag` layout instead of importing it), so this lint fires there
+# and `-D warnings` turns it into a CI error. The fix is one line — `use rt_abi
+# as _;` in crates/backend/src/lib.rs (as crates/lsp/src/lib.rs now does for its
+# own reserved edge) — or, better, have codegen.rs import the `Tag` type it is
+# currently duplicating by hand. Uncomment this in the same change.
 # unused_crate_dependencies = "warn"
 
 [workspace.lints.clippy]

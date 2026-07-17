@@ -1,6 +1,6 @@
 [package]
 name = "lsp"
-description = "bet language server (tower-lsp), consuming the frontend library"
+description = "bet language server (not yet implemented), consuming the frontend library"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

@@ -1,3 +1,13 @@
 # Configurable clippy values only. Lint *levels* live in [workspace.lints] in
 # the root Cargo.toml. Keep this MSRV equal to rust-toolchain.toml's channel.
+#
+# Why the MSRV lives here rather than in [workspace.package] `rust-version`:
+# clippy does prefer a package's `rust-version` when one is set, but
+# `[workspace.package]` values are NOT inherited automatically — each member must
+# opt in with `rust-version.workspace = true`. No member does, so setting it at
+# the workspace root alone leaves every package at `rust_version = None` and
+# clippy falls back to... nothing, silently dropping MSRV enforcement entirely
+# (verified with `clippy::incompatible_msrv`). This file is the only copy that
+# actually enforces anything today. To move it: add `rust-version.workspace =
+# true` to all 13 crate manifests in the same change that deletes the key below.
 msrv = "1.96.1"
