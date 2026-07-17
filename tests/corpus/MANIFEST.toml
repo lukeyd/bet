@@ -79,6 +79,7 @@ all = [
   "doom.tag-refs-scale",
   # 15 simd (first-class fixed-width vector types: `f32x4`/`i64x2`/`vec2..4`)
   "simd.construct", "simd.arithmetic", "simd.lanes", "simd.minmax", "simd.reduce", "simd.float",
+  "simd.swizzle",
 ]
 
 # --- 01 basics --------------------------------------------------------------
@@ -604,5 +605,11 @@ compiled = "pass"
 [[program]]
 path = "15-simd/simd-float"
 covers = ["simd.float", "simd.reduce"]
+interp = "pass"
+compiled = "pass"
+
+[[program]]
+path = "15-simd/simd-swizzle"
+covers = ["simd.swizzle"]
 interp = "pass"
 compiled = "pass"
