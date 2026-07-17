@@ -12,6 +12,9 @@ edition = "2024"
 version = "0.0.0"
 license = "Apache-2.0"
 publish = false
+# NOTE: no `rust-version` here on purpose — see clippy.toml. Inheriting it would
+# require `rust-version.workspace = true` in all 13 member manifests; adding it
+# here alone is inert and would only create a second copy to drift.
 
 [workspace.dependencies]
 # --- live now (used by xtask) ---
