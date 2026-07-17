@@ -14,22 +14,20 @@ aspect-fit upscale, centered with black letterbox bars.
 default build stays dependency-free. Both build paths open the same window.
 
 ```sh
-# one-time env for the LLVM codegen path (this machine)
-export LLVM_SYS_180_PREFIX=/opt/homebrew/opt/llvm@18
-export LIBRARY_PATH="/opt/homebrew/lib:$LIBRARY_PATH"
-
 # --- native (the real deliverable) ---
-cargo build -p driver  --features llvm           # the bet compiler
-cargo build -p runtime --features gg-desktop     # the windowed runtime (libruntime.a)
-target/debug/bet build ports/gg-demo/gg-demo.bet --runtime real -o gg-demo
-./gg-demo
+cargo xtask run gg-demo                       # builds the compiler + runtime + demo, then runs it
 
 # --- headless (CI): the SAME binary, no window, no audio device ---
-BET_GG_HEADLESS=1 ./gg-demo                      # runs its 600 frames and exits cleanly
+BET_GG_HEADLESS=1 cargo xtask run gg-demo     # runs its 600 frames and exits cleanly
 
 # --- interpreter (same window, quick iteration; render-bound, so it paces below 60fps) ---
 cargo run -p driver --features "llvm,gg-desktop" -- run ports/gg-demo/gg-demo.bet
 ```
+
+`cargo xtask run` discovers LLVM 18 itself (`cargo xtask setup-llvm` reports what it found), so
+there is nothing to export. The interpreter path needs LLVM in the environment the normal way —
+`eval "$(cargo xtask setup-llvm | sed -n 's/^  export /export /p')"` prints the right exports for
+your machine.
 
 The demo **self-terminates after 600 frames (~10s)** — or on `Esc` / window close — which is
 what lets the headless CI invocation run to completion unattended. It prints the audio device

@@ -2,9 +2,11 @@
 //!
 //! Commands:
 //!   graph-check         enforce the internal dependency graph (graph-allowlist.toml)
+//!   run <port>          build and run a ports/ program (discovers LLVM; handles assets)
 //!   timelog report      per-activity / per-task active-time totals from timelog/events
 //!   timelog eta         velocity + estimated time to completion (timelog/tasks.toml)
-//!   setup-llvm          print per-OS guidance for the pinned LLVM (backend --features llvm)
+//!   setup-llvm          locate the pinned LLVM (backend --features llvm), or explain how to
+//!                       install it
 //!   corpus --check      structural lint of tests/corpus (pairing + feature coverage)
 //!   corpus              execute each program via `bet run` and diff stdout vs .expected
 //!   corpus --compiled   compiled differential column: `bet build` + run each program and
@@ -21,6 +23,8 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 
 mod bake_fb;
+mod llvm;
+mod run_port;
 // The DOOM port's dev tooling is gated behind the non-default `doom` feature so the port never
 // enters the workspace build gate (see xtask/Cargo.toml). Off by default, these modules and their
 // unit tests are not compiled or run by `cargo build/clippy/nextest --workspace`.
@@ -40,9 +44,13 @@ mod doom_verify;
 const USAGE: &str = "\
 usage: cargo xtask <command>
   graph-check                 verify workspace deps against graph-allowlist.toml
+  run <port> [-- args]        build + run a ports/ program (pong|fireworks|gg-demo|doom|
+                              frozen-bubble|oregon-trail). Discovers LLVM, builds the driver
+                              and the windowed runtime, and sorts out the port's assets.
+                              `cargo xtask run` with no port lists them.
   timelog report [--json] [--idle-cap SECS]
   timelog eta    [--hours-per-day N] [--idle-cap SECS]
-  setup-llvm                  per-OS LLVM install guidance
+  setup-llvm                  locate the pinned LLVM, or explain how to install it
   corpus [--check|--compiled] --check:    structural lint of tests/corpus;
                               --compiled: compiled differential column (needs an LLVM
                                           codegen driver; skipped cleanly without one);
@@ -81,6 +89,7 @@ fn main() -> ExitCode {
         "graph-check" => graph_check(),
         "timelog" => timelog(rest),
         "setup-llvm" => setup_llvm(),
+        "run" => run_port::run(rest, &workspace_root()),
         "corpus" => corpus(rest),
         "selfhost" => selfhost(&workspace_root()),
         "bake-frozen-bubble" => bake_fb::run(rest),
@@ -759,19 +768,52 @@ fn eta(root: &Path, totals: &Totals, hours_per_day: Option<f64>) -> Result<()> {
 // setup-llvm
 // ---------------------------------------------------------------------------
 
+/// Report whether the pinned LLVM can be found, and what to do if not.
+///
+/// This used to print static per-OS guidance and nothing else — it never actually looked, and it
+/// named the wrong environment variable (`LLVM_SYS_181_PREFIX`; `llvm-sys 180.x` reads
+/// `LLVM_SYS_180_PREFIX`). It now runs the same [`llvm::discover`] probe `cargo xtask run` uses,
+/// so "does my machine work?" has an answer that matches what the build will do.
 fn setup_llvm() -> Result<()> {
-    const LLVM: &str = "18";
-    println!(
-        "\
-bet pins LLVM {LLVM}. Building `backend` with `--features llvm` requires it installed:
-  macOS:   brew install llvm@{LLVM}     (export LLVM_SYS_181_PREFIX=\"$(brew --prefix llvm@{LLVM})\")
-  Ubuntu:  sudo apt-get install -y llvm-{LLVM}-dev libpolly-{LLVM}-dev
-  Windows: install the LLVM {LLVM} release, then set LLVM_SYS_181_PREFIX
-
-Step 0 does NOT build LLVM — the default workspace build has no LLVM dependency.
-This command is guidance-only until the backend work begins."
-    );
-    Ok(())
+    let root = workspace_root();
+    match llvm::discover(&root) {
+        Some(l) => {
+            println!(
+                "found LLVM {} via {}\n  prefix: {}",
+                l.version,
+                l.source,
+                l.prefix.display()
+            );
+            if let Some(lp) = &l.library_path {
+                println!("  linker search path (zstd): {}", lp.display());
+            }
+            println!(
+                "\n`cargo xtask run <port>` applies this automatically — no exports needed.\n\
+                 To use it in a bare cargo invocation:\n  export {}=\"{}\"{}",
+                llvm::PREFIX_VAR,
+                l.prefix.display(),
+                // `${LIBRARY_PATH:+:$LIBRARY_PATH}` rather than `:$LIBRARY_PATH`: when the
+                // variable is unset the naive form leaves a trailing colon, and an empty element
+                // in a search path means "the current directory" to the linker.
+                l.library_path
+                    .as_ref()
+                    .map(|p| {
+                        format!(
+                            "\n  export LIBRARY_PATH=\"{}${{LIBRARY_PATH:+:$LIBRARY_PATH}}\"",
+                            p.display()
+                        )
+                    })
+                    .unwrap_or_default(),
+            );
+            Ok(())
+        }
+        // Not an error: "LLVM isn't installed" is the question this command exists to answer, and
+        // the default workspace build genuinely doesn't need it. Report and exit clean.
+        None => {
+            println!("{}", llvm::not_found_message());
+            Ok(())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

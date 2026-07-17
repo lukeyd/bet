@@ -1,6 +1,7 @@
 # `ports/doom` — DOOM, ported to `bet`
 
-A faithful, playable port of id Software's DOOM (from the GPL `linuxdoom-1.10` source) to
+A faithful, playable port of id Software's DOOM (from the `linuxdoom-1.10` source — released in
+1997 under the non-commercial DOOM Source Code License, and relicensed under the GPL in 1999) to
 `bet`, targeting the `gg` platform layer. ~30,000 lines of C translated into ~90 `bet`
 modules that compile to a single native binary — the BSP software renderer, the full play
 simulation (physics, collision, monster AI, weapons, sector specials), WAD/asset loading,
@@ -33,19 +34,37 @@ pixel-by-pixel against id's behavior via deterministic demo-lump playback.
 ## Build & run
 
 ```sh
-# one-time env (this Mac; see the llvm-local-build-env memory)
-export LLVM_SYS_180_PREFIX=/opt/homebrew/opt/llvm@18
-export LIBRARY_PATH="/opt/homebrew/lib:$LIBRARY_PATH"
+cargo xtask run doom                        # attract loop → menu → New Game
+cargo xtask run doom -- -warp 1 1 -skill 3  # straight into E1M1
+```
 
-# build the compiler + the windowed runtime, then the port
+That builds the compiler (`driver --features llvm`) and the windowed runtime
+(`runtime --features gg-desktop`), compiles the port, and runs it. It finds LLVM 18 itself —
+nothing to export. Extra arguments after `--` go to the game.
+
+**The WAD.** `xtask run` uses `$DOOM_WAD` if set, else `doom-reference/doom1.wad` (id's
+shareware WAD — the demo-parity oracle, so it's preferred when present), else
+`doom-reference/freedoom1.wad`. With none of those it downloads **Freedoom** (BSD-licensed,
+checksum-pinned) into `doom-reference/` — so a fresh clone needs no manual asset step. Note
+that the parity figures above are against *`doom1.wad`*; Freedoom is a different IWAD and has
+no DEMO lumps to verify against.
+
+**Overflow checks are off** for this port (`--overflow-checks off`, applied automatically).
+DOOM's 16.16 fixed-point render/physics math is a direct translation of C and relies on `int`
+2's-complement wraparound; `bet` traps signed overflow at `-O0` like Rust, so with checks on the
+renderer aborts on overflowing geometry as soon as play starts.
+
+<details>
+<summary>The equivalent by hand, if you need to vary a step</summary>
+
+```sh
+eval "$(cargo xtask setup-llvm | sed -n 's/^  export /export /p')"   # or set LLVM_SYS_180_PREFIX
 cargo build -p driver  --features llvm
 cargo build -p runtime --features gg-desktop
-target/debug/bet build ports/doom/doom.bet --runtime real -o /tmp/doom
-
-# play it (opens a gg window)
-/tmp/doom -iwad doom-reference/doom1.wad                 # attract loop → menu → New Game
-/tmp/doom -iwad doom-reference/doom1.wad -warp 1 1 -skill 3   # straight into E1M1
+target/debug/bet build ports/doom/doom.bet --runtime real --overflow-checks off -o /tmp/doom
+/tmp/doom -iwad doom-reference/doom1.wad
 ```
+</details>
 
 Controls follow DOOM: arrows move/turn, Ctrl fire, Alt strafe, Shift run, Space use, Esc
 menu, Tab automap, number keys select weapons; the classic cheats work (`iddqd`, `idkfa`,
@@ -96,10 +115,14 @@ the `fs.drop` write intrinsic, `cop T{}` zero-defaults, a dozen `gg` additions
 `gs.bet` design and two demo-sync bugs turned on this). See `CONTRACTS.md`.
 
 ## Licensing & assets
-- **The port is GPL** (derived from id's GPL source); the `bet` language/toolchain are
-  unaffected — this GPL code stays isolated in this directory.
-- **No copyrighted WADs are committed.** Test with the shareware `doom1.wad` (its DEMO1/2/3
-  lumps are the correctness oracle) or Freedoom. The reference source and WAD live outside
-  the repo at `doom-reference/` (never edited except `// PORTED:` markers).
+- **The port is GPL-2.0-only** — id's 1999 relicense grants "version 2" with no "or later"
+  clause, so the port cannot be redistributed under GPL-3. It is derived from id's source and
+  stays isolated in this directory; the `bet` language/toolchain are unaffected (Apache-2.0 —
+  see the root [`LICENSING.md`](../../LICENSING.md) for the boundary). Full text:
+  [`COPYING`](COPYING); the port's own grant: [`LICENSE`](LICENSE).
+- **No copyrighted WADs are committed.** `cargo xtask run doom` fetches **Freedoom**
+  (BSD-licensed, checksum-pinned) by default. The demo-parity figures above need the shareware
+  `doom1.wad` specifically, since its DEMO1/2/3 lumps are the correctness oracle. The reference
+  source and any WADs live outside the repo at `doom-reference/`, which is gitignored.
 - **Correctness oracle:** deterministic demo-lump playback diffed against a reference port
   (differential testing against id's 1993 behavior; amendment §6.3).

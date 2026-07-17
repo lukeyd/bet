@@ -5,15 +5,16 @@ CDC CYBER BASIC listing) to `bet`. It runs on the interpreter and compiles to na
 code, playing byte-for-byte identically on both.
 
 ```sh
-# interpreter
+# native machine code (needs LLVM 18 — found automatically, nothing to export)
+cargo xtask run oregon-trail
+
+# interpreter (no LLVM at all)
 cargo build -p driver
 target/debug/bet run ports/oregon-trail/oregon.bet
-
-# native machine code (needs LLVM 18; see the repo README / selfhost/README.md)
-cargo build -p driver -p rt-stub --features llvm
-target/debug/bet build ports/oregon-trail/oregon.bet -o oregon
-./oregon
 ```
+
+It's text/stdin only — no window, no audio — so it links the bootstrap `rt-stub` runtime and
+`cargo xtask run` skips building the windowed runtime for it.
 
 ## Source layout
 
