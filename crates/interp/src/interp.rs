@@ -1016,8 +1016,42 @@ impl<'p> Interp<'p> {
                             field: name.clone(),
                         })
                     }
-                    // `v.x`/`.y`/`.z`/`.w` — read a SIMD lane as a scalar.
+                    // `v.x`/`.y`/`.z`/`.w` — read a SIMD lane as a scalar; a 2-4 letter swizzle
+                    // (`v.yx`, `v.xxww`) builds a new vector from the named lanes, in order.
                     Value::Simd(sv) => {
+                        if name.len() >= 2 && name.len() <= 4 {
+                            let idx: Option<Vec<usize>> = name
+                                .chars()
+                                .map(|c| match c {
+                                    'x' => Some(0),
+                                    'y' => Some(1),
+                                    'z' => Some(2),
+                                    'w' => Some(3),
+                                    _ => None,
+                                })
+                                .collect();
+                            if let Some(idx) = idx {
+                                if let Some(&bad) = idx.iter().find(|&&l| l >= sv.len()) {
+                                    let letter = char::from(b"xyzw"[bad]);
+                                    return Err(RunError::Type(format!(
+                                        "lane `.{letter}` is out of range for a {}-lane vector",
+                                        sv.len()
+                                    )));
+                                }
+                                let out = match &sv {
+                                    SimdVal::F32(v) => {
+                                        SimdVal::F32(idx.iter().map(|&l| v[l]).collect())
+                                    }
+                                    SimdVal::F64(v) => {
+                                        SimdVal::F64(idx.iter().map(|&l| v[l]).collect())
+                                    }
+                                    SimdVal::Int(v) => {
+                                        SimdVal::Int(idx.iter().map(|&l| v[l]).collect())
+                                    }
+                                };
+                                return Ok(Value::Simd(out));
+                            }
+                        }
                         let lane = match name.as_str() {
                             "x" => 0,
                             "y" => 1,

@@ -2736,6 +2736,18 @@ finna laneIndex(name: str) -> int {
     bet 0 - 1
 }
 
+// True if every byte of `name` is a lane letter whose index is within `lanes` — the swizzle
+// validity check (mirror lower_field's all-letters-validated-before-emitting rule).
+finna swizzleOk(name: str, lanes: int) -> bool {
+    lowkey i = 0
+    vibin i < str.len(name) {
+        lowkey li = laneIndex(str.sub(name, i, i + 1))
+        fr li < 0 || li >= lanes { bet cap }
+        i = i + 1
+    }
+    bet nocap
+}
+
 // `%t = simd.<op>[<tyTag>](<a>)` into a fresh local of `resTy`; returns (reg, resTy).
 finna emitSimdOp1(c: LowerCtx, op: str, tyTag: str, a: str, resTy: str) -> (str, str) {
     lowkey tmp = newLocal(c, resTy)
@@ -5918,6 +5930,32 @@ finna fieldAccessStr(c: LowerCtx, p: P, idx: int) -> (str, str) {
     // A `<N x elem>` SIMD lane read: `v.x/.y/.z/.w` extract lane 0/1/2/3 as a scalar (mirror
     // lower_field's TyKind::Simd arm). Lanes are read-only in v1, so this yields a value.
     fr isSimdTy(bty) {
+        // A multi-lane swizzle `v.yx`/`.wzy`/`.xxww` (mirror lower_field's swizzle arm): 2-4
+        // lane letters build a new vector from the named lanes, in order — the same extract +
+        // build MIR the lane-by-lane constructor emits. Every letter is validated up front so
+        // nothing is emitted on the error path.
+        lowkey swn = str.len(fname)
+        fr swn >= 2 && swn <= 4 && swizzleOk(fname, simdLanes(bty)) {
+            lowkey swelem = simdElem(bty)
+            lowkey swops = vec.new[str]()
+            lowkey swi = 0
+            vibin swi < swn {
+                lowkey swlane = laneIndex(str.sub(fname, swi, swi + 1))
+                lowkey swo, swt = emitSimdOp1(c, cat2("lane.", itoa(swlane)), swelem, bop, swelem)
+                swops.stack(swo)
+                swi = swi + 1
+            }
+            lowkey swty = cat3(swelem, "x", itoa(swn))
+            lowkey swtmp = newLocal(c, swty)
+            lowkey swsb = sbNew()
+            swsb.add("simd[")
+            swsb.add(swelem)
+            swsb.add("](")
+            swsb.add(joinComma(swops))
+            swsb.add(")")
+            emitAssign(c, swtmp, swsb.finish())
+            bet reg(swtmp), swty
+        }
         lowkey lane = laneIndex(fname)
         fr lane < 0 {
             lcFail(c)

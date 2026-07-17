@@ -1,0 +1,27 @@
+// simd-swizzle — GLSL-style multi-lane swizzles: 2-4 lane letters (`.yx`, `.wzy`, `.xxww`)
+// read the named lanes of a vector into a NEW vector, in letter order. Pure sugar for the
+// lane-by-lane constructor (`v.yx` == `vec2(v.y, v.x)`), so interp == compiled by construction.
+// Duplicate letters and re-broadening a narrower vector are allowed; single-letter reads
+// (`.x`) stay scalar. Floats are never printed bare (corpus rule) — results reduce to `int`.
+pull "spill"
+
+finna main() {
+    lowkey a: vec4 = vec4(1.0, 2.0, 3.0, 4.0)
+
+    lowkey r: vec2 = a.yx                          // reverse: [2,1]
+    spill.it(r.x as int)                           // 2
+    spill.it(r.y as int)                           // 1
+
+    lowkey b: vec3 = a.wzy                         // narrow + reorder: [4,3,2]
+    spill.it(b.sum() as int)                       // 9
+
+    lowkey d: vec4 = a.xxww                        // duplicate lanes: [1,1,4,4]
+    spill.it(d.dot(a) as int)                      // 1 + 2 + 12 + 16 = 31
+
+    lowkey e: vec4 = vec2(5.0, 6.0).yxyx           // broaden a vec2: [6,5,6,5]
+    spill.it(e.sum() as int)                       // 22
+
+    lowkey n: i32x4 = i32x4(10, 20, 30, 40)        // integer vectors swizzle the same way
+    lowkey m: i32x2 = n.wy                         // [40,20]
+    spill.it((m.x + m.y) as int)                   // 60
+}

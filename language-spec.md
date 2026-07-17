@@ -202,7 +202,9 @@ FFI raw-pointer type at the boundary.
   — plus the float aliases `vec2`/`vec3`/`vec4` — lower to LLVM `<N x T>` with **single-instruction
   lane ops** (guaranteed SIMD, independent of the loop vectorizer). Construct with `f32x4(a,b,c,d)`
   (or `f32x4(x)` to splat); element-wise `+ - * /` and shifts (a scalar operand broadcasts); read
-  lanes with `.x/.y/.z/.w`; reduce/transform with `.dot`/`.sum`/`.min`/`.max`/`.abs`/`.scale`, and
+  lanes with `.x/.y/.z/.w`, or **swizzle** 2-4 lanes into a new vector GLSL-style (`v.yx`, `v.wzy`,
+  `v.xxww` — duplicates and re-broadening allowed; sugar for the lane-by-lane constructor);
+  reduce/transform with `.dot`/`.sum`/`.min`/`.max`/`.abs`/`.scale`, and
   `.length`/`.norm` for float vectors. Integer lanes wrap (no per-lane trap); the interpreter holds
   float lanes in their true width so `f32` results are bit-identical to the compiled path. `mat4`
   (4×4 matrix ops) is still planned. Rationale/IR: [spec/midir.md](spec/midir.md) (`TyKind::Simd`).

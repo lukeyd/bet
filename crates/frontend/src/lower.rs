@@ -2268,6 +2268,53 @@ impl LowerCtx {
         // A `<N x elem>` SIMD lane read: `v.x`/`.y`/`.z`/`.w` extract lane 0/1/2/3 as a scalar.
         // Lanes are read-only in v1 (no `v.x = ...`), so this yields a value, not a place.
         if let TyKind::Simd { elem, lanes } = *self.m.ty(bty) {
+            // A multi-lane swizzle `v.yx`/`.wzy`/`.xxww`: 2-4 lane letters build a new vector
+            // from the named lanes, in order — pure sugar for the lane-by-lane constructor
+            // (`v.yx` lowers exactly like `vec2(v.y, v.x)`), so no new IR is needed. Duplicate
+            // letters are allowed; every letter is validated before any code is emitted.
+            if name.len() >= 2 && name.len() <= 4 {
+                let idx: Option<Vec<u32>> = name
+                    .chars()
+                    .map(|c| match c {
+                        'x' => Some(0),
+                        'y' => Some(1),
+                        'z' => Some(2),
+                        'w' => Some(3),
+                        _ => None,
+                    })
+                    .collect();
+                if let Some(idx) = idx {
+                    if let Some(&bad) = idx.iter().find(|&&l| l >= lanes) {
+                        let letter = char::from(b"xyzw"[bad as usize]);
+                        return Err(format!(
+                            "lane `.{letter}` is out of range for a {lanes}-lane vector"
+                        ));
+                    }
+                    let mut ops = Vec::with_capacity(idx.len());
+                    for &l in &idx {
+                        let t = self.new_local(elem);
+                        self.fb().assign(
+                            Place::local(t),
+                            Rvalue::Simd {
+                                op: SimdOp::Lane(l),
+                                args: vec![bop.clone()],
+                                ty: elem,
+                            },
+                        );
+                        ops.push(Operand::Copy(Place::local(t)));
+                    }
+                    let vty = self.m.intern_ty(TyKind::Simd {
+                        elem,
+                        lanes: idx.len() as u32,
+                    });
+                    let tmp = self.new_local(vty);
+                    self.fb().assign(
+                        Place::local(tmp),
+                        Rvalue::Aggregate(AggKind::Simd(elem), ops),
+                    );
+                    return Ok((Operand::Copy(Place::local(tmp)), vty));
+                }
+            }
             let lane = match name {
                 "x" => 0u32,
                 "y" => 1,
