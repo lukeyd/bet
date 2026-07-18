@@ -55,7 +55,6 @@ finna hueRGB(epoch: int) -> u32 {
 finna main() {
     lowkey frame = 0
     lowkey running = nocap
-    lowkey last = gg.ticks()
     vibin running {
         // Window close ends the loop (headless never sends QUIT; the frame cap ends it instead).
         lowkey kind, code = gg.poll()
@@ -106,12 +105,8 @@ finna main() {
 
         frame = frame + 1
         fr frame >= MAXFRAMES { running = cap }
-
-        // pace to ~60fps (16.6ms/frame) so the window is watchable (gg.ticks is nanoseconds)
-        lowkey target = last + 16600000
-        vibin gg.ticks() < target {
-        }
-        last = gg.ticks()
+        // Pacing is automatic: gg.flush() idles to the 60 FPS cap (override with GG_FPS),
+        // so the window stays watchable without a manual busy-wait spin burning a core.
     }
     spill.it(frame)                          // total frames run
 }
