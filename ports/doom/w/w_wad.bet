@@ -58,8 +58,18 @@ flex facts MAXLUMPS: int = 65536
 flex finna initWad(gt: tag gs.GameState, path: str) {
     holla g = gt in gs.gsc {
         g.wad.buf = fs.peep(path)
-        // wadinfo_t.identification: 'I'|'P', 'W', 'A', 'D'. (Reading buf[0..12] faults on an
-        // empty buffer — a missing WAD is an I_Error condition either way.)
+        // MISSING-WAD guard (id's I_Error("W_AddFile: couldn't open %s")): a missing file comes back
+        // from fs.peep as an EMPTY []u8 (bet_fs_read returns a null/len-0 slice), so the buf[0..12]
+        // magic reads below would fault with a raw index-out-of-bounds. Require the full 12-byte
+        // wadinfo_t header (magic[4] + numlumps i32 + infotableofs i32) up front and I_Error with the
+        // path so the user knows *which* file is a ghost. Same fileLen idiom as below:
+        // str.fromBytesTrust reinterprets the []u8 fat pointer with no copy, so str.len yields the
+        // slice length exactly (native — the only path this loader runs).
+        fr str.len(str.fromBytesTrust(g.wad.buf)) < 12 {
+            spill.f("W_AddFile: yo, no WAD where you pointed me: {} — that file's a ghost (couldn't open it). drop a real IWAD/PWAD there.\n", path)
+            yeet("wad-missing")
+        }
+        // wadinfo_t.identification: 'I'|'P', 'W', 'A', 'D'.
         lowkey m0 = g.wad.buf[0] as int
         lowkey okMagic = (m0 == 73 || m0 == 80) && g.wad.buf[1] as int == 87
         okMagic = okMagic && g.wad.buf[2] as int == 65 && g.wad.buf[3] as int == 68
