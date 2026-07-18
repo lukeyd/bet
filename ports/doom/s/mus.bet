@@ -23,7 +23,8 @@
 //
 // Event descriptor byte: bit7 = "last" (a variable-length time delay follows),
 // bits6-4 = type, bits3-0 = channel. Types: 0 release, 1 play(+opt volume),
-// 2 pitch-wheel, 3 system(channel-mode), 4 controller, 6 score-end. The delay is
+// 2 pitch-wheel, 3 system(channel-mode), 4 controller, 5 end-of-measure (a
+// zero-payload timing marker), 6 score-end (7 is reserved/unused). The delay is
 // 7-bit groups, MSB = continue, measured in 140Hz ticks.
 //
 // `decodeMus` is a PURE decode — no synthesis, no allocation beyond the event
@@ -92,8 +93,16 @@ flex finna decodeMus(wadBuf: []u8, lumpOfs: int, lumpLen: int) -> vec[MusEvent] 
             pos = pos + 1
             b = (wadBuf[pos] as int) & 0x7F
             pos = pos + 1
+        } naw fr typ == 5 {
+            // type 5 = end-of-measure: a zero-payload timing marker (an optional
+            // trailing delay may still follow via the descriptor's "last" bit). No
+            // data bytes to consume, and — unlike type 6 — it must NOT stop the
+            // stream. Freedoom's demo2/demo3 score lumps emit these (issue #113).
         } naw fr typ == 6 {
             // score end: no data bytes
+        } naw fr typ == 7 {
+            // type 7 = unused/reserved: no data bytes. Skip it gracefully rather
+            // than abort, so a stray reserved marker can't kill playback.
         } naw {
             yeet("bad MUS event type")
         }
