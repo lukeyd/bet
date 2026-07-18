@@ -1,11 +1,12 @@
 // pong.bet — a `bet` port of PONG with TRUE DYNAMIC RESOLUTION, and the shakeout for the `gg`
-// platform layer. It exercises all FIVE gg primitives:
+// platform layer. It exercises FOUR gg primitives:
 //   * video  — `gg.blit(fb, w, h)` presents a software-rendered 32-bit RGBA framebuffer
 //   * input  — `gg.poll()` drains keyboard/quit events (a `(kind, code)` pair)
 //   * audio  — `gg.audio(samples, count)` pushes interleaved-stereo i16 sound
-//   * timing — `gg.ticks()` monotonic nanoseconds, for frame pacing
 //   * SIZE   — `gg.size()` the live window `(width, height)`, so the framebuffer matches the
 //              window pixel-for-pixel and the field fills the whole (resizable) window
+// Frame pacing is automatic: the gg present path (`gg.blit`) idles to the 60 FPS cap
+// (override with `GG_FPS`), so there is no manual busy-wait spin burning a core.
 //
 // Runs on the interpreter (`bet run`) and compiles native (`bet build`); both drive the same
 // windowed backend through the shared `gg-backend` crate — see ports/pong/README.md.
@@ -67,7 +68,6 @@ finna main() {
     }
 
     lowkey running = nocap
-    lowkey last = gg.ticks()
     vibin running {
         // ---- drain input ----
         lowkey polling = nocap
@@ -176,16 +176,11 @@ finna main() {
         }
 
         // ---- present + audio ----
+        // gg.blit idles to the 60 FPS cap (the gg limiter), so no manual pacing is needed.
         gg.blit(fb, w, h)
         fr g.beep != 0 {
             gg.audio(beepbuf, consts.BEEP_FRAMES * 2)
         }
-
-        // ---- pace to ~60fps (16.6ms) ----
-        lowkey target = last + 16600000
-        vibin gg.ticks() < target {
-        }
-        last = gg.ticks()
     }
 
     spill.f("final score {} - {}\n", g.s1, g.s2)
