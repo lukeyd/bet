@@ -44,6 +44,7 @@ pull "../util/bstream" as bstream
 pull "../w/w_wad" as w
 pull "../i/i_sound" as isnd
 pull "../s/s_sound" as ss
+pull "../util/m_argv" as margv
 
 // printChannels — dump the 8 mixing channels as {sfxId, voice, endRel} where endRel = endTick -
 // gametic (0 for a free channel). endRel of a just-started sound == its sfxLenTics.
@@ -84,7 +85,7 @@ finna main() {
     rnd.clearRandom(g0)
 
     // Load the IWAD and pre-cache all SFX (the native-only heavy step).
-    w.initWad(g0, "/Users/lukebaggett/Documents/bet/doom-reference/doom1.wad")
+    w.initWad(g0, margv.wadPath())
     isnd.initSound(g0)
 
     // ---- load stats: how many of the NUMSFX sounds have a present DS* lump ----

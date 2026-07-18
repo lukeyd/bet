@@ -37,8 +37,7 @@ pull "../i/i_music" as imus
 pull "../p/p_setup" as psetup
 pull "../p/p_think" as pthink
 pull "../st/st_stuff" as st
-
-facts WADP: str = "/Users/lukebaggett/Documents/bet/doom-reference/doom1.wad"
+pull "../util/m_argv" as margv
 
 // feed a typed string through ST_Responder as EV_KEYDOWN events, char by char (as the game does).
 finna feed(gt: tag gs.GameState, s: str) {
@@ -62,7 +61,7 @@ finna main() {
     } ghosted {
         yeet("gs")
     }
-    wad.initWad(g0, WADP)
+    wad.initWad(g0, margv.wadPath())
     holla g = g0 in gs.gsc {
         g.shell.gamemode = doomdef.GM_SHAREWARE as i32
         g.shell.gameskill = 2

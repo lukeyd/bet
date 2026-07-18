@@ -48,8 +48,8 @@ pull "../i/i_music" as imus
 pull "../s/mus" as mus
 pull "../s/genmidi" as genmidi
 pull "../s/opl" as opl
+pull "../util/m_argv" as margv
 
-facts WAD: str = "/Users/lukebaggett/Documents/bet/doom-reference/doom1.wad"
 facts FRAMES: int = 350          // ~10s at 35fps
 facts GOLDEN_N: int = 44100      // first-N samples fed to the golden crc
 facts COMPARE_N: int = 132300    // samples cross-checked against mus.musToOpl (3s @ 44100-equiv)
@@ -101,7 +101,7 @@ finna main() {
     gs.gsInit(g0)
 
     // Load the IWAD and parse the GENMIDI OPL instrument bank (musicInit).
-    w.initWad(g0, WAD)
+    w.initWad(g0, margv.wadPath())
     imus.musicInit(g0)
 
     lowkey ninstr = 0

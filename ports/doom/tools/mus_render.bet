@@ -33,8 +33,8 @@ pull "../s/wad"
 pull "../s/genmidi"
 pull "../s/mus"
 pull "../s/opl"
+pull "../util/m_argv" as margv
 
-facts WAD: str = "/Users/lukebaggett/Documents/bet/doom-reference/doom1.wad"
 facts OUT: str = "/tmp/doom_e1m1.wav"
 facts RATE: int = 44100
 facts SECONDS: int = 10
@@ -61,7 +61,7 @@ finna putStr(b: vec[int], s: str) {
 }
 
 finna main() {
-    lowkey buf = fs.peep(WAD)
+    lowkey buf = fs.peep(margv.wadPath())
     lowkey gmOfs, gmLen = wad.findLump(buf, "GENMIDI")
     lowkey muOfs, muLen = wad.findLump(buf, "D_E1M1")
     fr gmOfs < 0 || muOfs < 0 {

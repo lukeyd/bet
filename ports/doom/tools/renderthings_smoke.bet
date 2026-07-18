@@ -36,6 +36,7 @@ pull "../defs/sounds" as sounds
 pull "../w/w_wad" as wad
 pull "../r/r_data" as rdata
 pull "../r/r_main" as rmain
+pull "../util/m_argv" as margv
 
 flex facts FU: int = 65536
 
@@ -225,7 +226,7 @@ finna main() {
     } ghosted {
         yeet("gs")
     }
-    wad.initWad(g0, "/Users/lukebaggett/Documents/bet/doom-reference/doom1.wad")
+    wad.initWad(g0, margv.wadPath())
     rmain.rInit(g0)
     buildSyntheticLevel(g0)
 

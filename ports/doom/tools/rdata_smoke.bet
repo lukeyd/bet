@@ -31,6 +31,7 @@ pull "str"
 pull "../defs/gs" as gs
 pull "../w/w_wad" as wad
 pull "../r/r_data" as rdata
+pull "../util/m_argv" as margv
 
 // crc32 (IEEE-802.3 reflected, poly 0xEDB88320, init/xorout 0xFFFFFFFF) — the pipeline crc,
 // specialized to a []u8 stream (same as tools/video_smoke.bet + goldens.bet).
@@ -84,7 +85,7 @@ flex finna crc32U8(tbl: []i32, t: []u8, n: int) -> int {
 finna main() {
     lowkey g0 = cop gs.GameState{} in gs.gsc
     gs.gsInit(g0)
-    wad.initWad(g0, "/Users/lukebaggett/Documents/bet/doom-reference/doom1.wad")
+    wad.initWad(g0, margv.wadPath())
     rdata.initData(g0)
 
     lowkey ctab = crcTable()

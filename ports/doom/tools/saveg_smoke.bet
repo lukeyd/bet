@@ -52,8 +52,8 @@ pull "../p/p_specutil" as psu
 pull "../p/p_doors" as pdoors
 pull "../p/p_spec" as pspec
 pull "../p/p_saveg" as psaveg
+pull "../util/m_argv" as margv
 
-flex facts WAD: str = "/Users/lukebaggett/Documents/bet/doom-reference/doom1.wad"
 flex facts SAVEPATH: str = "/tmp/doomsav0.bet"
 flex facts PERTURB_SEC: int = 5       // an arbitrary sector to re-height + re-light
 flex facts TAG_HEALTH: int = 4242     // the distinctive health marking the target-link probe mobj
@@ -216,7 +216,7 @@ flex finna bootState(gt: tag gs.GameState) {
         yeet("gs")
     }
     rnd.clearRandom(gt)
-    wad.initWad(gt, WAD)
+    wad.initWad(gt, margv.wadPath())
     rdata.initData(gt)
     pspec.wireHooks(gt)
 }

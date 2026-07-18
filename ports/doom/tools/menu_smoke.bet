@@ -43,6 +43,7 @@ pull "../s/s_sound" as ssnd
 pull "../hu/hu_stuff" as hu
 pull "../m/m_menu" as menu
 pull "../am/am_map" as am
+pull "../util/m_argv" as margv
 
 // ---- crc32 (IEEE reflected, poly 0xEDB88320) over scr0 (same as renderworld_smoke) ----------
 flex finna hex8(v: int) -> str {
@@ -158,7 +159,7 @@ finna main() {
     }
     rnd.clearRandom(g0)
 
-    wad.initWad(g0, "/Users/lukebaggett/Documents/bet/doom-reference/doom1.wad")
+    wad.initWad(g0, margv.wadPath())
     ssnd.sInit(g0, 8, 8)          // set the sfx/music volumes (menu nav plays UI sounds)
     hu.huInit(g0)                 // load the HU_FONT (menu M_WriteText / message prompts)
     menu.mInit(g0)

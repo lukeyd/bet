@@ -17,7 +17,7 @@ flat/texture swap as a cluster of index pairs, geometry as scattered pairs.
 import struct, sys, zlib, os
 
 W, H = 320, 200
-DEFAULT_WAD = "/Users/lukebaggett/Documents/bet/doom-reference/doom1.wad"
+DEFAULT_WAD = "doom-reference/doom1.wad"
 
 
 def read_playpal(wad_path, palnum=0):
