@@ -10,7 +10,7 @@ use frontend::ast::{
 };
 
 use crate::error::RunError;
-use crate::value::{SimdVal, Value, display};
+use crate::value::{IntTy, SimdVal, Value, display, wrap_to};
 
 /// Recursion cap for the evaluator (issue #38). Every `eval_expr` and `call_fn` entry bumps a
 /// shared depth counter; past this it returns [`RunError::RecursionLimit`] instead of overflowing
@@ -790,7 +790,7 @@ impl<'p> Interp<'p> {
                     && let Value::Vec(rc) = self.eval_expr(env, vbase)?
                 {
                     let i = match self.eval_expr(env, index)? {
-                        Value::Int(i) if i >= 0 => i as usize,
+                        Value::Int { v: i, .. } if i >= 0 => i as usize,
                         other => {
                             return Err(RunError::Type(format!(
                                 "index must be a non-negative int, got {}",
@@ -841,7 +841,7 @@ impl<'p> Interp<'p> {
             }
             ExprKind::Index { base, index } => {
                 let i = match self.eval_expr(env, index)? {
-                    Value::Int(i) if i >= 0 => i as usize,
+                    Value::Int { v: i, .. } if i >= 0 => i as usize,
                     other => {
                         return Err(RunError::Type(format!(
                             "index must be a non-negative int, got {}",
@@ -906,7 +906,7 @@ impl<'p> Interp<'p> {
                 }
                 ExprKind::Index { base, index } => {
                     let i = match self.eval_expr(env, index)? {
-                        Value::Int(i) if i >= 0 => i as usize,
+                        Value::Int { v: i, .. } if i >= 0 => i as usize,
                         other => {
                             return Err(RunError::Type(format!(
                                 "index must be a non-negative int, got {}",
@@ -1000,7 +1000,7 @@ impl<'p> Interp<'p> {
         match &e.kind {
             // Literals arrive normalized to `i128`; the value model stores an `i64`, so a
             // literal above `i64::MAX` truncates two's-complement (as the old `u64` path did).
-            ExprKind::Int(i) => Ok(Value::Int(*i as i64)),
+            ExprKind::Int(i) => Ok(Value::int(*i as i64)),
             ExprKind::Float(f) => Ok(Value::Float(*f)),
             ExprKind::Str(s) => Ok(Value::Str(s.clone())),
             ExprKind::Byte(b) => Ok(Value::Byte(*b)),
@@ -1075,7 +1075,7 @@ impl<'p> Interp<'p> {
                 let base = self.eval_expr(env, base)?;
                 let idx = self.eval_expr(env, index)?;
                 let i = match idx {
-                    Value::Int(i) if i >= 0 => i as usize,
+                    Value::Int { v: i, .. } if i >= 0 => i as usize,
                     other => {
                         return Err(RunError::Type(format!(
                             "index must be a non-negative int, got {}",
@@ -1295,7 +1295,7 @@ impl<'p> Interp<'p> {
                 }
                 match name.as_str() {
                     "int" | "uint" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32"
-                    | "u64" => Ok(Value::Int(0)),
+                    | "u64" => Ok(Value::int(0)),
                     "float" | "f32" | "f64" => Ok(Value::Float(0.0)),
                     "bool" => Ok(Value::Bool(false)),
                     "str" => Ok(Value::Str(String::new())),
@@ -1340,7 +1340,7 @@ impl<'p> Interp<'p> {
             // `soa C` is a layout the interp doesn't model; its default is the inner
             // container's default (SoA and AoS are observationally identical here).
             TypeKind::Soa(inner) => self.zero_default(inner, subst),
-            TypeKind::RawPtr => Ok(Value::Int(0)),
+            TypeKind::RawPtr => Ok(Value::int(0)),
         }
     }
 
@@ -1414,16 +1414,16 @@ impl<'p> Interp<'p> {
                     // has no meaningful offset to report and returns 0. The gauge is exercised on
                     // the native `runtime`, where scratch is a real bump arena.
                     "mem" if method == "receipts" => {
-                        return Ok(vec![Value::Int(0)]);
+                        return Ok(vec![Value::int(0)]);
                     }
                     // `mem.slab[T](n)` — a zero-initialized buffer of `n` elements. Scalars
-                    // erase to `Value::Int(0)` (matching `bet_alloc_zeroed`); a `drip` element
+                    // erase to `Value::int(0)` (matching `bet_alloc_zeroed`); a `drip` element
                     // (the `soa []Drip` case) zeroes each field, so `slab[i].field` reads a real
                     // struct. The interpreter is layout-agnostic — a `soa` slab is just an array.
                     "mem" if method == "slab" => {
                         let vals = self.eval_args(env, args)?;
                         let n = match vals.as_slice() {
-                            [Value::Int(n)] if *n >= 0 => *n as usize,
+                            [Value::Int { v: n, .. }] if *n >= 0 => *n as usize,
                             _ => {
                                 return Err(RunError::Type(
                                     "`mem.slab` takes a single non-negative length".into(),
@@ -1437,7 +1437,7 @@ impl<'p> Interp<'p> {
                             {
                                 self.zero_default(t, &HashMap::new())?
                             }
-                            _ => Value::Int(0),
+                            _ => Value::int(0),
                         };
                         // Bound the allocation before it happens (issue #40): a drip element may
                         // itself carry fixed arrays, so charge `n * cells(zero)`.
@@ -1505,7 +1505,7 @@ impl<'p> Interp<'p> {
         args: &[Arg],
     ) -> Result<Vec<Value>, RunError> {
         match method {
-            "gang" => Ok(vec![Value::Int(xs.len() as i64)]),
+            "gang" => Ok(vec![Value::int(xs.len() as i64)]),
             "vibeCheck" => {
                 let f = self.one_fn_arg(env, method, args)?;
                 let mut out = Vec::new();
@@ -1630,7 +1630,7 @@ impl<'p> Interp<'p> {
     ) -> Result<Vec<Value>, RunError> {
         let vals = self.eval_args(env, args)?;
         match (name, vals.as_slice()) {
-            ("abs", [Value::Int(x)]) => Ok(vec![Value::Int(x.abs())]),
+            ("abs", [Value::Int { v: x, .. }]) => Ok(vec![Value::int(x.abs())]),
             (other, _) => Err(RunError::Unsupported(format!(
                 "no interpreter shim for extern `{other}`"
             ))),
@@ -1732,7 +1732,7 @@ impl<'p> Interp<'p> {
                     if !arg_vals.is_empty() {
                         return Err(RunError::Type("`rng.roll` takes no arguments".into()));
                     }
-                    Ok(vec![Value::Int(rc.borrow_mut().next_u64() as i64)])
+                    Ok(vec![Value::int(rc.borrow_mut().next_u64() as i64)])
                 }
                 // `rng.frac()` — a float in `[0.0, 1.0)` (the BASIC `RND(-1)` analog).
                 "frac" => {
@@ -1743,8 +1743,8 @@ impl<'p> Interp<'p> {
                 }
                 // `rng.upTo(n)` — an unbiased int in `[0, n)`.
                 "upTo" => match arg_vals.as_slice() {
-                    [Value::Int(n)] => {
-                        Ok(vec![Value::Int(rc.borrow_mut().up_to(*n as u64) as i64)])
+                    [Value::Int { v: n, .. }] => {
+                        Ok(vec![Value::int(rc.borrow_mut().up_to(*n as u64) as i64)])
                     }
                     _ => Err(RunError::Type("`rng.upTo` takes a single int".into())),
                 },
@@ -1830,7 +1830,7 @@ impl<'p> Interp<'p> {
                 m.retain(|(ek, _)| ek != k);
                 Ok(vec![Value::Bool(m.len() != before)])
             }
-            "gang" => Ok(vec![Value::Int(map.borrow().len() as i64)]),
+            "gang" => Ok(vec![Value::int(map.borrow().len() as i64)]),
             other => Err(RunError::Undefined(format!("stash.{other}"))),
         }
     }
@@ -1917,13 +1917,13 @@ impl<'p> Interp<'p> {
             ("glow", [Value::Str(s)]) => Ok(Value::Str(s.to_uppercase())),
             ("slaps", [Value::Str(a), Value::Str(b)]) => Ok(Value::Bool(a == b)),
             // `str.len(s)` — byte length as an `int` (matches the fat-`str` len projection).
-            ("len", [Value::Str(s)]) => Ok(Value::Int(s.len() as i64)),
+            ("len", [Value::Str(s)]) => Ok(Value::int(s.len() as i64)),
             // `str.at(s, i)` — the byte at index `i`, as an `int` (0..=255).
-            ("at", [Value::Str(s), Value::Int(i)]) if *i >= 0 => {
+            ("at", [Value::Str(s), Value::Int { v: i, .. }]) if *i >= 0 => {
                 let bytes = s.as_bytes();
                 let i = *i as usize;
                 match bytes.get(i) {
-                    Some(b) => Ok(Value::Int(i64::from(*b))),
+                    Some(b) => Ok(Value::int(i64::from(*b))),
                     None => Err(RunError::Type(format!(
                         "str.at index {i} out of range (len {})",
                         bytes.len()
@@ -1931,7 +1931,14 @@ impl<'p> Interp<'p> {
                 }
             }
             // `str.sub(s, start, end)` — the byte substring `s[start..end]`.
-            ("sub", [Value::Str(s), Value::Int(a), Value::Int(b)]) if *a >= 0 && *b >= *a => {
+            (
+                "sub",
+                [
+                    Value::Str(s),
+                    Value::Int { v: a, .. },
+                    Value::Int { v: b, .. },
+                ],
+            ) if *a >= 0 && *b >= *a => {
                 let bytes = s.as_bytes();
                 let (a, b) = (*a as usize, *b as usize);
                 if b > bytes.len() {
@@ -1989,15 +1996,15 @@ impl<'p> Interp<'p> {
     fn call_sys(&mut self, env: &mut Env, method: &str, args: &[Arg]) -> Result<Value, RunError> {
         let vals = self.eval_args(env, args)?;
         match (method, vals.as_slice()) {
-            ("argc", []) => Ok(Value::Int(std::env::args_os().count() as i64)),
-            ("arg", [Value::Int(i)]) if *i >= 0 => {
+            ("argc", []) => Ok(Value::int(std::env::args_os().count() as i64)),
+            ("arg", [Value::Int { v: i, .. }]) if *i >= 0 => {
                 let arg = std::env::args_os()
                     .nth(*i as usize)
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 Ok(Value::Str(arg))
             }
-            ("arg", [Value::Int(_)]) => Ok(Value::Str(String::new())),
+            ("arg", [Value::Int { .. }]) => Ok(Value::Str(String::new())),
             // `sys.peep()` reads one line from stdin, the trailing newline stripped; empty string
             // at EOF. Reads stdin directly (as `sys.arg` reads the process env directly); the
             // semantics match the runtime's `bet_read_line`, so the two paths agree.
@@ -2027,7 +2034,7 @@ impl<'p> Interp<'p> {
     fn call_math(&mut self, env: &mut Env, method: &str, args: &[Arg]) -> Result<Value, RunError> {
         let vals = self.eval_args(env, args)?;
         match (method, vals.as_slice()) {
-            ("cook", [Value::Int(seed)]) => Ok(Value::Rng(Rc::new(RefCell::new(
+            ("cook", [Value::Int { v: seed, .. }]) => Ok(Value::Rng(Rc::new(RefCell::new(
                 rt_abi::RngState::new(*seed as u64),
             )))),
             ("cook", _) => Err(RunError::Type("`math.cook` takes a single int seed".into())),
@@ -2107,7 +2114,7 @@ impl<'p> Interp<'p> {
         match (method, vals.as_slice()) {
             ("peep", [Value::Str(path)]) => match std::fs::read(path) {
                 Ok(bytes) => Ok(Value::Array(
-                    bytes.into_iter().map(|b| Value::Int(b as i64)).collect(),
+                    bytes.into_iter().map(|b| Value::int(b as i64)).collect(),
                 )),
                 Err(_) => Ok(Value::Array(Vec::new())),
             },
@@ -2118,7 +2125,7 @@ impl<'p> Interp<'p> {
                 let mut bytes = Vec::with_capacity(data.len());
                 for v in data {
                     match v {
-                        Value::Int(b) => bytes.push(*b as u8),
+                        Value::Int { v: b, .. } => bytes.push(*b as u8),
                         Value::Byte(b) => bytes.push(*b),
                         other => {
                             return Err(RunError::Type(format!(
@@ -2140,12 +2147,12 @@ impl<'p> Interp<'p> {
     fn call_bytes(&mut self, env: &mut Env, method: &str, args: &[Arg]) -> Result<Value, RunError> {
         let vals = self.eval_args(env, args)?;
         match (method, vals.as_slice()) {
-            ("readU32le", [Value::Array(bytes), Value::Int(off)]) if *off >= 0 => {
+            ("readU32le", [Value::Array(bytes), Value::Int { v: off, .. }]) if *off >= 0 => {
                 let off = *off as usize;
                 let mut acc: u32 = 0;
                 for k in 0..4 {
                     let byte = match bytes.get(off + k) {
-                        Some(Value::Int(b)) => (*b as u32) & 0xFF,
+                        Some(Value::Int { v: b, .. }) => (*b as u32) & 0xFF,
                         Some(Value::Byte(b)) => *b as u32,
                         _ => {
                             return Err(RunError::Type(
@@ -2155,14 +2162,14 @@ impl<'p> Interp<'p> {
                     };
                     acc |= byte << (8 * k as u32);
                 }
-                Ok(Value::Int(acc as i64))
+                Ok(Value::int(acc as i64))
             }
-            ("readU16le", [Value::Array(bytes), Value::Int(off)]) if *off >= 0 => {
+            ("readU16le", [Value::Array(bytes), Value::Int { v: off, .. }]) if *off >= 0 => {
                 let off = *off as usize;
                 let mut acc: u16 = 0;
                 for k in 0..2 {
                     let byte = match bytes.get(off + k) {
-                        Some(Value::Int(b)) => (*b as u32) & 0xFF,
+                        Some(Value::Int { v: b, .. }) => (*b as u32) & 0xFF,
                         Some(Value::Byte(b)) => *b as u32,
                         _ => {
                             return Err(RunError::Type(
@@ -2172,17 +2179,17 @@ impl<'p> Interp<'p> {
                     };
                     acc |= (byte as u16) << (8 * k as u32);
                 }
-                Ok(Value::Int(acc as i64))
+                Ok(Value::int(acc as i64))
             }
             ("readU16le", _) => Err(RunError::Type(
                 "bytes.readU16le(buf, off) called with the wrong argument shape".into(),
             )),
-            ("readI16le", [Value::Array(bytes), Value::Int(off)]) if *off >= 0 => {
+            ("readI16le", [Value::Array(bytes), Value::Int { v: off, .. }]) if *off >= 0 => {
                 let off = *off as usize;
                 let mut acc: u16 = 0;
                 for k in 0..2 {
                     let byte = match bytes.get(off + k) {
-                        Some(Value::Int(b)) => (*b as u32) & 0xFF,
+                        Some(Value::Int { v: b, .. }) => (*b as u32) & 0xFF,
                         Some(Value::Byte(b)) => *b as u32,
                         _ => {
                             return Err(RunError::Type(
@@ -2192,7 +2199,7 @@ impl<'p> Interp<'p> {
                     };
                     acc |= (byte as u16) << (8 * k as u32);
                 }
-                Ok(Value::Int(acc as i16 as i64))
+                Ok(Value::int(acc as i16 as i64))
             }
             ("readI16le", _) => Err(RunError::Type(
                 "bytes.readI16le(buf, off) called with the wrong argument shape".into(),
@@ -2218,7 +2225,7 @@ impl<'p> Interp<'p> {
         let vals = self.eval_args(env, args)?;
         match (method, vals.as_slice()) {
             // `gg.blit(pixels, w, h)` presents a tightly packed `w * h` framebuffer (stride == w).
-            ("blit", [pixels, Value::Int(w), Value::Int(h)]) if *w >= 0 && *h >= 0 => {
+            ("blit", [pixels, Value::Int { v: w, .. }, Value::Int { v: h, .. }]) if *w >= 0 && *h >= 0 => {
                 // Bound `w * h` before resizing (issue #40): huge or overflowing dimensions must
                 // return a clean AllocLimit, never OOM or panic on `Vec` capacity overflow.
                 let n = checked_alloc((*w as u128).saturating_mul(*h as u128))?;
@@ -2236,7 +2243,7 @@ impl<'p> Interp<'p> {
                     .into(),
             )),
             // `gg.audio(samples, count)` queues the first `count` interleaved i16 samples.
-            ("audio", [samples, Value::Int(count)]) if *count >= 0 => {
+            ("audio", [samples, Value::Int { v: count, .. }]) if *count >= 0 => {
                 let buf = marshal_ints(samples, |i| i as i16).ok_or_else(|| {
                     RunError::Type("`gg.audio` needs an array of sample integers".into())
                 })?;
@@ -2252,26 +2259,26 @@ impl<'p> Interp<'p> {
             ("poll", []) => {
                 let e = gg_backend::poll();
                 Ok(vec![
-                    Value::Int(i64::from(e.kind)),
-                    Value::Int(i64::from(e.code)),
+                    Value::int(i64::from(e.kind)),
+                    Value::int(i64::from(e.code)),
                 ])
             }
             ("poll", _) => Err(RunError::Type("`gg.poll` takes no arguments".into())),
             // `gg.ticks()` returns a monotonic nanosecond counter.
-            ("ticks", []) => Ok(vec![Value::Int(gg_backend::ticks() as i64)]),
+            ("ticks", []) => Ok(vec![Value::int(gg_backend::ticks() as i64)]),
             ("ticks", _) => Err(RunError::Type("`gg.ticks` takes no arguments".into())),
             // `gg.size()` returns the live window `(width, height)`; the ABI packs `w << 32 | h`.
             ("size", []) => {
                 let v = gg_backend::size();
                 Ok(vec![
-                    Value::Int((v >> 32) as i64),
-                    Value::Int((v & 0xFFFF_FFFF) as i64),
+                    Value::int((v >> 32) as i64),
+                    Value::int((v & 0xFFFF_FFFF) as i64),
                 ])
             }
             ("size", _) => Err(RunError::Type("`gg.size` takes no arguments".into())),
             // `gg.tex(buf, byteOff, w, h)` uploads a `w * h` RGBA8 texture from a byte view of the
             // buffer; returns its 1-based id.
-            ("tex", [pixels, Value::Int(off), Value::Int(w), Value::Int(h)])
+            ("tex", [pixels, Value::Int { v: off, .. }, Value::Int { v: w, .. }, Value::Int { v: h, .. }])
                 if *off >= 0 && *w >= 0 && *h >= 0 =>
             {
                 let (w, h) = (*w as u32, *h as u32);
@@ -2286,13 +2293,13 @@ impl<'p> Interp<'p> {
                     RunError::Type("`gg.tex` needs an array of pixel bytes".into())
                 })?;
                 let id = gg_backend::tex(&window, w, h);
-                Ok(vec![Value::Int(i64::from(id))])
+                Ok(vec![Value::int(i64::from(id))])
             }
             ("tex", _) => Err(RunError::Type(
                 "`gg.tex(buf, byteOff, w, h)` takes a buffer and three non-negative ints".into(),
             )),
             // `gg.frame(w, h, color)` begins a frame and clears the canvas to `color` (0x00RRGGBB).
-            ("frame", [Value::Int(w), Value::Int(h), Value::Int(c)]) if *w >= 0 && *h >= 0 => {
+            ("frame", [Value::Int { v: w, .. }, Value::Int { v: h, .. }, Value::Int { v: c, .. }]) if *w >= 0 && *h >= 0 => {
                 gg_backend::frame(*w as u32, *h as u32, *c as u32);
                 Ok(Vec::new())
             }
@@ -2300,7 +2307,7 @@ impl<'p> Interp<'p> {
                 "`gg.frame(w, h, color)` takes two non-negative dimensions and a color".into(),
             )),
             // `gg.sprite(tex, x, y)` blits texture `tex` at `(x, y)`.
-            ("sprite", [Value::Int(t), Value::Int(x), Value::Int(y)]) => {
+            ("sprite", [Value::Int { v: t, .. }, Value::Int { v: x, .. }, Value::Int { v: y, .. }]) => {
                 gg_backend::sprite(*t as u32, *x as i32, *y as i32);
                 Ok(Vec::new())
             }
@@ -2311,13 +2318,13 @@ impl<'p> Interp<'p> {
             (
                 "spriteSub",
                 [
-                    Value::Int(t),
-                    Value::Int(sx),
-                    Value::Int(sy),
-                    Value::Int(sw),
-                    Value::Int(sh),
-                    Value::Int(dx),
-                    Value::Int(dy),
+                    Value::Int { v: t, .. },
+                    Value::Int { v: sx, .. },
+                    Value::Int { v: sy, .. },
+                    Value::Int { v: sw, .. },
+                    Value::Int { v: sh, .. },
+                    Value::Int { v: dx, .. },
+                    Value::Int { v: dy, .. },
                 ],
             ) => {
                 gg_backend::sprite_sub(
@@ -2334,11 +2341,11 @@ impl<'p> Interp<'p> {
             (
                 "rect",
                 [
-                    Value::Int(x),
-                    Value::Int(y),
-                    Value::Int(w),
-                    Value::Int(h),
-                    Value::Int(c),
+                    Value::Int { v: x, .. },
+                    Value::Int { v: y, .. },
+                    Value::Int { v: w, .. },
+                    Value::Int { v: h, .. },
+                    Value::Int { v: c, .. },
                 ],
             ) => {
                 gg_backend::rect(*x as i32, *y as i32, *w as u32, *h as u32, *c as u32);
@@ -2361,10 +2368,10 @@ impl<'p> Interp<'p> {
                 "sound",
                 [
                     samples,
-                    Value::Int(off),
-                    Value::Int(len),
-                    Value::Int(ch),
-                    Value::Int(rate),
+                    Value::Int { v: off, .. },
+                    Value::Int { v: len, .. },
+                    Value::Int { v: ch, .. },
+                    Value::Int { v: rate, .. },
                 ],
             ) if *off >= 0 && *len >= 0 && *ch >= 0 && *rate >= 0 => {
                 // Serialize ONLY the samples spanning the `[off, off + len)` byte window instead
@@ -2374,7 +2381,7 @@ impl<'p> Interp<'p> {
                     RunError::Type("`gg.sound` needs an array of sample integers".into())
                 })?;
                 let id = gg_backend::sound(&win, *ch as u32, *rate as u32);
-                Ok(vec![Value::Int(i64::from(id))])
+                Ok(vec![Value::int(i64::from(id))])
             }
             ("sound", _) => Err(RunError::Type(
                 "`gg.sound(buf, byteOff, byteLen, channels, rate)` takes a buffer and four \
@@ -2382,16 +2389,16 @@ impl<'p> Interp<'p> {
                     .into(),
             )),
             // `gg.play(soundId, loop, volume)` starts a voice; returns its 1-based id.
-            ("play", [Value::Int(s), Value::Int(lp), Value::Int(vol)]) if *s >= 0 && *vol >= 0 => {
+            ("play", [Value::Int { v: s, .. }, Value::Int { v: lp, .. }, Value::Int { v: vol, .. }]) if *s >= 0 && *vol >= 0 => {
                 let id = gg_backend::play(*s as u32, *lp as u32, *vol as u32);
-                Ok(vec![Value::Int(i64::from(id))])
+                Ok(vec![Value::int(i64::from(id))])
             }
             ("play", _) => Err(RunError::Type(
                 "`gg.play(soundId, loop, volume)` takes a sound id, a loop flag, and a volume"
                     .into(),
             )),
             // `gg.stop(voiceId)` stops a voice.
-            ("stop", [Value::Int(v)]) if *v >= 0 => {
+            ("stop", [Value::Int { v, .. }]) if *v >= 0 => {
                 gg_backend::stop(*v as u32);
                 Ok(Vec::new())
             }
@@ -2401,8 +2408,8 @@ impl<'p> Interp<'p> {
             ("mouse", []) => {
                 let v = gg_backend::mouse();
                 Ok(vec![
-                    Value::Int((v >> 32) as i64),
-                    Value::Int((v & 0xFFFF_FFFF) as i64),
+                    Value::int((v >> 32) as i64),
+                    Value::int((v & 0xFFFF_FFFF) as i64),
                 ])
             }
             ("mouse", _) => Err(RunError::Type("`gg.mouse` takes no arguments".into())),
@@ -2413,14 +2420,14 @@ impl<'p> Interp<'p> {
             ("mouseDelta", []) => {
                 let v = gg_backend::mouse_delta();
                 Ok(vec![
-                    Value::Int(i64::from((v >> 32) as u32 as i32)),
-                    Value::Int(i64::from(v as u32 as i32)),
+                    Value::int(i64::from((v >> 32) as u32 as i32)),
+                    Value::int(i64::from(v as u32 as i32)),
                 ])
             }
             ("mouseDelta", _) => Err(RunError::Type("`gg.mouseDelta` takes no arguments".into())),
             // `gg.tune(voiceId, volume, pan)` live-updates a playing voice's Q8 volume and
             // stereo pan (0 = full left, 128 = center, 255 = full right).
-            ("tune", [Value::Int(v), Value::Int(vol), Value::Int(pan)])
+            ("tune", [Value::Int { v, .. }, Value::Int { v: vol, .. }, Value::Int { v: pan, .. }])
                 if *v >= 0 && *vol >= 0 && *pan >= 0 =>
             {
                 gg_backend::tune(*v as u32, *vol as u32, *pan as u32);
@@ -2432,7 +2439,7 @@ impl<'p> Interp<'p> {
             // `gg.show(pixels, w, h)` presents a tightly packed fixed-logical-size `w * h`
             // framebuffer, aspect-fit (integer nearest-neighbor, centered letterbox) into the
             // window — `gg.blit`'s input model with `gg.flush`'s scaling.
-            ("show", [pixels, Value::Int(w), Value::Int(h)]) if *w >= 0 && *h >= 0 => {
+            ("show", [pixels, Value::Int { v: w, .. }, Value::Int { v: h, .. }]) if *w >= 0 && *h >= 0 => {
                 // Bound `w * h` before resizing (issue #40): huge or overflowing dimensions must
                 // return a clean AllocLimit, never OOM or panic on `Vec` capacity overflow.
                 let n = checked_alloc((*w as u128).saturating_mul(*h as u128))?;
@@ -2454,14 +2461,14 @@ impl<'p> Interp<'p> {
             ("audioSpec", []) => {
                 let v = gg_backend::audio_spec();
                 Ok(vec![
-                    Value::Int((v >> 32) as i64),
-                    Value::Int((v & 0xFFFF_FFFF) as i64),
+                    Value::int((v >> 32) as i64),
+                    Value::int((v & 0xFFFF_FFFF) as i64),
                 ])
             }
             ("audioSpec", _) => Err(RunError::Type("`gg.audioSpec` takes no arguments".into())),
             // `gg.pending()` returns the interleaved i16 samples still queued in the raw
             // `gg.audio` ring — the streaming-synth backpressure signal.
-            ("pending", []) => Ok(vec![Value::Int(gg_backend::pending() as i64)]),
+            ("pending", []) => Ok(vec![Value::int(gg_backend::pending() as i64)]),
             ("pending", _) => Err(RunError::Type("`gg.pending` takes no arguments".into())),
             // `gg.title(name)` sets the window title (applied live / used at window creation).
             ("title", [Value::Str(s)]) => {
@@ -2479,8 +2486,12 @@ impl<'p> Interp<'p> {
     /// wrapping an integer into a sized-integer type (mirrors an explicit `as` cast).
     fn coerce(&self, val: Value, ty: Option<&Type>) -> Value {
         match (ty.map(|t| &t.kind), &val) {
-            (Some(TypeKind::Named(name, _)), Value::Int(i)) => match int_type(name) {
-                Some((bits, signed)) => Value::Int(wrap_int(*i as i128, bits, signed)),
+            // Stamp the binding's declared width/signedness onto the value (wrapping into range),
+            // so later arithmetic on it wraps/traps at the true width like the compiled path — not
+            // just at this boundary (spec §2.4). `int` restamps as `WORD`; a bare literal thereby
+            // takes on its declared sized type.
+            (Some(TypeKind::Named(name, _)), Value::Int { v, .. }) => match int_ty(name) {
+                Some(ity) => Value::sized(i128::from(*v), ity),
                 None => val,
             },
             _ => val,
@@ -2526,7 +2537,7 @@ fn bytes_of(vals: &[Value]) -> Result<Vec<u8>, RunError> {
     vals.iter()
         .map(|v| match v {
             Value::Byte(b) => Ok(*b),
-            Value::Int(i) => Ok(*i as u8),
+            Value::Int { v: i, .. } => Ok(*i as u8),
             _ => Err(RunError::Type(
                 "str.fromBytes* needs a []u8 (byte-valued elements)".into(),
             )),
@@ -2544,7 +2555,7 @@ fn marshal_ints<T>(v: &Value, conv: impl Fn(i64) -> T) -> Option<Vec<T>> {
     let mut out = Vec::with_capacity(xs.len());
     for e in xs {
         match e {
-            Value::Int(i) => out.push(conv(*i)),
+            Value::Int { v: i, .. } => out.push(conv(*i)),
             Value::Byte(b) => out.push(conv(i64::from(*b))),
             _ => return None,
         }
@@ -2573,7 +2584,7 @@ fn marshal_ints_window<T>(
     let mut out = Vec::with_capacity(end - start);
     for e in &xs[start..end] {
         match e {
-            Value::Int(i) => out.push(conv(*i)),
+            Value::Int { v: i, .. } => out.push(conv(*i)),
             Value::Byte(b) => out.push(conv(i64::from(*b))),
             _ => return None,
         }
@@ -2620,7 +2631,7 @@ fn exactly_one(mut vals: Vec<Value>) -> Result<Value, RunError> {
 fn default_value(ty: &Type) -> Value {
     match &ty.kind {
         TypeKind::Named(name, _) => match name.as_str() {
-            "i8" | "i16" | "i32" | "i64" | "int" | "u8" | "u16" | "u32" | "u64" => Value::Int(0),
+            "i8" | "i16" | "i32" | "i64" | "int" | "u8" | "u16" | "u32" | "u64" => Value::int(0),
             "f32" | "f64" | "float" => Value::Float(0.0),
             "bool" => Value::Bool(false),
             "str" => Value::Str(String::new()),
@@ -2642,33 +2653,41 @@ fn type_head(ty: &Type) -> &str {
     }
 }
 
-/// `(bits, signed)` for a sized-integer type name, if it names one.
-fn int_type(name: &str) -> Option<(u32, bool)> {
+/// The [`IntTy`] a sized-integer type name denotes, if it names one. `int` is the signed 64-bit
+/// [`IntTy::WORD`]; `u64` is unsigned 64-bit; and so on down the tower.
+fn int_ty(name: &str) -> Option<IntTy> {
     Some(match name {
-        "i8" => (8, true),
-        "i16" => (16, true),
-        "i32" => (32, true),
-        "i64" | "int" => (64, true),
-        "u8" => (8, false),
-        "u16" => (16, false),
-        "u32" => (32, false),
-        "u64" => (64, false),
+        "i8" => IntTy {
+            bits: 8,
+            signed: true,
+        },
+        "i16" => IntTy {
+            bits: 16,
+            signed: true,
+        },
+        "i32" => IntTy {
+            bits: 32,
+            signed: true,
+        },
+        "i64" | "int" => IntTy::WORD,
+        "u8" => IntTy {
+            bits: 8,
+            signed: false,
+        },
+        "u16" => IntTy {
+            bits: 16,
+            signed: false,
+        },
+        "u32" => IntTy {
+            bits: 32,
+            signed: false,
+        },
+        "u64" => IntTy {
+            bits: 64,
+            signed: false,
+        },
         _ => return None,
     })
-}
-
-/// Wrap `v` into a `bits`-wide integer of the given signedness (two's-complement).
-fn wrap_int(v: i128, bits: u32, signed: bool) -> i64 {
-    if bits >= 64 {
-        // i64/u64 already fit our storage; nothing to truncate for the corpus range.
-        return v as i64;
-    }
-    let modulus = 1i128 << bits;
-    let mut m = v.rem_euclid(modulus);
-    if signed && m >= (1i128 << (bits - 1)) {
-        m -= modulus;
-    }
-    m as i64
 }
 
 fn compound_binop(op: AssignOp) -> BinOp {
@@ -2690,12 +2709,15 @@ fn compound_binop(op: AssignOp) -> BinOp {
 fn unary_op(op: UnOp, v: &Value) -> Result<Value, RunError> {
     match (op, v) {
         (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
-        (UnOp::Neg, Value::Int(i)) => i
-            .checked_neg()
-            .map(Value::Int)
-            .ok_or_else(|| RunError::Overflow("negation".into())),
+        // `-v` is `0 - v` on the compiled path: signed traps on overflow (debug §2.4 — `int`
+        // keeps its `i64::MIN` trap), unsigned wraps at the operand width.
+        (UnOp::Neg, Value::Int { v, ty }) => neg_int(*v, *ty),
         (UnOp::Neg, Value::Float(f)) => Ok(Value::Float(-f)),
-        (UnOp::BitNot, Value::Int(i)) => Ok(Value::Int(!i)),
+        // Bitwise complement at the operand width: `~0 == -1` for `int`, `~0u8 == 255`.
+        (UnOp::BitNot, Value::Int { v, ty }) => Ok(Value::Int {
+            v: wrap_to(!i128::from(*v), *ty),
+            ty: *ty,
+        }),
         (op, v) => Err(RunError::Type(format!(
             "cannot apply `{op:?}` to {}",
             v.type_name()
@@ -2711,21 +2733,23 @@ fn binary_op(op: BinOp, l: &Value, r: &Value) -> Result<Value, RunError> {
         Ne => Ok(Value::Bool(!values_equal(l, r))),
         And | Or => unreachable!("logical connectives are short-circuited in eval_binary"),
         _ => match (l, r) {
-            (Value::Int(a), Value::Int(b)) => int_binary(op, *a, *b),
+            (Value::Int { v: a, ty: ta }, Value::Int { v: b, ty: tb }) => {
+                int_binary(op, *a, *ta, *b, *tb)
+            }
             (Value::Float(a), Value::Float(b)) => float_binary(op, *a, *b),
-            (Value::Int(a), Value::Float(b)) => float_binary(op, *a as f64, *b),
-            (Value::Float(a), Value::Int(b)) => float_binary(op, *a, *b as f64),
+            (Value::Int { v: a, .. }, Value::Float(b)) => float_binary(op, *a as f64, *b),
+            (Value::Float(a), Value::Int { v: b, .. }) => float_binary(op, *a, *b as f64),
             (Value::Str(a), Value::Str(b)) if matches!(op, Add) => {
                 Ok(Value::Str(format!("{a}{b}")))
             }
             // Element-wise SIMD arithmetic/shift; a scalar operand is broadcast to every lane
             // (`v >> 16`, `v * s`), matching the frontend's splat on the compiled path.
             (Value::Simd(a), Value::Simd(b)) => simd_binary(op, a, b),
-            (Value::Simd(a), Value::Int(_) | Value::Float(_)) => {
+            (Value::Simd(a), Value::Int { .. } | Value::Float(_)) => {
                 let bs = splat_like(a, r)?;
                 simd_binary(op, a, &bs)
             }
-            (Value::Int(_) | Value::Float(_), Value::Simd(b)) => {
+            (Value::Int { .. } | Value::Float(_), Value::Simd(b)) => {
                 let a = splat_like(b, l)?;
                 simd_binary(op, &a, b)
             }
@@ -2839,7 +2863,7 @@ fn splat_like(target: &SimdVal, s: &Value) -> Result<SimdVal, RunError> {
 
 fn value_to_i64(v: &Value) -> Result<i64, RunError> {
     match v {
-        Value::Int(i) => Ok(*i),
+        Value::Int { v: i, .. } => Ok(*i),
         Value::Byte(b) => Ok(*b as i64),
         Value::Bool(b) => Ok(*b as i64),
         other => Err(RunError::Type(format!(
@@ -2852,7 +2876,7 @@ fn value_to_i64(v: &Value) -> Result<i64, RunError> {
 fn value_to_f64(v: &Value) -> Result<f64, RunError> {
     match v {
         Value::Float(f) => Ok(*f),
-        Value::Int(i) => Ok(*i as f64),
+        Value::Int { v: i, .. } => Ok(*i as f64),
         other => Err(RunError::Type(format!(
             "cannot use {} as a SIMD float lane",
             other.type_name()
@@ -2932,7 +2956,7 @@ fn simd_lane(sv: &SimdVal, i: usize) -> Result<Value, RunError> {
     match sv {
         SimdVal::F32(v) => v.get(i).map(|&x| Value::Float(x as f64)).ok_or_else(oob),
         SimdVal::F64(v) => v.get(i).map(|&x| Value::Float(x)).ok_or_else(oob),
-        SimdVal::Int(v) => v.get(i).map(|&x| Value::Int(x)).ok_or_else(oob),
+        SimdVal::Int(v) => v.get(i).map(|&x| Value::int(x)).ok_or_else(oob),
     }
 }
 
@@ -2997,7 +3021,7 @@ fn simd_reduce_add(sv: &SimdVal) -> Value {
             for &x in &v[1..] {
                 s = s.wrapping_add(x);
             }
-            Value::Int(s)
+            Value::int(s)
         }
     }
 }
@@ -3024,7 +3048,7 @@ fn simd_dot(a: &SimdVal, b: &SimdVal) -> Result<Value, RunError> {
             for i in 1..x.len() {
                 s = s.wrapping_add(x[i].wrapping_mul(y[i]));
             }
-            Ok(Value::Int(s))
+            Ok(Value::int(s))
         }
         _ => Err(RunError::Type("SIMD dot on mismatched vectors".into())),
     }
@@ -3078,45 +3102,186 @@ fn simd_norm(sv: &SimdVal) -> Result<Value, RunError> {
 
 fn values_equal(l: &Value, r: &Value) -> bool {
     match (l, r) {
-        (Value::Int(a), Value::Float(b)) => (*a as f64) == *b,
-        (Value::Float(a), Value::Int(b)) => *a == (*b as f64),
+        (Value::Int { v: a, .. }, Value::Float(b)) => (*a as f64) == *b,
+        (Value::Float(a), Value::Int { v: b, .. }) => *a == (*b as f64),
+        // Int/Int falls through to the width-blind derived `PartialEq` (see `IntTy`), so `5` and a
+        // `u8` holding `5` compare equal.
         _ => l == r,
     }
 }
 
-fn int_binary(op: BinOp, a: i64, b: i64) -> Result<Value, RunError> {
-    use BinOp::*;
-    let arith = |o: Option<i64>, what: &str| {
-        o.map(Value::Int)
-            .ok_or_else(|| RunError::Overflow(what.to_string()))
+/// The result type of an integer binary op. Well-typed programs give both operands the same
+/// [`IntTy`] (the frontend coerces to match); a bare `int` literal ([`IntTy::WORD`]) adapts to a
+/// sized partner. Between two distinct *sized* types (only reachable via ill-typed input) keep the
+/// wider one, defensively.
+fn combine_int_ty(a: IntTy, b: IntTy) -> IntTy {
+    if a.same_repr(b) {
+        return a;
+    }
+    match (a.same_repr(IntTy::WORD), b.same_repr(IntTy::WORD)) {
+        (false, true) => a,
+        (true, false) => b,
+        _ if a.bits >= b.bits => a,
+        _ => b,
+    }
+}
+
+/// The stored `i64` reinterpreted as the unsigned value at `ty`'s width (a `u64` past `i64::MAX`
+/// is held as a negative `i64`; the narrow towers are stored non-negative).
+fn operand_u64(a: i64, ty: IntTy) -> u64 {
+    let bits = u32::from(ty.bits);
+    if bits >= 64 {
+        a as u64
+    } else {
+        (a as u64) & ((1u64 << bits) - 1)
+    }
+}
+
+/// Store an unsigned `res` reduced into `ty`'s width (`res` may exceed the width; the low `bits`
+/// are kept). u128 lets `u64 * u64` be computed without overflow before the reduction.
+fn store_unsigned(res: u128, ty: IntTy) -> Value {
+    let bits = u32::from(ty.bits);
+    let v = if bits >= 64 {
+        res as u64 as i64
+    } else {
+        (res & ((1u128 << bits) - 1)) as i64
     };
+    Value::Int { v, ty }
+}
+
+/// `-v` at the operand width: `0 - v`. Signed traps on overflow (`i64::MIN`/`i8::MIN`/… negation,
+/// debug §2.4); unsigned wraps (`-1u8 == 255`).
+fn neg_int(a: i64, ty: IntTy) -> Result<Value, RunError> {
+    if ty.signed {
+        let res = -i128::from(a);
+        let w = wrap_to(res, ty);
+        if i128::from(w) != res {
+            return Err(RunError::Overflow("negation".into()));
+        }
+        Ok(Value::Int { v: w, ty })
+    } else {
+        Ok(store_unsigned(
+            0u128.wrapping_sub(u128::from(operand_u64(a, ty))),
+            ty,
+        ))
+    }
+}
+
+/// Integer binary op at the operands' declared width/signedness (spec §2.4). This mirrors the
+/// compiled path, which lowers each `iN` to `custom_width_int_type(bits)` so it already wraps
+/// (unsigned) or traps (signed `+`/`-`/`*`, debug build) at the true width — the interpreter is
+/// that debug-build oracle. Every result is re-wrapped into the result width, so narrow
+/// intermediates never leak an out-of-range `i64` into a following `/`/`%`/comparison/`>>`.
+fn int_binary(op: BinOp, a: i64, ta: IntTy, b: i64, tb: IntTy) -> Result<Value, RunError> {
+    use BinOp::*;
+    let ty = combine_int_ty(ta, tb);
+    let bits = u32::from(ty.bits);
+
     match op {
-        Add => arith(a.checked_add(b), "addition"),
-        Sub => arith(a.checked_sub(b), "subtraction"),
-        Mul => arith(a.checked_mul(b), "multiplication"),
-        Div => {
-            if b == 0 {
-                Err(RunError::DivByZero)
+        Add | Sub | Mul => {
+            if ty.signed {
+                // i64 operands widened to i128 never overflow the accumulator, so we can detect
+                // the true out-of-width overflow ourselves and trap (debug §2.4).
+                let (x, y) = (i128::from(a), i128::from(b));
+                let (res, what) = match op {
+                    Add => (x + y, "addition"),
+                    Sub => (x - y, "subtraction"),
+                    _ => (x * y, "multiplication"),
+                };
+                let w = wrap_to(res, ty);
+                if i128::from(w) != res {
+                    return Err(RunError::Overflow(what.to_string()));
+                }
+                Ok(Value::Int { v: w, ty })
             } else {
-                arith(a.checked_div(b), "division")
+                // Unsigned wraps, never traps. u128 holds `u64 * u64` before the width reduction.
+                let (x, y) = (
+                    u128::from(operand_u64(a, ty)),
+                    u128::from(operand_u64(b, ty)),
+                );
+                let res = match op {
+                    Add => x.wrapping_add(y),
+                    Sub => x.wrapping_sub(y),
+                    _ => x.wrapping_mul(y),
+                };
+                Ok(store_unsigned(res, ty))
             }
         }
-        Rem => {
+        Div | Rem => {
             if b == 0 {
-                Err(RunError::DivByZero)
+                return Err(RunError::DivByZero);
+            }
+            if ty.signed {
+                let (x, y) = (i128::from(a), i128::from(b));
+                // Signed `INT_MIN / -1` overflows; the compiled `guard_div` traps it for both
+                // `/` and `%`.
+                if x == -(1i128 << (bits - 1)) && y == -1 {
+                    let what = if matches!(op, Div) {
+                        "division"
+                    } else {
+                        "remainder"
+                    };
+                    return Err(RunError::Overflow(what.into()));
+                }
+                let res = if matches!(op, Div) { x / y } else { x % y };
+                Ok(Value::Int {
+                    v: wrap_to(res, ty),
+                    ty,
+                })
             } else {
-                arith(a.checked_rem(b), "remainder")
+                let (x, y) = (operand_u64(a, ty), operand_u64(b, ty));
+                let res = if matches!(op, Div) { x / y } else { x % y };
+                Ok(store_unsigned(u128::from(res), ty))
             }
         }
-        BitAnd => Ok(Value::Int(a & b)),
-        BitOr => Ok(Value::Int(a | b)),
-        BitXor => Ok(Value::Int(a ^ b)),
-        Shl => Ok(Value::Int(a.wrapping_shl(b as u32))),
-        Shr => Ok(Value::Int(a.wrapping_shr(b as u32))),
-        Lt => Ok(Value::Bool(a < b)),
-        Le => Ok(Value::Bool(a <= b)),
-        Gt => Ok(Value::Bool(a > b)),
-        Ge => Ok(Value::Bool(a >= b)),
+        BitAnd => Ok(Value::Int {
+            v: wrap_to(i128::from(a & b), ty),
+            ty,
+        }),
+        BitOr => Ok(Value::Int {
+            v: wrap_to(i128::from(a | b), ty),
+            ty,
+        }),
+        BitXor => Ok(Value::Int {
+            v: wrap_to(i128::from(a ^ b), ty),
+            ty,
+        }),
+        // Shift amount is masked to the width (`amt & (bits - 1)`), matching the backend's
+        // `mask_shift_amount`; `>>` is arithmetic for signed, logical for unsigned.
+        Shl => {
+            let k = (b as u32) & (bits - 1);
+            Ok(Value::Int {
+                v: wrap_to(i128::from(a.wrapping_shl(k)), ty),
+                ty,
+            })
+        }
+        Shr => {
+            let k = (b as u32) & (bits - 1);
+            let v = if ty.signed {
+                a.wrapping_shr(k)
+            } else {
+                (operand_u64(a, ty) >> k) as i64
+            };
+            Ok(Value::Int {
+                v: wrap_to(i128::from(v), ty),
+                ty,
+            })
+        }
+        Lt | Le | Gt | Ge => {
+            let ord = if ty.signed {
+                a.cmp(&b)
+            } else {
+                operand_u64(a, ty).cmp(&operand_u64(b, ty))
+            };
+            use std::cmp::Ordering::{Greater, Less};
+            let res = match op {
+                Lt => ord == Less,
+                Le => ord != Greater,
+                Gt => ord == Greater,
+                _ => ord != Less, // Ge
+            };
+            Ok(Value::Bool(res))
+        }
         Eq | Ne | And | Or => unreachable!("handled by binary_op"),
     }
 }
@@ -3144,12 +3309,12 @@ fn cast(v: Value, ty: &Type) -> Result<Value, RunError> {
     let TypeKind::Named(name, _) = &ty.kind else {
         return Err(RunError::Unsupported(format!("cast to {ty:?}")));
     };
-    if let Some((bits, signed)) = int_type(name) {
+    if let Some(ity) = int_ty(name) {
         let raw = match v {
-            Value::Int(i) => i as i128,
-            Value::Byte(b) => b as i128,
+            Value::Int { v, .. } => i128::from(v),
+            Value::Byte(b) => i128::from(b),
             Value::Float(f) => f.trunc() as i128,
-            Value::Bool(b) => b as i128,
+            Value::Bool(b) => i128::from(b),
             other => {
                 return Err(RunError::Type(format!(
                     "cannot cast {} to {name}",
@@ -3157,11 +3322,13 @@ fn cast(v: Value, ty: &Type) -> Result<Value, RunError> {
                 )));
             }
         };
-        return Ok(Value::Int(wrap_int(raw, bits, signed)));
+        // A narrowing cast truncates two's-complement, and the result carries its new width so it
+        // keeps wrapping/trapping at that width in later arithmetic (spec §2.4).
+        return Ok(Value::sized(raw, ity));
     }
     match name.as_str() {
         "f32" | "f64" | "float" => match v {
-            Value::Int(i) => Ok(Value::Float(i as f64)),
+            Value::Int { v: i, .. } => Ok(Value::Float(i as f64)),
             Value::Float(f) => Ok(Value::Float(f)),
             Value::Byte(b) => Ok(Value::Float(b as f64)),
             other => Err(RunError::Type(format!(
@@ -3217,7 +3384,7 @@ mod gg_marshal_tests {
     use super::*;
 
     fn ints(xs: &[i64]) -> Value {
-        Value::Array(xs.iter().map(|&i| Value::Int(i)).collect())
+        Value::Array(xs.iter().map(|&i| Value::int(i)).collect())
     }
 
     // Oracles: the OLD whole-buffer behavior, kept verbatim to prove the windowed fix is
@@ -3275,9 +3442,9 @@ mod gg_marshal_tests {
             Some(vec![1u8, 2])
         );
         // not an array
-        assert_eq!(marshal_ints_window(&Value::Int(5), 0, 1, |i| i as u8), None);
+        assert_eq!(marshal_ints_window(&Value::int(5), 0, 1, |i| i as u8), None);
         // a non-int element INSIDE the window rejects
-        let mixed = Value::Array(vec![Value::Int(1), Value::Str("x".into())]);
+        let mixed = Value::Array(vec![Value::int(1), Value::Str("x".into())]);
         assert_eq!(marshal_ints_window(&mixed, 0, 2, |i| i as u8), None);
         // ... but a bad element OUTSIDE the window is never inspected
         assert_eq!(

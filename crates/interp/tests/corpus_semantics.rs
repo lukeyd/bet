@@ -1360,3 +1360,137 @@ fn signed_overflow_traps() {
     ))])]));
     assert!(matches!(err, Err(RunError::Overflow(_))), "got {err:?}");
 }
+
+// ============================================================================
+// Narrow integer wrap/trap — issue #53, spec §2.4.
+//
+// The old evaluator computed every sized-int op at i64 width and did NOT re-wrap to the operand's
+// declared width, so u8/u16/u32 arithmetic diverged from the compiled LLVM path (which lowers each
+// `iN` to `custom_width_int_type(bits)` and thus wraps/traps at the real width). It also used
+// `checked_*`, trapping on i64 overflow where the compiled path just wraps. `Value::Int` now
+// carries its width/signedness, so each op wraps (unsigned) or traps (signed, debug §2.4) at the
+// true width. The oracle is Rust's own `wrapping_*` on the same fixed-width type.
+// ============================================================================
+
+#[test]
+fn narrow_unsigned_arithmetic_wraps() {
+    // u8: 250 + 10 wraps to 4; 250 - 10 stays 240; 0 - 1 wraps to 255 (a bare `1` literal adapts
+    // to its u8 partner); 16 * 16 == 0 (256 mod 256).
+    let out = run_main(vec![
+        let_(&["a"], Some(tn("u8")), vec![int(250)]),
+        let_(&["b"], Some(tn("u8")), vec![int(10)]),
+        spill_it(bin(BinOp::Add, name("a"), name("b"))),
+        spill_it(bin(BinOp::Sub, name("a"), name("b"))),
+        let_(&["z"], Some(tn("u8")), vec![int(0)]),
+        spill_it(bin(BinOp::Sub, name("z"), int(1))),
+        let_(&["h"], Some(tn("u8")), vec![int(16)]),
+        spill_it(bin(BinOp::Mul, name("h"), name("h"))),
+    ]);
+    assert_eq!(
+        out,
+        format!(
+            "{}\n{}\n{}\n{}\n",
+            250u8.wrapping_add(10),
+            250u8.wrapping_sub(10),
+            0u8.wrapping_sub(1),
+            16u8.wrapping_mul(16),
+        )
+    );
+}
+
+#[test]
+fn narrow_unsigned_wraps_at_width_boundaries() {
+    // u16 rolls over at 2^16, u32 at 2^32 — and a u32 product that overflows *i64* (where the old
+    // `checked_mul` trapped) now wraps like the compiled path.
+    let out = run_main(vec![
+        let_(&["a"], Some(tn("u16")), vec![int(65_535)]),
+        spill_it(bin(BinOp::Add, name("a"), int(1))),
+        let_(&["b"], Some(tn("u32")), vec![int(4_294_967_295)]),
+        spill_it(bin(BinOp::Add, name("b"), int(1))),
+        // 4e9 * 4e9 = 1.6e19 overflows i64 (~9.2e18); must wrap mod 2^32, not trap.
+        let_(&["c"], Some(tn("u32")), vec![int(4_000_000_000)]),
+        let_(&["d"], Some(tn("u32")), vec![int(4_000_000_000)]),
+        spill_it(bin(BinOp::Mul, name("c"), name("d"))),
+    ]);
+    assert_eq!(
+        out,
+        format!(
+            "{}\n{}\n{}\n",
+            65_535u16.wrapping_add(1),
+            4_294_967_295u32.wrapping_add(1),
+            4_000_000_000u32.wrapping_mul(4_000_000_000),
+        )
+    );
+}
+
+#[test]
+fn narrow_signed_arithmetic_traps_at_width() {
+    // Signed `+`/`-`/`*` trap on overflow (debug §2.4) at the operand's *true* width, matching the
+    // compiled `-O0` path (`llvm.sadd.with.overflow` at `iN`) — not only at i64 as the old
+    // interpreter did. `cast` gives each operand its sized type.
+    let run = |ty: &str, op: BinOp, l: Expr, r: Expr| {
+        run_to_string(&program(vec![main_fn(vec![spill_it(bin(
+            op,
+            cast(l, tn(ty)),
+            cast(r, tn(ty)),
+        ))])]))
+    };
+    // i8: 100 + 100 = 200 > i8::MAX (127) → trap.
+    assert!(matches!(
+        run("i8", BinOp::Add, int(100), int(100)),
+        Err(RunError::Overflow(_))
+    ));
+    // i8: 20 * 20 = 400 > 127 → trap.
+    assert!(matches!(
+        run("i8", BinOp::Mul, int(20), int(20)),
+        Err(RunError::Overflow(_))
+    ));
+    // i16: 30000 + 10000 = 40000 > i16::MAX (32767) → trap.
+    assert!(matches!(
+        run("i16", BinOp::Add, int(30_000), int(10_000)),
+        Err(RunError::Overflow(_))
+    ));
+    // i32: 2e9 + 2e9 = 4e9 > i32::MAX (~2.147e9) → trap. This one does NOT overflow i64, so the
+    // old interpreter silently produced 4000000000 instead of trapping — the core divergence.
+    assert!(matches!(
+        run("i32", BinOp::Add, int(2_000_000_000), int(2_000_000_000)),
+        Err(RunError::Overflow(_))
+    ));
+    // In range: i8 100 + 27 == 127, no trap.
+    assert_eq!(
+        run("i8", BinOp::Add, int(100), int(27)).unwrap(),
+        format!("{}\n", 100i8 + 27)
+    );
+}
+
+#[test]
+fn narrow_intermediate_wraps_before_comparison() {
+    // The strongest check that *intermediates* wrap (not just values re-bound through a typed
+    // `let`, which the old `coerce` already fixed for the ring ops): `(a - b)` on `u8` wraps to
+    // 251, so `> 100` is true. The old evaluator computed -5 and reported false.
+    let out = run_main(vec![
+        let_(&["a"], Some(tn("u8")), vec![int(5)]),
+        let_(&["b"], Some(tn("u8")), vec![int(10)]),
+        spill_it(bin(
+            BinOp::Gt,
+            bin(BinOp::Sub, name("a"), name("b")),
+            int(100),
+        )),
+    ]);
+    assert_eq!(out, "nocap\n");
+}
+
+#[test]
+fn narrowing_cast_truncates_twos_complement() {
+    // `x as u8` truncates mod 256 (spec §2.4), `x as i8` re-signs, both matching the compiled
+    // path's narrowing truncation. `-1 as u8 == 255`, `300 as u8 == 44`, `200 as i8 == -56`.
+    let out = run_main(vec![
+        spill_it(cast(int(300), tn("u8"))),
+        spill_it(cast(un(UnOp::Neg, int(1)), tn("u8"))),
+        spill_it(cast(int(200), tn("i8"))),
+    ]);
+    assert_eq!(
+        out,
+        format!("{}\n{}\n{}\n", 300u32 as u8, (-1i32) as u8, 200u32 as i8),
+    );
+}
