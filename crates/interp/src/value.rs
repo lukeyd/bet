@@ -14,11 +14,77 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
+/// The declared width and signedness of a [`Value::Int`] (spec §2.4). The interpreter tracks it
+/// so narrow-integer arithmetic wraps (unsigned) or traps (signed, debug-build behavior) at the
+/// operand's *true* width — matching the compiled LLVM path, which lowers each `iN` to
+/// `custom_width_int_type(N)` so it already wraps/traps at the real width. The default `int` is
+/// [`IntTy::WORD`] (a signed 64-bit `i64`); `u64` is 64-bit unsigned; and so on down the tower.
+///
+/// **Equality is width-blind on purpose.** An integer's identity is its value, not its declared
+/// type — `5` and a `u8` holding `5` compare equal, just as they do in source. So `PartialEq` is
+/// implemented to always hold, which makes the derived [`Value`] equality (used for `==`/`!=`,
+/// `stash` keys, and tests) compare only the stored value. Code that needs the *real* width/sign
+/// must read the fields or call [`IntTy::same_repr`], never `==`.
+#[derive(Clone, Copy, Debug)]
+pub struct IntTy {
+    /// Bit width: 8/16/32/64.
+    pub bits: u8,
+    /// `true` for the signed tower (`i8..i64`/`int`), `false` for the unsigned tower (`u8..u64`).
+    pub signed: bool,
+}
+
+impl IntTy {
+    /// The default `int` — a signed 64-bit integer. Bare integer literals also carry this until a
+    /// typed context (a bind/`coerce`, a cast, or a sized partner in arithmetic) narrows them.
+    pub const WORD: IntTy = IntTy {
+        bits: 64,
+        signed: true,
+    };
+
+    /// Structural (width + signedness) comparison — the real one, since `==` is width-blind.
+    pub fn same_repr(self, other: IntTy) -> bool {
+        self.bits == other.bits && self.signed == other.signed
+    }
+}
+
+impl Default for IntTy {
+    fn default() -> Self {
+        IntTy::WORD
+    }
+}
+
+/// Wrap `v` into `ty`'s width, two's complement (spec §2.4). For 64-bit types the `i64` storage
+/// already holds the full width, so the value passes through; narrower types truncate to
+/// `bits` and re-sign, mirroring the compiled path's `custom_width_int_type(bits)` semantics.
+pub fn wrap_to(v: i128, ty: IntTy) -> i64 {
+    let bits = u32::from(ty.bits);
+    if bits >= 64 {
+        // i64/u64 fill the storage; narrowing is a no-op (any wrap already happened in `i64`).
+        return v as i64;
+    }
+    let modulus = 1i128 << bits;
+    let mut m = v.rem_euclid(modulus);
+    if ty.signed && m >= (1i128 << (bits - 1)) {
+        m -= modulus;
+    }
+    m as i64
+}
+
+// See the `IntTy` doc comment: value identity ignores declared width, so all `IntTy` compare
+// equal and the derived `Value` equality reduces to comparing the stored integer.
+impl PartialEq for IntTy {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
 /// A runtime value.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
-    /// A signed 64-bit integer — the `int`/`i64` default and (for this slice) every sized int.
-    Int(i64),
+    /// A sized integer: the stored two's-complement value plus its declared width/signedness
+    /// ([`IntTy`]). `int`/`i64` is [`IntTy::WORD`]; the narrower tower carries its true width so
+    /// arithmetic wraps/traps at that width like the compiled path (spec §2.4).
+    Int { v: i64, ty: IntTy },
     /// A 64-bit float (`f64`/`float`).
     Float(f64),
     /// A single byte literal.
@@ -112,7 +178,11 @@ impl SimdVal {
 /// its trailing newline, and the text each `{}` in `spill.f` expands to.
 pub fn display(v: &Value) -> String {
     match v {
-        Value::Int(i) => i.to_string(),
+        // Narrow unsigned values are stored non-negative (wrapped into `0..2^bits`), so the plain
+        // stored value already renders correctly; a full-width `u64` past `i64::MAX` (held as a
+        // negative `i64`) reinterprets as unsigned.
+        Value::Int { v, ty } if !ty.signed && ty.bits >= 64 => (*v as u64).to_string(),
+        Value::Int { v, .. } => v.to_string(),
         Value::Byte(b) => b.to_string(),
         Value::Float(x) => display_float(*x),
         Value::Bool(true) => "nocap".to_string(),
@@ -180,10 +250,27 @@ fn display_float(x: f64) -> String {
 }
 
 impl Value {
+    /// A default-`int` (signed 64-bit, [`IntTy::WORD`]) integer value. The interpreter's ubiquitous
+    /// constructor — bare literals, intrinsic results, indices, and anything not carrying a narrower
+    /// declared type. Narrow/typed integers are stamped via [`Value::sized`] (at a bind/cast/field
+    /// boundary or an arithmetic result).
+    pub fn int(v: i64) -> Value {
+        Value::Int { v, ty: IntTy::WORD }
+    }
+
+    /// An integer of a specific declared width/signedness, wrapped (two's complement) into that
+    /// width so it is stored canonically — matching a bind/cast to that type on the compiled path.
+    pub fn sized(v: i128, ty: IntTy) -> Value {
+        Value::Int {
+            v: wrap_to(v, ty),
+            ty,
+        }
+    }
+
     /// The value's type name, for error messages.
     pub fn type_name(&self) -> &'static str {
         match self {
-            Value::Int(_) => "int",
+            Value::Int { .. } => "int",
             Value::Float(_) => "float",
             Value::Byte(_) => "byte",
             Value::Bool(_) => "bool",
