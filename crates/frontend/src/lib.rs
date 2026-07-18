@@ -19,9 +19,22 @@ mod resolve;
 
 pub use loader::load;
 
+/// Re-exported so tooling (the formatter) can name the recovered comment trivia.
+pub use lexer::{Comment, CommentKind};
+
 /// Re-exported so callers (e.g. the `driver`) can hold the produced module without naming
 /// the `midir` crate directly.
 pub use midir::Module;
+
+/// Lexical trivia recovered alongside a parse — currently the source's comments, span-sorted.
+///
+/// The surface [`ast`] deliberately carries no comments (they are structurally irrelevant), so a
+/// tool that must preserve them — the formatter — gets them here instead and re-interleaves them
+/// by span. The compiler pipeline uses [`parse`] and never sees this.
+#[derive(Clone, Debug, Default)]
+pub struct Trivia {
+    pub comments: Vec<Comment>,
+}
 
 /// Parse `bet` source into a surface [`ast::Program`].
 ///
@@ -32,6 +45,18 @@ pub use midir::Module;
 pub fn parse(src: &str) -> Result<ast::Program, CompileError> {
     let tokens = lexer::tokenize(src).map_err(CompileError::Lex)?;
     parser::parse(&tokens).map_err(CompileError::Parse)
+}
+
+/// Parse `bet` source like [`parse`], additionally returning the source's lexical [`Trivia`]
+/// (its comments), for tooling that must round-trip them.
+///
+/// The parsed [`ast::Program`] is identical to what [`parse`] returns — the recovered comments
+/// ride alongside in the token scan and never affect parsing. Only the formatter needs this; the
+/// compiler pipeline stays on [`parse`].
+pub fn parse_with_trivia(src: &str) -> Result<(ast::Program, Trivia), CompileError> {
+    let (tokens, comments) = lexer::tokenize_with_trivia(src).map_err(CompileError::Lex)?;
+    let program = parser::parse(&tokens).map_err(CompileError::Parse)?;
+    Ok((program, Trivia { comments }))
 }
 
 /// A failure anywhere in the front-end pipeline.

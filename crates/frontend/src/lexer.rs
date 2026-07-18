@@ -16,6 +16,29 @@ pub struct Spanned {
     pub span: Span,
 }
 
+/// A comment recovered from the source, with its byte [`Span`].
+///
+/// Comments are lexical *trivia*: they never enter the token stream (the parser ignores them),
+/// so `logos` skips them. But tooling like the formatter must round-trip them, so
+/// [`tokenize_with_trivia`] recovers them into a span-sorted side table. `text` is the comment's
+/// exact source slice, delimiters included (`// …` or `/* … */`).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Comment {
+    pub span: Span,
+    pub text: String,
+    pub kind: CommentKind,
+}
+
+/// Which of the two comment forms a [`Comment`] is (they round-trip differently: a line comment
+/// owns the rest of its line, a block comment can span lines and sit mid-line).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CommentKind {
+    /// `// …` — runs to the end of the line.
+    Line,
+    /// `/* … */` — non-nesting, may span lines.
+    Block,
+}
+
 /// A lexical token. `Newline` is produced by the raw scan and consumed by ASI; the parser
 /// only ever sees `Semi` (never `Newline`).
 #[derive(Logos, Clone, PartialEq, Debug)]
@@ -228,7 +251,23 @@ impl Token {
 }
 
 /// Tokenize a whole source string, or fail at the first unrecognized input.
+///
+/// This is the parser's entry point: comments and whitespace are elided from the returned stream.
+/// Callers that must round-trip comments (the formatter) use [`tokenize_with_trivia`], which
+/// returns the exact same token stream *plus* the recovered comments.
 pub fn tokenize(src: &str) -> Result<Vec<Spanned>, String> {
+    Ok(tokenize_with_trivia(src)?.0)
+}
+
+/// Tokenize `src`, additionally recovering the comments the token scan skips.
+///
+/// The token stream is byte-for-byte the one [`tokenize`] produces — comments never enter it, so
+/// the parser (and every non-formatter consumer) is completely unaffected. `logos` still *skips*
+/// both comment forms; the bytes they occupied survive only as gaps between adjacent token spans,
+/// and [`scan_comments`] reads those gaps back. Because every string / byte literal (and every
+/// other lexeme) is itself a token, a `//` or `/*` inside a literal is never in a gap and so is
+/// never mistaken for a comment. The returned comments are sorted by ascending byte offset.
+pub fn tokenize_with_trivia(src: &str) -> Result<(Vec<Spanned>, Vec<Comment>), String> {
     let mut raw = Vec::new();
     let mut lex = Token::lexer(src);
     while let Some(res) = lex.next() {
@@ -247,7 +286,66 @@ pub fn tokenize(src: &str) -> Result<Vec<Spanned>, String> {
             }
         }
     }
-    Ok(apply_asi(raw))
+    let comments = scan_comments(src, &raw);
+    Ok((apply_asi(raw), comments))
+}
+
+/// Recover comments from the gaps between the raw tokens in `toks` (see [`tokenize_with_trivia`]).
+///
+/// `logos` skips both comment forms, so the only bytes *not* covered by a token span are
+/// horizontal whitespace and comments — meaning any `//` / `/*` found in a gap is a genuine
+/// comment (never text inside a string literal, which is a single token). The two forms are
+/// recognized exactly as the lexer's skip patterns do: a line comment runs to the next newline, a
+/// block comment to the first `*/`. An unterminated `/*` never reaches here — `logos` would have
+/// lexed it as `/` `*` tokens (no gap), so the block-comment arm only runs on well-formed spans.
+fn scan_comments(src: &str, toks: &[Spanned]) -> Vec<Comment> {
+    let bytes = src.as_bytes();
+    let mut comments = Vec::new();
+    let mut ti = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // Advance past any token that ends at or before `i`.
+        while ti < toks.len() && (toks[ti].span.end as usize) <= i {
+            ti += 1;
+        }
+        // If `i` sits inside the next token, jump over that whole lexeme.
+        if ti < toks.len() && (toks[ti].span.start as usize) <= i {
+            i = toks[ti].span.end as usize;
+            continue;
+        }
+        // `i` is in a gap: horizontal whitespace or a comment.
+        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            let mut j = i + 2;
+            while j < bytes.len() && bytes[j] != b'\n' {
+                j += 1;
+            }
+            comments.push(Comment {
+                span: Span::new(i as u32, j as u32),
+                text: src[i..j].to_string(),
+                kind: CommentKind::Line,
+            });
+            i = j;
+        } else if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            let mut j = i + 2;
+            while j + 1 < bytes.len() && !(bytes[j] == b'*' && bytes[j + 1] == b'/') {
+                j += 1;
+            }
+            let end = if j + 1 < bytes.len() {
+                j + 2
+            } else {
+                bytes.len()
+            };
+            comments.push(Comment {
+                span: Span::new(i as u32, end as u32),
+                text: src[i..end].to_string(),
+                kind: CommentKind::Block,
+            });
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    comments
 }
 
 /// The L6 ASI pass: collapse `Newline` tokens into statement-terminating `Semi`s.
@@ -452,9 +550,14 @@ mod tests {
     }
 
     #[test]
-    fn comments_are_skipped_but_newlines_survive() {
+    fn comments_are_captured_as_trivia() {
+        let (toks, comments) =
+            tokenize_with_trivia("a // trailing\n/* block\n spanning */ b\n").unwrap();
+        // The token stream is UNCHANGED: comments never enter it, so ASI still fires exactly as
+        // before (`a` and `b` each get a terminating `Semi`) and the parser is unaffected.
+        let toks: Vec<Token> = toks.into_iter().map(|s| s.tok).collect();
         assert_eq!(
-            kinds("a // trailing\n/* block\n spanning */ b\n"),
+            toks,
             vec![
                 Token::Ident("a".into()),
                 Token::Semi,
@@ -462,5 +565,21 @@ mod tests {
                 Token::Semi,
             ]
         );
+        // Both comments are recovered as trivia, in source order, with kind, exact text, and span.
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0].kind, CommentKind::Line);
+        assert_eq!(comments[0].text, "// trailing");
+        assert_eq!(comments[0].span, Span::new(2, 13));
+        assert_eq!(comments[1].kind, CommentKind::Block);
+        assert_eq!(comments[1].text, "/* block\n spanning */");
+    }
+
+    #[test]
+    fn double_slash_inside_string_is_not_a_comment() {
+        // A `//` inside a string literal must NOT be recovered as a comment: the string is one
+        // token, so the `//` is never in an inter-token gap.
+        let (_toks, comments) = tokenize_with_trivia("lowkey u = \"http://x\" // real\n").unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].text, "// real");
     }
 }
