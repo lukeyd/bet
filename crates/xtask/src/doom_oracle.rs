@@ -1,8 +1,9 @@
 //! `cargo xtask doom-oracle` — the doomgeneric-based reference oracle.
 //!
-//! `--setup` clones https://github.com/ozkl/doomgeneric (pinned to [`DOOMGENERIC_SHA`]) into
-//! `/Users/lukebaggett/Documents/bet/doom-oracle` (outside the repo; `/doom-oracle/` is in the
-//! repo root .gitignore) and applies `ports/doom/goldens/oracle.patch`, which adds the headless
+//! `--setup` clones https://github.com/ozkl/doomgeneric (pinned to [`DOOMGENERIC_SHA`]) into the
+//! oracle checkout dir (see [`crate::doom::oracle_dir`]: the `BET_DOOM_ORACLE` env var if set, else
+//! the repo-relative `doom-oracle`, which is gitignored at the repo root) and applies
+//! `ports/doom/goldens/oracle.patch`, which adds the headless
 //! dump platform `doomgeneric/doomgeneric_dump.c` (no window, uncapped time) plus two one-line
 //! hooks (after `G_Ticker()` in d_net.c's RunTic; after `P_SetupLevel(..)` in g_game.c).
 //!
@@ -20,7 +21,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-use crate::doom::{DEFAULT_IWAD, ORACLE_DIR};
+use crate::doom::{default_iwad, oracle_dir};
 
 /// The pinned doomgeneric commit (master as cloned 2026-07-06).
 pub const DOOMGENERIC_SHA: &str = "dcb7a8dbc7a16ce3dda29382ac9aae9d77d21284";
@@ -133,7 +134,7 @@ pub fn run(args: &[String], root: &Path) -> Result<()> {
 
 /// Clone (if needed), pin, and patch the oracle checkout. Idempotent.
 fn setup(root: &Path) -> Result<PathBuf> {
-    let dir = PathBuf::from(ORACLE_DIR);
+    let dir = oracle_dir();
     if !dir.join(".git").exists() {
         println!(
             "doom-oracle: cloning {DOOMGENERIC_URL} -> {}",
@@ -258,11 +259,18 @@ pub fn produce_sync(args: &[String], root: &Path, demo: &str) -> Result<PathBuf>
     let _ = fs::remove_file(&out_path); // the dump appends; start clean
     fs::create_dir_all(out_path.parent().expect("has parent"))?;
 
-    println!("doom-oracle: running -timedemo {demo} (iwad: {DEFAULT_IWAD})...");
+    let iwad = default_iwad();
+    println!(
+        "doom-oracle: running -timedemo {demo} (iwad: {})...",
+        iwad.display()
+    );
     let out = Command::new(&bin)
         .current_dir(&dir)
         .env("DOOM_SYNC_OUT", &out_path)
-        .args(["-iwad", DEFAULT_IWAD, "-timedemo", demo])
+        .arg("-iwad")
+        .arg(&iwad)
+        .arg("-timedemo")
+        .arg(demo)
         .output()
         .context("running the headless oracle")?;
     // Vanilla-family timedemo quits through I_Error("timed %i gametics...") — a nonzero exit

@@ -124,6 +124,16 @@ fn goldens(root: &Path) -> Result<()> {
             continue;
         };
         let path = dir.join(format!("{name}.golden"));
+        if !path.exists() {
+            bail!(
+                "golden not found: {}\n\
+                 The `{name}.golden` tables are gitignored (id-derived output), so a fresh checkout\n\
+                 has none. Regenerate them from the reference source with:\n    \
+                 cargo xtask-doom doom-golden-gen\n\
+                 (making --goldens runnable in CI without that step is tracked in #114).",
+                path.display()
+            );
+        }
         let golden =
             fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
         if let Some(d) = first_line_diff(twin_text, &golden) {
