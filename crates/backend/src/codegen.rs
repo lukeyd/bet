@@ -222,6 +222,19 @@ impl<'c> Cg<'c> {
     /// type, and it MUST be identical at all those call sites (`get_or_add` keeps the first
     /// declaration, so a divergent signature would silently mis-type the ABI).
     fn tag_ty(&self) -> StructType<'c> {
+        // Pin this LLVM struct to the real `rt_abi::Tag` at compile time so the hand-written
+        // lanes here can never silently drift from the ABI type (issue #103). The `#[repr(C)]`
+        // `Tag` is 16 bytes / 8-aligned with `slot`@0 (u32), `_pad`@4 (u32), `generation`@8
+        // (u64) — exactly the `{ i32, i32, i64 }` emitted below.
+        const _: () = {
+            assert!(std::mem::size_of::<rt_abi::Tag>() == 16);
+            assert!(std::mem::align_of::<rt_abi::Tag>() == 8);
+            assert!(std::mem::offset_of!(rt_abi::Tag, slot) == 0);
+            assert!(std::mem::offset_of!(rt_abi::Tag, _pad) == 4);
+            assert!(std::mem::offset_of!(rt_abi::Tag, generation) == 8);
+            assert!(std::mem::size_of::<u32>() == 4); // slot / _pad -> i32 lanes
+            assert!(std::mem::size_of::<u64>() == 8); // generation -> i64 lane
+        };
         self.cx.struct_type(
             &[
                 self.cx.i32_type().into(),
@@ -2297,14 +2310,17 @@ impl<'c> Cg<'c> {
                     "float const with non-float type".into(),
                 )),
             },
-            // `ghosted` in a tag context is the null tag (`rt_abi::Tag::NULL`: slot=u32::MAX,
-            // _pad=0, generation=0), built as the `{ i32 slot, i32 _pad, i64 generation }` struct value (issues
-            // #34). Its slot is out of range for any crib, so it always resolves as ghosted.
-            // Other (contextual) uses of `ghosted` are not supported yet.
+            // `ghosted` in a tag context is the null tag, whose field values are read straight
+            // off `rt_abi::Tag::NULL` (slot = u32::MAX, _pad = 0, generation = 0) rather than
+            // re-spelled here (issue #103), then built as the `{ i32 slot, i32 _pad, i64
+            // generation }` struct value (issue #34). Its slot is out of range for any crib, so
+            // it always resolves as ghosted. Other (contextual) uses of `ghosted` are not
+            // supported yet.
             Const::Ghosted => {
-                let slot = self.cx.i32_type().const_int(0xFFFF_FFFF, false);
-                let pad = self.cx.i32_type().const_zero();
-                let generation = self.cx.i64_type().const_zero();
+                let null = rt_abi::Tag::NULL;
+                let slot = self.cx.i32_type().const_int(null.slot as u64, false);
+                let pad = self.cx.i32_type().const_int(null._pad as u64, false);
+                let generation = self.cx.i64_type().const_int(null.generation, false);
                 Ok(self
                     .tag_ty()
                     .const_named_struct(&[slot.into(), pad.into(), generation.into()])

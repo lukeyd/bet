@@ -14,6 +14,12 @@
 #[cfg(feature = "llvm")]
 mod codegen;
 
+// `codegen` genuinely uses `rt_abi::Tag` (see `tag_ty` / the `ghosted` lowering), but it is
+// compiled only under `--features llvm`. This keeps the allowlisted `backend -> rt-abi` edge
+// live in the default (LLVM-free) build too, so `unused_crate_dependencies` stays satisfied in
+// every configuration (issue #103; mirrors `lsp`'s `use frontend as _;`).
+use rt_abi as _;
+
 /// How to emit an object from a module.
 #[derive(Clone, Debug)]
 pub struct EmitOptions {
