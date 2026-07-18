@@ -16,38 +16,119 @@
 //! - Redundant parentheses are dropped: the printer re-inserts exactly the parentheses that
 //!   precedence (and the header "no struct literal" rule) require, and no more.
 //!
+//! ## Comment preservation
+//! Comments are not part of the surface AST, so the formatter re-interleaves them from a
+//! span-sorted side table ([`frontend::Trivia`], via [`frontend::parse_with_trivia`]): as it
+//! walks the tree it emits any pending comment that starts before the current node (a *leading*
+//! comment, on its own line) and re-attaches a same-line *trailing* comment to the line it
+//! follows. Comment placement is normalized (leading comments sit at the node's indentation;
+//! trailing comments are separated by exactly two spaces), so — like the rest of the output — it
+//! is a fixed point: re-formatting never moves a comment again. No comment is ever dropped.
+//!
 //! ## Deliberate non-preservation
-//! The surface AST does not carry comments or integer literal bases, so the formatter cannot
-//! preserve them: comments are dropped and every integer is printed in decimal. Both are pure
-//! surface concerns — the re-parsed AST is structurally identical either way.
+//! The surface AST does not carry integer literal bases, so every integer is printed in decimal;
+//! source blank lines and comment column-alignment are likewise not preserved (both are pure
+//! surface concerns — the re-parsed AST is structurally identical either way).
 
 use frontend::ast::*;
+use frontend::{Comment, CommentKind};
 
 /// Parse `bet` source and render it in canonical form.
 ///
 /// Returns the formatted program (always terminated by a single newline), or the front-end's
-/// error message if the input does not parse.
+/// error message if the input does not parse. Comments are preserved (see the module docs).
 pub fn format_source(src: &str) -> Result<String, String> {
-    let program = frontend::parse(src).map_err(|e| e.to_string())?;
-    let mut f = Formatter { out: String::new() };
+    let (program, trivia) = frontend::parse_with_trivia(src).map_err(|e| e.to_string())?;
+    let mut f = Formatter {
+        out: String::new(),
+        src,
+        comments: &trivia.comments,
+        next: 0,
+    };
     f.program(&program);
     Ok(f.out)
 }
 
-struct Formatter {
+struct Formatter<'a> {
     out: String,
+    /// The original source, used to tell whether a comment sits on the same line as the node it
+    /// follows (a trailing comment) by checking the byte gap between them for a newline.
+    src: &'a str,
+    /// All source comments, sorted by ascending byte offset.
+    comments: &'a [Comment],
+    /// Index of the next not-yet-emitted comment in `comments`.
+    next: usize,
 }
 
-impl Formatter {
+impl Formatter<'_> {
+    // --- comment interleaving ----------------------------------------------
+
+    /// Emit every pending comment that starts before byte `pos`, each on its own line at
+    /// indentation `ind`. Used both for a node's *leading* comments (`pos` = node start) and for
+    /// a block's *dangling* comments before its closing brace (`pos` = block end). Trailing
+    /// whitespace inside each comment is trimmed so no line gains trailing spaces.
+    fn flush_before(&mut self, pos: u32, ind: usize) {
+        while self.next < self.comments.len() && self.comments[self.next].span.start < pos {
+            let text = self.comments[self.next].text.trim_end().to_string();
+            self.next += 1;
+            self.emit_comment_line(&text, ind);
+        }
+    }
+
+    /// Emit a standalone comment: `ind` levels of indent, the (already trimmed) text, a newline.
+    /// A multi-line block comment keeps its interior lines verbatim — the leading indent applies
+    /// only to its first line, which is stable across re-formats (the interior bytes are copied
+    /// unchanged either way).
+    fn emit_comment_line(&mut self, text: &str, ind: usize) {
+        self.indent(ind);
+        self.out.push_str(text);
+        self.out.push('\n');
+    }
+
+    /// After emitting a node whose output ends in a newline, re-attach any comment(s) that sit on
+    /// the *same source line* as the node's end (byte `end`) as a trailing `  // …`. A gap
+    /// containing a newline means the comment is on a later line, so it is left for `flush_before`.
+    /// A line comment ends the line, so at most one can follow it.
+    fn trailing_comment(&mut self, end: u32) {
+        let mut cursor = end as usize;
+        while self.next < self.comments.len() {
+            let c = &self.comments[self.next];
+            let start = c.span.start as usize;
+            // Only attach comments that come after `cursor` on the same line (no newline between).
+            if start < cursor || self.src[cursor..start].contains('\n') {
+                break;
+            }
+            let text = c.text.trim_end().to_string();
+            let is_line = c.kind == CommentKind::Line;
+            cursor = c.span.end as usize;
+            self.next += 1;
+            // Splice the comment in before the just-emitted trailing newline.
+            if self.out.ends_with('\n') {
+                self.out.pop();
+            }
+            self.out.push_str("  ");
+            self.out.push_str(&text);
+            self.out.push('\n');
+            if is_line {
+                break;
+            }
+        }
+    }
     // --- program & top-level items -----------------------------------------
 
     fn program(&mut self, p: &Program) {
         for (i, item) in p.items.iter().enumerate() {
+            let span = item_span(item);
             if i > 0 && !compact_pair(&p.items[i - 1], item) {
                 self.out.push('\n');
             }
+            // Leading comments sit after the item-separating blank line but before the item.
+            self.flush_before(span.start, 0);
             self.item(item);
+            self.trailing_comment(span.end);
         }
+        // Any comments after the last item (a trailing file comment, say) flush at top level.
+        self.flush_before(u32::MAX, 0);
     }
 
     fn item(&mut self, item: &Item) {
@@ -106,6 +187,7 @@ impl Formatter {
         self.generic_params(&d.generics);
         self.out.push_str(" {\n");
         for field in &d.fields {
+            self.flush_before(field.span.start, 1);
             self.indent(1);
             match field.vis {
                 Some(Vis::Flex) => self.out.push_str("flex "),
@@ -116,7 +198,9 @@ impl Formatter {
             self.out.push_str(": ");
             self.out.push_str(&type_str(&field.ty));
             self.out.push('\n');
+            self.trailing_comment(field.span.end);
         }
+        self.flush_before(d.span.end, 1);
         self.out.push_str("}\n");
     }
 
@@ -127,6 +211,7 @@ impl Formatter {
         self.generic_params(&m.generics);
         self.out.push_str(" {\n");
         for (i, v) in m.variants.iter().enumerate() {
+            self.flush_before(v.span.start, 1);
             self.indent(1);
             self.out.push_str(&v.name);
             if !v.payload.is_empty() {
@@ -138,7 +223,9 @@ impl Formatter {
                 self.out.push(',');
             }
             self.out.push('\n');
+            self.trailing_comment(v.span.end);
         }
+        self.flush_before(m.span.end, 1);
         self.out.push_str("}\n");
     }
 
@@ -233,8 +320,12 @@ impl Formatter {
 
     fn block_body(&mut self, block: &Block, ind: usize) {
         for s in &block.stmts {
+            self.flush_before(s.span.start, ind);
             self.stmt(s, ind);
+            self.trailing_comment(s.span.end);
         }
+        // Comments after the last statement but before the closing brace dangle inside the block.
+        self.flush_before(block.span.end, ind);
     }
 
     fn stmt(&mut self, s: &Stmt, ind: usize) {
@@ -285,6 +376,7 @@ impl Formatter {
                 self.expr(scrutinee, true);
                 self.out.push_str(" {\n");
                 for arm in arms {
+                    self.flush_before(arm.span.start, ind + 1);
                     self.indent(ind + 1);
                     self.out.push_str(&arm.variant);
                     if !arm.bindings.is_empty() {
@@ -296,14 +388,18 @@ impl Formatter {
                     self.block_body(&arm.body, ind + 2);
                     self.indent(ind + 1);
                     self.out.push_str("}\n");
+                    self.trailing_comment(arm.span.end);
                 }
                 if let Some(def) = default {
+                    self.flush_before(def.span.start, ind + 1);
                     self.indent(ind + 1);
                     self.out.push_str("naw {\n");
                     self.block_body(def, ind + 2);
                     self.indent(ind + 1);
                     self.out.push_str("}\n");
                 }
+                // Comments after the last arm / default but before the vibe's own brace dangle here.
+                self.flush_before(s.span.end, ind + 1);
                 self.indent(ind);
                 self.out.push_str("}\n");
             }
@@ -846,6 +942,20 @@ fn compact_pair(a: &Item, b: &Item) -> bool {
     )
 }
 
+/// The source [`Span`] of a top-level item, used to interleave its leading/trailing comments.
+fn item_span(item: &Item) -> Span {
+    match item {
+        Item::Pull(p) => p.span,
+        Item::Func(f) => f.span,
+        Item::Drip(d) => d.span,
+        Item::Moods(m) => m.span,
+        Item::Crib(c) => c.span,
+        Item::Const(c) => c.span,
+        Item::Var(v) => v.span,
+        Item::Extern(e) => e.span,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::format_source;
@@ -941,6 +1051,164 @@ mod tests {
     #[test]
     fn parse_error_is_reported() {
         assert!(format_source("finna (").is_err());
+    }
+
+    // --- comment preservation (issue #54) -----------------------------------
+
+    #[test]
+    fn leading_line_comment_survives() {
+        // A comment on its own line above a statement stays a leading comment at that indent.
+        check(
+            "finna main() {\n    // greet\n    spill.it(1)\n}\n",
+            "finna main() {\n    // greet\n    spill.it(1)\n}\n",
+        );
+    }
+
+    #[test]
+    fn trailing_line_comment_survives() {
+        // An end-of-line comment re-attaches to its line, normalized to two leading spaces.
+        check(
+            "finna main() {\n    lowkey x = 1 // the answer\n}\n",
+            "finna main() {\n    lowkey x = 1  // the answer\n}\n",
+        );
+    }
+
+    #[test]
+    fn file_header_comment_survives() {
+        // A comment before the very first item is that item's leading comment (no blank line).
+        check(
+            "// bit-ops demo\npull \"spill\"\n",
+            "// bit-ops demo\npull \"spill\"\n",
+        );
+    }
+
+    #[test]
+    fn block_comment_survives_and_dangling_before_brace() {
+        // A block comment leads a statement; a trailing comment dangles before the closing brace.
+        check(
+            "finna f() {\n    /* setup */\n    lowkey x = 1\n    // done\n}\n",
+            "finna f() {\n    /* setup */\n    lowkey x = 1\n    // done\n}\n",
+        );
+    }
+
+    #[test]
+    fn comments_on_drip_fields_survive() {
+        check(
+            "drip Point {\n    x: int // horizontal\n    // vertical follows\n    y: int\n}\n",
+            "drip Point {\n    x: int  // horizontal\n    // vertical follows\n    y: int\n}\n",
+        );
+    }
+
+    #[test]
+    fn comments_on_moods_variants_survive() {
+        check(
+            "moods Shape {\n    Dot // a point\n    Circle(int)\n}\n",
+            "moods Shape {\n    Dot,  // a point\n    Circle(int)\n}\n",
+        );
+    }
+
+    #[test]
+    fn leading_and_trailing_together_are_idempotent() {
+        // Both forms on adjacent lines, mixed with a top-level header — the whole thing is a fixed
+        // point (the second format equals the first), which is what `fmt --check` relies on.
+        let src = "\
+// top of file
+pull \"spill\"
+
+// main entry
+finna main() {
+    lowkey a = 1  // first
+    // between
+    spill.it(a)  // print it
+}
+";
+        check(src, src);
+    }
+
+    #[test]
+    fn many_spaces_before_trailing_comment_normalize_to_two() {
+        // Column-aligned comments collapse to a single canonical spacing, then stay put.
+        check(
+            "finna main() {\n    lowkey a = 1        // aligned\n}\n",
+            "finna main() {\n    lowkey a = 1  // aligned\n}\n",
+        );
+    }
+
+    #[test]
+    fn no_comment_is_dropped_across_every_construct() {
+        // A program touching an import, a drip, a moods, a fr/naw chain, and a vibe match — each
+        // carrying line and block comments in leading, trailing, and dangling positions. Every
+        // comment must survive the format, and the result must be a fixed point.
+        let src = "\
+// file header
+pull \"spill\"
+
+drip Pt {
+    x: int  // the x
+    // y follows
+    y: int
+}
+
+moods Shape {
+    Dot,  // nullary
+    Circle(int)  // has a radius
+}
+
+finna classify(n: int) -> str {
+    // leading on fr
+    fr n < 0 {
+        bet \"neg\"  // negative
+    } naw {
+        /* fallthrough */
+        bet \"nonneg\"
+    }
+    // dangling before the fn brace
+}
+
+finna main() {
+    lowkey s = Dot
+    vibe s {
+        // before an arm
+        Dot {
+            spill.it(\"dot\")  // trailing in arm
+        }
+        Circle(r) {
+            spill.it(r)
+        }
+        // dangling in vibe
+    }
+}
+";
+        let once = format_source(src).expect("format");
+        for needle in [
+            "// file header",
+            "// the x",
+            "// y follows",
+            "// nullary",
+            "// has a radius",
+            "// leading on fr",
+            "// negative",
+            "/* fallthrough */",
+            "// dangling before the fn brace",
+            "// before an arm",
+            "// trailing in arm",
+            "// dangling in vibe",
+        ] {
+            assert!(once.contains(needle), "dropped {needle:?}:\n{once}");
+        }
+        let twice = format_source(&once).expect("re-format");
+        assert_eq!(once, twice, "not idempotent:\n{once}");
+    }
+
+    #[test]
+    fn comment_is_never_dropped_even_when_reflowed() {
+        // A comment wedged inside an expression cannot stay in place (the AST has no slot for it),
+        // but it must NOT be lost: it floats to the next statement boundary and then stabilizes.
+        let once = format_source("finna f() {\n    lowkey x = 1 /* mid */ + 2\n    bet x\n}\n")
+            .expect("format");
+        assert!(once.contains("/* mid */"), "comment was dropped:\n{once}");
+        let twice = format_source(&once).expect("re-format");
+        assert_eq!(once, twice, "not idempotent:\n{once}");
     }
 
     /// Issue #38: `type_str` must not overflow the stack on a pathologically deep type. The
