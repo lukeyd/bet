@@ -46,6 +46,7 @@ pull "../util/m_random" as rnd
 pull "../w/w_wad" as wad
 pull "../r/r_data" as rdata
 pull "../p/p_setup" as psetup
+pull "../util/m_argv" as margv
 
 // ---- crc32 (IEEE reflected, poly 0xEDB88320) over []i32 slabs, little-endian per entry (same as
 // goldens.bet / rdata_smoke) ----------------------------------------------------------------
@@ -202,7 +203,7 @@ finna main() {
     }
     rnd.clearRandom(g0)
 
-    wad.initWad(g0, "/Users/lukebaggett/Documents/bet/doom-reference/doom1.wad")
+    wad.initWad(g0, margv.wadPath())
     rdata.initData(g0)
 
     psetup.setupLevel(g0, 1, 1, doomdef.SK_HARD)

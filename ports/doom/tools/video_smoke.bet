@@ -38,6 +38,7 @@ pull "../w/w_wad" as wad
 pull "../i/i_system" as isys
 pull "../i/i_video" as iv
 pull "../v/v_video" as vv
+pull "../util/m_argv" as margv
 
 // ---- crc32 (IEEE-802.3 reflected, poly 0xEDB88320, init/xorout 0xFFFFFFFF) — the same
 // pipeline crc as ports/doom/goldens + tools/goldens.bet, specialized to a []u8 stream. -------
@@ -92,7 +93,7 @@ finna main() {
     lowkey g0 = cop gs.GameState{} in gs.gsc
     gs.gsInit(g0)
     isys.initTime(g0)
-    wad.initWad(g0, "/Users/lukebaggett/Documents/bet/doom-reference/doom1.wad")
+    wad.initWad(g0, margv.wadPath())
     iv.initGraphics(g0)
     iv.setPalette(g0, 0)
 

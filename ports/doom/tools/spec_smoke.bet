@@ -31,6 +31,7 @@ pull "../p/p_specutil" as psu
 pull "../p/p_doors" as pdoors
 pull "../p/p_plats" as pplats
 pull "../p/p_spec" as pspec
+pull "../util/m_argv" as margv
 
 flex finna noopMobj(gt: tag gs.GameState, actor: tag think.Thinker) {
 }
@@ -161,7 +162,7 @@ finna main() {
         yeet("gs")
     }
     rnd.clearRandom(g0)
-    wad.initWad(g0, "/Users/lukebaggett/Documents/bet/doom-reference/doom1.wad")
+    wad.initWad(g0, margv.wadPath())
     rdata.initData(g0)
     psetup.setupLevel(g0, 1, 1, doomdef.SK_HARD)
     pspec.wireHooks(g0)

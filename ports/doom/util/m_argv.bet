@@ -34,3 +34,21 @@ flex finna checkParm(check: str) -> int {
     }
     bet 0
 }
+
+// wadPath — where the smoke tools should look for the shareware IWAD. `-iwad <path>`
+// wins (same M_CheckParm dance as d_main.argAfter), else a bare first positional arg,
+// else the repo-relative default so no tool has to pin one dev's absolute path.
+flex finna wadPath() -> str {
+    lowkey p = checkParm("-iwad")
+    fr p != 0 && p < sys.argc() - 1 {
+        bet sys.arg(p + 1)
+    }
+    // a lone positional path (not another flag) works too: `rdata_smoke my.wad`.
+    fr sys.argc() > 1 {
+        lowkey a1 = sys.arg(1)
+        fr str.len(a1) > 0 && str.at(a1, 0) != 45 {
+            bet a1
+        }
+    }
+    bet "doom-reference/doom1.wad"
+}

@@ -50,6 +50,7 @@ pull "../p/p_action" as paction
 pull "../p/p_mobj" as pmobj
 pull "../p/p_map" as pmap
 pull "../p/p_pspr" as ppspr
+pull "../util/m_argv" as margv
 
 finna main() {
     lowkey g0 = cop gs.GameState{} in gs.gsc
@@ -78,7 +79,7 @@ finna main() {
     }
     rnd.clearRandom(g0)
 
-    wad.initWad(g0, "/Users/lukebaggett/Documents/bet/doom-reference/doom1.wad")
+    wad.initWad(g0, margv.wadPath())
     rdata.initData(g0)
     pthink.initThinkers(g0)
     paction.wireActions(g0)               // <-- the whole dispatch is now LIVE

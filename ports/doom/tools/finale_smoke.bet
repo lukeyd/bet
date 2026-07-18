@@ -45,6 +45,7 @@ pull "../s/s_sound" as ssnd
 pull "../hu/hu_stuff" as hu
 pull "../wi/wi_stuff" as wi
 pull "../f/f_finale" as fin
+pull "../util/m_argv" as margv
 
 // ---- crc32 (IEEE reflected, poly 0xEDB88320) over scr0 — same as menu_smoke ------------------
 flex finna hex8(v: int) -> str {
@@ -142,7 +143,7 @@ finna main() {
     }
     rnd.clearRandom(g0)
 
-    wad.initWad(g0, "/Users/lukebaggett/Documents/bet/doom-reference/doom1.wad")
+    wad.initWad(g0, margv.wadPath())
     ssnd.sInit(g0, 8, 8)          // sfx/music volumes (the counting SFX go through S_StartSound)
     rdata.initData(g0)            // flats/colormaps (F_TextWrite tiles a flat)
     hu.huInit(g0)                 // the HU_FONT (F_TextWrite reveals the crawl through it)

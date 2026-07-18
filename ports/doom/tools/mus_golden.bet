@@ -25,11 +25,10 @@ pull "spill"
 pull "fs"
 pull "../s/wad"
 pull "../s/mus"
-
-facts WAD: str = "/Users/lukebaggett/Documents/bet/doom-reference/doom1.wad"
+pull "../util/m_argv" as margv
 
 finna main() {
-    lowkey buf = fs.peep(WAD)
+    lowkey buf = fs.peep(margv.wadPath())
     lowkey ofs, len = wad.findLump(buf, "D_E1M1")
     fr ofs < 0 {
         spill.it("D_E1M1 not found")

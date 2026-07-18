@@ -38,6 +38,7 @@ pull "../i/i_system" as isys
 pull "../i/i_video" as iv
 pull "../st/st_stuff" as st
 pull "../hu/hu_stuff" as hu
+pull "../util/m_argv" as margv
 
 // ---- crc32 (IEEE-802.3 reflected; same as tools/goldens.bet + video_smoke.bet) -------------
 flex finna hex8(v: int) -> str {
@@ -110,7 +111,7 @@ finna main() {
     lowkey g0 = cop gs.GameState{} in gs.gsc
     gs.gsInit(g0)
     isys.initTime(g0)
-    wad.initWad(g0, "/Users/lukebaggett/Documents/bet/doom-reference/doom1.wad")
+    wad.initWad(g0, margv.wadPath())
     iv.initGraphics(g0)
     st.stInit(g0)
     hu.huInit(g0)
