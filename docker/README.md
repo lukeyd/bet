@@ -32,6 +32,33 @@ Drop into a shell to poke around:
 docker compose -f docker/compose.yaml exec bet bash
 ```
 
+## Reproducing the x86_64 compiler segfault (#111)
+
+The `bet` compiler **SIGSEGVs (exit 139) compiling `ports/doom/doom.bet` on x86_64 Linux**, but
+compiles it fine on aarch64. The whole project was developed on macOS/ARM64, so this had never
+surfaced locally: an unqualified Docker build on an Apple Silicon host produces a native **arm64**
+image — the arch where the bug is *absent*. The `bet` service now pins **`platform: linux/amd64`**
+(see `compose.yaml`), so on Apple Silicon the image builds and runs under **Rosetta emulation** and
+the crash reproduces off an x86_64 box.
+
+Requires **Docker Desktop with "Use Rosetta for x86/amd64 emulation" enabled** (Settings →
+General). The emulated LLVM build is *slow* (many minutes) — that's expected; let it run.
+
+```sh
+export UID; export GID=$(id -g)
+docker compose -f docker/compose.yaml build
+docker compose -f docker/compose.yaml run --rm bet bash -lc \
+  'uname -m; cargo build -p driver --features llvm && ulimit -c unlimited && \
+   gdb -q -batch -ex run -ex bt -ex "thread apply all bt" \
+     --args target/debug/bet build ports/doom/doom.bet --runtime real -o /tmp/doom'
+```
+
+`uname -m` must print `x86_64` (confirming the emulated target), after which `gdb` runs the
+compiler to the fault and prints the SIGSEGV backtrace. Note: **139 = 128 + 11 = SIGSEGV**, a real
+compiler crash — distinct from **137 = 128 + 9 = SIGKILL**, the cgroup-OOM kill `verify.sh` guards
+against. (`verify.sh` previously conflated the two; stage 3 now labels 139 as a segfault and points
+here.) This harness reproduces #111; it does not fix it — the codegen fix lands separately.
+
 ## What `verify.sh` checks
 
 All stages run (continue-on-error) and a PASS/FAIL summary prints at the end:

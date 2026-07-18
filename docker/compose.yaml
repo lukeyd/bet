@@ -13,6 +13,12 @@ name: bet-build
 
 services:
   bet:
+    # Pin the target platform to x86_64. The whole project was built on macOS/ARM64, so on an
+    # Apple Silicon host an unqualified build produces a native arm64 image — which is exactly the
+    # arch where the DOOM-compile segfault (#111) is ABSENT. Forcing linux/amd64 makes Docker build
+    # and run the x86_64 image under Rosetta emulation, so the bug reproduces off an x86_64 box.
+    # (Requires Docker Desktop with "Use Rosetta for x86/amd64 emulation" enabled. Slow but faithful.)
+    platform: linux/amd64
     build:
       context: .
     image: bet-build:llvm18-ubuntu2204

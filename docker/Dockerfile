@@ -21,8 +21,11 @@ ENV DEBIAN_FRONTEND=noninteractive
 #    final compiled programs reference. The `gg-desktop` block (alsa/x11/wayland/xkbcommon) is
 #    only needed to *build* the windowed runtime (minifb + cpal); the headless correctness path
 #    does not use it, but installing it keeps the desktop build available too.
+#    `gdb` is here so the x86_64 compiler segfault (#111) can be caught under a debugger and a
+#    backtrace captured (`gdb -batch -ex run -ex bt ... --args target/debug/bet build …`); it is a
+#    small base-layer tool and belongs with the rest of the build/debug tooling.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl gnupg git build-essential pkg-config cmake xz-utils \
+      ca-certificates curl gnupg git build-essential pkg-config cmake xz-utils gdb \
       zlib1g-dev libzstd-dev libffi-dev libxml2-dev libedit-dev libncurses5-dev \
       libasound2-dev libx11-dev libxkbcommon-dev libwayland-dev \
  && rm -rf /var/lib/apt/lists/*

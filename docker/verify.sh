@@ -88,8 +88,14 @@ rc=$?
 if [[ $rc -eq 0 ]]; then
   ok "compile ports/doom/doom.bet"
   file /tmp/doom; ls -la /tmp/doom
-elif [[ $rc -eq 137 || $rc -eq 139 ]]; then
-  bad "compile ports/doom/doom.bet (exit $rc — OOM-killed at the cgroup cap; raise BET_MEM_LIMIT to investigate)"
+elif [[ $rc -eq 137 ]]; then
+  # 137 = 128 + 9 (SIGKILL): the cgroup memory cap OOM-killed the compile. Raise BET_MEM_LIMIT.
+  bad "compile ports/doom/doom.bet (exit 137 — SIGKILL, OOM-killed at the cgroup cap; raise BET_MEM_LIMIT to investigate)"
+elif [[ $rc -eq 139 ]]; then
+  # 139 = 128 + 11 (SIGSEGV): the compiler itself segfaulted — NOT an OOM. This is the x86_64
+  # codegen crash tracked in #111 (reproduces under linux/amd64, absent on aarch64). It is a real
+  # compiler bug, not a memory-cap kill; run under gdb to capture a backtrace (see docker/README.md).
+  bad "compile ports/doom/doom.bet (exit 139 — SIGSEGV, compiler segfault; see #111, NOT an OOM — run under gdb for a backtrace)"
 else
   bad "compile ports/doom/doom.bet (exit $rc)"
 fi
