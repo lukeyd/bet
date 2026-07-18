@@ -53,11 +53,38 @@ docker compose -f docker/compose.yaml run --rm bet bash -lc \
      --args target/debug/bet build ports/doom/doom.bet --runtime real -o /tmp/doom'
 ```
 
-`uname -m` must print `x86_64` (confirming the emulated target), after which `gdb` runs the
-compiler to the fault and prints the SIGSEGV backtrace. Note: **139 = 128 + 11 = SIGSEGV**, a real
+`uname -m` must print `x86_64` (confirming the emulated target); the compiler then dies with
+**`Segmentation fault`, exit `139`** during `bet build`. Note: **139 = 128 + 11 = SIGSEGV**, a real
 compiler crash — distinct from **137 = 128 + 9 = SIGKILL**, the cgroup-OOM kill `verify.sh` guards
 against. (`verify.sh` previously conflated the two; stage 3 now labels 139 as a segfault and points
 here.) This harness reproduces #111; it does not fix it — the codegen fix lands separately.
+
+### Capturing an x86_64 backtrace (why not gdb-under-Rosetta)
+
+The `gdb -ex run` above **reproduces the crash but cannot backtrace it under Rosetta**: Rosetta
+translates x86_64 to arm64, and gdb's live ptrace can't read the guest registers —
+`Couldn't get registers: Input/output error`, and it ends up tracing the wrong (`sh`) process. A
+core dump doesn't help either: the kernel writes an **aarch64** core (`e_machine = EM_AARCH64`),
+unreadable against the x86_64 `bet` binary. Rosetta is faithful enough to *crash* the same way, but
+it is not debuggable.
+
+To get a real, source-level x86_64 backtrace on Apple Silicon, run the (unmodified, x86_64) `bet`
+binary under **QEMU user-mode emulation with its gdbstub** — QEMU exposes true guest x86_64
+registers, so `gdb-multiarch` symbolizes the frames. From a native arm64 container with the amd64
+runtime libs added via multiarch (`archive.ubuntu.com` serves amd64; `ports.ubuntu.com` does not):
+
+```sh
+# in an arm64 ubuntu:22.04 container, with the repo at /work and target/debug/bet already built:
+qemu-x86_64 -g 1234 target/debug/bet build ports/doom/doom.bet --runtime real -o /tmp/doom &
+gdb-multiarch -q -batch -ex 'target remote :1234' -ex continue \
+  -ex bt -ex 'thread apply all bt' target/debug/bet
+```
+
+The captured backtrace is posted on **#111**: the fault is inside **LLVM's X86 SelectionDAG
+instruction selector** (`X86DAGToDAGISel` → `DAGCombiner::visitMERGE_VALUES` →
+`SelectionDAG::ReplaceAllUsesWith`), reached from `backend::codegen::Cg::emit_object` — i.e. it is
+an **LLVM x86-64 codegen crash**, not a bug in bet's IR builder, which is why aarch64 (a different
+instruction selector) is unaffected.
 
 ## What `verify.sh` checks
 
