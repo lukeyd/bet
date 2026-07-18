@@ -49,13 +49,21 @@ unsafe_code = "warn"
 # [workspace.dependencies] catalog above — an entry no member references is
 # invisible to it, so prune those by hand.
 #
-# BLOCKED on exactly one crate: `backend` declares the allowlisted `backend ->
-# rt-abi` edge but only names `rt_abi` in comments (codegen.rs hardcodes the
-# 16-byte `rt_abi::Tag` layout instead of importing it), so this lint fires there
-# and `-D warnings` turns it into a CI error. The fix is one line — `use rt_abi
-# as _;` in crates/backend/src/lib.rs (as crates/lsp/src/lib.rs now does for its
-# own reserved edge) — or, better, have codegen.rs import the `Tag` type it is
-# currently duplicating by hand. Uncomment this in the same change.
+# `backend`'s hardcoded-`rt_abi::Tag` blocker is now FIXED (issue #103): codegen.rs
+# reads `rt_abi::Tag::NULL` for the null-tag sentinel and pins `tag_ty()` to the
+# real `rt_abi::Tag` layout with a compile-time guard, and lib.rs holds the edge
+# open for the default (LLVM-free) build with `use rt_abi as _;` (as
+# crates/lsp/src/lib.rs does for its own reserved `frontend` edge). `backend` is
+# lint-clean now — it is NOT what keeps this commented.
+#
+# The lint stays OFF because enabling it workspace-wide under `--all-targets`
+# (what CI runs) is NOT a one-crate change: the lint is per-compilation-unit, so
+# it also fires on ~20 test/bench/bin targets that legitimately don't reference
+# every dep of their package — dev-deps used by only some tests (`insta`,
+# `criterion`) and normal deps used by a lib but not a sibling integration test
+# (`logos`, `midir`, `rt_abi`, `thiserror`, `frontend`, `interp`, ...) across
+# frontend/driver/interp/midir/rt-stub/runtime. Turning it on cleanly first needs
+# `use X as _;` shims in all of those targets — a separate cross-cutting cleanup.
 # unused_crate_dependencies = "warn"
 
 [workspace.lints.clippy]
